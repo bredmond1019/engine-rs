@@ -45,14 +45,14 @@
 //! **`ImplementTaskNode -> TestTaskNode` stays a single plain edge**
 //! (`ticket-implement-node-transport-retry`, shape (A)): a `claude_code_rs`
 //! transport failure inside `ImplementTaskNode` (and every other
-//! `ClaudeCodeStep`-backed node — `TriageTaskNode`, `ConsolidatedReviewNode`,
+//! `AgentCodeStep`-backed node — `TriageTaskNode`, `ConsolidatedReviewNode`,
 //! `GenerateTasksNode`, `PatchDocsNode`) is retried with backoff *inside*
-//! `ClaudeCodeStep::process` before it ever returns `Err`, so this file's
+//! `AgentCodeStep::process` before it ever returns `Err`, so this file's
 //! graph topology does not gain a branch point for it. Only a persistent
 //! transport failure (retry budget exhausted, or a non-retryable
 //! `claude_code_rs::Error` variant) still surfaces as a plain `NodeError`
 //! and halts the walk exactly as before. See
-//! `crates/engine-core/src/nodes/claude_code_step.rs` and this ticket's
+//! `crates/engine-core/src/nodes/agent_code_step.rs` and this ticket's
 //! Amendment Log for the retryable/non-retryable classification.
 
 use std::collections::HashMap;
@@ -341,7 +341,7 @@ pub fn agentic_write_config(model: &str) -> Config {
 
 /// The real `claude_code_rs::execute` transport — the cloud fallback a
 /// `local`-tier judgment stage's `openai_compat_transport` routes to when
-/// its local endpoint is unavailable. `ClaudeCodeStep` deliberately keeps
+/// its local endpoint is unavailable. `AgentCodeStep` deliberately keeps
 /// its own equivalent default private (D4 owns that seam); this is the same
 /// one-line delegation, just visible to this module so `registry_for_policy`
 /// can hand it to `openai_compat_transport_live` as the fallback.
@@ -716,7 +716,7 @@ mod tests {
 
         // Rewiring TriageTaskNode/ConsolidatedReviewNode's transport must not
         // change the registry's node count or identity set — only the
-        // transport those two nodes' composed `ClaudeCodeStep` uses.
+        // transport those two nodes' composed `AgentCodeStep` uses.
         assert_eq!(registry.len(), super::registry().len());
         assert!(registry.contains("TriageTaskNode"));
         assert!(registry.contains("ConsolidatedReviewNode"));

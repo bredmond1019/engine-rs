@@ -51,7 +51,7 @@ pub use dispatch::{DispatchError, Dispatcher, WorkflowFactory};
 pub use locale::{Currency, Locale};
 pub use loop_combinator::{build_loop, ExitPredicate, LoopCluster, LoopSpec};
 pub use node::{Identified, InputBinding, Node, NodeError, NodeExt, NodeRegistry, WithInput};
-pub use nodes::ClaudeCodeStep;
+pub use nodes::AgentCodeStep;
 pub use nodes::{BrainConfig, BrainConfigError, HttpGet};
 pub use parallel::{BranchFailure, BranchOutcome, ParallelNode};
 pub use progress::{

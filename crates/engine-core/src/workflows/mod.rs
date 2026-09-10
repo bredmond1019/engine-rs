@@ -49,7 +49,7 @@ pub mod transport_slot;
 pub use transport_slot::TransportSlot;
 
 /// The injectable transport signature for model-calling nodes' composed
-/// `ClaudeCodeStep`s — identical shape to `ClaudeCodeStep`'s own (private)
+/// `AgentCodeStep`s — identical shape to `AgentCodeStep`'s own (private)
 /// transport type. Defaults to the real `claude_code_rs::execute`; tests
 /// substitute a stub via each node's `with_transport`.
 pub type ModelTransport = Arc<
@@ -70,7 +70,7 @@ pub(crate) fn get_result<'a>(
 }
 
 /// Snapshot the current length of `ctx`'s session ledger, to be paired with [`sessions_since`]
-/// after a wrapper's inner `ClaudeCodeStep` call returns.
+/// after a wrapper's inner `AgentCodeStep` call returns.
 ///
 /// # Why a length, not a clone
 ///
@@ -212,7 +212,7 @@ pub(crate) fn strip_json_fence(text: &str) -> &str {
     }
 }
 
-/// Prefer the pre-parsed `structured` value written by a `ClaudeCodeStep`
+/// Prefer the pre-parsed `structured` value written by a `AgentCodeStep`
 /// (stamped onto `ctx.nodes[node_name]["structured"]`) when present and
 /// non-null; otherwise fall back to [`strip_json_fence`] +
 /// `serde_json::from_str` on the raw text `content`. Factored out of the
@@ -246,7 +246,7 @@ pub struct CommandOutput {
 /// (`git`, `gh`, `mev`, ...). Defaults to the real subprocess via
 /// [`default_command_runner`]; tests substitute a stub so the gated
 /// `cargo test` suite never shells out — mirrors
-/// `ClaudeCodeStep::with_transport` (EN.2.A).
+/// `AgentCodeStep::with_transport` (EN.2.A).
 pub type CommandRunner =
     Arc<dyn Fn(&str, &[&str], &Path) -> std::io::Result<CommandOutput> + Send + Sync>;
 

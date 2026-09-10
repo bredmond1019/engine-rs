@@ -5,7 +5,7 @@
 //! A row here records a node **dispatch** — one pass through the framework's
 //! single dispatch choke point (`node_context` in `engine-core`'s
 //! `workflow.rs`). It is NOT a record of an LLM call: 22 production node
-//! bodies dispatch an inner `ClaudeCodeStep` *outside* `node_context`, so the
+//! bodies dispatch an inner `AgentCodeStep` *outside* `node_context`, so the
 //! per-call view is `claude_sessions` (`ClaudeSession` in
 //! `engine-core::sessions`), and this is the per-dispatch view. They have
 //! different cardinalities and both are correct: a single dispatch of a node

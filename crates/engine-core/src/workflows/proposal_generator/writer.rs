@@ -2,7 +2,7 @@
 //! `AutomationRoadmap` from the identified opportunities.
 //!
 //! A non-terminal, cloud-default model node wrapping
-//! `crate::nodes::claude_code_step::ClaudeCodeStep` (no WebSearch — it works
+//! `crate::nodes::agent_code_step::AgentCodeStep` (no WebSearch — it works
 //! from `OpportunityIdentifierNode`'s already-scored candidates plus the
 //! `ProposalCompanyResearchNode` brief). On `process`:
 //! 1. read the run's [`super::policy::ProposalGeneratorPolicy`] stamped once
@@ -25,7 +25,7 @@ use engine_contract::TaskContext;
 
 use crate::locale::{EngagementKind, Locale, MoneyRange, RateCard, RateSheet};
 use crate::node::{Node, NodeError};
-use crate::nodes::ClaudeCodeStep;
+use crate::nodes::AgentCodeStep;
 use crate::policy::PolicyConfigSource;
 use crate::workflows::{get_result, parse_structured_or_fenced, put_result, ModelTransport};
 
@@ -35,7 +35,7 @@ use super::schema::{
 };
 
 /// The `Node::name()` identity `ProposalWriterNode` runs its composed
-/// `ClaudeCodeStep` under, and the `ctx.nodes`/`ctx.node_runs` key its
+/// `AgentCodeStep` under, and the `ctx.nodes`/`ctx.node_runs` key its
 /// output/usage are stamped onto.
 pub const NODE_NAME: &str = "ProposalWriterNode";
 
@@ -134,7 +134,7 @@ impl ProposalWriterNode {
         }
     }
 
-    /// Override the transport used by the composed `ClaudeCodeStep`. Tests
+    /// Override the transport used by the composed `AgentCodeStep`. Tests
     /// use this to stub a real subprocess call with a canned `Outcome`, so
     /// the gated suite never spawns a real `claude`.
     #[must_use]
@@ -166,7 +166,7 @@ impl Node for ProposalWriterNode {
             policy.output_verbosity,
         );
 
-        let mut step = ClaudeCodeStep::new(NODE_NAME, config, prompt);
+        let mut step = AgentCodeStep::new(NODE_NAME, config, prompt);
         if let Some(transport) = self.transport.clone() {
             step = step.with_transport(move |config, prompt| (transport)(config, prompt));
         }

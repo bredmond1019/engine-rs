@@ -23,7 +23,7 @@
 //!
 //! # `JudgeClaimNode`
 //!
-//! One `ClaudeCodeStep` call per claim, asking only for an `action` +
+//! One `AgentCodeStep` call per claim, asking only for an `action` +
 //! `reasoning` — never for the evidence citations themselves. Citations are
 //! built deterministically from `ClaimRecallNode`'s actual recall results,
 //! not from anything the model claims to have cited, which is what makes
@@ -41,7 +41,7 @@ use serde_json::{json, Value};
 
 use crate::node::{Node, NodeError};
 use crate::nodes::{
-    BrainConfig, ClaudeCodeStep, HttpGet, MetaTransport, RecallNode, RecallResult, RECALL_NODE_NAME,
+    AgentCodeStep, BrainConfig, HttpGet, MetaTransport, RecallNode, RecallResult, RECALL_NODE_NAME,
 };
 use crate::policy::LocalConfig;
 use crate::workflows::{
@@ -264,7 +264,7 @@ fn read_recall_result(ctx: &TaskContext) -> (bool, Vec<RecallResult>) {
 // ---------------------------------------------------------------------------
 
 /// The `Node::name()` identity `JudgeClaimNode` runs its composed
-/// `ClaudeCodeStep` under, and the `ctx.nodes` key its output is stamped
+/// `AgentCodeStep` under, and the `ctx.nodes` key its output is stamped
 /// onto. Read by `SaveVerdictNode`.
 pub const JUDGE_NODE_NAME: &str = "JudgeClaimNode";
 
@@ -356,7 +356,7 @@ fn build_prompt(
     )
 }
 
-/// One `ClaudeCodeStep` per claim: reads `ClaimRecallNode`'s evidence,
+/// One `AgentCodeStep` per claim: reads `ClaimRecallNode`'s evidence,
 /// judges via the model, and structurally enforces the OR.K3 guard before
 /// storing a [`Verdict`]. Skips the model call entirely (no billed session)
 /// when `ClaimRecallNode` reported a recall failure — `SaveVerdictNode`
@@ -380,7 +380,7 @@ impl JudgeClaimNode {
         }
     }
 
-    /// Override the transport used by the composed `ClaudeCodeStep`. Tests
+    /// Override the transport used by the composed `AgentCodeStep`. Tests
     /// use this to stub a real subprocess call with a canned `Outcome`.
     #[must_use]
     pub fn with_transport(mut self, transport: ModelTransport) -> Self {
@@ -444,7 +444,7 @@ impl Node for JudgeClaimNode {
 
         let step = self
             .transport
-            .apply(ClaudeCodeStep::new(JUDGE_NODE_NAME, config, prompt));
+            .apply(AgentCodeStep::new(JUDGE_NODE_NAME, config, prompt));
 
         let baseline = session_baseline(&ctx);
         let mut ctx = step.process(ctx).await?;

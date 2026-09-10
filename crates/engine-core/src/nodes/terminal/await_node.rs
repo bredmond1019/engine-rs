@@ -16,11 +16,11 @@
 //! the run loop, checked once a node's `process` call returns. An abort
 //! against a node parked inside a long `.await` therefore does nothing
 //! until that `.await` resolves on its own. [`TerminalAwaitNode::with_cancellation_token`]
-//! (mirroring `ClaudeCodeStep::with_cancellation_token`) takes a token
+//! (mirroring `AgentCodeStep::with_cancellation_token`) takes a token
 //! through the node's OWN builder so the poll loop's `select!` can race
 //! cancellation against every single tick, not just the whole call.
 //!
-//! Mirroring `ClaudeCodeStep`'s documented convention: a cancel win returns
+//! Mirroring `AgentCodeStep`'s documented convention: a cancel win returns
 //! `Ok(ctx)` UNCHANGED (no result stamped under this node's `ctx.nodes`
 //! identity) rather than `Err` — the runner's own between-node check
 //! (`workflow.rs`) is what stamps `cancellation::stamp_cancelled` onto
@@ -769,7 +769,7 @@ mod tests {
             .expect("process() returned an error");
 
         // Cancel wins: no result is stamped for this node, matching
-        // `ClaudeCodeStep`'s documented convention.
+        // `AgentCodeStep`'s documented convention.
         assert!(!result.nodes.contains_key(NODE_NAME));
     }
 

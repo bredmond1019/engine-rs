@@ -1,7 +1,7 @@
 //! A cheaply-cloneable cancellation token for the run loop (EN.2.B task 1).
 //!
 //! `Workflow::run` (EN.2.B task 3) checks a `CancellationToken` at each node
-//! boundary before dispatching the next node; `ClaudeCodeStep` (EN.2.B task 4)
+//! boundary before dispatching the next node; `AgentCodeStep` (EN.2.B task 4)
 //! races it against an in-flight session future so a cancel drops the future
 //! rather than awaiting it to completion.
 //!
@@ -69,7 +69,7 @@ impl CancellationToken {
 
     /// Resolves once the token is cancelled. Resolves immediately if it is
     /// already cancelled. Intended for `tokio::select!`/`futures::select`
-    /// races against an in-flight future (see `nodes::claude_code_step`).
+    /// races against an in-flight future (see `nodes::agent_code_step`).
     pub async fn cancelled(&self) {
         if self.is_cancelled() {
             return;

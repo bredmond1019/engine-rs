@@ -197,7 +197,7 @@ fn real_cloud_transport() -> ModelTransport {
 /// `policy` resolves to [`ModelTier::Local`] rewired to route through
 /// [`openai_compat_meta_transport_live`] (falling back to the real `claude` CLI
 /// transport on any local-endpoint failure). **Never** rewires `research`
-/// (`ProposalCompanyResearchNode`) — it wraps `ClaudeCodeStep` with
+/// (`ProposalCompanyResearchNode`) — it wraps `AgentCodeStep` with
 /// WebSearch/WebFetch tools granted, which a local single-shot endpoint
 /// cannot serve (spec Context Pointers). `writer` also never rewires — it
 /// is cloud-default per the policy module's docs and carries no `Local`
@@ -372,7 +372,7 @@ mod tests {
         let registry = registry_for_policy(&policy);
 
         // Rewiring must not change the registry's node count or identity
-        // set — only the transport those nodes' composed `ClaudeCodeStep`
+        // set — only the transport those nodes' composed `AgentCodeStep`
         // uses.
         assert_eq!(registry.len(), super::registry().len());
         assert!(registry.contains("OpportunityIdentifierNode"));

@@ -43,7 +43,7 @@
 #[allow(unused_imports)]
 pub(crate) use super::{get_result, parse_structured_or_fenced, put_result, strip_json_fence};
 // `session_baseline`/`sessions_since` (EN.14.C task 1) — the ledger-delta
-// helper pair a wrapper reads before its inner `ClaudeCodeStep` call and
+// helper pair a wrapper reads before its inner `AgentCodeStep` call and
 // attaches to any `NodeError` it constructs after that call, so a billed
 // session survives a post-billed-call wrapper failure.
 #[allow(unused_imports)]
@@ -98,9 +98,9 @@ pub const DEFAULT_STATE_FILENAME: &str = "sdlc-flow-state.json";
 /// rather than merging into it. A `COST_BEARING_STAGES` wrapper node that
 /// builds a fresh `result` object (its own verdict/content JSON) and then
 /// calls `put_result` therefore silently drops everything the inner
-/// `ClaudeCodeStep::process` already stamped onto that same identity —
+/// `AgentCodeStep::process` already stamped onto that same identity —
 /// `cost_usd`, both cache channels, and the `"transport"` tier stamp
-/// (`crates/engine-core/src/nodes/claude_code_step.rs:485-510`). That loss
+/// (`crates/engine-core/src/nodes/agent_code_step.rs:485-510`). That loss
 /// is why `BudgetLedger::node_cost_usd` folds in `None` for every SDLC
 /// stage and `Budget::max_cost_usd` can never fire, and why
 /// `policy::telemetry::total_cost_usd`'s fallback reports zero for

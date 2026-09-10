@@ -1,4 +1,4 @@
-//! Commander triage — `EN.15.F` task 4: the single gated `ClaudeCodeStep` in the whole
+//! Commander triage — `EN.15.F` task 4: the single gated `AgentCodeStep` in the whole
 //! COMMANDER workflow.
 //!
 //! Ports the two judgement steps `/orchestration-commander`'s prompt still owns after this
@@ -7,7 +7,7 @@
 //! each finding against `planning/open-work/index.md` before filing it fresh. Every OTHER
 //! judgement step `/orchestration-commander` performs is explicitly out of scope for this
 //! port (see the block record's `out_of_scope`) — this module must never grow a second
-//! `ClaudeCodeStep`.
+//! `AgentCodeStep`.
 //!
 //! ## Gated on `GatedAction::RunDrain`, never bypassed
 //!
@@ -29,7 +29,7 @@
 
 use claude_code_rs::Config;
 
-use crate::nodes::claude_code_step::ClaudeCodeStep;
+use crate::nodes::agent_code_step::AgentCodeStep;
 use crate::policy::permission::{decide, Decision, GatedAction, PermissionProfile};
 
 /// The commander triage step's stable system/task prompt — a colocated file per standing
@@ -64,9 +64,9 @@ pub fn triage_config(model: Option<String>) -> Config {
 #[derive(Debug)]
 pub enum TriageOutcome {
     /// `GatedAction::RunDrain` permitted the step; here it is, ready to run. Boxed per
-    /// clippy's `large_enum_variant` — `ClaudeCodeStep` is the far larger of the two
+    /// clippy's `large_enum_variant` — `AgentCodeStep` is the far larger of the two
     /// variants and `SuppressedByProfile` carries no data at all.
-    Step(Box<ClaudeCodeStep>),
+    Step(Box<AgentCodeStep>),
     /// `GatedAction::RunDrain` denied the step under this profile. The step is skipped —
     /// this variant IS the record of that, mirroring `sweep::route`'s
     /// `suppressed_by_profile: true` discipline: a caller matching on this variant reports
@@ -84,10 +84,10 @@ impl TriageOutcome {
     }
 }
 
-/// Build the commander's one and only `ClaudeCodeStep` — orphan classification plus the
+/// Build the commander's one and only `AgentCodeStep` — orphan classification plus the
 /// `planning/open-work/index.md` check — gated on `GatedAction::RunDrain` under `profile`.
 ///
-/// This is the single call site in the COMMANDER workflow that constructs a `ClaudeCodeStep`;
+/// This is the single call site in the COMMANDER workflow that constructs a `AgentCodeStep`;
 /// see this module's doc comment for why a second one would be a scope violation, not a bug
 /// fix.
 #[must_use]
@@ -96,7 +96,7 @@ pub fn build_triage_step(profile: PermissionProfile, model: Option<String>) -> T
         Decision::Deny => TriageOutcome::SuppressedByProfile,
         Decision::Permit => {
             let config = triage_config(model);
-            TriageOutcome::Step(Box::new(ClaudeCodeStep::new(
+            TriageOutcome::Step(Box::new(AgentCodeStep::new(
                 TRIAGE_STEP_NAME,
                 config,
                 TRIAGE_PROMPT,
@@ -165,7 +165,7 @@ mod tests {
                 panic!("Unrestricted must permit GatedAction::RunDrain")
             }
         }
-        assert!(!TriageOutcome::Step(Box::new(ClaudeCodeStep::new(
+        assert!(!TriageOutcome::Step(Box::new(AgentCodeStep::new(
             TRIAGE_STEP_NAME,
             Config::default(),
             "x"

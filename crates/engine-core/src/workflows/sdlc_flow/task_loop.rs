@@ -25,7 +25,7 @@ use serde_json::json;
 
 use crate::cancellation::CancellationToken;
 use crate::node::{Node, NodeError};
-use crate::nodes::{ClaudeCodeStep, MetaTransport};
+use crate::nodes::{AgentCodeStep, MetaTransport};
 use crate::routing::Router;
 
 #[cfg(test)]
@@ -103,7 +103,7 @@ pub(super) fn apply_policy(
 /// call timeout — without the prompt half.
 ///
 /// Split out for `docs::PatchDocsNode`, which builds its prompt in a
-/// `ClaudeCodeStep::with_prompt_builder` closure at call time and so has no
+/// `AgentCodeStep::with_prompt_builder` closure at call time and so has no
 /// prompt string to hand [`apply_policy`] up front; it applies this to its
 /// `Config` and `crate::policy::apply_verbosity_directive` inside the
 /// closure. Keeping the two halves in one place is what stops the shaping
@@ -1027,7 +1027,7 @@ incomplete, finish it now rather than reporting a partial task.
 pub(super) const TRIAGE_STABLE_PROMPT: &str = include_str!("prompts/triage.md");
 
 /// Model node (Sonnet): drives Claude Code to implement the current task.
-/// Composes a `ClaudeCodeStep` under its own identity so it can post-process
+/// Composes a `AgentCodeStep` under its own identity so it can post-process
 /// the model's JSON output into `{summary, modified_files, tests_added}`.
 ///
 /// **This node is where `telemetry.total_attempts` is charged** — one per
@@ -1053,7 +1053,7 @@ pub struct ImplementTaskNode {
     transport: Option<ModelTransport>,
     /// Taken through this node's OWN builder, never inferred from context —
     /// mirrors `OrchestrationRunNode::with_cancellation_token` /
-    /// `ClaudeCodeStep::with_cancellation_token`. `None` (the default) is
+    /// `AgentCodeStep::with_cancellation_token`. `None` (the default) is
     /// behavior-stable: no token, no cancellation check, identical to
     /// today. See [`Self::with_cancellation_token`].
     cancellation_token: Option<CancellationToken>,
@@ -1099,7 +1099,7 @@ impl ImplementTaskNode {
         }
     }
 
-    /// Override the transport used by the composed `ClaudeCodeStep`. Tests
+    /// Override the transport used by the composed `AgentCodeStep`. Tests
     /// use this to stub a real subprocess call with a canned `Outcome`, so
     /// the gated suite never spawns a real `claude`.
     #[must_use]
@@ -1109,7 +1109,7 @@ impl ImplementTaskNode {
     }
 
     /// Attach a `CancellationToken`, raced against the composed
-    /// `ClaudeCodeStep`'s in-flight model call (`ClaudeCodeStep::
+    /// `AgentCodeStep`'s in-flight model call (`AgentCodeStep::
     /// with_cancellation_token`'s `tokio::select!`) so an abort issued
     /// mid-call interrupts this node instead of only taking effect at the
     /// next node boundary. With no token attached (the default), behavior
@@ -1222,7 +1222,7 @@ impl Node for ImplementTaskNode {
 
         config.json_schema = Some(implement_output_schema());
 
-        let mut step = ClaudeCodeStep::new("ImplementTaskNode", config, prompt)
+        let mut step = AgentCodeStep::new("ImplementTaskNode", config, prompt)
             .with_retry_policy(policy.transport_retry);
         if let Some(transport) = self.transport.clone() {
             step = step.with_transport(move |config, prompt| (transport)(config, prompt));
@@ -1233,7 +1233,7 @@ impl Node for ImplementTaskNode {
 
         // Baseline taken immediately before the billed call, per EN.14.C —
         // any wrapper `Err` returned below this line carries whatever the
-        // inner `ClaudeCodeStep` appended to the ledger, so a billed session
+        // inner `AgentCodeStep` appended to the ledger, so a billed session
         // never dies with the discarded `ctx` on the by-value `Err` path.
         let baseline = session_baseline(&ctx);
         let mut ctx = step.process(ctx).await?;
@@ -1268,7 +1268,7 @@ impl Node for ImplementTaskNode {
             NodeError::new(format!("failed to serialize SDLCState: {err}"))
                 .with_sessions(sessions_since(&ctx, baseline))
         })?;
-        // Preserve billing/telemetry from the inner ClaudeCodeStep's just-stamped
+        // Preserve billing/telemetry from the inner AgentCodeStep's just-stamped
         // entry before this wrapper overwrites it — this site previously carried
         // forward nothing at all (EN.14.A).
         carry_forward_billing(&ctx, "ImplementTaskNode", &mut result);
@@ -2184,7 +2184,7 @@ impl Node for TestTaskNode {
 /// `PASS`/`RETRYABLE`/`MAJOR_BAIL`. Deterministic by default (a passing test
 /// forces `PASS`; an over-budget task forces `MAJOR_BAIL`; a failing task
 /// still under budget is deterministically `RETRYABLE`), consulting a
-/// `ClaudeCodeStep` (Sonnet) only when triage is enabled: the bare
+/// `AgentCodeStep` (Sonnet) only when triage is enabled: the bare
 /// `event.llm_triage` field wins if set, else the resolved policy's
 /// `llm_triage` (see `resolved_policy` above).
 pub struct TriageTaskNode {
@@ -2252,7 +2252,7 @@ impl TriageTaskNode {
         }
     }
 
-    /// Override the transport used by the composed `ClaudeCodeStep` for the
+    /// Override the transport used by the composed `AgentCodeStep` for the
     /// `llm_triage` model branch. Tests use this to assert it is (or isn't)
     /// invoked.
     #[must_use]
@@ -2262,7 +2262,7 @@ impl TriageTaskNode {
     }
 
     /// Attach a `CancellationToken`, raced against the composed
-    /// `ClaudeCodeStep`'s in-flight `llm_triage` model call so an abort
+    /// `AgentCodeStep`'s in-flight `llm_triage` model call so an abort
     /// issued mid-call interrupts this node instead of only taking effect
     /// at the next node boundary. With no token attached (the default),
     /// behavior is unchanged from before this builder existed.
@@ -2455,7 +2455,7 @@ impl Node for TriageTaskNode {
         config.json_schema = Some(triage_output_schema());
 
         let mut step = self.transport.apply(
-            ClaudeCodeStep::new("TriageTaskNode", config, prompt)
+            AgentCodeStep::new("TriageTaskNode", config, prompt)
                 .with_retry_policy(policy.transport_retry),
         );
         if let Some(token) = self.cancellation_token.clone() {
@@ -2464,7 +2464,7 @@ impl Node for TriageTaskNode {
 
         // Baseline taken immediately before the billed call, per EN.14.C —
         // any wrapper `Err` returned below carries whatever the inner
-        // `ClaudeCodeStep` appended to the ledger, so this triage wrapper's
+        // `AgentCodeStep` appended to the ledger, so this triage wrapper's
         // billed session survives a post-billed-call parse/content failure
         // (the measured case this block exists for).
         let baseline = session_baseline(&ctx);
@@ -2513,7 +2513,7 @@ impl Node for TriageTaskNode {
         }
         // Carried forward below: `put_result` replaces this node's whole
         // `ctx.nodes` entry, which would otherwise silently drop what
-        // `ClaudeCodeStep::process` just wrote onto this same identity —
+        // `AgentCodeStep::process` just wrote onto this same identity —
         // the `"transport"` tier stamp the exact tier-telemetry
         // `RunTelemetry`/`observed_model_tiers` (`policy/telemetry.rs`)
         // reads back out by this same node name, plus `cost_usd` and both
@@ -2604,7 +2604,7 @@ impl Router for TriageRouterNode {
 
 /// Model node (Sonnet): reviews the task's working-tree diff against `HEAD`
 /// (`git add -N -A` then `git diff HEAD` — see [`stage_untracked_intent`])
-/// against its acceptance criteria via a composed `ClaudeCodeStep`.
+/// against its acceptance criteria via a composed `AgentCodeStep`.
 pub struct ConsolidatedReviewNode {
     config: Config,
     transport: TransportSlot,
@@ -2715,7 +2715,7 @@ impl ConsolidatedReviewNode {
         }
     }
 
-    /// Override the transport used by the composed `ClaudeCodeStep`.
+    /// Override the transport used by the composed `AgentCodeStep`.
     #[must_use]
     pub fn with_transport(mut self, transport: ModelTransport) -> Self {
         self.transport.set_plain(transport);
@@ -2723,7 +2723,7 @@ impl ConsolidatedReviewNode {
     }
 
     /// Attach a `CancellationToken`, raced against the composed
-    /// `ClaudeCodeStep`'s in-flight review model call so an abort issued
+    /// `AgentCodeStep`'s in-flight review model call so an abort issued
     /// mid-call interrupts this node instead of only taking effect at the
     /// next node boundary. With no token attached (the default), behavior
     /// is unchanged from before this builder existed.
@@ -2834,7 +2834,7 @@ impl Node for ConsolidatedReviewNode {
         config.json_schema = Some(review_output_schema());
 
         let mut step = self.transport.apply(
-            ClaudeCodeStep::new("ConsolidatedReviewNode", config, prompt)
+            AgentCodeStep::new("ConsolidatedReviewNode", config, prompt)
                 .with_retry_policy(policy.transport_retry),
         );
         if let Some(token) = self.cancellation_token.clone() {
@@ -2843,7 +2843,7 @@ impl Node for ConsolidatedReviewNode {
 
         // Baseline taken immediately before the billed call, per EN.14.C —
         // any wrapper `Err` returned below carries whatever the inner
-        // `ClaudeCodeStep` appended to the ledger, so this review wrapper's
+        // `AgentCodeStep` appended to the ledger, so this review wrapper's
         // billed session survives a post-billed-call failure.
         let baseline = session_baseline(&ctx);
         let mut ctx = step.process(ctx).await?;
@@ -2928,7 +2928,7 @@ impl Node for ConsolidatedReviewNode {
         })?;
         // Carried forward below: `put_result` replaces this node's whole
         // `ctx.nodes` entry, which would otherwise silently drop what
-        // `ClaudeCodeStep::process` just wrote onto this same identity —
+        // `AgentCodeStep::process` just wrote onto this same identity —
         // the `"transport"` tier stamp the exact tier-telemetry
         // `RunTelemetry`/`observed_model_tiers` (`policy/telemetry.rs`)
         // reads back out by this same node name, plus `cost_usd` and both
@@ -7267,7 +7267,7 @@ pub(crate) mod tests {
     }
 
     /// A schema-tagged reply (`structured_output: Some(..)`) is consumed via
-    /// the `structured` field written by `ClaudeCodeStep`, not the
+    /// the `structured` field written by `AgentCodeStep`, not the
     /// fence-strip path — proven by making `text` a value that would fail a
     /// strict-JSON parse (an unfenced non-JSON string) while `structured`
     /// carries the real payload.
@@ -7478,7 +7478,7 @@ pub(crate) mod tests {
     }
 
     /// A default-policy `transport_retry` must reproduce exactly the attempt
-    /// count `ClaudeCodeStep`'s own built-in default already produced before
+    /// count `AgentCodeStep`'s own built-in default already produced before
     /// this ticket wired the policy value through — behaviour-stable, proven
     /// rather than assumed (both are literally `TransportRetry::default()`).
     #[tokio::test]
@@ -7498,7 +7498,7 @@ pub(crate) mod tests {
         assert_eq!(
             calls.load(std::sync::atomic::Ordering::SeqCst),
             TransportRetry::default().max_attempts,
-            "default policy transport_retry must match ClaudeCodeStep's own \
+            "default policy transport_retry must match AgentCodeStep's own \
              built-in default attempt count"
         );
     }
@@ -7506,7 +7506,7 @@ pub(crate) mod tests {
     /// A non-default `transport_retry` set on the resolved policy changes
     /// the observed attempt count against a persistently failing transport —
     /// proof the value actually reaches `ImplementTaskNode`'s composed
-    /// `ClaudeCodeStep`, not just that it resolves.
+    /// `AgentCodeStep`, not just that it resolves.
     #[tokio::test]
     async fn implement_transport_retry_nondefault_changes_observed_attempts() {
         let task = SDLCTask::new(1, "One", "d1");
@@ -7845,7 +7845,7 @@ pub(crate) mod tests {
     }
 
     /// `prompt_cache = true` sets a stable `system_prompt` cache breakpoint
-    /// on the composed `ClaudeCodeStep`'s `Config`; the default
+    /// on the composed `AgentCodeStep`'s `Config`; the default
     /// (`prompt_cache = false`) leaves it unset.
     #[tokio::test]
     async fn implement_node_sets_cache_breakpoint_when_prompt_cache_enabled() {
@@ -9413,7 +9413,7 @@ pub(crate) mod tests {
 
     /// Sets a shared flag when dropped — lets a stub transport future prove
     /// it was actually dropped (not awaited to completion) by a
-    /// cancellation win. Mirrors `claude_code_step.rs`'s own `DropSignal`.
+    /// cancellation win. Mirrors `agent_code_step.rs`'s own `DropSignal`.
     struct DropSignal(Arc<AtomicBool>);
 
     impl Drop for DropSignal {
@@ -9441,7 +9441,7 @@ pub(crate) mod tests {
     }
 
     /// `ImplementTaskNode` must observe a `with_cancellation_token` token:
-    /// a cancel fired WHILE the composed `ClaudeCodeStep`'s model call is
+    /// a cancel fired WHILE the composed `AgentCodeStep`'s model call is
     /// in flight must interrupt it promptly rather than waiting for that
     /// call to return — the transport future is dropped, never resolved.
     /// A test that aborts between nodes proves nothing here; this fires the
@@ -9515,7 +9515,7 @@ pub(crate) mod tests {
             .expect("a mid-call cancel must return promptly, not hang")
             .expect("the spawned task must not panic");
 
-        // A cancel win leaves `ClaudeCodeStep::process` returning `Ok(ctx)`
+        // A cancel win leaves `AgentCodeStep::process` returning `Ok(ctx)`
         // unchanged (no `TriageTaskNode` entry stamped); this node's own
         // subsequent `content` lookup then errors on the missing entry
         // rather than hanging. Either outcome proves the point this test
@@ -9860,7 +9860,7 @@ pub(crate) mod tests {
             // Negative: a carry-forward that copied everything indiscriminately
             // would also pass every assertion above, so this proves the
             // wrapper's carry-forward is selective — session_id and the raw
-            // model content are stamped by `ClaudeCodeStep::process` onto the
+            // model content are stamped by `AgentCodeStep::process` onto the
             // same identity but are deliberately not among the four billing
             // keys `carry_forward_billing` copies.
             assert!(

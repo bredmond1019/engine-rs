@@ -37,7 +37,7 @@ pub struct ClaimReaffirmPolicy {
     /// is marked [`ClaimStatus::Failed`] and the drain moves on rather than
     /// halting the whole lane (task 2's per-item containment).
     pub max_attempts: u32,
-    /// The `ClaudeCodeStep` model tier `JudgeClaimNode` (task 2) resolves
+    /// The `AgentCodeStep` model tier `JudgeClaimNode` (task 2) resolves
     /// for its one-verdict-per-claim call. A `Local`-tier run is subject to
     /// `openai_compat_transport.rs`'s silent local->cloud fallback — see
     /// [`super::TransportInfo`], which every `Verdict` stamps so that
@@ -256,7 +256,7 @@ pub struct Citation {
 }
 
 /// Which transport actually served a `JudgeClaimNode` call — mirrors the
-/// `"transport"` object `ClaudeCodeStep` stamps onto `ctx.nodes[name]`
+/// `"transport"` object `AgentCodeStep` stamps onto `ctx.nodes[name]`
 /// (`tier`/`model`/`endpoint`), carried onto the `Verdict` itself so the
 /// silent local->cloud fallback (`openai_compat_transport.rs:18-24`) stays
 /// visible per claim rather than only in run-level telemetry.

@@ -100,7 +100,7 @@ use engine_contract::TaskContext;
 use serde_json::Value;
 
 use crate::node::{Node, NodeError, NodeRegistry};
-use crate::nodes::ClaudeCodeStep;
+use crate::nodes::AgentCodeStep;
 use crate::routing::Router;
 use crate::schema::{NodeConfig, WorkflowSchema};
 use crate::workflow::Workflow;
@@ -259,7 +259,7 @@ impl TranslateGateNode {
         }
     }
 
-    /// Override the transport used by the composed `ClaudeCodeStep`. Tests
+    /// Override the transport used by the composed `AgentCodeStep`. Tests
     /// use this to stub a real subprocess call with a canned `Outcome`, so
     /// the gated suite never spawns a real `claude`. Only reached when
     /// `translate_enabled` is `true` — the no-op path never calls the
@@ -336,7 +336,7 @@ impl Node for TranslateGateNode {
         );
         let prompt = build_translate_prompt(&draft);
 
-        let mut step = ClaudeCodeStep::new(TRANSLATE_NODE_NAME, config, prompt);
+        let mut step = AgentCodeStep::new(TRANSLATE_NODE_NAME, config, prompt);
         if let Some(transport) = self.transport.clone() {
             step = step.with_transport(move |config, prompt| (transport)(config, prompt));
         }

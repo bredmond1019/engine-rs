@@ -26,7 +26,7 @@ use engine_core::{
 
 /// A node that increments a shared counter every time it runs, stamps a
 /// trivial `ctx.nodes[identity]` output, optionally reports token usage
-/// (mirroring `ClaudeCodeStep`'s pattern), and optionally runs an
+/// (mirroring `AgentCodeStep`'s pattern), and optionally runs an
 /// arbitrary side effect on its way out (e.g. pausing a shared
 /// `PauseSignal` from *inside* `process`).
 type OnProcessHook = Arc<dyn Fn(&mut TaskContext) + Send + Sync>;

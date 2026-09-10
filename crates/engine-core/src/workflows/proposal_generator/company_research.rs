@@ -2,7 +2,7 @@
 //! entry node, adapting `crate::workflows::research_agent::CompanyResearchNode`
 //! into the proposal-generator pipeline.
 //!
-//! A non-terminal model node wrapping `crate::nodes::claude_code_step::ClaudeCodeStep`.
+//! A non-terminal model node wrapping `crate::nodes::agent_code_step::AgentCodeStep`.
 //! On `process`:
 //! 1. read the run's [`super::policy::ProposalGeneratorPolicy`] stamped once
 //!    at dispatch (`crate::policy::resolved_policy_strict`, EN.5.D task 8)
@@ -23,7 +23,7 @@ use claude_code_rs::Config;
 use engine_contract::TaskContext;
 
 use crate::node::{Node, NodeError};
-use crate::nodes::ClaudeCodeStep;
+use crate::nodes::AgentCodeStep;
 use crate::workflows::research_agent::schema::{company_brief_json_schema, CompanyBrief};
 use crate::workflows::{parse_structured_or_fenced, put_result, ModelTransport};
 
@@ -31,7 +31,7 @@ use super::policy::ProposalGeneratorPolicy;
 use super::schema::ProposalGeneratorEventSchema;
 
 /// The `Node::name()` identity `ProposalCompanyResearchNode` runs its
-/// composed `ClaudeCodeStep` under, and the `ctx.nodes`/`ctx.node_runs` key
+/// composed `AgentCodeStep` under, and the `ctx.nodes`/`ctx.node_runs` key
 /// its output/usage are stamped onto.
 pub const NODE_NAME: &str = "ProposalCompanyResearchNode";
 
@@ -99,7 +99,7 @@ impl ProposalCompanyResearchNode {
         }
     }
 
-    /// Override the transport used by the composed `ClaudeCodeStep`. Tests
+    /// Override the transport used by the composed `AgentCodeStep`. Tests
     /// use this to stub a real subprocess call with a canned `Outcome`, so
     /// the gated suite never spawns a real `claude`.
     #[must_use]
@@ -132,7 +132,7 @@ impl Node for ProposalCompanyResearchNode {
         let prompt =
             crate::policy::apply_verbosity_directive(build_prompt(&event), policy.output_verbosity);
 
-        let mut step = ClaudeCodeStep::new(NODE_NAME, config, prompt);
+        let mut step = AgentCodeStep::new(NODE_NAME, config, prompt);
         if let Some(transport) = self.transport.clone() {
             step = step.with_transport(move |config, prompt| (transport)(config, prompt));
         }

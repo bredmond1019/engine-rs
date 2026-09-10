@@ -9,7 +9,7 @@
 //! off) for both stages.
 //!
 //! Both stages (`research`, `prospect`) are cloud-only — they wrap
-//! `ClaudeCodeStep` with `WebSearch`/`WebFetch` tools granted, which a
+//! `AgentCodeStep` with `WebSearch`/`WebFetch` tools granted, which a
 //! local single-shot endpoint cannot serve. `LocalConfig` is still carried
 //! for API-shape parity with `crate::policy::tier`, but no stage default
 //! ever resolves to `ModelTier::Local`.

@@ -26,7 +26,7 @@
 //!   how mev exposes the lane and why the library path was chosen over
 //!   shelling out to `mev attention-queue`.
 //! - `queue_router` / `judge` / `save_verdict` (task 2) — the queue-drain
-//!   loop: per-claim recall evidence, one `ClaudeCodeStep` judgment, and
+//!   loop: per-claim recall evidence, one `AgentCodeStep` judgment, and
 //!   the read-modify-write verdict accumulator.
 //! - `render_report` / `graph` (task 3) — the reviewable markdown report,
 //!   written through an injectable `ReportFs` seam to one fixed path, and

@@ -1,14 +1,14 @@
 //! Reusable `Node` implementations that wrap external transports (as opposed to
 //! `crate::node`, which defines the `Node` trait/registry themselves).
 //!
-//! `claude_code_step` (`EN.2.A`) wires the `core/claude-code-rs` SDK's async
+//! `agent_code_step` (`EN.2.A`) wires the `core/claude-code-rs` SDK's async
 //! `execute()` into a `Node`, mapping its `Outcome` into `NodeRun`/`TaskContext`.
 //!
 //! `openai_compat_transport` (`EN.3.C` task 5) builds a `ModelTransport` for
 //! the `local` model tier: an OpenAI-compatible HTTP transport with the same
 //! signature as `claude_code_rs::execute`, so it slots into
-//! `ClaudeCodeStep::with_transport` (or any task-loop node's own
-//! `with_transport`) with zero changes to `ClaudeCodeStep` itself.
+//! `AgentCodeStep::with_transport` (or any task-loop node's own
+//! `with_transport`) with zero changes to `AgentCodeStep` itself.
 //!
 //! `http_post` (`EN.4.C` task 2) is the injectable engine-brain HTTP-POST
 //! seam `PersistToBrainNode` calls to push the finished `AutomationRoadmap`
@@ -119,10 +119,10 @@
 //! session-naming helper plus the per-struct `session_input: InputBinding`
 //! field/builder convention the module's nodes follow.
 
+pub mod agent_code_step;
 pub mod aggregate;
 pub mod brain_client;
 pub mod channel_transport;
-pub mod claude_code_step;
 pub mod doc_materializer;
 pub mod email;
 pub mod fan_out;
@@ -137,6 +137,7 @@ pub mod opportunity_edit;
 pub mod suspend;
 pub mod terminal;
 
+pub use agent_code_step::{AgentCodeStep, MetaTransport, TransportInfo};
 pub use aggregate::AggregateNode;
 pub use brain_client::{
     http_get_live, BrainConfig, BrainConfigError, HttpGet, RecallNode, RecallResult,
@@ -147,7 +148,6 @@ pub use channel_transport::{
     ChannelSendReceipt, ChannelTransport, OutboundAction, OutboundBody, StubChannelTransport,
     UnwiredChannelTransport, WorkflowTriggerDispatch,
 };
-pub use claude_code_step::{ClaudeCodeStep, MetaTransport, TransportInfo};
 pub use doc_materializer::{
     doc_materializer_live, DocMaterializer, MaterializeDiagnostic, MaterializeOutcome,
     MaterializedFile, OpportunityEdit, RecordedEditCall, RecordedMaterializeCall,

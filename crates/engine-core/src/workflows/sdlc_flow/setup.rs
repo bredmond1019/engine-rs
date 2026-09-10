@@ -5,10 +5,10 @@
 //!
 //! Model/deterministic split: only `GenerateTasksNode` ever calls a model
 //! (the planning-fallback path, gated off the common path by
-//! `SpecExistsRouterNode`) — it composes a `ClaudeCodeStep` (EN.2.A) under
+//! `SpecExistsRouterNode`) — it composes a `AgentCodeStep` (EN.2.A) under
 //! its own node identity rather than being one. `SetupWorktreeNode` and
 //! `LoadTaskStateNode` are pure Rust; `SetupWorktreeNode` uses an injectable
-//! command-runner seam (mirroring `ClaudeCodeStep::with_transport`) so tests
+//! command-runner seam (mirroring `AgentCodeStep::with_transport`) so tests
 //! never shell out to a real `git` subprocess.
 
 use std::path::{Path, PathBuf};
@@ -20,7 +20,7 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::node::{Node, NodeError};
-use crate::nodes::ClaudeCodeStep;
+use crate::nodes::AgentCodeStep;
 use crate::repo_registry::RepoRegistry;
 use crate::routing::Router;
 
@@ -1353,8 +1353,8 @@ fn gather_context(dir: &Path) -> String {
 
 /// Model node (planning-fallback path only): gathers
 /// `planning/{spec_slug}/*.md` context, prompts for a task list, and writes
-/// `tasks.md` + `tasks.json`. Composes a `ClaudeCodeStep` (EN.2.A) under its
-/// own identity rather than being a bare `ClaudeCodeStep` instance, so it
+/// `tasks.md` + `tasks.json`. Composes a `AgentCodeStep` (EN.2.A) under its
+/// own identity rather than being a bare `AgentCodeStep` instance, so it
 /// can post-process the model's JSON output into the two files this task's
 /// acceptance criteria require.
 ///
@@ -1381,7 +1381,7 @@ impl GenerateTasksNode {
         }
     }
 
-    /// Override the transport used by the composed `ClaudeCodeStep`. Tests
+    /// Override the transport used by the composed `AgentCodeStep`. Tests
     /// use this to stub a real subprocess call with a canned `Outcome`, so
     /// the gated suite never spawns a real `claude`.
     #[must_use]
@@ -1438,7 +1438,7 @@ impl Node for GenerateTasksNode {
 
         config.json_schema = Some(generated_tasks_schema());
 
-        let mut step = ClaudeCodeStep::new("GenerateTasksNode", config, prompt)
+        let mut step = AgentCodeStep::new("GenerateTasksNode", config, prompt)
             .with_retry_policy(policy.transport_retry);
         if let Some(transport) = self.transport.clone() {
             step = step.with_transport(move |config, prompt| (transport)(config, prompt));
@@ -1502,7 +1502,7 @@ impl Node for GenerateTasksNode {
         });
         // This site previously carried forward nothing — `put_result` below
         // replaces this node's whole `ctx.nodes` entry, which would
-        // otherwise silently drop what `ClaudeCodeStep::process` just wrote
+        // otherwise silently drop what `AgentCodeStep::process` just wrote
         // onto this same identity: the `"transport"` tier stamp,
         // `cost_usd`, and both cache channels (`EN.14.A`).
         carry_forward_billing(&ctx, "GenerateTasksNode", &mut result);

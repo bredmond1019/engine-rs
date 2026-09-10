@@ -74,7 +74,7 @@
 //! typing the invocation into the pane via `TerminalDriver`, the
 //! programmatic sibling of `bastion sessions`' interactive CLI (never a
 //! replacement for it). See the module's own doc for why this is not
-//! `ClaudeCodeStep` again.
+//! `AgentCodeStep` again.
 
 pub mod admission;
 pub mod await_node;

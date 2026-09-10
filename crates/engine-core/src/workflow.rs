@@ -624,7 +624,7 @@ fn stamp_run_telemetry(ctx: &mut TaskContext, start_node_identity: &str) {
 }
 
 /// Reads a completed node's dollar cost out of its own `ctx.nodes[identity]`
-/// output, the same `"cost_usd"` field shape `ClaudeCodeStep` writes (and
+/// output, the same `"cost_usd"` field shape `AgentCodeStep` writes (and
 /// `policy::telemetry::total_cost_usd` reads for SDLC's cost-bearing
 /// stages). `None` when the node's output has no such field (non-LLM nodes,
 /// or an LLM node whose SDK call reported no cost) — folded into the
@@ -958,7 +958,7 @@ mod tests {
     // itself, not merely in one wrapper's plumbing.
 
     /// Appends one known [`crate::sessions::ClaudeSession`] to `ctx.metadata`
-    /// (standing in for a billed inner `ClaudeCodeStep` call), then fails —
+    /// (standing in for a billed inner `AgentCodeStep` call), then fails —
     /// carrying exactly the delta since its own baseline, the same pattern
     /// `TriageTaskNode` etc. use post-EN.14.C.
     struct AppendsSessionThenFailsNode {
@@ -1079,7 +1079,7 @@ mod tests {
     /// SUCCESS-PATH STABILITY: a passing dispatch produces the same ledger
     /// it did before this block — `node_context`'s `Ok` branch is untouched
     /// by EN.14.C, so a session appended on the success path (by
-    /// `SuccessNode` itself here, standing in for an inner `ClaudeCodeStep`)
+    /// `SuccessNode` itself here, standing in for an inner `AgentCodeStep`)
     /// is exactly what comes back, with no replay/delta logic in play at
     /// all.
     #[tokio::test]

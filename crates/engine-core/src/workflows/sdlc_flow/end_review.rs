@@ -43,7 +43,7 @@ use engine_contract::TaskContext;
 use serde_json::json;
 
 use crate::node::{Node, NodeError};
-use crate::nodes::{ClaudeCodeStep, MetaTransport};
+use crate::nodes::{AgentCodeStep, MetaTransport};
 use crate::routing::Router;
 
 use super::policy::ReviewMode;
@@ -112,7 +112,7 @@ impl EndReviewNode {
         }
     }
 
-    /// Override the transport used by the composed `ClaudeCodeStep`.
+    /// Override the transport used by the composed `AgentCodeStep`.
     #[must_use]
     pub fn with_transport(mut self, transport: ModelTransport) -> Self {
         self.transport.set_plain(transport);
@@ -212,8 +212,7 @@ impl Node for EndReviewNode {
         config.json_schema = Some(review_output_schema());
 
         let step = self.transport.apply(
-            ClaudeCodeStep::new(NODE_NAME, config, prompt)
-                .with_retry_policy(policy.transport_retry),
+            AgentCodeStep::new(NODE_NAME, config, prompt).with_retry_policy(policy.transport_retry),
         );
 
         let mut ctx = step.process(ctx).await?;
@@ -249,7 +248,7 @@ impl Node for EndReviewNode {
         // Carry billing/telemetry forward the same way `ConsolidatedReviewNode`
         // does — `put_result` below replaces this node's whole `ctx.nodes`
         // entry, which would otherwise silently drop what
-        // `ClaudeCodeStep::process` just wrote onto this same identity: the
+        // `AgentCodeStep::process` just wrote onto this same identity: the
         // `"transport"` tier stamp, `cost_usd`, and both cache channels
         // (`EN.14.A`). `EndReviewNode` is deliberately NOT a member of
         // `COST_BEARING_STAGES` — this repairs the carry-forward without

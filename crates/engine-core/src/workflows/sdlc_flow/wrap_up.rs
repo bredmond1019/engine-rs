@@ -590,7 +590,7 @@ fn total_retries(state: &SDLCState) -> u32 {
 const VERDICT_STAGES: [&str; 2] = ["TriageTaskNode", "ConsolidatedReviewNode"];
 
 /// The model-node identities whose `ctx.nodes` output may carry a
-/// `"cost_usd"` field (`ClaudeCodeStep`'s output shape). Passed to the
+/// `"cost_usd"` field (`AgentCodeStep`'s output shape). Passed to the
 /// generic `crate::policy::telemetry::harvest` as
 /// `RunTelemetryInputs::cost_bearing_stages` (EN.4.0).
 pub(crate) const COST_BEARING_STAGES: [&str; 4] = [

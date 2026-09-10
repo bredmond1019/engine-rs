@@ -3,7 +3,7 @@
 //! invariant on `schema::PostCandidate` and the block's unsupported-claim
 //! flagging requirement (`planning/EN.5.G/tasks.md` + `tasks.json` task 4).
 //!
-//! A `ClaudeCodeStep`-based model node modeled on
+//! A `AgentCodeStep`-based model node modeled on
 //! `research_agent::company_research::CompanyResearchNode`, with a
 //! `with_transport(...)` seam so tests stub the model and the gated suite
 //! never spawns a real `claude` subprocess. On `process`:
@@ -30,7 +30,7 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::node::{Node, NodeError};
-use crate::nodes::ClaudeCodeStep;
+use crate::nodes::AgentCodeStep;
 use crate::workflows::{get_result, parse_structured_or_fenced, put_result, ModelTransport};
 
 use super::policy::LinkedInPostPolicy;
@@ -40,7 +40,7 @@ use super::work_source;
 use claude_code_rs::Config;
 
 /// The `Node::name()` identity `PostDraftNode` runs its composed
-/// `ClaudeCodeStep` under, and the `ctx.nodes` key its output is stamped
+/// `AgentCodeStep` under, and the `ctx.nodes` key its output is stamped
 /// onto.
 pub const NODE_NAME: &str = "PostDraftNode";
 
@@ -184,7 +184,7 @@ impl PostDraftNode {
         }
     }
 
-    /// Override the transport used by the composed `ClaudeCodeStep`. Tests
+    /// Override the transport used by the composed `AgentCodeStep`. Tests
     /// use this to stub a real subprocess call with a canned `Outcome`, so
     /// the gated suite never spawns a real `claude`.
     #[must_use]
@@ -214,7 +214,7 @@ impl Node for PostDraftNode {
 
         let prompt = build_prompt(&sources, event.candidate_count);
 
-        let mut step = ClaudeCodeStep::new(NODE_NAME, config, prompt);
+        let mut step = AgentCodeStep::new(NODE_NAME, config, prompt);
         if let Some(transport) = self.transport.clone() {
             step = step.with_transport(move |config, prompt| (transport)(config, prompt));
         }

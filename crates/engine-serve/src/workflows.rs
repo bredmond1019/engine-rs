@@ -1512,7 +1512,7 @@ pub fn register_sweep_with(
 /// the drain-as-a-workflow port — discover every lane's inbox under the fleet lock dir, route
 /// by kind and complete with receipts, run the scoped emit + manifest-ONLY commit, append the
 /// drain-log without ever skipping, stamp the heartbeat, then the block's one gated
-/// `ClaudeCodeStep` (`GatedAction::RunDrain`). Neither graph node here takes an injectable
+/// `AgentCodeStep` (`GatedAction::RunDrain`). Neither graph node here takes an injectable
 /// placeholder transport/waker (unlike `SWEEP`), so — mirroring `register_recall`/
 /// `register_terminal_probe`'s shape rather than `register_sweep`'s — there is a single
 /// registration entry point. Registering makes `COMMANDER` dispatchable via

@@ -6,7 +6,7 @@
 //! standing rule 6.
 //!
 //! Three knobs, none of them model-tier — this workflow drives no
-//! `ClaudeCodeStep`, so there is no `ModelTiers`/`LocalConfig` here the way
+//! `AgentCodeStep`, so there is no `ModelTiers`/`LocalConfig` here the way
 //! `content_pipeline`/`diagnostic_intake` carry one:
 //!
 //! - `drain_batch_max` — how many pending-harvest records one drain pass

@@ -438,7 +438,7 @@ async fn local_judgment_profile_routes_judgment_stages_through_local_dispatch() 
 
     // The local-routed `OpportunityIdentifierNode` stage's final output
     // (scored + sorted candidates, `put_result`-written over the raw
-    // `ClaudeCodeStep` output) should carry the candidate the local stub
+    // `AgentCodeStep` output) should carry the candidate the local stub
     // returned.
     let opportunity_output = &final_ctx.nodes["OpportunityIdentifierNode"];
     let candidate_names: Vec<&str> = opportunity_output["candidates"]
@@ -453,7 +453,7 @@ async fn local_judgment_profile_routes_judgment_stages_through_local_dispatch() 
     );
 
     // `research` never rewires: its final output (the parsed `CompanyBrief`,
-    // `put_result`-written over the raw `ClaudeCodeStep` output) carries the
+    // `put_result`-written over the raw `AgentCodeStep` output) carries the
     // cloud stub's brief.
     let research_output = &final_ctx.nodes["ProposalCompanyResearchNode"];
     assert_eq!(

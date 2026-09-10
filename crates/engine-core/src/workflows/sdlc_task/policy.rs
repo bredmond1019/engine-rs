@@ -180,7 +180,7 @@ pub struct SdlcTaskPolicy {
     /// `ImplementTaskNode`'s retry prompt, and how large that block may
     /// get. Reused type — see `sdlc_flow::policy::RetryFeedback`.
     pub retry_feedback: RetryFeedback,
-    /// Bounded in-node retry-with-backoff budget for `ClaudeCodeStep`'s
+    /// Bounded in-node retry-with-backoff budget for `AgentCodeStep`'s
     /// transport call. Reused type — see
     /// `sdlc_flow::policy::TransportRetry`.
     pub transport_retry: TransportRetry,
@@ -524,7 +524,7 @@ mod tests {
     //
     // The live precedent both guards exist to prevent:
     // `SdlcPolicy.transport_retry` resolves through all four layers while
-    // every `ClaudeCodeStep` consumer runs `TransportRetry::default()` — the
+    // every `AgentCodeStep` consumer runs `TransportRetry::default()` — the
     // knob and the value actually read are two different things
     // (`transport-retry-policy-not-wired-to-call-sites`). Guard A pins that
     // `harness.json`'s advertised key set matches the struct's real field

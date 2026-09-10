@@ -4,8 +4,8 @@
 //! (`Fn(Config, String) -> BoxFuture<'static, claude_code_rs::Result<Outcome>>`)
 //! by POSTing to an OpenAI-compatible `/v1/chat/completions` endpoint (e.g. a
 //! local Ollama server) instead of spawning the `claude` CLI subprocess.
-//! **Zero changes to `ClaudeCodeStep`**: this module only builds a closure
-//! of the same shape that `ClaudeCodeStep::with_transport` (and each
+//! **Zero changes to `AgentCodeStep`**: this module only builds a closure
+//! of the same shape that `AgentCodeStep::with_transport` (and each
 //! task-loop node's own `with_transport`) already accepts — the seam is the
 //! integration point, per `planning/local-llm-tier-investigation/notes.md`.
 //!
@@ -33,7 +33,7 @@ use futures::future::BoxFuture;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use crate::nodes::claude_code_step::{MetaTransport, TransportInfo};
+use crate::nodes::agent_code_step::{MetaTransport, TransportInfo};
 use crate::workflows::sdlc_flow::policy::LocalConfig;
 use crate::workflows::sdlc_flow::ModelTransport;
 
@@ -41,7 +41,7 @@ use crate::workflows::sdlc_flow::ModelTransport;
 /// endpoint. Defaults to a real `reqwest` POST via
 /// [`default_local_http_post`]; tests substitute a stub so the gated
 /// `cargo test` suite never needs a live Ollama server — mirrors
-/// `ClaudeCodeStep`'s own transport seam (`EN.2.A`) and
+/// `AgentCodeStep`'s own transport seam (`EN.2.A`) and
 /// `sdlc_flow::CommandRunner` (`EN.3.A`).
 pub type LocalHttpPost =
     Arc<dyn Fn(String, Value) -> BoxFuture<'static, Result<Value, String>> + Send + Sync>;
@@ -224,7 +224,7 @@ fn build_request_body(local: &LocalConfig, prompt: &str, json_schema: Option<&Va
 ///   fallback. It is already ATTRIBUTABLE rather than silent:
 ///   [`openai_compat_meta_transport`] stamps `{"tier": "cloud", "model":
 ///   <the fallback's primary model>, "endpoint": None}`, and
-///   `ClaudeCodeStep`'s plain-transport branch stamps a generic `"cloud"`
+///   `AgentCodeStep`'s plain-transport branch stamps a generic `"cloud"`
 ///   tier — so telemetry records what actually ran, not what policy intended.
 fn clear_local_model(mut config: Config) -> Config {
     config.model = None;
@@ -282,7 +282,7 @@ pub fn openai_compat_transport_live(
 
 /// [`openai_compat_transport`]'s tier-aware sibling: builds a
 /// [`MetaTransport`] (`EN.5.D` task 9) instead of a plain [`ModelTransport`],
-/// so the caller's `ClaudeCodeStep` (via `with_meta_transport`) can stamp
+/// so the caller's `AgentCodeStep` (via `with_meta_transport`) can stamp
 /// what actually ran rather than what the resolved policy intended. Local
 /// success stamps `{"tier": "local", "model": local.model, "endpoint":
 /// Some(local.endpoint)}`; the cloud fallback — reached on any local-side
@@ -339,7 +339,7 @@ pub fn openai_compat_meta_transport(
 
 /// Convenience: [`openai_compat_meta_transport`] wired to the real
 /// `reqwest` HTTP POST ([`default_local_http_post`]). Production callers
-/// reach for this once `graph.rs` migrates to `ClaudeCodeStep`'s
+/// reach for this once `graph.rs` migrates to `AgentCodeStep`'s
 /// `with_meta_transport` seam; tests build the transport directly with a
 /// stubbed `http_post` instead.
 #[must_use]

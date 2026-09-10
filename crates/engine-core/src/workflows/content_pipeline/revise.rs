@@ -2,7 +2,7 @@
 //! `SummaryResult` for the critic loop's back-edge (EN.5.A task 9).
 //!
 //! A non-terminal, Local-eligible model node wrapping
-//! `crate::nodes::claude_code_step::ClaudeCodeStep`. On `process`:
+//! `crate::nodes::agent_code_step::AgentCodeStep`. On `process`:
 //! 1. read the current summary (bound `summary_input` [`InputBinding`],
 //!    falling back to `SummarizeNode`'s identity when unbound — `EN.5.E`
 //!    `with_input_from`, mirroring `SelfCriticNode`'s read-preference
@@ -27,7 +27,7 @@ use engine_contract::TaskContext;
 use serde_json::Value;
 
 use crate::node::{InputBinding, Node, NodeError};
-use crate::nodes::{ClaudeCodeStep, MetaTransport};
+use crate::nodes::{AgentCodeStep, MetaTransport};
 use crate::workflows::{
     get_result, parse_structured_or_fenced, put_result, ModelTransport, TransportSlot,
 };
@@ -38,7 +38,7 @@ use super::source_router;
 use super::summarize::{self, summary_json_schema, SummaryResult};
 
 /// The `Node::name()` identity `ReviseNode` runs its composed
-/// `ClaudeCodeStep` under, and the `ctx.nodes`/`ctx.node_runs` key its
+/// `AgentCodeStep` under, and the `ctx.nodes`/`ctx.node_runs` key its
 /// output/usage are stamped onto. Read by `SelfCriticNode` (and, on the
 /// terminal pass, `DigestRenderNode`) as the read-preference fallback
 /// after their bound summary identity.
@@ -162,7 +162,7 @@ impl ReviseNode {
         }
     }
 
-    /// Override the transport used by the composed `ClaudeCodeStep`. Tests
+    /// Override the transport used by the composed `AgentCodeStep`. Tests
     /// use this to stub a real subprocess call with a canned `Outcome`, so
     /// the gated suite never spawns a real `claude`.
     #[must_use]
@@ -172,7 +172,7 @@ impl ReviseNode {
     }
 
     /// Override the transport with a tier-aware [`MetaTransport`] that
-    /// reports the [`crate::nodes::claude_code_step::TransportInfo`] of
+    /// reports the [`crate::nodes::agent_code_step::TransportInfo`] of
     /// whichever call actually executed (e.g. local vs. cloud fallback),
     /// taking precedence over a plain transport set via
     /// [`Self::with_transport`].
@@ -225,7 +225,7 @@ impl Node for ReviseNode {
 
         let step = self
             .transport
-            .apply(ClaudeCodeStep::new(NODE_NAME, config, prompt));
+            .apply(AgentCodeStep::new(NODE_NAME, config, prompt));
 
         let mut ctx = step.process(ctx).await?;
 
@@ -238,7 +238,7 @@ impl Node for ReviseNode {
             .to_string();
         // `put_result` below replaces this node's whole `ctx.nodes` entry,
         // which would otherwise silently drop the `"transport"` stamp
-        // `ClaudeCodeStep::process` just wrote — the exact tier-telemetry
+        // `AgentCodeStep::process` just wrote — the exact tier-telemetry
         // `RunTelemetry`/`observed_model_tiers` (`policy/telemetry.rs`)
         // reads back out by this same node name.
         let transport_stamp = ctx
