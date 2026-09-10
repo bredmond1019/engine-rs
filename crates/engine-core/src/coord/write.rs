@@ -1825,7 +1825,7 @@ mod tests {
             true,
             None,
             Some("engine-rs-holder"),
-            None,
+            Some(lock_dir.as_path()),
             &repo_dir,
         );
         assert!(
@@ -1853,7 +1853,7 @@ mod tests {
             true,
             None,
             Some("engine-rs-someone-else"),
-            None,
+            Some(lock_dir.as_path()),
             &repo_dir,
         );
         let err =
@@ -1872,7 +1872,7 @@ mod tests {
             true,
             None,
             Some("engine-rs-holder"),
-            None,
+            Some(lock_dir.as_path()),
             &repo_dir,
         );
         assert!(
@@ -1893,7 +1893,7 @@ mod tests {
             true,
             None,
             Some("engine-rs-someone-else"),
-            None,
+            Some(lock_dir.as_path()),
             &repo_dir,
         );
         assert!(
