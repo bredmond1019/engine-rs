@@ -697,7 +697,11 @@ Each has already cost a real run in this fleet.
    verified — that is the post-run verifier's job. Like the run record itself, a ledger is
    addressed per (repo × roadmap) (D57) — a second wave against an existing ledger **appends** to
    it, it never overwrites the file, which is exactly the clobber a sibling lane hit and repaired
-   in commit `559f1039d`.
+   in commit `559f1039d`. Before handoff, a lane may optionally run
+   `python3 scripts/check_verification_ledger.py` (run from BRAIN_ROOT) against its own ledger — it
+   is purely informational, exit code is always 0, and it never gates; it flags things worth a
+   second look (an unusually large per-block entry count, a likely-duplicate pair, overlong prose)
+   before the ledger is reviewed.
 
    **When a capability this lane shipped is found BROKEN, the remediation half of the ledger
    contract is what to write — not a note, not a ping.** File the ticket, then record

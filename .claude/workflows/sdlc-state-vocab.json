@@ -1,0 +1,42 @@
+{
+  "running": {
+    "meaning": "The engine has started this run and is actively working through tasks; the initial status written when state is first created.",
+    "emitters": ["sdlc-task", "sdlc-flow"]
+  },
+  "passed": {
+    "meaning": "A single task's implement->test loop finished clean; a per-task status, not the top-level run status.",
+    "emitters": ["sdlc-task", "sdlc-flow"]
+  },
+  "failed": {
+    "meaning": "A single task's implement->test loop did not finish clean after its retry budget; a per-task status, not the top-level run status.",
+    "emitters": ["sdlc-task", "sdlc-flow"]
+  },
+  "blocked": {
+    "meaning": "The run bailed before reaching a terminal outcome (a task failed and triage judged it stuck, or another stop condition fired) -- the top-level run status when a bail occurred.",
+    "emitters": ["sdlc-task", "sdlc-flow"]
+  },
+  "done": {
+    "meaning": "The run completed cleanly: every task passed, and (sdlc-task only) the terminal reconcile and acceptance-criteria verdict did not refuse the close.",
+    "emitters": ["sdlc-task", "sdlc-flow"]
+  },
+  "criteria_refused": {
+    "meaning": "sdlc-task only: every task passed and reconcile succeeded, but the acceptance-criteria verdict stage refused a clean close -- replaces a would-be 'done' status; the block is not closed.",
+    "emitters": ["sdlc-task"]
+  },
+  "reconcile_failed": {
+    "meaning": "sdlc-task only: every task passed its own fast per-task tripwire, but the terminal authoritative reconcile (D56) -- re-running checks the fast path had substituted or skipped -- failed; the block is not closed.",
+    "emitters": ["sdlc-task"]
+  },
+  "review": {
+    "meaning": "sdlc-flow only: the run has finished the task loop and is in the end-of-flow review stage over the integrated tree.",
+    "emitters": ["sdlc-flow"]
+  },
+  "docs": {
+    "meaning": "sdlc-flow only: review passed and the run is now in the documentation-patch stage.",
+    "emitters": ["sdlc-flow"]
+  },
+  "wrapup": {
+    "meaning": "sdlc-flow only: docs are patched and the run is in its final wrap-up/PR stage.",
+    "emitters": ["sdlc-flow"]
+  }
+}

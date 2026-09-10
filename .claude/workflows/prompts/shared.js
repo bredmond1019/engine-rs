@@ -456,19 +456,31 @@ PYEOF`
 // exactly as before. Rewriting emit-state's own worktree-deferral behavior is out of scope for this
 // ticket; this decision only says which route THIS script takes.
 //
-// mev ABSENT, or this repo unregistered in brain.toml (no repo slug resolves), MUST DEGRADE, NEVER
-// BAIL: these engines ship to 18+ downstream repos with no brain.toml and no `mev` on PATH (D5,
-// standing rule 1: mechanism, never stack defaults). Both of those cases fall back to the identical
-// validated hand-edit the worktree case uses -- see the adjacent `emit-state` call site's identical
-// contract.
+// Repo UNREGISTERED in brain.toml (no repo slug resolves) but mev IS on PATH still DEGRADES, NEVER
+// BAILS: falls to the same validated hand-edit the worktree case uses (validated via
+// `mev validate-brain --state` before/after diagnostics -- see the adjacent `emit-state` call
+// site's identical contract).
+//
+// mev ABSENT is different (D86 / BT.ticket.sdlc-state-status-vocabulary task 3): this fallback
+// used to silently write an UNVALIDATED status straight into state.json's JSON whenever `mev`
+// could not be found on PATH, with no signal beyond an easily-missed "UNVALIDATED:" output line --
+// bypassing `mev set-block-status`'s validation at the moment of write entirely. It now REFUSES
+// instead of writing: "FLIP_REFUSED: <id>" followed by "MEV_OUTPUT: <line>" (exit 1) -- the SAME
+// refusal contract the deterministic path above already uses for a failed `mev set-block-status`
+// call, so a caller that already handles that contract needs no new branch. These engines still
+// ship to downstream repos with no `mev` on PATH (D5, standing rule 1: mechanism, never stack
+// defaults); a block closed through this fallback route in such a repo now requires installing
+// `mev` rather than landing an unvalidated write.
 //
 // Machine-readable result lines a caller's bookkeep prompt copies verbatim, never re-derives:
 //   deterministic path  -- "FLIPPED: <repo>:<id>" (exit 0) or "FLIP_REFUSED: <repo>:<id>" followed
 //                          by "MEV_OUTPUT: <line>" lines (exit 1) -- both read from mev's own exit
 //                          code, never from mev's stdout wording.
-//   hand-edit fallback  -- unchanged from before this ticket: "NOT_FOUND" (exit 0), "FLIPPED:<id>"
-//                          with an optional "UNVALIDATED:" line (exit 0), or "REJECTED:<id>" with
-//                          "NET_NEW:" lines (exit 1).
+//   hand-edit fallback  -- "NOT_FOUND" (exit 0); "FLIPPED:<id>" (exit 0, mev on PATH: validated via
+//                          `mev validate-brain --state` before/after diagnostics); "REJECTED:<id>"
+//                          with "NET_NEW:" lines (exit 1, net-new validate-brain errors); or, when
+//                          `mev` is not on PATH, "FLIP_REFUSED:<id>" with "MEV_OUTPUT:" lines
+//                          (exit 1, D86 -- no more silent unvalidated write).
 //
 // `indent` exists only because the two prompts nest it at different depths.
 async function renderStateFlipScript({ runRoot, indent, runningInWorktree = false }) {
@@ -532,12 +544,9 @@ def diagnostics():
     return set(l for l in lines if l.strip().startswith('[E_') or l.strip().startswith('[W_'))
 
 if not mev_available:
-    with open(path, 'w') as fh:
-        json.dump(data, fh, indent=2, ensure_ascii=False)
-        fh.write(chr(10))
-    print('FLIPPED:' + bid)
-    print('UNVALIDATED: mev not on PATH -- schema check skipped, write landed with only json.load-level parsing')
-    sys.exit(0)
+    print('FLIP_REFUSED:' + bid)
+    print('MEV_OUTPUT: mev is not on PATH -- refusing to write an unvalidated status directly into state.json (D86). Install mev and re-run, or close this block by hand with a reviewed \`mev set-block-status\` once mev is available.')
+    sys.exit(1)
 
 baseline = diagnostics()
 

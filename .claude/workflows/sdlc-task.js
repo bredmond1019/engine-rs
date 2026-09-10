@@ -59,7 +59,7 @@
 //     substituted (fastCommand) or skipped (perTask:false) → on failure, status
 //     "reconcile_failed" — bookkeep is skipped, the block is NOT flipped to done.
 //
-// STATE (NOT gitignored, but deliberately never committed — at planning/<spec>/sdlc/)
+// STATE (NOT gitignored, but deliberately never committed — at planning/blocks/<spec>/)
 //   sdlc-task-state.json   the authoritative run index (per-task summary/issues/fixes/commit +
 //                          the Block-A `tokens` block, plus `base_sha` — the pre-task HEAD this
 //                          run's own emoji gate diffs from). Written to disk after every task and
@@ -168,13 +168,13 @@ if (rangeSpec) {
 // Resolved against the git root by default; re-derived under a tier prefix (e.g. "business/")
 // once setup reports where the spec actually lives (see setupResult.tierPrefix below) — `let`,
 // not `const`, following the same pattern specFile already uses for its own reassignment.
-let blockDir       = `planning/${blockId}`
-let blockRecordFile = `planning/blocks/${blockId}.json`   // D65: the authored block record — preferred spec source
+let blockDir       = `planning/blocks/${blockId}`
+let blockRecordFile = `${blockDir}/${blockId}.json`   // D65: the authored block record — preferred spec source
 let specFile         = `${blockDir}/tasks.md`                // legacy fallback for a spec with no block record (reassigned once setup reports which source exists)
 let tasksJsonFile = `${blockDir}/tasks.json`
 let breakdownFile = `${blockDir}/breakdown.md`
-let reportsDir    = `${blockDir}/sdlc/reports`
-let stateFile     = `${blockDir}/sdlc/sdlc-task-state.json`   // COMMITTED authoritative run index (Block A)
+let reportsDir    = `${blockDir}/reports`
+let stateFile     = `${blockDir}/sdlc-task-state.json`   // COMMITTED authoritative run index (Block A)
 const baseBranchName = `${blockId}-task`.toLowerCase().replace(/[^a-z0-9.-]/g, '-')  // worktree branch base
 
 const MAX_TASK_ATTEMPTS = 3   // implement→test→fix attempts per task before bail (final on Opus)
@@ -578,19 +578,31 @@ PYEOF`
 // exactly as before. Rewriting emit-state's own worktree-deferral behavior is out of scope for this
 // ticket; this decision only says which route THIS script takes.
 //
-// mev ABSENT, or this repo unregistered in brain.toml (no repo slug resolves), MUST DEGRADE, NEVER
-// BAIL: these engines ship to 18+ downstream repos with no brain.toml and no `mev` on PATH (D5,
-// standing rule 1: mechanism, never stack defaults). Both of those cases fall back to the identical
-// validated hand-edit the worktree case uses -- see the adjacent `emit-state` call site's identical
-// contract.
+// Repo UNREGISTERED in brain.toml (no repo slug resolves) but mev IS on PATH still DEGRADES, NEVER
+// BAILS: falls to the same validated hand-edit the worktree case uses (validated via
+// `mev validate-brain --state` before/after diagnostics -- see the adjacent `emit-state` call
+// site's identical contract).
+//
+// mev ABSENT is different (D86 / BT.ticket.sdlc-state-status-vocabulary task 3): this fallback
+// used to silently write an UNVALIDATED status straight into state.json's JSON whenever `mev`
+// could not be found on PATH, with no signal beyond an easily-missed "UNVALIDATED:" output line --
+// bypassing `mev set-block-status`'s validation at the moment of write entirely. It now REFUSES
+// instead of writing: "FLIP_REFUSED: <id>" followed by "MEV_OUTPUT: <line>" (exit 1) -- the SAME
+// refusal contract the deterministic path above already uses for a failed `mev set-block-status`
+// call, so a caller that already handles that contract needs no new branch. These engines still
+// ship to downstream repos with no `mev` on PATH (D5, standing rule 1: mechanism, never stack
+// defaults); a block closed through this fallback route in such a repo now requires installing
+// `mev` rather than landing an unvalidated write.
 //
 // Machine-readable result lines a caller's bookkeep prompt copies verbatim, never re-derives:
 //   deterministic path  -- "FLIPPED: <repo>:<id>" (exit 0) or "FLIP_REFUSED: <repo>:<id>" followed
 //                          by "MEV_OUTPUT: <line>" lines (exit 1) -- both read from mev's own exit
 //                          code, never from mev's stdout wording.
-//   hand-edit fallback  -- unchanged from before this ticket: "NOT_FOUND" (exit 0), "FLIPPED:<id>"
-//                          with an optional "UNVALIDATED:" line (exit 0), or "REJECTED:<id>" with
-//                          "NET_NEW:" lines (exit 1).
+//   hand-edit fallback  -- "NOT_FOUND" (exit 0); "FLIPPED:<id>" (exit 0, mev on PATH: validated via
+//                          `mev validate-brain --state` before/after diagnostics); "REJECTED:<id>"
+//                          with "NET_NEW:" lines (exit 1, net-new validate-brain errors); or, when
+//                          `mev` is not on PATH, "FLIP_REFUSED:<id>" with "MEV_OUTPUT:" lines
+//                          (exit 1, D86 -- no more silent unvalidated write).
 //
 // `indent` exists only because the two prompts nest it at different depths.
 async function renderStateFlipScript({ runRoot, indent, runningInWorktree = false }) {
@@ -654,12 +666,9 @@ def diagnostics():
     return set(l for l in lines if l.strip().startswith('[E_') or l.strip().startswith('[W_'))
 
 if not mev_available:
-    with open(path, 'w') as fh:
-        json.dump(data, fh, indent=2, ensure_ascii=False)
-        fh.write(chr(10))
-    print('FLIPPED:' + bid)
-    print('UNVALIDATED: mev not on PATH -- schema check skipped, write landed with only json.load-level parsing')
-    sys.exit(0)
+    print('FLIP_REFUSED:' + bid)
+    print('MEV_OUTPUT: mev is not on PATH -- refusing to write an unvalidated status directly into state.json (D86). Install mev and re-run, or close this block by hand with a reviewed \`mev set-block-status\` once mev is available.')
+    sys.exit(1)
 
 baseline = diagnostics()
 
@@ -1058,9 +1067,9 @@ const SETUP_SCHEMA = {
     worktreeFailed: { type: 'boolean', description: '--worktree only: true iff the worktree could not be resolved or created and setup stopped rather than falling back to the current branch — either no free candidate name was found among "<base>" through "<base>-10", or the worktree-add/creation step itself errored. Always false in in-place mode.' },
     worktreeFailureReason: { type: 'string', description: 'Empty unless worktreeFailed is true. Names the spec slug, every candidate branch name tried, and (for a creation failure) the exact command output.' },
     specFileExists: { type: 'boolean', description: 'true if EITHER the block record or the legacy tasks.md exists (D65 stage 2)' },
-    specSource:     { type: 'string', enum: ['block-record', 'tasks-md', 'missing'], description: "D65 stage 2: 'block-record' if planning/blocks/<BlockID>.json exists (preferred), else 'tasks-md' if the legacy spec file exists, else 'missing'. Evaluated at the WINNING location (root if the spec exists there, else tier) — see specFoundInTier." },
+    specSource:     { type: 'string', enum: ['block-record', 'tasks-md', 'missing'], description: "D65 stage 2: 'block-record' if planning/blocks/<BlockID>/<BlockID>.json exists (preferred), else 'tasks-md' if the legacy spec file exists, else 'missing'. Evaluated at the WINNING location (root if the spec exists there, else tier) — see specFoundInTier." },
     tierPrefix:     { type: 'string', description: 'The invoking directory\'s path relative to the git root, with a trailing slash (e.g. "business/"), or "" when /sdlc-task was invoked at the git root. This is the CANDIDATE tier location checked in STEP 4a — reported regardless of whether the spec was actually found there.' },
-    specFoundInTier: { type: 'boolean', description: 'true iff the spec (block record or legacy tasks.md) exists ONLY at the tier location (<tierPrefix>planning/<blockId>), not at the root (planning/<blockId>). False when found at the root (even if ALSO present at the tier — the root always wins) or found nowhere.' },
+    specFoundInTier: { type: 'boolean', description: 'true iff the spec (block record or legacy tasks.md) exists ONLY at the tier location (<tierPrefix>planning/blocks/<blockId>), not at the root (planning/blocks/<blockId>). False when found at the root (even if ALSO present at the tier — the root always wins) or found nowhere.' },
     blockStatus:    { type: 'string', description: "This spec's Status in status.md (title-case), or 'Unknown'" },
     specThin:       { type: 'boolean', description: 'D19: true on a fresh (non-resume) run with a structurally-valid but substantively-thin spec; false on resume or a healthy spec.' },
     thinReason:     { type: 'string', description: 'D19: the specific thin-spec failures when specThin; empty string otherwise.' },
@@ -1232,7 +1241,7 @@ const BOOKKEEP_SCHEMA = {
     statusWriteRejected: { type: 'boolean', description: 'true if the planning/status.md mutation introduced net-new corpus errors and was rolled back byte-exact; status.md on disk is unchanged from before this step ran' },
     tasksMarked:        { type: 'boolean', description: 'true if tasks.md task markers were updated' },
     blockStatusFlipped: { type: 'string', description: 'the state.json tracks[].blocks[].id whose flip to "closed" was reported by `mev set-block-status`\'s own exit code (deterministic route) or by the degraded hand-edit fallback, transcribed from the flip script\'s stdout — never agent-authored; "" if none (partial run, no state.json, block not found, `mev set-block-status` refused via FLIP_REFUSED, or the fallback write was rejected by validation)' },
-    stateWriteValidated: { type: 'boolean', description: 'true when the deterministic `mev set-block-status --write` route ran and reported FLIPPED (mev\'s own exit code validated the write), or when the fallback hand-edit passed `mev validate-brain --state` (before/after diff, net-new only); false when the fallback wrote with only json.load-level parsing because mev was unavailable — a degrade, not a pass' },
+    stateWriteValidated: { type: 'boolean', description: 'true when the deterministic `mev set-block-status --write` route ran and reported FLIPPED (mev\'s own exit code validated the write), or when the fallback hand-edit passed `mev validate-brain --state` (before/after diff, net-new only); false otherwise — since D86 no route writes an unvalidated status (mev absent makes the fallback refuse via FLIP_REFUSED instead of writing)' },
     stateWriteRejected: { type: 'boolean', description: 'true if the state.json mutation introduced net-new schema errors and was rolled back byte-exact; the block was NOT flipped to closed this run' },
     emitStateRan:       { type: 'boolean', description: 'true if mev emit-state --write ran successfully (false when skipped: worktree mode or mev/brain.toml absent)' },
     postEmitHookRan:    { type: 'boolean', description: 'true if planning/harness.json\'s postEmitCommitCommand was configured AND invoked this run (in-place only, and only when emitStateRan is true); false when absent, or skipped (worktree mode / emit-state did not run)' },
@@ -1823,7 +1832,7 @@ let cachedStartedAt = null
 // Persist `state` to sdlc-task-state.json. This is deliberately WRITE-ONLY — no git command runs
 // here, and the `commit` option (if a caller still passes one) is ignored.
 //
-// Why: this run-state lives under planning/<blockId>/sdlc/, and under D46 every vaulted repo's
+// Why: this run-state lives under planning/blocks/<blockId>/, and under D46 every vaulted repo's
 // planning/ is a relative symlink into a brain-owned vault, so `git add planning/...` fails with
 // "fatal: pathspec is beyond a symbolic link". The state-writer agent used to "repair" that failure
 // by operating in the brain repo directly and checking out the run's branch there — contaminating
@@ -2193,13 +2202,13 @@ const tierPrefixCandidate = setupResult.tierPrefix || ''
 const rootBlockRecordFile = blockRecordFile   // pre-tier root form, kept for the Missing-spec abort
 const rootSpecFile        = specFile          // pre-tier root form, kept for the Missing-spec abort
 if (tierPrefixCandidate && setupResult.specFoundInTier) {
-  blockDir        = `${tierPrefixCandidate}planning/${blockId}`
-  blockRecordFile = `${tierPrefixCandidate}planning/blocks/${blockId}.json`
+  blockDir        = `${tierPrefixCandidate}planning/blocks/${blockId}`
+  blockRecordFile = `${blockDir}/${blockId}.json`
   specFile        = `${blockDir}/tasks.md`
   tasksJsonFile   = `${blockDir}/tasks.json`
   breakdownFile   = `${blockDir}/breakdown.md`
-  reportsDir      = `${blockDir}/sdlc/reports`
-  stateFile       = `${blockDir}/sdlc/sdlc-task-state.json`
+  reportsDir      = `${blockDir}/reports`
+  stateFile       = `${blockDir}/sdlc-task-state.json`
   log(`Spec resolved at tier location (${tierPrefixCandidate}) — not found at the root.`)
 }
 
@@ -2219,10 +2228,10 @@ const specDesc = specSource === 'block-record'
 
 if (!setupResult.specFileExists) {
   const rootPaths = `${rootBlockRecordFile} or ${rootSpecFile}`
-  const tierPaths = tierPrefixCandidate ? `${tierPrefixCandidate}planning/blocks/${blockId}.json or ${tierPrefixCandidate}planning/${blockId}/tasks.md` : null
+  const tierPaths = tierPrefixCandidate ? `${tierPrefixCandidate}planning/blocks/${blockId}/${blockId}.json or ${tierPrefixCandidate}planning/blocks/${blockId}/tasks.md` : null
   log(`No spec found — searched the root (${rootPaths})${tierPaths ? ` AND the tier location (${tierPaths})` : ''}. /sdlc-task expects an authored spec.`)
   log(`Fix: run /generate-tasks ${blockId} (and /breakdown) on main, commit, then re-run /sdlc-task ${blockId}.`)
-  return { error: 'Missing spec', blockId, searchedRoot: [rootBlockRecordFile, rootSpecFile], searchedTier: tierPaths ? [`${tierPrefixCandidate}planning/blocks/${blockId}.json`, `${tierPrefixCandidate}planning/${blockId}/tasks.md`] : [] }
+  return { error: 'Missing spec', blockId, searchedRoot: [rootBlockRecordFile, rootSpecFile], searchedTier: tierPaths ? [`${tierPrefixCandidate}planning/blocks/${blockId}/${blockId}.json`, `${tierPrefixCandidate}planning/blocks/${blockId}/tasks.md`] : [] }
 }
 
 // D19 — thin-spec guard for a fresh run (legacy tasks.md path only — see STEP 4c above).
@@ -3458,10 +3467,11 @@ ${await renderStateFlipScript({ runRoot: runDir, indent: '     ', runningInWorkt
        - "FLIPPED:<id>" with NO "UNVALIDATED:" line (exit 0, fallback route) → mev validated the
          write and found no net-new diagnostics. Set blockStatusFlipped to that id and
          stateWriteValidated=true.
-       - "FLIPPED:<id>" WITH an "UNVALIDATED:" line (exit 0, fallback route) → mev is not installed;
-         the write landed unchecked (json.load-level parse only, matching how the harness degrades
-         other absent tooling). Set blockStatusFlipped to that id, stateWriteValidated=false, and
-         copy the UNVALIDATED line verbatim into notes — this is a DEGRADE, not a silent pass.
+       - "FLIP_REFUSED:<id>" followed by one or more "MEV_OUTPUT:" lines (exit 1, fallback route) →
+         mev is not on PATH, so the script REFUSED to write an unvalidated status into state.json
+         (D86) and the file is byte-unchanged. Set blockStatusFlipped to "", and copy every
+         "MEV_OUTPUT:" line verbatim into notes — this MUST be reported, never silently swallowed. The
+         block stays open until mev is installed and a validated write lands on a later run.
        - "REJECTED:<id>" (exit 1, fallback route) → the write introduced net-new schema errors and
          was rolled back; state.json on disk is now byte-identical to its content before this step
          ran. Set blockStatusFlipped to "", stateWriteRejected=true, and copy every "NET_NEW:" line
@@ -3508,16 +3518,16 @@ ${vault.vaulted ? `
    file this step touches (the spec, status.md, state.json) lives under planning/, so stage + commit them
    ALL there, via \`git -C\`, on whatever branch that repo is already on. Do NOT cd into it and do NOT
    checkout/switch/branch there:
-   cd ${runDir} && ${GIT} -C ${vault.planningPath} add ${vault.planningPath}/${blockId}/tasks.md 2>/dev/null || true
+   cd ${runDir} && ${GIT} -C ${vault.planningPath} add ${vault.planningPath}/blocks/${blockId}/tasks.md 2>/dev/null || true
    cd ${runDir} && ${GIT} -C ${vault.planningPath} add ${vault.planningPath}/status.md
    cd ${runDir} && ${GIT} -C ${vault.planningPath} add ${vault.planningPath}/state.json 2>/dev/null || true
    Then commit ONLY these three paths — pass them explicitly to \`git commit\` itself (not merely to
    \`git add\`), so anything a sibling lane already had staged in this same vault repo is left staged
    and untouched by this commit; ${renderNoAttributionTrailer()}:
-   cd ${runDir} && ${GIT} -C ${vault.planningPath} diff --cached --quiet -- ${vault.planningPath}/${blockId}/tasks.md ${vault.planningPath}/status.md ${vault.planningPath}/state.json || (${renderCommitSafetyGuard('git -C ' + vault.planningPath)} && ${GIT} -C ${vault.planningPath} commit -m "$(cat <<'EOF'
+   cd ${runDir} && ${GIT} -C ${vault.planningPath} diff --cached --quiet -- ${vault.planningPath}/blocks/${blockId}/tasks.md ${vault.planningPath}/status.md ${vault.planningPath}/state.json || (${renderCommitSafetyGuard('git -C ' + vault.planningPath)} && ${GIT} -C ${vault.planningPath} commit -m "$(cat <<'EOF'
 chore: sdlc-task bookkeep — ${blockId}
 EOF
-)" -- ${vault.planningPath}/${blockId}/tasks.md ${vault.planningPath}/status.md ${vault.planningPath}/state.json)
+)" -- ${vault.planningPath}/blocks/${blockId}/tasks.md ${vault.planningPath}/status.md ${vault.planningPath}/state.json)
    cd ${runDir} && ${GIT} -C ${vault.planningPath} log --oneline -1` : `
    planning/ is a plain directory here (not vaulted) — everything commits together as before:
    cd ${runDir} && ${GIT} add ${specFile} planning/status.md
@@ -3537,7 +3547,7 @@ Return via StructuredOutput: statusUpdated, statusWriteValidated, statusWriteRej
   if (bookkeepResult?.stateWriteRejected) {
     log(`state.json: write REJECTED — net-new schema error(s) from mev validate-brain --state; rolled back byte-exact, block NOT closed this run. ${bookkeepResult?.notes || ''}`)
   } else if (bookkeepResult?.blockStatusFlipped) {
-    log(`state.json: block "${bookkeepResult.blockStatusFlipped}" → closed (${bookkeepResult.stateWriteValidated ? 'deterministic: mev set-block-status --write exit code, or fallback validated via mev validate-brain --state net-new only' : 'UNVALIDATED: mev not available, json.load-level parse only'})${bookkeepResult.emitStateRan ? '; derived surfaces (incl. focus.next) regenerated (mev emit-state --write).' : useWorktree ? '; focus.next is DEFERRED — it still points at the pre-close state until /clean-worktree runs `mev emit-state --write` on merge.' : '.'}`)
+    log(`state.json: block "${bookkeepResult.blockStatusFlipped}" → closed (${bookkeepResult.stateWriteValidated ? 'deterministic: mev set-block-status --write exit code, or fallback validated via mev validate-brain --state net-new only' : 'stateWriteValidated=false reported -- unexpected since D86 (mev absent refuses rather than writing); check bookkeep notes'})${bookkeepResult.emitStateRan ? '; derived surfaces (incl. focus.next) regenerated (mev emit-state --write).' : useWorktree ? '; focus.next is DEFERRED — it still points at the pre-close state until /clean-worktree runs `mev emit-state --write` on merge.' : '.'}`)
   } else if (blockDone) {
     log(`Bookkeep: no state.json block flipped (${bookkeepResult?.notes || 'no state.json, or block not found'}).`)
   }
