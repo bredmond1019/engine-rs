@@ -5,7 +5,7 @@ description: Chronological log of work completed for engine-rs.
 doc_id: log
 layer: [factory]
 status: active
-timestamp: "2026-09-03T06:25:27Z"
+timestamp: "2026-09-10T09:00:02Z"
 keywords: [work log, session history, development log]
 related: [status, context]
 ---
@@ -13,6 +13,13 @@ related: [status, context]
 # Log — engine-rs
 
 *Append-only working log. One dated entry per session. Newest entries at the top.*
+
+## [run: 2026-09-10]
+
+### Planned phase 16 — pluggable code-agent transport (EN.16.A/B/C)
+- **What:** Authored the initiative narrative (`planning/open-work/pre-plan/pluggable-code-agent-transport/plan.md`, in HQ) and three block records from the existing `/assess` -> `/seams` -> `/sequence` pre-plan, with no departures from its cut. EN.16.A renames `ClaudeCodeStep` -> `AgentCodeStep` (zero behaviour change, 24 instantiation files, 5 of them outside engine-core); EN.16.B adds the `agent_backend` policy knob, a new `AgentOutcome` type, `PiTransport` and a `BudgetLedger` unknown-cost flag; EN.16.C adds Aider reusing B's scaffolding. Registered at phase 16, waves 362/363/364 (asserted unused first), `depends_on` mirrored between records and `state.json`. Ran `emit-state` via the wrapper — 16 surfaces, 0 staging failures, wave table spliced, A derives `open` and B/C derive `blocked`. Committed locally as `fc4844546`; not pushed. Two adversarial passes ran against the block records rather than the narrative: a handoff test on EN.16.A failed then passed after 11 holes were closed, and a red team landed 9 of 10 findings, each verified against source. Filed one carryover for the doc sweep EN.16.A scopes out. Wrote `planning/handoff.md` for the next session.
+- **Why:** The operator confirmed on 2026-09-09 that this transport was always meant to be backend-agnostic and that the Claude Code subscription was a temporary simplification to isolate complexity, not the design's scope. Today every implement-stage token is billed and there is no knob to route elsewhere. Two red-team findings are worth remembering because both would have shipped silently: EN.16.B's cost-honesty acceptance criterion was **unachievable as written** (`claude_code_rs::Outcome.cost_usd` is a bare `f64` written unconditionally, and the writer file was missing from `files.modified`), and the stated dispatch guidance named the wrong pattern — `ImplementTaskNode` registers at `if let Some(t) = token`, not the local-tier shape, so `agent_backend: pi` with `token: None` would have fallen back to the billed Claude node. Also corrected the harness gate count in all three records: engine-rs has SEVEN `gates: true` checks, not the familiar four. One attack was rejected — demoting EN.16.C — because Fork 1 records the operator wanting both backends; the rejection is in the cut list with its reason. The roadmap-vs-lane driving decision is deliberately left open for review: this cut is one repo with zero cross-repo edges, which is precisely what `/generate-roadmap` exists to coordinate and has none of.
+- **Refs:** `planning/blocks/EN.16.{A,B,C}.json`; `planning/handoff.md`; HQ `planning/open-work/pre-plan/pluggable-code-agent-transport/`
 
 ## [run: 2026-09-08]
 
