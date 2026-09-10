@@ -225,14 +225,14 @@
       "items": { "type": "string" }
     },
     "origin": {
-      "description": "Where this block came from, when it was promoted rather than authored fresh. `mechanism` means a consolidation analysis produced it: `slug` is that mechanism's finding_id, so a block can be traced back to the analysis that filed it and forward to the carryover entries sharing the id. A block does NOT carry `finding_id` or `needs` of its own -- clustering is a carryover concern (the entries already have the field), and `needs` is a routing key consumed when a finding becomes work, which `sdlc_workflow`/`files`/`what` then answer.",
+      "description": "Where this block came from, when it was promoted rather than authored fresh. `mechanism` means a consolidation analysis produced it: `slug` is that mechanism's finding_id, so a block can be traced back to the analysis that filed it and forward to the carryover entries sharing the id. A block does NOT carry `finding_id` or `needs` of its own -- clustering is a carryover concern (the entries already have the field), and `needs` is a routing key consumed when a finding becomes work, which `sdlc_workflow`/`files`/`what` then answer. `remediation` = filed to close a docs/sandbox/remediation.json entry (slug is REM-NNN). `roadmap` = filed as part of a /generate-roadmap or /orchestrate multi-block roadmap (slug is the roadmap slug). `known_issue` = filed from a named audit/investigation finding (slug is that finding's own slug, distinct from `mechanism`'s consolidation-analysis finding_id). `operator` = filed directly from an operator request (slug names the request). `finding` = filed from a HQ.build-v2-style greenify/tracking finding. `deferred`/`defect` = filed from a cross-repo or cross-lane report naming the originating incident (slug is that incident's own identifier -- NOT a reuse of carryover[].kind's `deferred`/`defect` vocabulary, a different namespace entirely). `run` = filed from an orchestration run record (slug is the run's own slug). `cross-repo` = filed because another repo's event caused this block (slug names the originating block/repo). `message` = filed from a cross-lane ping-agent message (slug is the message id). `decision` = filed from a logged /log-decision cross-repo architectural decision record (slug is that decision's own id, e.g. D81) -- distinct from `roadmap`'s multi-block program slug and from `mechanism`'s consolidation-analysis finding_id.",
       "oneOf": [
         {
           "type": "object",
           "additionalProperties": false,
           "required": ["type", "slug"],
           "properties": {
-            "type": { "enum": ["backlog", "carryover", "capture", "mechanism"] },
+            "type": { "enum": ["backlog", "carryover", "capture", "mechanism", "remediation", "roadmap", "known_issue", "operator", "finding", "deferred", "run", "defect", "cross-repo", "message", "decision"] },
             "slug": { "type": "string" }
           }
         }

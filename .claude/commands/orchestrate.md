@@ -714,6 +714,23 @@ release `<lock_dir>/leases/lease-<repo>.json`; drain `<lock_dir>/queue/<repo>/<l
 `drain_queue()`/`complete_message()`; re-take the lease and re-stamp its `heartbeat` by hand
 before launching the next engine.
 
+**Mid-block re-stamp when the lane is driven by hand (BT.ticket.lane-heartbeat-goes-stale-mid-block).**
+The block-boundary re-stamp above is not enough on its own for a lane that drives its chain by
+hand rather than through `/sdlc-task`/`/sdlc-flow` — those two engines now restamp mid-block on
+their own (at the per-task test stage), but a hand-driven lane never reaches that code path, so
+its claim and lease can go un-restamped for as long as one block takes. Measured 2026-09-08: a
+hand-driven lane's claim sat un-restamped across two closed blocks, ~34 minutes from tripping
+`check_lane_agents.py`'s staleness threshold. If a single block is running long, re-stamp both
+records mid-block, without releasing the lease or touching `started_at`/`acquired_at`, by running:
+
+```
+python3 scripts/lane_heartbeat.py --agent <this lane's agent identity> --repo <this-repo-name> [--current-block <id>]
+```
+
+This is the same writer the engines call internally; it is safe to run at any point while the
+lease is held, non-fatal if no claim or lease exists yet, and never creates a record that was not
+already there.
+
 If `--stop-after` has been reached, or `--autonomy` says this is a stopping point, release the lease
 and registry claim as at lane close and stop here instead of continuing to step 6. Otherwise
 return to step 6.

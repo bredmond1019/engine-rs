@@ -127,6 +127,19 @@ def is_planning_authoring_artifact(fpath):
 WORKFLOWS = {"none", "patch", "task", "run", "flow"}
 MODELS = {"sonnet", "gemini-pro", "gemini-flash", "either"}
 
+# Mirrors block.schema.json's origin.type enum exactly (BT.ticket.block-origin-remediation
+# -never-reached-the-schema) -- the 2026-09-08 fleet audit's 13 live values, plus `decision`
+# (added task 3, after a live check_block_records.py run against this repo's own
+# planning/blocks/ tree found 3 records already using it -- the audit's list was incomplete).
+# Kept as a WARNING, not a hard error, matching this checker's posture for other backfill-era
+# gaps (WARN_IF_MISSING above): existing records predate the expanded enum and an unrecognized
+# value here is debt to surface, not a block to fail outright.
+ORIGIN_TYPES = {
+    "backlog", "carryover", "capture", "mechanism", "remediation", "roadmap",
+    "known_issue", "operator", "finding", "deferred", "run", "defect",
+    "cross-repo", "message", "decision",
+}
+
 
 # --- brain.toml prefix resolution ---------------------------------------------------------
 # A block ID's prefix declares which repo's NAMESPACE it lives in; the `repo` field declares which
@@ -324,6 +337,12 @@ def check(path, planning_root="planning", planning_is_symlinked=True):
             # D64: an un-gateable criterion with no fixture is the failure the rule exists
             # to catch -- it reads as verified while nothing observes it.
             bad(f"acceptance_criteria[{i}] is gateable:false but names no `evidence`")
+
+    origin = b.get("origin")
+    if isinstance(origin, dict):
+        origin_type = origin.get("type")
+        if origin_type is not None and origin_type not in ORIGIN_TYPES:
+            warn(f"origin.type `{origin_type}` not one of {sorted(ORIGIN_TYPES)}")
 
     for i, e in enumerate(b.get("depends_on") or []):
         if not isinstance(e, dict):
