@@ -134,7 +134,11 @@ policy surface over that lease/hold — it resolves and stamps policy only, and 
 once per run and reused across node boundaries via a process-global registry, with a background
 lease-renewal loop that detects both lease loss and external tmux kill — and
 `LiveClaudeSessionNode` (`live_claude.rs`), which types an interactive `claude` CLI invocation
-into an already-held pane so the session is visible to `bastion sessions`' tmux listing. See
+into an already-held pane so the session is visible to `bastion sessions`' tmux listing. `EN.15.I`
+registers `HeldSessionNode` as its own `HELD_SESSION` builtin workflow (dispatcher entry in
+`engine-serve`, mirroring `DEBRIEF`'s registration pattern) and adds `held_session_name(repo, lane)
+-> "lane-<repo>-<lane>"` — a small pure naming helper, distinct from `identity.rs`'s per-node
+`eng-<run_id>` scheme, for the operator-attach naming convention. See
 [architecture.md](architecture.md) for the module-map detail.
 
 ## `TmuxError`'s wrapped-error contract
