@@ -1061,6 +1061,21 @@ impl CloseBlockNode {
             };
         }
 
+        // An end review that refused the acceptance criteria must not close
+        // its block either. `schema::derive_committed_status` maps
+        // `TerminalSignal::EndReviewFail` to its own `criteria_refused`
+        // status (base-template D86) instead of `"blocked"`, so without
+        // this arm a refused run would fall through and close the block.
+        if state.global_status == "criteria_refused" {
+            return CloseOutcome::Skipped {
+                reason: format!(
+                    "run ended criteria_refused ({}) — the end review refused the acceptance \
+                     criteria; a refused run must not close its block",
+                    state.bail_reason.as_deref().unwrap_or("no reason recorded")
+                ),
+            };
+        }
+
         // A partial `task_range` run must not close its block either — the
         // JS engine's `fullRun` guard (`sdlc-task.js`): "the reconcile and
         // the block close only happen on a run covering EVERY task in the
@@ -1769,6 +1784,21 @@ mod tests {
             }
             other => panic!("expected Skipped, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn skips_a_criteria_refused_run_and_does_not_close() {
+        let (_dir, repo_dir) = brain_fixture("acme", &[("AC.1", "open", false)]);
+        let ctx = ctx_for(&repo_dir, Some("acme"), Some("AC.1"), "criteria_refused");
+        let node = CloseBlockNode::new();
+        let out = node.process(ctx).await.expect("process succeeds");
+        let result = get_result(&out, "CloseBlockNode").expect("stamped");
+        assert_eq!(result["outcome"], json!("SKIPPED"));
+
+        // Verify on disk: the block must still be "open".
+        let raw = std::fs::read_to_string(repo_dir.join("planning/state.json")).unwrap();
+        assert!(raw.contains("\"open\""));
+        assert!(!raw.contains("\"closed\""));
     }
 
     #[tokio::test]
