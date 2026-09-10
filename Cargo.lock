@@ -860,6 +860,7 @@ dependencies = [
  "serde_json",
  "sqlx",
  "tempfile",
+ "term-core",
  "tokio",
  "tracing",
  "tracing-subscriber",
