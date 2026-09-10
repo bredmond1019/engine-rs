@@ -1508,6 +1508,69 @@ pub fn held_session_name(repo: &str, lane: &str) -> String {
     format!("lane-{repo}-{lane}")
 }
 
+/// The terminal status the `HELD_SESSION` chain (`EN.15.I` task 3) records
+/// for one `HeldSessionNode::process` outcome. `HELD_SESSION` is a
+/// single-node micro-workflow ([`held_session_schema`]) that recorded no
+/// status at all before this task — this constant pair, and
+/// [`held_session_outcome_status`] below, are what introduce that
+/// recording; neither reuses nor rewrites any status enum shared with
+/// another workflow's terminal-state handling.
+pub const HELD_SESSION_OUTCOME_DONE: &str = "done";
+
+/// The chain must record THIS, never [`HELD_SESSION_OUTCOME_DONE`], when
+/// the held tmux session vanished out from under the run — a chain that
+/// recorded `"done"` after its session died would be exactly the
+/// terminal-state lie the block record's notes call out
+/// (`BT.ticket.engine-terminal-state-needs-evidence`).
+pub const HELD_SESSION_OUTCOME_SESSION_LOST: &str = "session_lost";
+
+/// Classify a `HeldSessionNode::process` (or a re-entry driven off
+/// [`crate::nodes::terminal::HeldSessionHandle::failure`]) outcome into the
+/// status this chain records:
+///
+/// - `Ok(_)` -> [`HELD_SESSION_OUTCOME_DONE`].
+/// - `Err(_)` whose message is the externally-killed shape
+///   (`crate::nodes::terminal::held_session::HeldSessionFailure::ExternallyKilled::into_node_error`'s
+///   "vanished externally" wording — see that type's own doc for why this
+///   is worded distinctly from a lease-lost message and a driver timeout)
+///   -> [`HELD_SESSION_OUTCOME_SESSION_LOST`].
+/// - `Err(_)` whose message carries `term_core::tmux::TmuxError::NoServer`'s
+///   own Display text ("no tmux server running") -> ALSO
+///   [`HELD_SESSION_OUTCOME_SESSION_LOST`]. This is a second, deliberate
+///   match arm, not a variant of the first: killing the WHOLE tmux
+///   SERVER (as opposed to just the one held session) never reaches
+///   `HeldSessionFailure::ExternallyKilled` at all — `renewal_loop`'s own
+///   `list_sessions` call errors outright against a dead server rather
+///   than succeeding with the session merely absent, so that loop falls
+///   through to `SessionLease::renew`, which fails the same way and is
+///   recorded as `HeldSessionFailure::LeaseLost` instead (verified against
+///   a real killed tmux server in `tests/it/escalate.rs`, not assumed from
+///   reading the loop). A `LeaseLost` whose `reason` names a dead server is
+///   just as much "the session is gone" as an `ExternallyKilled` is — the
+///   session cannot possibly still be alive with no server left to host it
+///   — so this chain must record `session_lost` for it too, even though
+///   `HeldSessionFailure::LeaseLost::into_node_error`'s own wording
+///   (unrelated to this task, not touched here) still says "the session
+///   itself may still be alive".
+/// - Any OTHER `Err(_)` (an ordinary lease-lost failure — a foreign nonce,
+///   not a dead server — a missing `run_id`, or any other driver error) ->
+///   `Err(<the NodeError's own message>)`, since neither terminal status
+///   honestly describes it and this function does not invent a third one.
+pub fn held_session_outcome_status(
+    result: &Result<TaskContext, NodeError>,
+) -> Result<&'static str, String> {
+    match result {
+        Ok(_) => Ok(HELD_SESSION_OUTCOME_DONE),
+        Err(err)
+            if err.message.contains("vanished externally")
+                || err.message.contains("no tmux server running") =>
+        {
+            Ok(HELD_SESSION_OUTCOME_SESSION_LOST)
+        }
+        Err(err) => Err(err.message.clone()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2976,5 +3039,83 @@ mod tests {
         let lane = resolved_lane.unwrap_or_else(|| repo.clone());
 
         assert_eq!(held_session_name(&repo, &lane), "lane-bastion-bastion");
+    }
+
+    // ── `held_session_outcome_status` (`EN.15.I` task 3) ──────────────────
+
+    #[test]
+    fn held_session_outcome_status_is_done_on_success() {
+        let ok: Result<TaskContext, NodeError> = Ok(TaskContext {
+            event: json!({}),
+            nodes: HashMap::new(),
+            metadata: json!({}),
+            node_runs: HashMap::new(),
+        });
+        assert_eq!(
+            held_session_outcome_status(&ok),
+            Ok(HELD_SESSION_OUTCOME_DONE)
+        );
+        assert_eq!(HELD_SESSION_OUTCOME_DONE, "done");
+    }
+
+    /// The chain must record `session_lost`, never `done`, for the exact
+    /// message shape
+    /// `HeldSessionFailure::ExternallyKilled::into_node_error` produces —
+    /// asserted here against that literal wording rather than a
+    /// hand-rolled approximation, so this test breaks if that wording ever
+    /// drifts out of sync with what this classifier matches on.
+    #[test]
+    fn held_session_outcome_status_is_session_lost_for_an_externally_killed_message() {
+        let err: Result<TaskContext, NodeError> = Err(NodeError::new(
+            "HeldSessionNode: session 'lane-engine-rs-lane-1' vanished externally — \
+             killed out from under the run (not a lease loss, not a driver timeout)"
+                .to_string(),
+        ));
+        assert_eq!(
+            held_session_outcome_status(&err),
+            Ok(HELD_SESSION_OUTCOME_SESSION_LOST)
+        );
+        assert_eq!(HELD_SESSION_OUTCOME_SESSION_LOST, "session_lost");
+    }
+
+    /// The whole-server-killed shape: `renewal_loop` records this as
+    /// `HeldSessionFailure::LeaseLost` (not `ExternallyKilled` — see
+    /// `held_session_outcome_status`'s own doc for why), with `reason`
+    /// carrying `TmuxError::NoServer`'s literal Display text. This chain
+    /// must still record `session_lost` for it, verified against the
+    /// EXACT message `HeldSessionFailure::LeaseLost::into_node_error`
+    /// produces, not a hand-rolled approximation.
+    #[test]
+    fn held_session_outcome_status_is_session_lost_when_the_whole_tmux_server_died() {
+        let err: Result<TaskContext, NodeError> = Err(NodeError::new(
+            "HeldSessionNode: lease lost for session 'lane-engine-rs-lane-1': \
+             driver error: no tmux server running \
+             (the session itself may still be alive; not an external kill, not a driver timeout)"
+                .to_string(),
+        ));
+        assert_eq!(
+            held_session_outcome_status(&err),
+            Ok(HELD_SESSION_OUTCOME_SESSION_LOST)
+        );
+    }
+
+    /// A lease-lost failure is a DIFFERENT NodeError shape (no "vanished
+    /// externally" wording, no dead-server wording) and must never be
+    /// folded into `session_lost` — it is surfaced as its own message
+    /// instead of either terminal status.
+    #[test]
+    fn held_session_outcome_status_does_not_fold_a_lease_lost_failure_into_session_lost() {
+        let err: Result<TaskContext, NodeError> = Err(NodeError::new(
+            "HeldSessionNode: lease lost for session 's': read-back does not show our nonce \
+             (the session itself may still be alive; not an external kill, not a driver timeout)"
+                .to_string(),
+        ));
+        let status = held_session_outcome_status(&err);
+        assert!(
+            status.is_err(),
+            "a lease-lost failure must not resolve to a terminal status"
+        );
+        assert_ne!(status, Ok(HELD_SESSION_OUTCOME_SESSION_LOST));
+        assert_ne!(status, Ok(HELD_SESSION_OUTCOME_DONE));
     }
 }
