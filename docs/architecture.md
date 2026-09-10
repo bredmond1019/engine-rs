@@ -576,7 +576,7 @@ the same four gate commands as `planning/harness.json`: `cargo fmt --check`,
 `crates/engine-store/migrations/` is engine-rs's first tracked migration directory, applied with
 plain `sqlx::migrate!` — the `migrate` feature of the workspace's existing `sqlx` dependency, not a
 second database stack or a second connection pool. A `diesel-async` spike ran ahead of this choice
-(`planning/EN.14.E/spike-fork-9.md`) and found it workable against this workspace's tokio/actix
+(`planning/archive/EN.14.E/spike-fork-9.md`) and found it workable against this workspace's tokio/actix
 runtime, but adding it would mean a second Postgres driver stack alongside sqlx's for no compile-time
 safety gain: `engine-store` has zero `query!`/`query_as!` macro calls today, so there is no `.sqlx`
 offline-query cache to lose by staying on sqlx and no compile-time-checked-query benefit to gain by
@@ -595,7 +595,7 @@ its own runtime (brain D84 + Amendment 1: the table is shared by contract, not b
 and this migration does not touch anything under `../synapse/`) — so an engine database can be stood
 up from engine-rs's own migrations alone. Its column types and nullability were diffed against the
 live `orchestration_dev` schema rather than authored from `docs/data-contract.md`
-(`planning/EN.14.I/live-schema-diff.md`): `data`/`task_context` are `json` (not `jsonb`), and
+(`planning/archive/EN.14.I/live-schema-diff.md`): `data`/`task_context` are `json` (not `jsonb`), and
 `data`/`task_context`/`created_at`/`updated_at` are all nullable.
 
 Apply pending migrations programmatically with `engine_store::run_migrations(&pool)`, or from the

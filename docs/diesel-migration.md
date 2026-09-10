@@ -189,6 +189,6 @@ Also unresolved from D84 Amendment 1 and not this port's to fix, but it will blo
 
 | Spike | Question | Where |
 |---|---|---|
-| 1 (2026-09-03) | Does diesel-async work against this runtime at all? | `planning/EN.14.E/spike-fork-9.md` |
-| 2 (2026-09-07) | Concurrent pooled load under actix; sqlx coexistence | `planning/EN.14.E/spike-fork-9-concurrency.md` |
-| 3 (2026-09-07) | Does the typed DSL reject wrong queries? | `planning/EN.14.E/spike-fork-9-typed-dsl.md` |
+| 1 (2026-09-03) | Does diesel-async work against this runtime at all? | `planning/archive/EN.14.E/spike-fork-9.md` |
+| 2 (2026-09-07) | Concurrent pooled load under actix; sqlx coexistence | `planning/archive/EN.14.E/spike-fork-9-concurrency.md` |
+| 3 (2026-09-07) | Does the typed DSL reject wrong queries? | `planning/archive/EN.14.E/spike-fork-9-typed-dsl.md` |

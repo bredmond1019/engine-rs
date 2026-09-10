@@ -175,7 +175,7 @@ async fn assert_node_invocations_table_and_index_exist(pool: &PgPool) -> Result<
 
 /// Assert EN.14.I task 1's `events` table migration
 /// (`0004_create_events.sql`) produced exactly the schema recorded in
-/// `planning/EN.14.I/live-schema-diff.md`: `data`/`task_context` are `json`
+/// `planning/archive/EN.14.I/live-schema-diff.md`: `data`/`task_context` are `json`
 /// (NOT `jsonb`), `created_at`/`updated_at` are `timestamp` WITHOUT time
 /// zone, and `data`/`task_context`/`created_at`/`updated_at` are all
 /// NULLABLE — matching the live table's measured nullability rather than

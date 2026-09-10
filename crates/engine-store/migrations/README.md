@@ -2,7 +2,7 @@
 
 engine-rs's first tracked migration directory, applied with `sqlx::migrate!` /
 `sqlx::migrate::Migrator` (the `migrate` feature of the workspace's existing `sqlx` dependency —
-no new database stack, no second connection pool; see `planning/EN.14.E/spike-fork-9.md` for why
+no new database stack, no second connection pool; see `planning/archive/EN.14.E/spike-fork-9.md` for why
 `diesel-async` was evaluated and not adopted).
 
 Files here follow sqlx's `<VERSION>_<description>.sql` naming convention (a leading integer
