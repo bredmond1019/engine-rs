@@ -5,7 +5,7 @@ description: Chronological log of work completed for engine-rs.
 doc_id: log
 layer: [factory]
 status: active
-timestamp: "2026-09-10T09:00:02Z"
+timestamp: "2026-09-10T22:26:09Z"
 keywords: [work log, session history, development log]
 related: [status, context]
 ---
@@ -15,6 +15,28 @@ related: [status, context]
 *Append-only working log. One dated entry per session. Newest entries at the top.*
 
 ## [run: 2026-09-10]
+
+### Closed EN.16.A + the quiesce-test hermeticity fix; docs re-synced; /close-out run
+- **What:** Two per-block `/begin-orchestration` sessions closed
+  `EN.ticket.coord-quiesce-test-is-environment-dependent-and-now-red` (made `coord::write`'s test
+  hermetic by passing an explicit `lock_dir` instead of relying on ambient `.fleet-locks/` state,
+  `d8499d4`) and `EN.16.A` (the `ClaudeCodeStep` -> `AgentCodeStep` rename across all 63 Rust call
+  sites, all 7 ACs + all 7 harness gates met, `9126068`/`d608ce3`). Then ran `/close-out`: full
+  9-check harness suite + emoji gate green on the recovered range `fe7b12c..HEAD`; a coverage scan
+  found no blocking gaps; `/update-docs --patch` re-synced 14 docs to the new type/module name
+  (`4f36ab0`), deliberately leaving `docs/data-contract.md`'s two dated changelog rows saying the
+  old name, per D20's append-only discipline. Deleted the
+  `agent-code-step-rename-leaves-doc-prose-naming-the-old-type` carryover entry (work done; its
+  `clears_when` predicate couldn't account for the append-only exception and would never have
+  fired). Both orchestration-run sessions left the full four-artifact set (`notes.md`, `review.md`,
+  `verification-ledger.json`/`.md`) under `planning/orchestration-run/pluggable-code-agent-transport/`,
+  contract-checked.
+- **Why:** Operator authorized autonomous execution of the already-planned `EN.16.A` after
+  generating its tasks; the prior handoff's plan-review gate was resolved before this session
+  opened. `EN.16.B` stays held on `coordination-layer-port`'s `EN.17.I/J` (operator-sequenced
+  first) plus an operator gate (`install-pi-and-capture-a-real-cli-run`) — not started this
+  session.
+- **Refs:** `planning/handoff.md`, `planning/orchestration-run/pluggable-code-agent-transport/review.md`
 
 ### Planned phase 16 — pluggable code-agent transport (EN.16.A/B/C)
 - **What:** Authored the initiative narrative (`planning/open-work/pre-plan/pluggable-code-agent-transport/plan.md`, in HQ) and three block records from the existing `/assess` -> `/seams` -> `/sequence` pre-plan, with no departures from its cut. EN.16.A renames `ClaudeCodeStep` -> `AgentCodeStep` (zero behaviour change, 24 instantiation files, 5 of them outside engine-core); EN.16.B adds the `agent_backend` policy knob, a new `AgentOutcome` type, `PiTransport` and a `BudgetLedger` unknown-cost flag; EN.16.C adds Aider reusing B's scaffolding. Registered at phase 16, waves 362/363/364 (asserted unused first), `depends_on` mirrored between records and `state.json`. Ran `emit-state` via the wrapper — 16 surfaces, 0 staging failures, wave table spliced, A derives `open` and B/C derive `blocked`. Committed locally as `fc4844546`; not pushed. Two adversarial passes ran against the block records rather than the narrative: a handoff test on EN.16.A failed then passed after 11 holes were closed, and a red team landed 9 of 10 findings, each verified against source. Filed one carryover for the doc sweep EN.16.A scopes out. Wrote `planning/handoff.md` for the next session.
