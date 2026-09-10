@@ -65,7 +65,7 @@ description: >
      substituted (fastCommand) or skipped (perTask:false) → on failure, status
      "reconcile_failed" — bookkeep is skipped, the block is NOT flipped to done.
 
- STATE (NOT gitignored, but deliberately never committed — at planning/blocks/<spec>/)
+ STATE (NOT gitignored, but deliberately never committed — at planning/<spec>/sdlc/)
    sdlc-task-state.json   the authoritative run index (per-task summary/issues/fixes/commit +
                           the Block-A `tokens` block, plus `base_sha` — the pre-task HEAD this
                           run's own emoji gate diffs from). Written to disk after every task and
@@ -848,16 +848,16 @@ Skip this entire step if the run bailed OR Step 3.5 set `reconcileFailed = true`
      **never** a plain `git add planning/...` from this repo root (fails: "pathspec is beyond a
      symbolic link"), and never a `git checkout`/branch operation inside the vault:
      ```
-     git -C <vaultRealPath> add <vaultRealPath>/blocks/<blockId>/tasks.md 2>/dev/null || true
+     git -C <vaultRealPath> add <vaultRealPath>/<blockId>/tasks.md 2>/dev/null || true
      git -C <vaultRealPath> add <vaultRealPath>/status.md
      git -C <vaultRealPath> add <vaultRealPath>/state.json 2>/dev/null || true
      Then commit ONLY these three paths — pass them explicitly to `git commit` itself (not merely to
      `git add`), so anything a sibling lane already had staged in this same vault repo is left staged
      and untouched by this commit:
-     git -C <vaultRealPath> diff --cached --quiet -- <vaultRealPath>/blocks/<blockId>/tasks.md <vaultRealPath>/status.md <vaultRealPath>/state.json || (<COMMIT-SAFETY GUARD, using "git -C <vaultRealPath>" in place of "git"> && git -C <vaultRealPath> commit -m "$(cat <<'EOF'
+     git -C <vaultRealPath> diff --cached --quiet -- <vaultRealPath>/<blockId>/tasks.md <vaultRealPath>/status.md <vaultRealPath>/state.json || (<COMMIT-SAFETY GUARD, using "git -C <vaultRealPath>" in place of "git"> && git -C <vaultRealPath> commit -m "$(cat <<'EOF'
      chore: sdlc-task bookkeep — <blockId>
      EOF
-     )" -- <vaultRealPath>/blocks/<blockId>/tasks.md <vaultRealPath>/status.md <vaultRealPath>/state.json)
+     )" -- <vaultRealPath>/<blockId>/tasks.md <vaultRealPath>/status.md <vaultRealPath>/state.json)
      git -C <vaultRealPath> log --oneline -1
      ```
      This must be a clean, targeted commit of just those files' changes — not a broader checkout or

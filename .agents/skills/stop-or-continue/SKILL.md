@@ -22,7 +22,7 @@ first.
 
 | Trigger | Why continuing is wrong |
 |---|---|
-| **An engine, command or binary changed this session** | Standing rule 10: the Workflow harness copies each engine `.js` at launch and runs *that* copy; `.claude/commands/*.md` behave the same way. A fix on `main` does not change the running session. A stale engine emits the pre-fix command, the pre-fix failure returns, and it reads as an unreliable agent rather than a stale snapshot. Measured 2026-08-19: one block re-run **four times** against an engine that never changed. |
+| **An engine, command or binary changed this session** | Standing rule 10: a launch by name runs a cached copy of each engine `.js`, not the working tree, and that cache can stay stale or jump to another revision (even a reverted one) mid-session; `.claude/commands/*.md` are resolved once. A fix on `main` does not reliably reach the next run — hash the copy after each launch, or launch the engine from its file. A stale engine emits the pre-fix command, the pre-fix failure returns, and it reads as an unreliable agent rather than a stale snapshot. Measured 2026-08-19: one block re-run **four times** against an engine that never changed. |
 | **A locally-installed binary was rebuilt** (`mev`, `bastion`) | Same shape one layer down, plus `emit-state --write` from a stale binary **reverts** generated boards to an older format. See `derive-state-safely`. |
 | **`settings.json`, hooks, or MCP config changed** | The harness reads these at startup. |
 | **The operator changed a `CLAUDE.md` you already read** | You are working from the superseded text. A mid-session diff notice is enough; a full rewrite is not. |
