@@ -59,7 +59,7 @@
 //     substituted (fastCommand) or skipped (perTask:false) → on failure, status
 //     "reconcile_failed" — bookkeep is skipped, the block is NOT flipped to done.
 //
-// STATE (NOT gitignored, but deliberately never committed — at planning/blocks/<spec>/)
+// STATE (NOT gitignored, but deliberately never committed — at planning/<spec>/sdlc/)
 //   sdlc-task-state.json   the authoritative run index (per-task summary/issues/fixes/commit +
 //                          the Block-A `tokens` block, plus `base_sha` — the pre-task HEAD this
 //                          run's own emoji gate diffs from). Written to disk after every task and
@@ -168,13 +168,13 @@ if (rangeSpec) {
 // Resolved against the git root by default; re-derived under a tier prefix (e.g. "business/")
 // once setup reports where the spec actually lives (see setupResult.tierPrefix below) — `let`,
 // not `const`, following the same pattern specFile already uses for its own reassignment.
-let blockDir       = `planning/blocks/${blockId}`
-let blockRecordFile = `${blockDir}/${blockId}.json`   // D65: the authored block record — preferred spec source
+let blockDir       = `planning/${blockId}`
+let blockRecordFile = `planning/blocks/${blockId}.json`   // D65: the authored block record — preferred spec source
 let specFile         = `${blockDir}/tasks.md`                // legacy fallback for a spec with no block record (reassigned once setup reports which source exists)
 let tasksJsonFile = `${blockDir}/tasks.json`
 let breakdownFile = `${blockDir}/breakdown.md`
-let reportsDir    = `${blockDir}/reports`
-let stateFile     = `${blockDir}/sdlc-task-state.json`   // COMMITTED authoritative run index (Block A)
+let reportsDir    = `${blockDir}/sdlc/reports`
+let stateFile     = `${blockDir}/sdlc/sdlc-task-state.json`   // COMMITTED authoritative run index (Block A)
 const baseBranchName = `${blockId}-task`.toLowerCase().replace(/[^a-z0-9.-]/g, '-')  // worktree branch base
 
 const MAX_TASK_ATTEMPTS = 3   // implement→test→fix attempts per task before bail (final on Opus)
@@ -438,7 +438,7 @@ import json
 d = json.load(open('${tasksJsonPath}'))
 t = [x for x in d if x.get('task_id') == ${taskNum}]
 print(chr(10).join(t[0].get('files', []) if t else []))
-"); WA_MATCH=0; WA_BADDEL=""; while IFS=$'\t' read -r WA_ST WA_P1 WA_P2; do WA_CHK="$WA_P1"; case "$WA_ST" in R*) WA_CHK="$WA_P2" ;; esac; if printf '%s\n' "$WA_DECLARED" | grep -qFx "$WA_CHK"; then WA_MATCH=1; else case "$WA_ST" in D*) WA_BADDEL="$WA_CHK" ;; esac; fi; done <<< "$NAME_STATUS"; if [ "$WA_MATCH" -eq 0 ]; then echo "WORK_ASSERTION_ABORT: task ${taskNum} commit's changed paths do not intersect declared files[] (condition 2) - declared: [$WA_DECLARED] - changed: [$NAME_STATUS]"; exit 1; fi; if [ -n "$WA_BADDEL" ]; then echo "WORK_ASSERTION_ABORT: task ${taskNum} commit deletes undeclared file '$WA_BADDEL' not present in files[] (condition 3) - declared: [$WA_DECLARED]"; exit 1; fi`
+"); WA_MATCH=0; WA_BADDEL=""; while IFS=$'\t' read -r WA_ST WA_P1 WA_P2; do WA_CHK="$WA_P1"; case "$WA_ST" in R*) WA_CHK="$WA_P2" ;; esac; if printf '%s\n' "$WA_DECLARED" | grep -qFx "$WA_CHK"; then WA_MATCH=1; else case "$WA_ST" in D*) WA_BADDEL="$WA_CHK" ;; esac; fi; done <<< "$NAME_STATUS"; if [ -z "$WA_DECLARED" ]; then WA_MATCH=1; fi; if [ "$WA_MATCH" -eq 0 ]; then echo "WORK_ASSERTION_ABORT: task ${taskNum} commit's changed paths do not intersect declared files[] (condition 2) - declared: [$WA_DECLARED] - changed: [$NAME_STATUS]"; exit 1; fi; if [ -n "$WA_BADDEL" ]; then echo "WORK_ASSERTION_ABORT: task ${taskNum} commit deletes undeclared file '$WA_BADDEL' not present in files[] (condition 3) - declared: [$WA_DECLARED]"; exit 1; fi`
 }
 // <</shared:renderWorkAssertion>>
 
@@ -1067,9 +1067,9 @@ const SETUP_SCHEMA = {
     worktreeFailed: { type: 'boolean', description: '--worktree only: true iff the worktree could not be resolved or created and setup stopped rather than falling back to the current branch — either no free candidate name was found among "<base>" through "<base>-10", or the worktree-add/creation step itself errored. Always false in in-place mode.' },
     worktreeFailureReason: { type: 'string', description: 'Empty unless worktreeFailed is true. Names the spec slug, every candidate branch name tried, and (for a creation failure) the exact command output.' },
     specFileExists: { type: 'boolean', description: 'true if EITHER the block record or the legacy tasks.md exists (D65 stage 2)' },
-    specSource:     { type: 'string', enum: ['block-record', 'tasks-md', 'missing'], description: "D65 stage 2: 'block-record' if planning/blocks/<BlockID>/<BlockID>.json exists (preferred), else 'tasks-md' if the legacy spec file exists, else 'missing'. Evaluated at the WINNING location (root if the spec exists there, else tier) — see specFoundInTier." },
+    specSource:     { type: 'string', enum: ['block-record', 'tasks-md', 'missing'], description: "D65 stage 2: 'block-record' if planning/blocks/<BlockID>.json exists (preferred), else 'tasks-md' if the legacy spec file exists, else 'missing'. Evaluated at the WINNING location (root if the spec exists there, else tier) — see specFoundInTier." },
     tierPrefix:     { type: 'string', description: 'The invoking directory\'s path relative to the git root, with a trailing slash (e.g. "business/"), or "" when /sdlc-task was invoked at the git root. This is the CANDIDATE tier location checked in STEP 4a — reported regardless of whether the spec was actually found there.' },
-    specFoundInTier: { type: 'boolean', description: 'true iff the spec (block record or legacy tasks.md) exists ONLY at the tier location (<tierPrefix>planning/blocks/<blockId>), not at the root (planning/blocks/<blockId>). False when found at the root (even if ALSO present at the tier — the root always wins) or found nowhere.' },
+    specFoundInTier: { type: 'boolean', description: 'true iff the spec (block record or legacy tasks.md) exists ONLY at the tier location (<tierPrefix>planning/<blockId>), not at the root (planning/<blockId>). False when found at the root (even if ALSO present at the tier — the root always wins) or found nowhere.' },
     blockStatus:    { type: 'string', description: "This spec's Status in status.md (title-case), or 'Unknown'" },
     specThin:       { type: 'boolean', description: 'D19: true on a fresh (non-resume) run with a structurally-valid but substantively-thin spec; false on resume or a healthy spec.' },
     thinReason:     { type: 'string', description: 'D19: the specific thin-spec failures when specThin; empty string otherwise.' },
@@ -1832,7 +1832,7 @@ let cachedStartedAt = null
 // Persist `state` to sdlc-task-state.json. This is deliberately WRITE-ONLY — no git command runs
 // here, and the `commit` option (if a caller still passes one) is ignored.
 //
-// Why: this run-state lives under planning/blocks/<blockId>/, and under D46 every vaulted repo's
+// Why: this run-state lives under planning/<blockId>/sdlc/, and under D46 every vaulted repo's
 // planning/ is a relative symlink into a brain-owned vault, so `git add planning/...` fails with
 // "fatal: pathspec is beyond a symbolic link". The state-writer agent used to "repair" that failure
 // by operating in the brain repo directly and checking out the run's branch there — contaminating
@@ -2202,13 +2202,13 @@ const tierPrefixCandidate = setupResult.tierPrefix || ''
 const rootBlockRecordFile = blockRecordFile   // pre-tier root form, kept for the Missing-spec abort
 const rootSpecFile        = specFile          // pre-tier root form, kept for the Missing-spec abort
 if (tierPrefixCandidate && setupResult.specFoundInTier) {
-  blockDir        = `${tierPrefixCandidate}planning/blocks/${blockId}`
-  blockRecordFile = `${blockDir}/${blockId}.json`
+  blockDir        = `${tierPrefixCandidate}planning/${blockId}`
+  blockRecordFile = `${tierPrefixCandidate}planning/blocks/${blockId}.json`
   specFile        = `${blockDir}/tasks.md`
   tasksJsonFile   = `${blockDir}/tasks.json`
   breakdownFile   = `${blockDir}/breakdown.md`
-  reportsDir      = `${blockDir}/reports`
-  stateFile       = `${blockDir}/sdlc-task-state.json`
+  reportsDir      = `${blockDir}/sdlc/reports`
+  stateFile       = `${blockDir}/sdlc/sdlc-task-state.json`
   log(`Spec resolved at tier location (${tierPrefixCandidate}) — not found at the root.`)
 }
 
@@ -2228,10 +2228,10 @@ const specDesc = specSource === 'block-record'
 
 if (!setupResult.specFileExists) {
   const rootPaths = `${rootBlockRecordFile} or ${rootSpecFile}`
-  const tierPaths = tierPrefixCandidate ? `${tierPrefixCandidate}planning/blocks/${blockId}/${blockId}.json or ${tierPrefixCandidate}planning/blocks/${blockId}/tasks.md` : null
+  const tierPaths = tierPrefixCandidate ? `${tierPrefixCandidate}planning/blocks/${blockId}.json or ${tierPrefixCandidate}planning/${blockId}/tasks.md` : null
   log(`No spec found — searched the root (${rootPaths})${tierPaths ? ` AND the tier location (${tierPaths})` : ''}. /sdlc-task expects an authored spec.`)
   log(`Fix: run /generate-tasks ${blockId} (and /breakdown) on main, commit, then re-run /sdlc-task ${blockId}.`)
-  return { error: 'Missing spec', blockId, searchedRoot: [rootBlockRecordFile, rootSpecFile], searchedTier: tierPaths ? [`${tierPrefixCandidate}planning/blocks/${blockId}/${blockId}.json`, `${tierPrefixCandidate}planning/blocks/${blockId}/tasks.md`] : [] }
+  return { error: 'Missing spec', blockId, searchedRoot: [rootBlockRecordFile, rootSpecFile], searchedTier: tierPaths ? [`${tierPrefixCandidate}planning/blocks/${blockId}.json`, `${tierPrefixCandidate}planning/${blockId}/tasks.md`] : [] }
 }
 
 // D19 — thin-spec guard for a fresh run (legacy tasks.md path only — see STEP 4c above).
@@ -3518,16 +3518,16 @@ ${vault.vaulted ? `
    file this step touches (the spec, status.md, state.json) lives under planning/, so stage + commit them
    ALL there, via \`git -C\`, on whatever branch that repo is already on. Do NOT cd into it and do NOT
    checkout/switch/branch there:
-   cd ${runDir} && ${GIT} -C ${vault.planningPath} add ${vault.planningPath}/blocks/${blockId}/tasks.md 2>/dev/null || true
+   cd ${runDir} && ${GIT} -C ${vault.planningPath} add ${vault.planningPath}/${blockId}/tasks.md 2>/dev/null || true
    cd ${runDir} && ${GIT} -C ${vault.planningPath} add ${vault.planningPath}/status.md
    cd ${runDir} && ${GIT} -C ${vault.planningPath} add ${vault.planningPath}/state.json 2>/dev/null || true
    Then commit ONLY these three paths — pass them explicitly to \`git commit\` itself (not merely to
    \`git add\`), so anything a sibling lane already had staged in this same vault repo is left staged
    and untouched by this commit; ${renderNoAttributionTrailer()}:
-   cd ${runDir} && ${GIT} -C ${vault.planningPath} diff --cached --quiet -- ${vault.planningPath}/blocks/${blockId}/tasks.md ${vault.planningPath}/status.md ${vault.planningPath}/state.json || (${renderCommitSafetyGuard('git -C ' + vault.planningPath)} && ${GIT} -C ${vault.planningPath} commit -m "$(cat <<'EOF'
+   cd ${runDir} && ${GIT} -C ${vault.planningPath} diff --cached --quiet -- ${vault.planningPath}/${blockId}/tasks.md ${vault.planningPath}/status.md ${vault.planningPath}/state.json || (${renderCommitSafetyGuard('git -C ' + vault.planningPath)} && ${GIT} -C ${vault.planningPath} commit -m "$(cat <<'EOF'
 chore: sdlc-task bookkeep — ${blockId}
 EOF
-)" -- ${vault.planningPath}/blocks/${blockId}/tasks.md ${vault.planningPath}/status.md ${vault.planningPath}/state.json)
+)" -- ${vault.planningPath}/${blockId}/tasks.md ${vault.planningPath}/status.md ${vault.planningPath}/state.json)
    cd ${runDir} && ${GIT} -C ${vault.planningPath} log --oneline -1` : `
    planning/ is a plain directory here (not vaulted) — everything commits together as before:
    cd ${runDir} && ${GIT} add ${specFile} planning/status.md
