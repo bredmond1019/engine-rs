@@ -18,17 +18,21 @@
 //! frozen "now" literal masquerading as fresh. A frozen "now" literal reproduces the exact
 //! `da4c847` defect this repo hit and fixed earlier in this same spec.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde_json::json;
 
+use engine_core::policy::permission::{GatedAction, PermissionProfile};
 use engine_core::repo_registry::RepoRegistry;
 use engine_core::workflows::orchestration::chain::ChainStep;
 use engine_core::workflows::orchestration::coord_lane::CoordHandle;
 use engine_core::workflows::orchestration::execute::{EngineKind, FlowRunner};
-use engine_core::workflows::orchestration::gates::AdmissionGate;
+use engine_core::workflows::orchestration::gates::{
+    check_permission_gate, make_author_operator_edge, AdmissionGate, OperatorEdgeAuthorConfig,
+    PermissionGateError,
+};
 use engine_core::workflows::orchestration::integrate::{
     integrate_chain_with_coord, NeverHeld, StepProgress,
 };
@@ -563,5 +567,335 @@ async fn a_rendezvous_delivered_mid_chain_is_answered_in_the_senders_inbox() {
     assert_eq!(
         reply["sender"]["agent_name"], "engine-rs-1",
         "the reply must be sent AS the answering chain, not the original sender"
+    );
+}
+
+// ── (f) EN.15.J Task 3 — `check_permission_gate` through the REAL production
+//        `author_operator_edge`, against a real temp `state.json` ───────────────────────
+//
+// Everything below drives `check_permission_gate` (never `permission::decide` in
+// isolation) with the closure `make_author_operator_edge` actually builds — the same
+// production wiring `gates.rs` re-exports task 1/2's `operator_edge` module through —
+// against a real `brain.toml` + `planning/state.json` fixture, never a test-stub
+// closure. `operator_edge.rs`'s own `#[cfg(test)]` module already unit-tests
+// `make_author_operator_edge` directly (its duplicate-slug and quiesce-refusal cases in
+// particular); this module's job is the layer ABOVE that — `check_permission_gate`
+// itself, end to end, is what a real chain caller actually invokes at a permission gate,
+// and that call chain has zero production coverage before this task. Since task 1/2's
+// production closure and this task's tests were both authored and committed in the same
+// spec run, there is no earlier, uncommitted state of `operator_edge.rs`/`gates.rs` left
+// to observe red against without reverting another task's already-committed work (out of
+// this task's own file scope, per the harness's no-revert-other-paths rule) — the proof
+// that this exercises the REAL closure, not a stub, is structural instead: every test
+// below calls `make_author_operator_edge` itself and asserts against the resulting
+// `state.json` bytes on disk, so a swap back to a no-op stub would fail every assertion
+// here that reads the file back.
+
+/// A minimal brain root — one repo, one open block with no `depends_on` yet — that
+/// `mev::add_operator_edge_as` can resolve a `<repo>:<block_id>` key against. Mirrors
+/// `operator_edge.rs`'s own `brain_fixture_with_block` helper (duplicated here rather
+/// than exported across the crate boundary, matching this module's own stated
+/// convention for `one_repo_registry` et al.).
+fn brain_fixture_with_open_block(repo: &str, block_id: &str) -> (tempfile::TempDir, PathBuf) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo_dir = dir.path().join(repo);
+    std::fs::create_dir_all(repo_dir.join("planning")).expect("mkdir");
+    std::fs::write(
+        dir.path().join("brain.toml"),
+        format!("[[repos]]\nslug = \"{repo}\"\nrepo_path = \"{repo}\"\n"),
+    )
+    .expect("write brain.toml");
+    std::fs::write(
+        repo_dir.join("planning").join("state.json"),
+        format!(
+            r#"{{ "repo": "{repo}", "kind": "project", "updated": "2026-09-10",
+  "focus": {{ "now": [], "next": [], "blocked": [] }},
+  "tracks": [{{ "title": "P1", "blocks": [
+    {{ "id": "{block_id}", "title": "T", "status": "open", "depends_on": [] }}
+  ] }}] }}"#
+        ),
+    )
+    .expect("write state.json");
+    (dir, repo_dir)
+}
+
+fn permission_gate_step(repo: &str, block_id: &str) -> ChainStep {
+    ChainStep {
+        repo: repo.to_string(),
+        block_id: block_id.to_string(),
+        directives: None,
+        ..Default::default()
+    }
+}
+
+fn author_edge_config(
+    root: &Path,
+    repo: &str,
+    block_id: &str,
+    dir: &Path,
+) -> OperatorEdgeAuthorConfig {
+    OperatorEdgeAuthorConfig {
+        root: root.to_path_buf(),
+        repo: repo.to_string(),
+        block_id: block_id.to_string(),
+        dir: dir.to_path_buf(),
+        agent: Some("coord-chain-test-agent".to_string()),
+        lock_dir: None,
+        roadmap: None,
+        lane: None,
+        roadmap_dir: None,
+    }
+}
+
+/// Case (1): a `GatedAction` denied under a profile authors a real
+/// `{"type":"operator",...}` edge on the gating block via the REAL production closure,
+/// the chain HOLDS (`check_permission_gate` returns `Err`, never `Ok`), the edge
+/// round-trips through the written `state.json` verbatim, and `mev::validate_brain_state`
+/// (the in-process equivalent of `bastion validate-brain --state`) is green afterwards.
+#[test]
+fn a_denied_graded_action_authors_a_real_edge_via_the_real_closure_and_the_chain_holds() {
+    let (dir, repo_dir) = brain_fixture_with_open_block("engine-rs", "EN.15.J-NOPE1");
+    let root = dir.path();
+    let closure = make_author_operator_edge(author_edge_config(
+        root,
+        "engine-rs",
+        "EN.15.J-NOPE1",
+        &repo_dir,
+    ));
+    let step = permission_gate_step("engine-rs", "EN.15.J-NOPE1");
+
+    let result = check_permission_gate(
+        &step,
+        GatedAction::InstallOnMini,
+        PermissionProfile::Standard,
+        &closure,
+    );
+
+    let err = result.expect_err("a denied action must hold the chain, never proceed");
+    let edge = match err {
+        PermissionGateError::Denied { edge, .. } => edge,
+        other => panic!("expected Denied (the edge-author itself must succeed), got {other:?}"),
+    };
+    assert_eq!(edge.slug, "permission-install_on_mini");
+
+    let written = std::fs::read_to_string(repo_dir.join("planning").join("state.json"))
+        .expect("read state.json back");
+    let value: serde_json::Value = serde_json::from_str(&written).expect("valid JSON");
+    let depends_on = value["tracks"][0]["blocks"][0]["depends_on"]
+        .as_array()
+        .expect("depends_on array");
+    let authored = depends_on
+        .iter()
+        .find(|e| e["type"] == "operator" && e["slug"] == "permission-install_on_mini")
+        .unwrap_or_else(|| panic!("expected an authored operator edge, got: {depends_on:?}"));
+    assert_eq!(authored["exit"], edge.exit);
+    assert_eq!(authored["start"], edge.start);
+
+    let report = mev::validate_brain_state(root).expect("validate_brain_state must run");
+    assert!(
+        !report.is_failure(),
+        "bastion validate-brain --state must be green after the edge is written: {:?}",
+        report.diagnostics
+    );
+}
+
+/// Case (2): `check_permission_gate` called with `GatedAction::ClearOperatorGate` is
+/// denied BEFORE any profile lookup occurs — restating D71 — for every
+/// `PermissionProfile` variant including `Unrestricted`, driven through the REAL
+/// closure (never a stub), each against its own block so one profile's authored edge
+/// never interferes with the next.
+#[test]
+fn clear_operator_gate_is_denied_before_any_profile_lookup_via_the_real_closure() {
+    for (i, profile) in [
+        PermissionProfile::Locked,
+        PermissionProfile::Standard,
+        PermissionProfile::Unrestricted,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let block_id = format!("EN.15.J-NOPE2-{i}");
+        let (dir, repo_dir) = brain_fixture_with_open_block("engine-rs", &block_id);
+        let root = dir.path();
+        let closure =
+            make_author_operator_edge(author_edge_config(root, "engine-rs", &block_id, &repo_dir));
+        let step = permission_gate_step("engine-rs", &block_id);
+
+        let result =
+            check_permission_gate(&step, GatedAction::ClearOperatorGate, profile, &closure);
+
+        assert!(
+            result.is_err(),
+            "ClearOperatorGate must never be permitted at profile {profile:?}, even through \
+             the real production closure"
+        );
+        if let Err(PermissionGateError::Denied { edge, .. }) = result {
+            assert_eq!(
+                edge.slug, "permission-clear_operator_gate",
+                "the raised gate's slug must be derived from the action alone, not the \
+                 profile — same slug at every profile level"
+            );
+        }
+    }
+}
+
+/// Case (3): the real closure fed a request that makes `mev::add_operator_edge_as`
+/// return a non-zero/error result (a duplicate slug on the same block — authoring the
+/// same gate twice) makes the chain hold WITH that error surfaced as
+/// `PermissionGateError::EdgeAuthorFailed`, never silently mapped to
+/// `PermissionGateError::Denied` (which would read as "the gate is raised" when it is
+/// not) and never treated as success.
+#[test]
+fn a_non_zero_mev_exit_from_the_real_closure_holds_the_chain_with_the_error_surfaced() {
+    let (dir, repo_dir) = brain_fixture_with_open_block("engine-rs", "EN.15.J-NOPE3");
+    let root = dir.path();
+    let closure = make_author_operator_edge(author_edge_config(
+        root,
+        "engine-rs",
+        "EN.15.J-NOPE3",
+        &repo_dir,
+    ));
+    let step = permission_gate_step("engine-rs", "EN.15.J-NOPE3");
+
+    // First call authors the gate successfully.
+    let first = check_permission_gate(
+        &step,
+        GatedAction::PushToMain,
+        PermissionProfile::Locked,
+        &closure,
+    );
+    assert!(
+        matches!(first, Err(PermissionGateError::Denied { .. })),
+        "first call must author the edge cleanly: {first:?}"
+    );
+
+    // Second call against the same block, same denied action — the SAME slug — is a
+    // duplicate the underlying mev verb must refuse.
+    let second = check_permission_gate(
+        &step,
+        GatedAction::PushToMain,
+        PermissionProfile::Locked,
+        &closure,
+    );
+    match second {
+        Err(PermissionGateError::EdgeAuthorFailed { reason, .. }) => {
+            assert!(
+                reason.contains("E_OPERATOR_EDGE_DUPLICATE_SLUG") || reason.contains("duplicate"),
+                "expected the duplicate-slug refusal surfaced in the error, got: {reason}"
+            );
+        }
+        other => panic!(
+            "expected EdgeAuthorFailed carrying the mev refusal, got: {other:?} — a \
+             non-zero mev exit must never be silently treated as success"
+        ),
+    }
+}
+
+/// Case (4): `OP.<slug>` is derived purely from the authored edge's own `slug` field —
+/// asserted against the written `state.json` directly, with no second stored field
+/// duplicating it anywhere on the edge.
+#[test]
+fn op_slug_is_derived_from_the_edges_own_slug_field_with_no_second_stored_field() {
+    let (dir, repo_dir) = brain_fixture_with_open_block("engine-rs", "EN.15.J-NOPE4");
+    let root = dir.path();
+    let closure = make_author_operator_edge(author_edge_config(
+        root,
+        "engine-rs",
+        "EN.15.J-NOPE4",
+        &repo_dir,
+    ));
+    let step = permission_gate_step("engine-rs", "EN.15.J-NOPE4");
+
+    let result = check_permission_gate(
+        &step,
+        GatedAction::CrossRepoWrite,
+        PermissionProfile::Locked,
+        &closure,
+    );
+    let edge = match result {
+        Err(PermissionGateError::Denied { edge, .. }) => edge,
+        other => panic!("expected Denied, got {other:?}"),
+    };
+
+    let written = std::fs::read_to_string(repo_dir.join("planning").join("state.json"))
+        .expect("read state.json back");
+    let value: serde_json::Value = serde_json::from_str(&written).expect("valid JSON");
+    let depends_on = value["tracks"][0]["blocks"][0]["depends_on"]
+        .as_array()
+        .expect("depends_on array");
+    let authored = depends_on
+        .iter()
+        .find(|e| e["type"] == "operator")
+        .expect("an operator edge must have been written");
+
+    // `OP.<slug>` — the citation form docs/state/state-schema.md defines — is derivable
+    // straight from the edge's own `slug` field; no separate id/gate_id field exists on
+    // the edge to disagree with it.
+    let op_citation = format!("OP.{}", authored["slug"].as_str().unwrap());
+    assert_eq!(op_citation, format!("OP.{}", edge.slug));
+    let keys: std::collections::BTreeSet<&str> = authored
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(
+        keys,
+        std::collections::BTreeSet::from(["type", "slug", "exit", "start", "what"]),
+        "the edge must carry no field beyond the OperatorDep shape itself — no second \
+         stored id duplicating slug"
+    );
+}
+
+/// UN-GATEABLE CRITERION, declared per D64 — the block record's AC "A Telegram
+/// notification actually arrives on the phone" is `gateable: false` (delivery is
+/// bastion's `OperatorTransport` path, out of this block's scope, needing a live
+/// device). This asserts only the IN-REPO half its own `evidence` field names: driven
+/// through `check_permission_gate` (not `operator_edge.rs`'s own unit tests directly),
+/// a successful edge-author on the Deny path also composes and enqueues a
+/// schema-valid `operator-gate` notification escalation with a resolving
+/// `EscalationChannel` naming the operator gate — never asserting or claiming actual
+/// phone delivery.
+#[test]
+fn a_denied_action_through_check_permission_gate_also_enqueues_a_notification_escalation() {
+    let (dir, _repo_dir) = brain_fixture_with_open_block("engine-rs", "EN.15.J-NOPE5");
+    let root = dir.path();
+    let roadmap_dir = dir.path().join("roadmap");
+    std::fs::create_dir_all(&roadmap_dir).expect("mkdir roadmap dir");
+
+    let mut cfg = author_edge_config(
+        root,
+        "engine-rs",
+        "EN.15.J-NOPE5",
+        // A real git checkout so `git rev-parse` resolves a SHA for the escalation —
+        // the synthetic `repo_dir` fixture above is not one.
+        &PathBuf::from(env!("CARGO_MANIFEST_DIR")),
+    );
+    cfg.roadmap_dir = Some(roadmap_dir.clone());
+    cfg.roadmap = Some("coordination-layer-port".to_string());
+    cfg.lane = Some("engine-rs".to_string());
+    let closure = make_author_operator_edge(cfg);
+    let step = permission_gate_step("engine-rs", "EN.15.J-NOPE5");
+
+    let result = check_permission_gate(
+        &step,
+        GatedAction::WakeLane,
+        PermissionProfile::Standard,
+        &closure,
+    );
+    assert!(
+        matches!(result, Err(PermissionGateError::Denied { .. })),
+        "expected Denied: {result:?}"
+    );
+
+    let contents = std::fs::read_to_string(roadmap_dir.join("escalations.jsonl"))
+        .expect("read escalations.jsonl");
+    let line = contents.lines().next().expect("at least one line");
+    let value: serde_json::Value = serde_json::from_str(line).expect("valid JSON line");
+    assert_eq!(value["kind"], "operator-gate");
+    assert_eq!(value["channel"], "notification");
+    assert!(
+        value["summary"].as_str().unwrap_or_default().len() > 0,
+        "the escalation must name the gate: {value:?}"
     );
 }
