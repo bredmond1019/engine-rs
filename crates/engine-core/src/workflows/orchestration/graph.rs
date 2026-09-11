@@ -1271,9 +1271,14 @@ impl Node for OrchestrationRunNode {
         // clone, `Send + Sync + 'static`.
         let on_bail = policy.on_bail;
         let block_status = self.block_status.clone();
+        // `NodeError` now carries an optional `node_result` payload (the
+        // `chain_report`-past-revert seam below), which pushes this
+        // closure's `Err` variant past clippy's `result_large_err`
+        // threshold — box it rather than shrink `NodeError` itself, since
+        // every other caller of `NodeError` still wants it by value.
         let outcomes_result: Result<
             (Vec<ExecutionOutcome>, ChainReport),
-            (NodeError, ChainReport),
+            Box<(NodeError, ChainReport)>,
         > = tokio::task::spawn_blocking(move || {
             tracing::dispatcher::with_default(&current_dispatch, || {
                 let _span_guard = current_span.enter();
@@ -1283,10 +1288,10 @@ impl Node for OrchestrationRunNode {
                 {
                     Ok(rt) => rt,
                     Err(err) => {
-                        return Err((
+                        return Err(Box::new((
                             NodeError::new(format!("failed to start orchestration runtime: {err}")),
                             ChainReport::default(),
-                        ));
+                        )));
                     }
                 };
                 // `EN.17.B` task 4, part 5: accumulates `closed`/`bailed`/`skipped`
@@ -1351,7 +1356,7 @@ impl Node for OrchestrationRunNode {
                 ));
                 match result {
                     Ok(outcomes) => Ok((outcomes, chain_report)),
-                    Err(err) => Err((NodeError::new(err.to_string()), chain_report)),
+                    Err(err) => Err(Box::new((NodeError::new(err.to_string()), chain_report))),
                 }
             })
         })
@@ -1361,13 +1366,16 @@ impl Node for OrchestrationRunNode {
         // `EN.17.B` task 4, part 5: on the error path, `ctx` itself is still
         // discarded by the framework once this function returns `Err`
         // (`NodeError`'s own doc: `node_context` reverts to its pre-call
-        // snapshot) — there is no seam on `NodeError` today to carry a
-        // structured payload past that revert the way `sessions` does, so
-        // the accumulated report is folded into the error MESSAGE instead,
-        // naming every bailed block, rather than silently lost.
+        // snapshot). `NodeError::node_result` (the `sessions` seam's
+        // structured-payload counterpart) is what carries the accumulated
+        // report past that revert, so it lands in `ctx.nodes[NODE_NAME]`
+        // exactly like the success path's own stamp below — the error
+        // MESSAGE still names every bailed block too, for a reader who only
+        // sees the message.
         let (outcomes, chain_report) = match outcomes_result {
             Ok(pair) => pair,
-            Err((err, report)) => {
+            Err(boxed) => {
+                let (err, report) = *boxed;
                 return Err(if report.bailed.is_empty() {
                     err
                 } else {
@@ -1376,6 +1384,7 @@ impl Node for OrchestrationRunNode {
                         err.message,
                         report.bailed.join(", ")
                     ))
+                    .with_node_result(json!({ "chain_report": report }))
                 });
             }
         };
@@ -1778,6 +1787,7 @@ pub fn held_session_outcome_status(
 mod tests {
     use super::*;
     use crate::validate::WorkflowValidator;
+    use crate::WorkflowError;
 
     #[test]
     fn schema_passes_validation() {
@@ -2186,6 +2196,58 @@ mod tests {
         assert_eq!(lines[1]["lane"], lines[1]["repo"]);
         assert_eq!(lines[0]["repo"], "repo-a");
         assert_eq!(lines[1]["repo"], "repo-b");
+    }
+
+    /// Regression for the review finding on `EN.17.B` task 4, part 5: under
+    /// the built-in `OnBail::StopChain` default, a failing step makes
+    /// `integrate_chain_with_coord_and_policy` itself return `Err`, which
+    /// this function's own early-return arm (immediately after the
+    /// `spawn_blocking` join) used to propagate WITHOUT ever reaching the
+    /// `ctx.nodes.insert` stamp further down — so `chain_report` survived
+    /// only inside the error MESSAGE string, never in `ctx` itself. Proves
+    /// `NodeError::node_result` (the `sessions` seam's structured-payload
+    /// counterpart) now carries it past that early return.
+    #[tokio::test]
+    async fn process_hard_err_path_still_carries_chain_report_in_the_node_error() {
+        let dir = two_repo_brain_root();
+        // No done-state written for "A.1" — it never needs one: the runner
+        // itself fails the block before any state write is attempted.
+
+        let run_flow: FlowRunner = Arc::new(|invocation| {
+            Box::pin(async move {
+                Err(WorkflowError::new(format!(
+                    "simulated failure for {}",
+                    invocation.block_id
+                )))
+            })
+        });
+
+        let node = OrchestrationRunNode::new().with_run_flow(run_flow);
+        let ctx = base_ctx(json!({
+            "brain_root": dir.path(),
+            "blocks": [{ "repo": "repo-a", "block_id": "A.1" }],
+            "roadmap_slug": "my-roadmap",
+        }));
+
+        let err = node
+            .process(ctx)
+            .await
+            .expect_err("a failing step under the built-in StopChain default must return Err");
+
+        assert!(
+            err.message.contains("repo-a:A.1"),
+            "the error message should still name the bailed block: {}",
+            err.message
+        );
+        let node_result = err
+            .node_result
+            .as_ref()
+            .expect("NodeError::node_result must be set on the hard-Err path so chain_report survives the ctx revert");
+        assert_eq!(
+            node_result["chain_report"]["bailed"],
+            json!(["repo-a:A.1"]),
+            "chain_report in the carried node_result must name the bailed block"
+        );
     }
 
     /// `EN.ticket.wire-coord-handle-into-orchestration-run-node`: this is

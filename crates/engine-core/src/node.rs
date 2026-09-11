@@ -60,6 +60,14 @@ pub struct NodeError {
     /// Carrying them on the error is the only path back into the context;
     /// `node_context` appends them to the reverted snapshot.
     pub sessions: Vec<crate::sessions::ClaudeSession>,
+    /// This node's own `ctx.nodes[identity]` payload, captured before the
+    /// node gave up and returned `Err` — the same revert-survival seam as
+    /// [`NodeError::sessions`], but for a node's structured result rather
+    /// than its LLM ledger. `node_context` writes this into the reverted
+    /// snapshot's `ctx.nodes` map (keyed by the node's own identity) exactly
+    /// as `Ok` would have, so a caller inspecting only `ctx.nodes` can see a
+    /// node's terminal report even when the node ultimately failed.
+    pub node_result: Option<serde_json::Value>,
 }
 
 impl NodeError {
@@ -67,6 +75,7 @@ impl NodeError {
         Self {
             message: message.into(),
             sessions: Vec::new(),
+            node_result: None,
         }
     }
 
@@ -75,6 +84,14 @@ impl NodeError {
     #[must_use]
     pub fn with_sessions(mut self, sessions: Vec<crate::sessions::ClaudeSession>) -> Self {
         self.sessions = sessions;
+        self
+    }
+
+    /// Attach this node's own `ctx.nodes[identity]` payload so it survives
+    /// the discarded `TaskContext`. See [`NodeError::node_result`].
+    #[must_use]
+    pub fn with_node_result(mut self, node_result: serde_json::Value) -> Self {
+        self.node_result = Some(node_result);
         self
     }
 }
