@@ -19,22 +19,34 @@
 //! clean `404`, never a `500`. This mirrors `crate::resume::rehydrate_from_store`,
 //! which returns `None` on a missing pool so its caller 404s uniformly.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::Duration;
 
 use actix_web::{web, HttpRequest, HttpResponse, Responder};
 use async_trait::async_trait;
-use engine_contract::{JournalDecisionKind, JournalRow};
+use claude_code_rs::Config;
+use engine_contract::{JournalDecisionKind, JournalRow, TaskContext};
+use engine_core::policy::profiles::read_harness_policy_defaults;
+use engine_core::policy::resolve::{resolve, Policy};
+use engine_core::policy::tier::{model_tier_to_model_string, ModelTier};
 use engine_core::repo_registry::RepoRegistry;
 use engine_core::workflows::orchestration::chain::ChainStep;
 use engine_core::workflows::orchestration::debrief::JournalReader;
 use engine_core::workflows::orchestration::execute::{EngineKind, ExecutionOutcome, FlowRunner};
 use engine_core::workflows::orchestration::gates::{AdmissionGate, DependencyEdge};
 use engine_core::workflows::orchestration::integrate::{
-    integrate_chain_with_run_record, CloseBlockFn, HoldSource, IntegrateError, JournalSinkFn,
-    RunRecordLifecycle, RunRecordSinkFn, StepObserverFn,
+    integrate_chain_with_run_record, CloseBlockFn, ComposeLedgerEntriesFn, HoldSource,
+    IntegrateError, JournalSinkFn, RunRecordLifecycle, RunRecordSinkFn, StepObserverFn,
 };
+use engine_core::workflows::orchestration::ledger::{
+    Coverage, CrossRepo, CrossRepoE2e, LedgerStatus, NewLedgerEntry,
+};
+use engine_core::{AgentCodeStep, Node};
+use futures::future::BoxFuture;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -376,6 +388,297 @@ fn run_record_sink(
     })
 }
 
+// ---------------------------------------------------------------------------
+// `EN.15.L` task 3 — the production `ComposeLedgerEntriesFn` caller.
+//
+// `compose_ledger_entries_via_agent` (wired into `drive_chain_with_run_record` below,
+// alongside `run_record_sink`) is the first PRODUCTION caller of the seam `EN.15.L` task 2
+// threaded through `integrate_chain_impl` — before this, `ComposeLedgerEntriesFn` had test
+// call sites only. It runs one `AgentCodeStep` per just-integrated block, asking it to
+// propose candidate D57 verification-ledger entries from that block's `ExecutionOutcome`;
+// every deterministic rule (the `<repo>-` id stamp, forcing `status: untested`, the
+// `coverage`/`call_site` validation refusals, the merge-append write) stays in
+// `engine_core::workflows::orchestration::ledger` (task 1) and
+// `compose_and_append_ledger_entries` (task 2) — this function's only job is turning the
+// model's fenced-JSON reply into `Vec<NewLedgerEntry>`, unstamped and unvalidated.
+// ---------------------------------------------------------------------------
+
+/// The stable system-prompt prefix for the ledger composer (standing rule 7 / D24: a node's
+/// stable prompt is a file, `include_str!`-ed, never an inline literal — kept run-invariant so
+/// `apply_prompt_cache`'s breakpoint holds across every block this composer runs against).
+const COMPOSE_LEDGER_ENTRIES_PROMPT: &str =
+    include_str!("../../engine-core/src/workflows/orchestration/prompts/compose_ledger_entries.md");
+
+/// `Node::name()` identity the composer's `AgentCodeStep` runs under, and the `ctx.nodes` key
+/// its reply is read back from.
+const LEDGER_COMPOSER_NODE_NAME: &str = "VerificationLedgerComposer";
+
+/// `harness.json`'s existing `orchestration.policy` / `orchestration.profiles` sections (the
+/// same ones `OrchestrationPolicy` reads — `crates/engine-core/src/workflows/orchestration/graph.rs`)
+/// are the workflow-keyed lookup this reuses, per CLAUDE.md standing rule 6 ("nodes are
+/// configurable, not hardcoded"): no new harness.json section for one extra knob. This type
+/// declares only the one field it owns (`ledger_composer_model_tier`) — serde ignores every
+/// other sibling field already living in that JSON object on the way through, so this can be
+/// added without touching `OrchestrationPolicy`'s own struct at all. `EN.15.L` task 4 documents
+/// the field in `planning/harness.json` alongside the existing no-op defaults.
+const ORCHESTRATION_HARNESS_KEY: &str = "orchestration";
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+struct LedgerComposerPolicy {
+    ledger_composer_model_tier: ModelTier,
+}
+
+impl Default for LedgerComposerPolicy {
+    fn default() -> Self {
+        Self {
+            ledger_composer_model_tier: ModelTier::Sonnet,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+struct PartialLedgerComposerPolicy {
+    ledger_composer_model_tier: Option<ModelTier>,
+}
+
+impl Policy for LedgerComposerPolicy {
+    type Partial = PartialLedgerComposerPolicy;
+
+    fn apply(self, over: &Self::Partial) -> Self {
+        Self {
+            ledger_composer_model_tier: over
+                .ledger_composer_model_tier
+                .unwrap_or(self.ledger_composer_model_tier),
+        }
+    }
+}
+
+/// Resolve the composer's model tier: `harness.json`'s `orchestration.policy` (read from the
+/// just-integrated block's own repo checkout, `repo_path`) over the built-in `Sonnet` default.
+/// Only two of the four policy layers apply here — there is no per-run `profile`/`event`
+/// override reachable from a bare [`ExecutionOutcome`], so this deliberately resolves the
+/// same two layers [`crate::workflows::content_pipeline`] and friends fall back to when no
+/// profile was selected, rather than silently inventing a profile identity.
+fn resolve_ledger_composer_model_tier(repo_path: &Path) -> ModelTier {
+    let harness_defaults = read_harness_policy_defaults::<PartialLedgerComposerPolicy>(
+        repo_path,
+        ORCHESTRATION_HARNESS_KEY,
+    )
+    .ok()
+    .flatten();
+    resolve(
+        LedgerComposerPolicy::default(),
+        harness_defaults.as_ref(),
+        None,
+        None,
+    )
+    .ledger_composer_model_tier
+}
+
+fn ledger_status_from_wire(value: &str) -> LedgerStatus {
+    match value {
+        "tested" => LedgerStatus::Tested,
+        "partial" => LedgerStatus::Partial,
+        "failed" => LedgerStatus::Failed,
+        "blocked" => LedgerStatus::Blocked,
+        "not_applicable" => LedgerStatus::NotApplicable,
+        _ => LedgerStatus::Untested,
+    }
+}
+
+fn ledger_coverage_from_wire(value: &str) -> Coverage {
+    match value {
+        "covered" => Coverage::Covered,
+        "partial" => Coverage::Partial,
+        _ => Coverage::Uncovered,
+    }
+}
+
+fn cross_repo_e2e_from_wire(value: &str) -> CrossRepoE2e {
+    match value {
+        "exists" => CrossRepoE2e::Exists,
+        "needed" => CrossRepoE2e::Needed,
+        _ => CrossRepoE2e::NotApplicable,
+    }
+}
+
+fn string_array(value: &Value) -> Vec<String> {
+    value
+        .as_array()
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Map one raw JSON candidate object (whatever shape the model actually returned) into a
+/// [`NewLedgerEntry`] — unstamped, unvalidated. A missing field becomes an empty
+/// string/default, never an error: [`super::ledger`]'s own validation (task 1) is what refuses
+/// an unusable candidate, and it must see the empty value to do so (e.g. a missing `call_site`
+/// must arrive as `""`, not be silently defaulted to `"NONE"` here, or a real omission would be
+/// indistinguishable from the model's own considered `"NONE"` answer).
+fn candidate_from_json(value: &Value) -> Result<NewLedgerEntry, String> {
+    let obj = value
+        .as_object()
+        .ok_or_else(|| "composer candidate entry was not a JSON object".to_string())?;
+    let get_str = |key: &str| -> String {
+        obj.get(key)
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string()
+    };
+    let cross_repo = obj
+        .get("cross_repo")
+        .and_then(Value::as_object)
+        .map(|cr| CrossRepo {
+            dependent: cr
+                .get("dependent")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            repos: cr.get("repos").map(string_array).unwrap_or_default(),
+            e2e: cr
+                .get("e2e")
+                .and_then(Value::as_str)
+                .map(cross_repo_e2e_from_wire)
+                .unwrap_or_default(),
+            note: cr
+                .get("note")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+        });
+
+    Ok(NewLedgerEntry {
+        id: get_str("id"),
+        capability: get_str("capability"),
+        status: obj
+            .get("status")
+            .and_then(Value::as_str)
+            .map(ledger_status_from_wire)
+            .unwrap_or_default(),
+        env: get_str("env"),
+        how_to_verify: get_str("how_to_verify"),
+        call_site: get_str("call_site"),
+        evidence: get_str("evidence"),
+        coverage: obj
+            .get("coverage")
+            .and_then(Value::as_str)
+            .map(ledger_coverage_from_wire)
+            .unwrap_or_default(),
+        covered_by: obj.get("covered_by").map(string_array).unwrap_or_default(),
+        cross_repo,
+        // The composer never gets to attach a remediation directly (task 1's `compose` always
+        // stamps `status: untested`, and `remediation` is only valid on `failed`/`blocked`) —
+        // see this file's `compose_ledger_entries_via_agent` doc.
+        remediation: None,
+    })
+}
+
+/// Extract a JSON array from the model's raw reply: a fenced ` ```json ... ``` ` block if
+/// present, else the first `[` .. last `]` span. Returns `None` when neither shape is found —
+/// the caller turns that into `Err`, which `compose_and_append_ledger_entries` (task 2) treats
+/// exactly like an empty `Ok(vec![])` plus a logged, recorded gap.
+fn extract_json_array(content: &str) -> Option<&str> {
+    if let Some(fence_start) = content.find("```") {
+        let after = &content[fence_start + 3..];
+        let after = after.strip_prefix("json").unwrap_or(after);
+        if let Some(fence_end) = after.find("```") {
+            return Some(after[..fence_end].trim());
+        }
+    }
+    let start = content.find('[')?;
+    let end = content.rfind(']')?;
+    if end < start {
+        return None;
+    }
+    Some(&content[start..=end])
+}
+
+fn parse_candidate_entries(content: &str) -> Result<Vec<NewLedgerEntry>, String> {
+    let json_text = extract_json_array(content)
+        .ok_or_else(|| "composer output contained no JSON array".to_string())?;
+    let value: Value = serde_json::from_str(json_text)
+        .map_err(|err| format!("composer output was not valid JSON: {err}"))?;
+    let items = value
+        .as_array()
+        .ok_or_else(|| "composer output JSON was not an array".to_string())?;
+    items.iter().map(candidate_from_json).collect()
+}
+
+/// The dynamic, per-run body appended after [`COMPOSE_LEDGER_ENTRIES_PROMPT`]'s stable prefix —
+/// which block just integrated and the full `ctx.nodes` map of its child run, the composer's
+/// only source of truth for `capability`/`evidence`/`call_site`.
+fn build_compose_prompt(
+    repo: &str,
+    block_id: &str,
+    engine: EngineKind,
+    ctx_nodes: &Value,
+) -> String {
+    format!(
+        "{COMPOSE_LEDGER_ENTRIES_PROMPT}\n\n## This block\n\nrepo: {repo}\nblock_id: {block_id}\nengine: {engine}\n\n\
+         ## Child run context (`ctx.nodes`, JSON)\n\n```json\n{}\n```\n",
+        serde_json::to_string_pretty(ctx_nodes).unwrap_or_else(|_| "{}".to_string()),
+    )
+}
+
+/// The production [`ComposeLedgerEntriesFn`]: one `AgentCodeStep` call per just-integrated
+/// step, asking it to propose D57 verification-ledger candidates from that step's
+/// [`ExecutionOutcome`]. Wired into [`drive_chain_with_run_record`] below (this repo's own
+/// production caller, per this block's `why` — no test call site substitutes for it). A model
+/// or parse failure returns `Err(String)`, which `compose_and_append_ledger_entries` (task 2,
+/// `engine_core::workflows::orchestration::integrate`) already treats as a non-fatal gap: it
+/// logs via `tracing::warn!` and records it as a journal row, which `render_notes_md`
+/// (`EN.15.G` task 3, this same file) renders into the run's `notes.md` as an `**OPEN**`
+/// finding — never a failed chain or a blocked `close_block`.
+fn compose_ledger_entries_via_agent(
+    outcome: &ExecutionOutcome,
+) -> BoxFuture<'static, Result<Vec<NewLedgerEntry>, String>> {
+    let repo = outcome.repo.clone();
+    let block_id = outcome.block_id.clone();
+    let repo_path = outcome.repo_path.clone();
+    let engine = outcome.engine;
+    let ctx_nodes = serde_json::to_value(&outcome.ctx.nodes).unwrap_or(Value::Null);
+
+    Box::pin(async move {
+        let model_tier = resolve_ledger_composer_model_tier(&repo_path);
+        // `Local` has no meaning for this composer (no OpenAI-compatible transport is wired
+        // here) — `model_tier_to_model_string`'s `local_model` fallback is a placeholder that
+        // is never actually reached because `harness.json`'s built-in default is `Sonnet` and
+        // nothing sets this knob to `local` today; documented rather than silently supported.
+        let model = model_tier_to_model_string(model_tier, "unset-local-model");
+        let config = Config {
+            model: Some(model),
+            ..Config::default()
+        };
+        let prompt = build_compose_prompt(&repo, &block_id, engine, &ctx_nodes);
+        let step = AgentCodeStep::new(LEDGER_COMPOSER_NODE_NAME, config, prompt);
+
+        let ctx = TaskContext {
+            event: Value::Object(serde_json::Map::new()),
+            nodes: HashMap::new(),
+            metadata: Value::Object(serde_json::Map::new()),
+            node_runs: HashMap::new(),
+        };
+        let ctx = step
+            .process(ctx)
+            .await
+            .map_err(|err| format!("verification-ledger composer call failed: {err}"))?;
+
+        let content = ctx
+            .nodes
+            .get(LEDGER_COMPOSER_NODE_NAME)
+            .and_then(|value| value.get("content"))
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+
+        parse_candidate_entries(content)
+    })
+}
+
 /// Drive a real chain end to end through
 /// [`integrate_chain_with_run_record`](engine_core::workflows::orchestration::integrate::integrate_chain_with_run_record)
 /// while maintaining its D57 run record (`notes.md`/`review.md`) in `roadmap_dir` — the first
@@ -432,6 +735,7 @@ pub async fn drive_chain_with_run_record(
         Some(journal_sink.as_ref()),
         None,
         Some(record_sink.as_ref()),
+        Some(&compose_ledger_entries_via_agent as &ComposeLedgerEntriesFn),
     )
     .await
 }

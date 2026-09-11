@@ -325,6 +325,44 @@ All four existing `integrate_chain*` wrapper signatures (`integrate_chain`,
 unchanged — `integrate_chain_with_run_record` is a new wrapper, not a modified one, so none of
 their existing call sites needed to move.
 
+## The D57 verification-ledger seam (`EN.15.L`)
+
+`crates/engine-core/src/workflows/orchestration/ledger.rs` defines a typed `LedgerEntry`
+(`LedgerStatus` + optional `Coverage`/`CrossRepo`/`Remediation`) for the D57 test catalogue:
+`LedgerEntry::compose` deterministically stamps `id`/`block`/`status: untested` for a normal
+block-close write, while `LedgerEntry::new` is the general constructor a verifier pass uses to
+record a `failed`/`blocked` entry together with a `Remediation` — the two are split because
+`compose` never produces a remediation-bearing entry (validated at construction: a `Remediation` is
+only accepted alongside a failing status). `create_ledger_if_absent` seeds a roadmap's
+`verification-ledger.json` (plus its OKF `verification-ledger.md` wrapper) the first time an entry
+is written for it; `merge_append_entries` re-opens that file as opaque JSON (not a typed struct) and
+appends, so header fields (`roadmap`/`repo`/`lane`/`created`/`status_values`) round-trip
+byte-identical while `entries[]` grows, and a repeated `id` is a no-op collision rather than a
+duplicate row.
+
+`integrate_chain_with_run_record` (see above) now takes an additional injected seam,
+`ComposeLedgerEntriesFn` (`Fn(&ExecutionOutcome) -> BoxFuture<'static, Result<Vec<NewLedgerEntry>,
+String>> + Send + Sync`), and calls it on the genuinely-integrated path between the lane-log
+`closed` line and `close_block` — so entries land even when the *next* step in the chain bails.
+Every other `integrate_chain*` wrapper forwards `None` through this parameter, unchanged.
+`engine-serve/src/journal.rs` wires the production composer: an `AgentCodeStep` judgment call
+(prompt at `crates/engine-core/src/workflows/orchestration/prompts/compose_ledger_entries.md`) that
+proposes ledger entries from the step's `ExecutionOutcome`. A composer error, or output that fails
+`LedgerEntry` validation, is logged via `tracing` and recorded as a `GateRefused` journal row
+(rendered into `notes.md` by the `EN.15.G` run-record sink) — it never fails the chain.
+
+The composer resolves its model tier via `composer_model_tier` (`planning/harness.json`'s
+`orchestration.policy`/`orchestration.profiles`, see the Policy table below) rather than
+`OrchestrationPolicy` itself — it is a standalone `Partial` type engine-serve reads directly, since
+`ExecutionOutcome` carries no per-run `profile`/event identity to resolve a named bundle against;
+only the `harness_defaults` and built-in layers apply.
+
+**Known gap, tracked not invented:** no production call site today files a remediation ticket from
+a `BailEntry` — the composer never proposes a `Remediation` object, and `call_site: NONE` is its
+honest answer. This is an open finding in
+`agentic-portfolio/planning/orchestration-run/coordination-layer-port/notes.md` (vault), not
+something this block's tests should fabricate a caller for.
+
 ## `DEBRIEF`'s two outputs: the ops digest and `POST_DRAFT` (`EN.12.M`)
 
 `DebriefNode` (see [`debrief.md`](debrief.md) for its full mechanics) renders **two** separately-
@@ -508,6 +546,7 @@ Resolved through the standard four layers (per-run event override > named profil
 | `conductor_single_repo_only` | `true` | `CONDUCTOR`-only — trims a proposal to its first block's repo. Never varies by profile. |
 | `campaign_max_cost_usd_cents` | `Some(5_000)` | `CONDUCTOR`-only — the campaign cost ceiling in USD cents, wired into `integrate_chain`'s `campaign_budget` and enforced via the `budget_halted` terminal state (`EN.11.F`). |
 | `campaign_max_total_tokens` | `None` | `CONDUCTOR`-only — the same ceiling by token count. Unset on every named profile. |
+| `composer_model_tier` | `sonnet` | The model tier the injected D57 verification-ledger composer seam (see above) runs its `AgentCodeStep` judgment call at. Resolved from a standalone `Partial` type (not `OrchestrationPolicy` itself), read from this same `orchestration.policy`/`orchestration.profiles` section of `planning/harness.json`. |
 
 Named profiles (`crates/engine-core/src/workflows/orchestration/graph.rs`):
 
