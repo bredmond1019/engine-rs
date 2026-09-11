@@ -17,6 +17,7 @@
 //! `UpdateTaskStatusNode`, `SaveStateNode` — is pure Rust.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use claude_code_rs::Config;
 use engine_contract::TaskContext;
@@ -24,12 +25,15 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::cancellation::CancellationToken;
+use crate::coord::heavy_work::{HeavyWorkConfig, HeavyWorkQueue, HeavyWorkSpec};
 use crate::node::{Node, NodeError};
 use crate::nodes::{AgentCodeStep, MetaTransport};
 use crate::routing::Router;
+use crate::workflows::{admitted_command_runner, CommandSpec, SpecCommandRunner};
 
 #[cfg(test)]
 use super::policy::OutputVerbosity;
+use super::close_block::DEFAULT_REPO_SLUG;
 use super::policy::{ModelTier, RetryFeedback, ReviewMode, SdlcPolicy, TestDepth};
 use super::schema::{RunMeta, SDLCState, SDLCTask, SDLCTaskStatus};
 use super::setup::baseline_snapshot_path;
@@ -1417,6 +1421,12 @@ fn failure_class_of(check: &serde_json::Value) -> FailureClass {
 /// or a genuinely new kind never silently passes.
 pub struct TestTaskNode {
     runner: CommandRunner,
+    /// The heavy-work admission queue this node's check run is submitted
+    /// through (`EN.17.I` task 5). Defaults to a disabled queue via
+    /// [`Self::new`] — behavior-identical to every run before this block:
+    /// every check runs inline, unqueued, immediately. Override with
+    /// [`Self::with_heavy_work`].
+    heavy_work: HeavyWorkQueue,
 }
 
 /// Folded into a `baseline-diff` [`CheckResult`]'s `message` whenever
@@ -1434,6 +1444,11 @@ impl TestTaskNode {
     pub fn new() -> Self {
         Self {
             runner: super::default_command_runner(),
+            // The lock dir is never touched while `HeavyWorkConfig::disabled()`
+            // is in effect (`HeavyWorkQueue::run_to_completion`'s disabled
+            // branch runs inline without ever reading/writing the store), so
+            // an empty placeholder path is safe here.
+            heavy_work: HeavyWorkQueue::new(PathBuf::new(), HeavyWorkConfig::disabled()),
         }
     }
 
@@ -1442,6 +1457,18 @@ impl TestTaskNode {
     #[must_use]
     pub fn with_runner(mut self, runner: CommandRunner) -> Self {
         self.runner = runner;
+        self
+    }
+
+    /// Configure the heavy-work admission queue this node's check run is
+    /// submitted through. Mirrors [`Self::with_runner`]'s builder
+    /// convention. Leaving this unset (the [`Self::new`] default) is
+    /// behavior-stable: a disabled queue's `run` always executes inline
+    /// immediately, so an un-configured `TestTaskNode` behaves exactly as it
+    /// did before this seam existed.
+    #[must_use]
+    pub fn with_heavy_work(mut self, heavy_work: HeavyWorkQueue) -> Self {
+        self.heavy_work = heavy_work;
         self
     }
 
@@ -2265,11 +2292,21 @@ impl Node for TestTaskNode {
             Vec::new()
         };
 
+        let repo = ctx
+            .event
+            .get("repo")
+            .and_then(|v| v.as_str())
+            .unwrap_or(DEFAULT_REPO_SLUG)
+            .to_string();
+
         // No harness AND no self-validating `validation_commands`: there is
         // nothing to check. Previously this silently produced
         // `all_passed: true` with zero checks; now it is a gating
-        // `harness-missing` failure instead.
-        let (mut check_results, mut failed_names, selection) =
+        // `harness-missing` failure instead. Nothing runs on this path, so
+        // it never touches the heavy-work queue — `heavy_work` is stamped
+        // `disabled` here on its own terms, not by consulting `self.heavy_work`'s
+        // configured state, since no admission was ever attempted.
+        let (mut check_results, mut failed_names, selection, heavy_work_json) =
             if !harness_exists && task_validation_commands.is_empty() {
                 let result = CheckResult {
                     name: "harness-missing".to_string(),
@@ -2292,12 +2329,72 @@ impl Node for TestTaskNode {
                         depth,
                         excluded: Vec::new(),
                     },
+                    json!({
+                        "mode": "disabled",
+                        "job_id": null,
+                        "class": "test",
+                        "waited_ms": 0,
+                        "degraded": false,
+                    }),
                 )
             } else {
                 let (selected_checks, selection) =
                     select_task_checks(&harness_checks, &task_validation_commands, depth, true);
-                let (results, failed) = self.run_checks(&selected_checks, worktree, &spec_dir);
-                (results, failed, selection)
+
+                let heavy_work_spec = HeavyWorkSpec {
+                    class: "test".to_string(),
+                    repo,
+                    cwd: worktree.to_path_buf(),
+                    commands: selected_checks
+                        .iter()
+                        .filter_map(|check| {
+                            check
+                                .get("command")
+                                .and_then(|v| v.as_str())
+                                .map(str::to_string)
+                        })
+                        .collect(),
+                    run_id: None,
+                };
+
+                // The admitted job's own subprocess calls go through
+                // `admitted_command_runner` (task 4) so `fleet_build.py`'s
+                // separate permit sees `FLEET_BUILD_PREADMITTED=1` and skips
+                // its own (redundant) acquisition. `CommandRunner` carries no
+                // per-call env, so the wrapping `SpecCommandRunner` ignores
+                // `spec.env`/`spec.timeout` and forwards only the triple this
+                // node's own runner understands.
+                let admitted_runner: CommandRunner = {
+                    let base = self.runner.clone();
+                    let spec_runner: SpecCommandRunner = Arc::new(move |spec: &CommandSpec| {
+                        (base)(spec.program, spec.args, spec.cwd)
+                    });
+                    admitted_command_runner(spec_runner)
+                };
+                let job_node = TestTaskNode {
+                    runner: admitted_runner,
+                    heavy_work: self.heavy_work.clone(),
+                };
+                let checks_for_job = selected_checks;
+                let worktree_for_job = worktree.to_path_buf();
+                let spec_dir_for_job = spec_dir.clone();
+
+                let outcome = self
+                    .heavy_work
+                    .run(heavy_work_spec, move || {
+                        job_node.run_checks(&checks_for_job, &worktree_for_job, &spec_dir_for_job)
+                    })
+                    .await;
+
+                let heavy_work_json = json!({
+                    "mode": serde_json::to_value(outcome.mode).unwrap_or(serde_json::Value::Null),
+                    "job_id": outcome.job_id.map(|id| id.to_string()),
+                    "class": outcome.class,
+                    "waited_ms": outcome.waited_ms,
+                    "degraded": outcome.degraded,
+                });
+                let (results, failed) = outcome.output;
+                (results, failed, selection, heavy_work_json)
             };
 
         if let Some(guard_result) = write_verification {
@@ -2323,6 +2420,7 @@ impl Node for TestTaskNode {
                     .unwrap_or(serde_json::Value::Null),
                 "check_source": selection.source,
                 "excluded_checks": selection.excluded,
+                "heavy_work": heavy_work_json,
             }),
         );
 
@@ -10050,6 +10148,107 @@ pub(crate) mod tests {
         assert!(!results
             .iter()
             .any(|r| r["name"] == json!("harness-missing")));
+    }
+
+    // --- heavy-work admission (EN.17.I task 5) ---
+
+    #[tokio::test]
+    async fn test_task_stamps_heavy_work_disabled_by_default() {
+        let worktree = temp_worktree();
+        write_harness(&worktree, json!([cmd_check("fmt", "cargo fmt --check")]));
+        let task = SDLCTask::new(1, "One", "d1");
+        let state = state_with_tasks(vec![task.clone()]);
+        let ctx = ctx_with_current_task_and_worktree(&state, &task, &worktree);
+
+        let (runner, _recorded) = recording_command_runner();
+        // No `with_heavy_work` call — the default queue is disabled.
+        let node = TestTaskNode::new().with_runner(runner);
+        let out = node.process(ctx).await.expect("process should succeed");
+
+        let heavy_work = &out.nodes["TestTaskNode"]["heavy_work"];
+        assert_eq!(heavy_work["mode"], json!("disabled"));
+        assert!(heavy_work["job_id"].is_null());
+        assert_eq!(heavy_work["degraded"], json!(false));
+    }
+
+    #[tokio::test]
+    async fn test_task_admits_through_configured_queue() {
+        let worktree = temp_worktree();
+        write_harness(&worktree, json!([cmd_check("fmt", "cargo fmt --check")]));
+        let task = SDLCTask::new(1, "One", "d1");
+        let state = state_with_tasks(vec![task.clone()]);
+        let ctx = ctx_with_current_task_and_worktree(&state, &task, &worktree);
+
+        let lock_dir = tempfile::tempdir().expect("tempdir");
+        let mut classes = HashMap::new();
+        classes.insert(
+            "test".to_string(),
+            crate::coord::heavy_work::ClassLimit {
+                limit: 1,
+                min_free_mb: 0,
+            },
+        );
+        let config = crate::coord::heavy_work::HeavyWorkConfig {
+            enabled: true,
+            heartbeat_interval_secs: 60,
+            stale_after_secs: 300,
+            poll_interval_ms: 5,
+            classes,
+        };
+        let queue = HeavyWorkQueue::new(lock_dir.path().to_path_buf(), config);
+
+        let (runner, _recorded) = recording_command_runner();
+        let node = TestTaskNode::new()
+            .with_runner(runner)
+            .with_heavy_work(queue);
+        let out = node.process(ctx).await.expect("process should succeed");
+
+        let heavy_work = &out.nodes["TestTaskNode"]["heavy_work"];
+        assert_eq!(heavy_work["mode"], json!("enabled"));
+        assert!(!heavy_work["job_id"].is_null());
+        assert_eq!(heavy_work["degraded"], json!(false));
+        assert_eq!(out.nodes["TestTaskNode"]["all_passed"], true);
+    }
+
+    #[tokio::test]
+    async fn test_task_degrades_when_lock_dir_unwritable_but_still_runs_checks() {
+        let worktree = temp_worktree();
+        write_harness(&worktree, json!([cmd_check("fmt", "cargo fmt --check")]));
+        let task = SDLCTask::new(1, "One", "d1");
+        let state = state_with_tasks(vec![task.clone()]);
+        let ctx = ctx_with_current_task_and_worktree(&state, &task, &worktree);
+
+        // A lock "dir" that is actually a regular file: `write_job`'s
+        // `create_dir_all` on a path under it fails (not a directory),
+        // so the store write errors and the job runs inline, degraded.
+        let unwritable = tempfile::NamedTempFile::new().expect("tempfile");
+        let mut classes = HashMap::new();
+        classes.insert(
+            "test".to_string(),
+            crate::coord::heavy_work::ClassLimit {
+                limit: 1,
+                min_free_mb: 0,
+            },
+        );
+        let config = crate::coord::heavy_work::HeavyWorkConfig {
+            enabled: true,
+            heartbeat_interval_secs: 60,
+            stale_after_secs: 300,
+            poll_interval_ms: 5,
+            classes,
+        };
+        let queue = HeavyWorkQueue::new(unwritable.path().to_path_buf(), config);
+
+        let (runner, recorded) = recording_command_runner();
+        let node = TestTaskNode::new()
+            .with_runner(runner)
+            .with_heavy_work(queue);
+        let out = node.process(ctx).await.expect("process should succeed");
+
+        assert_eq!(*recorded.lock().unwrap(), vec!["cargo fmt --check"]);
+        assert_eq!(out.nodes["TestTaskNode"]["all_passed"], true);
+        let heavy_work = &out.nodes["TestTaskNode"]["heavy_work"];
+        assert_eq!(heavy_work["degraded"], json!(true));
     }
 
     // --- with_cancellation_token (EN.ticket.abort-must-interrupt-an-in-flight-agent-node) ---
