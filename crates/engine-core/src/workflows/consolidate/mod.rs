@@ -26,6 +26,7 @@
 
 pub mod discover;
 pub mod disposal;
+pub mod remediation;
 pub mod select;
 pub mod watermark;
 
@@ -33,6 +34,7 @@ pub use discover::{discover_participants, DiscoveryFinding, DiscoveryResult};
 pub use disposal::{
     disposal_row_from_ledger_entry, selected_rows_to_disposal, write_disposal, DisposalError,
 };
+pub use remediation::{promote_remediation, PromoteError, PromoteOutcome, ProposedOriginStamp};
 pub use select::{select_ledger_rows, since_filter, SelectedRow};
 pub use watermark::{
     advance_watermark, read_watermark, AdvanceOutcome, WatermarkEntry, WatermarkError,
