@@ -357,6 +357,14 @@ mod tests {
                     "budget_halted",
                 ],
             ),
+            // Scan-list drift fix (`EN.15.L` Task 5, same class of drift `escalate.rs`'s and
+            // `operator_edge.rs`'s own notes above already name): `ledger.rs` landed in Task 1
+            // without this guard's allowlist being updated. Every `&str`/`impl Into<String>`
+            // param on its `pub fn`s (`compose`, `new`, `create_ledger_if_absent`) sits on a
+            // multi-line, rustfmt-wrapped signature — never on the same source line as
+            // `pub fn` — so this scan (a single-line match, per its own doc) never reaches
+            // them and there is nothing to allowlist.
+            ("ledger.rs", &[]),
             ("mod.rs", &[]),
             // Scan-list drift fix (`EN.15.J` Task 3, same class of drift `escalate.rs`'s
             // own note above already names): `operator_edge.rs` landed in Task 1 without
