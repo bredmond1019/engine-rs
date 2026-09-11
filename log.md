@@ -16,6 +16,35 @@ related: [status, context]
 
 ## [run: 2026-09-10]
 
+`/sdlc-flow` on branch `EN.15.J-flow` completed all 3 tasks, PASS review — `EN.15.J` is closed.
+`author_operator_edge` (`orchestration/gates.rs`) now has its first production caller: task 1 added
+`operator_edge.rs`'s `make_author_operator_edge`, a constructor building the production
+`Fn(&OperatorGateRequest) -> Result<(), String>` closure that shells to `mev::add_operator_edge_as`
+(never an in-process `state.json` write), mapping both `Err` and diagnostic-carrying `Ok` refusals
+(e.g. a duplicate slug) to `Err`, and best-effort composing/enqueuing a notification escalation via
+`EN.15.G`'s `escalate.rs` machinery on success. Task 2 wired `gates.rs` to re-export that closure as
+the public `author_operator_edge` seam a real chain caller uses. Task 3 extended
+`tests/it/coord_chain.rs` to exercise `check_permission_gate` through the real closure against a
+real temp `state.json` — deny-then-author-then-hold, `ClearOperatorGate` denied pre-lookup at every
+profile, duplicate-slug `EdgeAuthorFailed`, `OP.<slug>` derivation, the notification-escalation
+enqueue, and a green `mev::validate_brain_state` — and fixed a pre-existing regression task 1's new
+file left in `engine_kind.rs`'s runner-escape guard test (file-list drift), needed to get the full
+workspace suite green. Full engine-rs harness green: fmt, clippy `-D warnings`, `cargo nextest run
+--workspace` (4021/4021), release build. One acceptance criterion — a Telegram notification actually
+reaching the phone — is explicitly non-gateable per the block record and is not attested here; only
+that the engine-side fixture composes and enqueues a resolving notification escalation. Closes
+`EN.15.J`.
+
+```
+0431383 docs: update docs for EN.15.J
+cbf56ef feat: implement EN.15.J-task3
+909c334 feat: implement EN.15.J-task2
+9660fec feat: implement EN.15.J-task1
+```
+
+Next: `EN.15.L` — the verification ledger, written from a Rust chain at every block close, or
+`EN.15.K` (blocked on base-template).
+
 `/sdlc-flow` on branch `EN.15.I-flow` completed all 3 tasks, PASS review — `EN.15.I` is closed.
 `HeldSessionNode` is registered in production as its own `HELD_SESSION` micro-workflow in
 `graph.rs` (schema+registry, mirroring `DEBRIEF`), with `held_session_name(repo, lane) ->
