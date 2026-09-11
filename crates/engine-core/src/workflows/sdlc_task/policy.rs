@@ -26,6 +26,23 @@
 //! class of bug the `transport-retry-policy-not-wired-to-call-sites`
 //! carryover records for `SdlcPolicy.transport_retry` itself.
 //!
+//! **`EN.17.F` task 6 — three of `sdlc_flow`'s newer knobs ARE applicable
+//! here, decided against what `graph.rs`'s registry actually runs (never
+//! assumed):**
+//! - [`SdlcTaskModelTiers::implement_final_attempt`] — `ImplementTaskNode`
+//!   is a shared, unmodified node reused by SDLC_TASK's own retry loop
+//!   (`IncrementAttemptNode -> ImplementTaskNode`), so the last-attempt
+//!   escalation applies exactly as it does in `sdlc_flow`.
+//! - [`SdlcTaskTurnCeilings`] — narrowed to `implement`/`triage`/`generate`,
+//!   mirroring [`SdlcTaskModelTiers`]/[`SdlcTaskCallTimeouts`]'s existing
+//!   narrowing exactly (never `review`/`docs`, which this workflow never
+//!   runs).
+//! - `SdlcTaskPolicy::generate_context_max_bytes` — `GenerateTasksNode` is
+//!   registered in `graph.rs` (the `SpecExistsRouterNode -> GenerateTasksNode
+//!   -> LoadTaskStateNode` edge IS this workflow's own planning-fallback
+//!   path, taken whenever a spec has no `tasks.json`/`tasks.md` yet), so the
+//!   context cap governs it identically to `sdlc_flow`.
+//!
 //! **Resolution — four layers, high-to-low precedence:** per-run
 //! `SdlcTaskEventSchema` `policy` override, then a named `profile:` bundle
 //! (`profiles.rs`), then `planning/harness.json`'s `sdlc_task.policy`
@@ -67,17 +84,25 @@ pub struct SdlcTaskModelTiers {
     /// `sdlc_flow::policy::ModelTiers::generate`'s note on why this is
     /// `Opus`, not `Sonnet`, by default.
     pub generate: ModelTier,
+    /// The model tier `ImplementTaskNode` escalates to on a task's LAST fix
+    /// attempt — same knob and same shared-node consumer as
+    /// `sdlc_flow::policy::ModelTiers::implement_final_attempt` (`EN.17.F`
+    /// task 3/6). Built-in `None` — behavior-stable: every attempt uses
+    /// [`Self::implement`] as today.
+    pub implement_final_attempt: Option<ModelTier>,
 }
 
 impl Default for SdlcTaskModelTiers {
-    /// Sonnet for `implement`/`triage`, `Opus` for `generate` — matches
-    /// `sdlc_flow::policy::ModelTiers::default()` field-for-field on every
-    /// field SDLC_TASK actually reads.
+    /// Sonnet for `implement`/`triage`, `Opus` for `generate`, `None` for
+    /// `implement_final_attempt` — matches `sdlc_flow::policy::
+    /// ModelTiers::default()` field-for-field on every field SDLC_TASK
+    /// actually reads.
     fn default() -> Self {
         Self {
             implement: ModelTier::Sonnet,
             triage: ModelTier::Sonnet,
             generate: ModelTier::Opus,
+            implement_final_attempt: None,
         }
     }
 }
@@ -89,6 +114,12 @@ pub struct PartialSdlcTaskModelTiers {
     pub implement: Option<ModelTier>,
     pub triage: Option<ModelTier>,
     pub generate: Option<ModelTier>,
+    /// Nested `Option` — [`SdlcTaskModelTiers::implement_final_attempt`] is
+    /// itself `Option<ModelTier>`, so an override layer needs "unset" (fall
+    /// through) distinct from "explicitly clear". Merged via `merge_opt`,
+    /// mirroring `sdlc_flow::policy::PartialModelTiers::
+    /// implement_final_attempt`.
+    pub implement_final_attempt: Option<Option<ModelTier>>,
 }
 
 fn merge_sdlc_task_model_tiers(
@@ -104,6 +135,7 @@ fn merge_sdlc_task_model_tiers(
     if let Some(v) = over.generate {
         base.generate = v;
     }
+    base.implement_final_attempt = merge_opt(base.implement_final_attempt, over.implement_final_attempt);
     base
 }
 
@@ -144,6 +176,44 @@ fn merge_sdlc_task_call_timeouts(
     base
 }
 
+/// Per-stage in-turn tool-call ceiling for SDLC_TASK's three model-driven
+/// stages. `None` (the behavior-stable built-in default for every field)
+/// leaves `claude_code_rs::Config.max_turns` at its own unbounded default —
+/// mirrors `sdlc_flow::policy::StageTurnCeilings`'s semantics exactly, just
+/// narrowed to the stages SDLC_TASK actually runs (`EN.17.F` task 6: never
+/// `review`/`docs`, which this workflow's registry never registers).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SdlcTaskTurnCeilings {
+    pub implement: Option<u32>,
+    pub triage: Option<u32>,
+    pub generate: Option<u32>,
+}
+
+/// All-optional mirror of [`SdlcTaskTurnCeilings`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PartialSdlcTaskTurnCeilings {
+    pub implement: Option<u32>,
+    pub triage: Option<u32>,
+    pub generate: Option<u32>,
+}
+
+fn merge_sdlc_task_turn_ceilings(
+    mut base: SdlcTaskTurnCeilings,
+    over: &PartialSdlcTaskTurnCeilings,
+) -> SdlcTaskTurnCeilings {
+    if let Some(v) = over.implement {
+        base.implement = Some(v);
+    }
+    if let Some(v) = over.triage {
+        base.triage = Some(v);
+    }
+    if let Some(v) = over.generate {
+        base.generate = Some(v);
+    }
+    base
+}
+
 /// The fully-resolved, per-run SDLC_TASK policy — the merge of built-in
 /// defaults, `harness.json`'s `sdlc_task.policy` defaults, a named
 /// `profile:` bundle, and any per-run event override, high->low precedence
@@ -167,6 +237,9 @@ pub struct SdlcTaskPolicy {
     pub test_depth: TestDepth,
     pub model_tiers: SdlcTaskModelTiers,
     pub timeouts: SdlcTaskCallTimeouts,
+    /// Per-stage in-turn tool-call ceiling for `implement`/`triage`/
+    /// `generate`. See [`SdlcTaskTurnCeilings`].
+    pub max_turns: SdlcTaskTurnCeilings,
     /// Configuration for the `local` model tier, when any stage uses it.
     pub local: LocalConfig,
     /// Enables `TriageTaskNode`'s model-triage branch — same semantics as
@@ -190,6 +263,14 @@ pub struct SdlcTaskPolicy {
     /// SdlcPolicy::node_invocation_payload_cap_bytes`. Behavior-stable
     /// default: `crate::invocations::DEFAULT_PAYLOAD_CAP_BYTES`.
     pub node_invocation_payload_cap_bytes: u64,
+    /// Per-file-section byte cap `GenerateTasksNode`'s planning-fallback
+    /// path applies via `sdlc_flow::setup::gather_context` — same knob and
+    /// same shared-node consumer as `sdlc_flow::policy::
+    /// SdlcPolicy::generate_context_max_bytes` (`EN.17.F` task 5/6): this
+    /// workflow's `SpecExistsRouterNode -> GenerateTasksNode` edge IS the
+    /// planning-fallback path. Built-in `None` — unbounded, byte-identical
+    /// to before this knob existed.
+    pub generate_context_max_bytes: Option<usize>,
 }
 
 impl Default for SdlcTaskPolicy {
@@ -205,12 +286,14 @@ impl Default for SdlcTaskPolicy {
             test_depth: TestDepth::Full,
             model_tiers: SdlcTaskModelTiers::default(),
             timeouts: SdlcTaskCallTimeouts::default(),
+            max_turns: SdlcTaskTurnCeilings::default(),
             local: LocalConfig::default(),
             llm_triage: false,
             max_attempts: 3,
             retry_feedback: RetryFeedback::default(),
             transport_retry: TransportRetry::default(),
             node_invocation_payload_cap_bytes: crate::invocations::DEFAULT_PAYLOAD_CAP_BYTES,
+            generate_context_max_bytes: None,
         }
     }
 }
@@ -241,11 +324,10 @@ impl SdlcTaskPolicy {
                 triage: self.model_tiers.triage,
                 generate: self.model_tiers.generate,
                 docs: fallback.model_tiers.docs,
-                // Not yet a SDLC_TASK-applicable knob until task 6 decides
-                // (per its own scoping note) — left at the fallback (`None`,
-                // behavior-stable) here rather than omitted, so this struct
-                // literal compiles against task 3's new `ModelTiers` field.
-                implement_final_attempt: fallback.model_tiers.implement_final_attempt,
+                // Applicable (EN.17.F task 6): `ImplementTaskNode` is the
+                // same shared node, reused unmodified by this workflow's
+                // own retry loop — see this module's doc comment.
+                implement_final_attempt: self.model_tiers.implement_final_attempt,
             },
             timeouts: crate::workflows::sdlc_flow::policy::CallTimeouts {
                 implement: self.timeouts.implement,
@@ -254,12 +336,17 @@ impl SdlcTaskPolicy {
                 generate: self.timeouts.generate,
                 docs: fallback.timeouts.docs,
             },
-            // Not yet a SDLC_TASK-applicable knob until task 6 decides (per
-            // its own scoping note) — left at the fallback (`None`,
-            // behavior-stable) here rather than omitted, so this struct
-            // literal compiles against task 4's new `SdlcPolicy` field.
-            // Mirrors `implement_final_attempt` above.
-            max_turns: fallback.max_turns,
+            // Applicable for implement/triage/generate (EN.17.F task 6) —
+            // review/docs never run under this workflow's registry, so
+            // those two fall back to the built-in `None`, mirroring
+            // `timeouts` immediately above.
+            max_turns: crate::workflows::sdlc_flow::policy::StageTurnCeilings {
+                implement: self.max_turns.implement,
+                triage: self.max_turns.triage,
+                review: fallback.max_turns.review,
+                generate: self.max_turns.generate,
+                docs: fallback.max_turns.docs,
+            },
             local: self.local.clone(),
             llm_triage: self.llm_triage,
             max_attempts: self.max_attempts,
@@ -268,12 +355,11 @@ impl SdlcTaskPolicy {
             transport_retry: self.transport_retry,
             review_diff_max_chars: fallback.review_diff_max_chars,
             node_invocation_payload_cap_bytes: self.node_invocation_payload_cap_bytes,
-            // Not a SDLC_TASK-applicable knob (it gates only
-            // `GenerateTasksNode`'s planning-fallback path, which SDLC_TASK
-            // never runs) — left at the fallback (`None`, behavior-stable)
-            // here rather than omitted, so this struct literal compiles
-            // against task 5's new `SdlcPolicy` field.
-            generate_context_max_bytes: fallback.generate_context_max_bytes,
+            // Applicable (EN.17.F task 6): `GenerateTasksNode` IS this
+            // workflow's planning-fallback path (`SpecExistsRouterNode ->
+            // GenerateTasksNode`), registered and run unmodified — see this
+            // module's doc comment.
+            generate_context_max_bytes: self.generate_context_max_bytes,
         }
     }
 }
@@ -291,12 +377,19 @@ pub struct PartialSdlcTaskPolicy {
     pub test_depth: Option<TestDepth>,
     pub model_tiers: Option<PartialSdlcTaskModelTiers>,
     pub timeouts: Option<PartialSdlcTaskCallTimeouts>,
+    pub max_turns: Option<PartialSdlcTaskTurnCeilings>,
     pub local: Option<PartialLocalConfig>,
     pub llm_triage: Option<bool>,
     pub max_attempts: Option<u32>,
     pub retry_feedback: Option<PartialRetryFeedback>,
     pub transport_retry: Option<PartialTransportRetry>,
     pub node_invocation_payload_cap_bytes: Option<u64>,
+    /// Nested `Option` — [`SdlcTaskPolicy::generate_context_max_bytes`] is
+    /// itself `Option<usize>`, so an override layer needs "unset" (fall
+    /// through) distinct from "explicitly clear". Merged via `merge_opt`,
+    /// mirroring `sdlc_flow::policy::PartialPolicy::
+    /// generate_context_max_bytes`.
+    pub generate_context_max_bytes: Option<Option<usize>>,
 }
 
 fn merge_retry_feedback(mut base: RetryFeedback, over: &PartialRetryFeedback) -> RetryFeedback {
@@ -340,6 +433,10 @@ impl crate::policy::Policy for SdlcTaskPolicy {
                 Some(t) => merge_sdlc_task_call_timeouts(base.timeouts, t),
                 None => base.timeouts,
             },
+            max_turns: match &over.max_turns {
+                Some(t) => merge_sdlc_task_turn_ceilings(base.max_turns, t),
+                None => base.max_turns,
+            },
             local: match &over.local {
                 Some(l) => base.local.overlay(l),
                 None => base.local,
@@ -357,6 +454,10 @@ impl crate::policy::Policy for SdlcTaskPolicy {
             node_invocation_payload_cap_bytes: merge_opt(
                 base.node_invocation_payload_cap_bytes,
                 over.node_invocation_payload_cap_bytes,
+            ),
+            generate_context_max_bytes: merge_opt(
+                base.generate_context_max_bytes,
+                over.generate_context_max_bytes,
             ),
         }
     }
@@ -479,6 +580,7 @@ mod tests {
                 implement: Some(ModelTier::Haiku),
                 triage: Some(ModelTier::Haiku),
                 generate: None,
+                implement_final_attempt: None,
             }),
             ..Default::default()
         };
@@ -487,6 +589,7 @@ mod tests {
                 implement: Some(ModelTier::Opus),
                 triage: None,
                 generate: None,
+                implement_final_attempt: None,
             }),
             ..Default::default()
         };
@@ -600,8 +703,14 @@ mod tests {
                 implement: Some(ModelTier::Sonnet),
                 triage: Some(ModelTier::Sonnet),
                 generate: Some(ModelTier::Opus),
+                implement_final_attempt: Some(None),
             }),
             timeouts: Some(PartialSdlcTaskCallTimeouts {
+                implement: None,
+                triage: None,
+                generate: None,
+            }),
+            max_turns: Some(PartialSdlcTaskTurnCeilings {
                 implement: None,
                 triage: None,
                 generate: None,
@@ -618,6 +727,7 @@ mod tests {
                 initial_backoff_ms: Some(200),
             }),
             node_invocation_payload_cap_bytes: Some(65536),
+            generate_context_max_bytes: Some(None),
         };
         let value = serde_json::to_value(&full).expect("serialize PartialSdlcTaskPolicy");
         let expected: std::collections::BTreeSet<String> = value
@@ -755,5 +865,64 @@ mod tests {
             p.to_sdlc_policy().transport_retry.max_attempts,
             default_projection.transport_retry.max_attempts
         );
+
+        // --- EN.17.F task 6: the three newly-applicable knobs ------------
+
+        let mut p = default.clone();
+        p.model_tiers.implement_final_attempt = Some(ModelTier::Opus);
+        assert_eq!(
+            p.to_sdlc_policy().model_tiers.implement_final_attempt,
+            Some(ModelTier::Opus)
+        );
+        assert_ne!(
+            p.to_sdlc_policy().model_tiers.implement_final_attempt,
+            default_projection.model_tiers.implement_final_attempt
+        );
+
+        let mut p = default.clone();
+        p.max_turns.implement = Some(11);
+        assert_eq!(p.to_sdlc_policy().max_turns.implement, Some(11));
+        assert_ne!(
+            p.to_sdlc_policy().max_turns.implement,
+            default_projection.max_turns.implement
+        );
+
+        let mut p = default.clone();
+        p.max_turns.triage = Some(12);
+        assert_eq!(p.to_sdlc_policy().max_turns.triage, Some(12));
+        assert_ne!(
+            p.to_sdlc_policy().max_turns.triage,
+            default_projection.max_turns.triage
+        );
+
+        let mut p = default.clone();
+        p.max_turns.generate = Some(13);
+        assert_eq!(p.to_sdlc_policy().max_turns.generate, Some(13));
+        assert_ne!(
+            p.to_sdlc_policy().max_turns.generate,
+            default_projection.max_turns.generate
+        );
+
+        let mut p = default.clone();
+        p.generate_context_max_bytes = Some(4096);
+        assert_eq!(p.to_sdlc_policy().generate_context_max_bytes, Some(4096));
+        assert_ne!(
+            p.to_sdlc_policy().generate_context_max_bytes,
+            default_projection.generate_context_max_bytes
+        );
+    }
+
+    /// `review`/`docs` never run under this workflow's registry (`graph.rs`
+    /// registers no `ConsolidatedReviewNode`/`PatchDocsNode`), so
+    /// `max_turns.review`/`.docs` must stay at the projected `SdlcPolicy`
+    /// fallback regardless of what `SdlcTaskTurnCeilings` carries — there is
+    /// no field on `SdlcTaskTurnCeilings` to even set them, so this pins the
+    /// projection's fallback side directly.
+    #[test]
+    fn max_turns_review_and_docs_are_never_settable_and_project_to_the_fallback() {
+        let projection = SdlcTaskPolicy::default().to_sdlc_policy();
+        let fallback = SdlcPolicy::default();
+        assert_eq!(projection.max_turns.review, fallback.max_turns.review);
+        assert_eq!(projection.max_turns.docs, fallback.max_turns.docs);
     }
 }

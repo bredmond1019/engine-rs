@@ -1648,6 +1648,35 @@ mod tests {
                 parsed.max_review_attempts.is_some(),
                 "{name} must set max_review_attempts"
             );
+            // EN.17.F task 6: the three knobs tasks 3/4/5 added must be
+            // advertised by every profile too — a profile that omits one
+            // silently falls back to the built-in default rather than the
+            // deliberate choice its own doc comment claims to make. Checked
+            // against the RAW JSON object, not the typed `parsed` value:
+            // `implement_final_attempt`/`generate_context_max_bytes` are
+            // both `Option<Option<T>>` on the typed side, and serde's plain
+            // derive collapses a JSON `null` straight to the OUTER `None`
+            // (it cannot tell "absent" from "present as null" without a
+            // custom `deserialize_with`) — so a typed `.is_some()` check
+            // would wrongly fail on exactly the common built-in-value case
+            // this assertion exists to require.
+            let bundle_obj = bundle.as_object().expect("profile bundle is a JSON object");
+            let model_tiers_obj = bundle_obj
+                .get("model_tiers")
+                .and_then(serde_json::Value::as_object)
+                .expect("model_tiers is a JSON object");
+            assert!(
+                model_tiers_obj.contains_key("implement_final_attempt"),
+                "{name} must set model_tiers.implement_final_attempt (even if to null)"
+            );
+            assert!(
+                bundle_obj.contains_key("max_turns"),
+                "{name} must set max_turns (even if every field inside it is null)"
+            );
+            assert!(
+                bundle_obj.contains_key("generate_context_max_bytes"),
+                "{name} must set generate_context_max_bytes (even if to null)"
+            );
         }
     }
 
