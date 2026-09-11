@@ -16,6 +16,21 @@ related: [status, context]
 
 ## [run: 2026-09-10]
 
+`/sdlc-flow` on branch `EN.15.L-flow` closed `EN.15.L` — the D57 verification-ledger seam for ORCHESTRATION — across 5 tasks, PASS review. Task 1 added `crates/engine-core/src/workflows/orchestration/ledger.rs`: a typed `LedgerEntry` (compile-time-unrepresentable `finding` field, remediation only valid on failed/blocked), `create_ledger_if_absent` (json + OKF-frontmatter md wrapper), and a read-modify-write `merge_append_entries` that is id-collision-safe. Task 2 wired the append into `integrate_chain_with_run_record` between the lane-log "closed" line and `close_block`, behind an injected `ComposeLedgerEntriesFn` seam, so a bail on the next step still leaves the just-closed block's entries on disk; a composer error is caught and recorded as a non-fatal `GateRefused` journal row rather than failing the chain. Task 3 gave `engine-serve`'s `journal.rs` a real production `AgentCodeStep`-based composer, resolving its model tier through a new `orchestration.policy.composer_model_tier` harness knob (sonnet/haiku/opus across baseline/cheap-fast/thorough) — and confirmed via `escalate.rs`'s `BailEntry` that no production path files a remediation ticket today, so the composer answers `call_site: NONE` and the gap is recorded as an open finding in `coordination-layer-port/notes.md` rather than inventing a caller. Task 4 documented the new knob in `planning/harness.json`. Task 5 added `crates/engine-core/tests/it/ledger.rs` (6 chain-level tests: bail-proves-per-close, happy path, create-if-absent, merge/dedupe, validation refusals, composer-error-is-non-fatal) and fixed a pre-existing `engine_kind.rs` scan-list drift (`ledger.rs` missing from the sanctioned-string-fn allowlist) that was failing the workspace-wide `cargo nextest run --workspace` gate independent of this spec's own changes. `docs/workflows/orchestration.md` updated. Next: EN.17.A — a refused or foreign-held lease stops the block, and the coordination reader sees real inboxes.
+
+```
+36db511 docs: update docs for "EN.15.L
+7d414b7 fix: review pass 1 for "EN.15.L
+c6427fc feat: implement EN.15.L-task5
+799e3f6 feat: implement EN.15.L-task3
+90f9155 feat: implement EN.15.L-task2
+a4acef6 feat: implement EN.15.L-task1
+3ea58b4 docs: log coordination-layer-port lane session (EN.15.I/J closed via /begin-orchestration)
+814c582 Merge remote-tracking branch 'origin/main'
+```
+
+## [run: 2026-09-10]
+
 ### `/begin-orchestration` — coordination-layer-port engine lane, `EN.15.I`/`EN.15.J` closed
 
 - **What:** Resumed the `engine` lane on `coordination-layer-port` (`/begin-orchestration
