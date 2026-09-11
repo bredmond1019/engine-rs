@@ -696,8 +696,12 @@ fn lane_log_contract_fixture_round_trips_into_lane_log_entry() {
             // by `integrate_chain` itself — no hand-written fixture line
             // uses them), so this round-trip test has nothing to flag for
             // either.
+            // `EN.17.B` task 4 added `Skipped` (also in-process only, never
+            // in a hand-written fixture line) — same no-op reasoning as
+            // `Cancelled`/`BudgetHalted` above.
             engine_core::workflows::orchestration::integrate::LaneLogStatus::Cancelled
-            | engine_core::workflows::orchestration::integrate::LaneLogStatus::BudgetHalted => {}
+            | engine_core::workflows::orchestration::integrate::LaneLogStatus::BudgetHalted
+            | engine_core::workflows::orchestration::integrate::LaneLogStatus::Skipped => {}
         }
     }
 

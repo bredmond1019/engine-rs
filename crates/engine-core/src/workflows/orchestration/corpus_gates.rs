@@ -106,6 +106,23 @@ impl fmt::Display for CorpusGatesError {
 
 impl std::error::Error for CorpusGatesError {}
 
+/// The result of [`CorpusGates::block_status`]: either the block's raw authored
+/// `status` string (`Row`), or proof that the id is absent from every track in the
+/// repo's `state.json` (`NotInTracks` — a block demoted to `backlog[]`, or simply
+/// never authored). `EN.17.B`'s per-step boundary check treats a `Row` of `"closed"`,
+/// `"wontfix"`, `"superseded"` or `"deferred"`, and `NotInTracks` itself, as reasons
+/// not to dispatch a step; any other `Row` value lets dispatch proceed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BlockPresence {
+    /// The block was found; its raw authored `status` (an absent `status` field is
+    /// normalized to `"open"`, matching [`CorpusGates::is_block_open`]'s existing
+    /// convention that no status means open).
+    Row(String),
+    /// The block id does not appear in any track of the repo's `state.json`, though
+    /// the file itself loaded successfully.
+    NotInTracks,
+}
+
 /// A pluggable `state.json` loader, defaulting to [`okf_core::load_state`].
 /// Overridable only for tests — e.g. a counting reader that proves the cache really
 /// avoids re-reading the same repo per step.
@@ -219,6 +236,36 @@ impl CorpusGates {
             .iter()
             .flat_map(|track| track.blocks.iter())
             .find(|block| block.id == block_id)
+    }
+
+    /// `block_status(repo, block_id)`: the raw authored status of a block, for the
+    /// ORCHESTRATION per-step boundary check (`EN.17.B`) — is this step's block
+    /// `closed`/`wontfix`/`superseded`/`deferred` (never dispatch), demoted out of
+    /// `tracks[].blocks[]` entirely (`NotInTracks`, never dispatch), or anything else
+    /// (`Row(status)`, dispatch proceeds)?
+    ///
+    /// A block with no `status` field at all (`None`) is reported as `Row("open")`,
+    /// matching [`Self::is_block_open`]'s own convention that an absent status is
+    /// treated as open (`status.as_deref() != Some("closed")`) rather than inventing a
+    /// second meaning for "no status" in this module.
+    ///
+    /// `NotInTracks` is returned only when the repo's `state.json` itself loaded
+    /// successfully and the id is simply absent from every track — a repo whose
+    /// `state.json` fails to load at all goes through [`Self::state_for`]'s existing
+    /// error path ([`CorpusGatesError::Load`]) and is reported there, not here; this
+    /// method does not re-report that failure, matching how [`Self::resolve_depends_on`]
+    /// treats a missing state as "nothing to resolve from" rather than a second error.
+    #[must_use]
+    pub fn block_status(&self, repo: &str, block_id: &str) -> BlockPresence {
+        let Some(state) = self.state_for(repo) else {
+            return BlockPresence::NotInTracks;
+        };
+        match Self::find_block(&state, block_id) {
+            Some(block) => {
+                BlockPresence::Row(block.status.clone().unwrap_or_else(|| "open".to_string()))
+            }
+            None => BlockPresence::NotInTracks,
+        }
     }
 
     /// `resolve_depends_on(repo, block_id)`: the block's authored `depends_on`,
@@ -700,6 +747,88 @@ repo_path = "repo-a"
                 load_count.load(Ordering::SeqCst)
             );
             assert!(gates.take_error().is_none());
+        });
+    }
+
+    #[test]
+    fn block_status_reports_each_terminal_status_and_the_open_control() {
+        env_guarded(|| {
+            let dir = two_repo_brain_root(
+                &state_json(
+                    r#"{"id": "A.1", "title": "a1", "status": "closed"},
+                       {"id": "A.2", "title": "a2", "status": "wontfix"},
+                       {"id": "A.3", "title": "a3", "status": "superseded"},
+                       {"id": "A.4", "title": "a4", "status": "deferred"},
+                       {"id": "A.5", "title": "a5", "status": "open"}"#,
+                ),
+                &state_json(r#"{"id": "B.1", "title": "b1", "status": "closed"}"#),
+            );
+            let gates = CorpusGates::new(registry_for(&dir));
+
+            assert_eq!(
+                gates.block_status("repo-a", "A.1"),
+                BlockPresence::Row("closed".to_string())
+            );
+            assert_eq!(
+                gates.block_status("repo-a", "A.2"),
+                BlockPresence::Row("wontfix".to_string())
+            );
+            assert_eq!(
+                gates.block_status("repo-a", "A.3"),
+                BlockPresence::Row("superseded".to_string())
+            );
+            assert_eq!(
+                gates.block_status("repo-a", "A.4"),
+                BlockPresence::Row("deferred".to_string())
+            );
+            assert_eq!(
+                gates.block_status("repo-a", "A.5"),
+                BlockPresence::Row("open".to_string())
+            );
+            assert!(gates.take_error().is_none());
+        });
+    }
+
+    #[test]
+    fn block_status_not_in_tracks_for_an_id_absent_from_every_track() {
+        env_guarded(|| {
+            let dir = two_repo_brain_root(
+                &state_json(r#"{"id": "A.1", "title": "a1", "status": "open"}"#),
+                &state_json(r#"{"id": "B.1", "title": "b1", "status": "closed"}"#),
+            );
+            let gates = CorpusGates::new(registry_for(&dir));
+
+            assert_eq!(
+                gates.block_status("repo-a", "GHOST"),
+                BlockPresence::NotInTracks
+            );
+            // block_status does not itself report a resolution failure for an id
+            // that is simply absent — the state.json loaded fine; there is nothing
+            // wrong with the corpus, only with the caller's assumption the id exists.
+            assert!(gates.take_error().is_none());
+        });
+    }
+
+    #[test]
+    fn block_status_is_a_pure_read_state_json_untouched() {
+        env_guarded(|| {
+            let dir = two_repo_brain_root(
+                &state_json(r#"{"id": "A.1", "title": "a1", "status": "closed"}"#),
+                &state_json(r#"{"id": "B.1", "title": "b1", "status": "open"}"#),
+            );
+            let state_path = dir
+                .path()
+                .join("repo-a")
+                .join("planning")
+                .join("state.json");
+            let before = std::fs::read(&state_path).expect("read before");
+
+            let gates = CorpusGates::new(registry_for(&dir));
+            let _ = gates.block_status("repo-a", "A.1");
+            let _ = gates.block_status("repo-a", "NOT-THERE");
+
+            let after = std::fs::read(&state_path).expect("read after");
+            assert_eq!(before, after, "block_status must never mutate state.json");
         });
     }
 }

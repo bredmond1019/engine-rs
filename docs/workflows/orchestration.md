@@ -193,6 +193,104 @@ diagnostic) is logged via `tracing::warn!` rather than silently swallowed; `clos
 fire-and-forget signature gives the seam no other channel to report through, so the block is simply
 left open in `state.json` and can still be closed by hand or on a later run.
 
+## A bail skips only its dependents, and every boundary re-reads the graph (`EN.17.B`)
+
+Before this block, one bail ended the whole chain: `record_bail_escalation` wrote its records and
+`integrate_chain_impl` returned `Err`, with no re-check of any later step's status. An unattended
+overnight lane therefore stopped at its first red block, and every independent block behind it —
+however unrelated — waited on a human.
+
+**The knob: `on_bail`.** `OrchestrationPolicy.on_bail` is a closed two-variant enum
+(`crates/engine-core/src/workflows/orchestration/graph.rs`):
+
+- **`stop_chain`** (built-in default, per CLAUDE.md standing rule 6) — the pre-`EN.17.B` behavior
+  exactly: the first bailed step returns `Err` and no later step, dependent or independent, is
+  dispatched.
+- **`skip_dependents`** — a bailed step records `bailed` and skips only the steps that
+  (transitively) depend on it; every independent step still runs to completion, and the run ends
+  with a terminal `chain_report` instead of an early `Err` (unless `bailed` is non-empty — see
+  below).
+
+**THE EFFECTIVE SWITCH LIVES IN HQ'S OWN `harness.json`, not this repo's**, for the same reason
+`child_sdlc_flow_policy`/`child_sdlc_task_policy` do (see "Child policy forwarding" below):
+`OrchestrationRunNode` resolves `OrchestrationPolicy` from `PolicyConfigSource::Worktree(event.
+brain_root)`, and the engine-mounted `bastion serve` that drives a real chain runs with
+`ENGINE_BRAIN_ROOT` pointed at HQ. HQ's `planning/harness.json` sets
+`orchestration.policy.on_bail: "skip_dependents"` and carries no `orchestration.profiles` section
+(`resolve_profile_from` returns a named bundle WHOLE, with no merge onto the built-in bundle of the
+same name — an HQ profile section would silently drop every other built-in knob in it). This
+repo's own `planning/harness.json` documents `on_bail` at its built-in value (`stop_chain`) only,
+with the same "not effective for a real chain" caveat. Of the three built-in named profiles, only
+`baseline` restates `on_bail` (verbatim `stop_chain`, its no-op contract) — `cheap-fast` and
+`thorough` leave it unset, so HQ's brain-root value governs any run naming them.
+
+**(1) Status-aware boundary.** `CorpusGates::block_status(repo, block_id) -> BlockPresence`
+(`corpus_gates.rs`) reads a block's row straight from the repo's own `planning/state.json` —
+`BlockPresence::Row(status)` when the id is in `tracks[].blocks[]`, `BlockPresence::NotInTracks`
+when it is not (demoted to `backlog[]`). At the top of every loop iteration — after the inbox
+drain and the cancellation/budget checks, before `check_dependencies` — a step whose status is
+`closed`, `wontfix`, `superseded` or `deferred`, or whose id is `NotInTracks`, is **not
+dispatched**. This check is unconditional (it runs regardless of `on_bail`) and is read fresh at
+each step's own boundary, never cached from chain resolution — a status flipped to `closed` by
+another lane *while this chain is running* is honoured the moment that step's boundary is reached.
+The step gets a `Skipped` lane-log line naming the status (or "not in tracks[]"), with no
+`blocked_by` — the note alone explains the skip.
+
+**(2) Skip-dependents on bail (transitive).** A loop-local set records every step this chain has
+itself bailed or skipped so far. For each later step, its authored `depends_on` edges are checked:
+a `block`-kind edge naming a step already in that set makes this step `Skipped` too, with
+`blocked_by` set to that exact edge, serialized in its authored shape
+(`{"type":"block","repo":...,"id":...}`). This applies transitively through the chain — a step
+whose only chain edge names an already-skipped step is itself skipped, naming that step. Only
+`block`-kind edges participate; `operator`/`approval`/`external` edges are not chain-internal and
+are handled by (3). This whole mechanism is inert under the built-in `stop_chain`, since the
+bailed/skipped set stays empty whenever the chain would already have returned `Err`.
+
+**(3) Unmet edge outside the chain.** `check_dependencies` failing no longer unconditionally
+returns from the chain. Under `skip_dependents`, the step is `Skipped` with `blocked_by` set to
+the unmet `DependencyEdge` in its authored shape (`block`, `operator`, `approval` or `external`),
+and the chain continues to the next step. Under `stop_chain` this is unchanged: the first unmet
+edge still returns `Err` immediately. `gates::check_permission_gate` is NOT currently called from
+this loop (`EN.15.J`'s scope was the HOLD/operator-edge path via `wait_for_clearance`, not this
+gate) — wiring it in, and deciding how a refusal should interact with `skip_dependents`, is tracked
+as carryover `check-permission-gate-never-wired-into-orchestration-loop`, not implemented by this
+block.
+
+**`blocked_by`.** `LaneLogEntry` gains an additive, optional `blocked_by: Option<serde_json::Value>`
+field (omitted, never `null`, on every status but `Skipped`) — see "The lane-log contract" above
+for the additive-field discipline this follows. On a `Skipped` line it is `Some(edge)` for a
+dependency-edge or transitive skip (cases 2 and 3 above), or `None` for a status-boundary skip
+(case 1), whose `note` already names the status. `LaneLogStatus` gains the `Skipped` variant
+itself, distinct from `Bailed` (this step's own execution failed) — nothing about a `Skipped` step
+ever ran.
+
+**(4) Terminal report.** `integrate_chain_impl_inner` accumulates a `ChainReport { closed: Vec<String>,
+bailed: Vec<String>, skipped: Vec<SkippedStep> }` (`"{repo}:{block_id}"` identity strings for
+`closed`/`bailed`; `SkippedStep { block, reason, blocked_by }` for `skipped`) via a `&mut
+ChainReport` threaded through the loop, so every push made before an early `return Err` is still
+visible in the caller's own copy once the call returns — the report itself is never part of the
+`Result`. `OrchestrationRunNode::process` `put_result`s it into
+`ctx.nodes["OrchestrationRunNode"]["chain_report"]` exactly once, **before** deciding the node's
+own success/error outcome, on both the success and the error path (the
+`ctx-nodes-holds-one-slot-per-node-so-repeat-invocations-overwrite-history` carryover is why this
+is one accumulated value stamped once, never a per-step `put_result` call that would overwrite
+history). The node returns an error naming every bailed block **if and only if** `bailed` is
+non-empty — a `skip_dependents` run with independent steps that all closed cleanly, despite one
+bail, still surfaces that bail in the node's own error, so the run's status stays honest even
+though the chain kept going. Under `skip_dependents`, `closed.len() + bailed.len() +
+skipped.len()` always sums to the chain's own block-step count (a `dispatch` step is counted in
+none of the three, matching its own `lane-log.jsonl` omission — see "A chain may also mix `block`
+and `dispatch` steps" above). Under the built-in `stop_chain`, `bailed` holds at most the one step
+that stopped the chain and `skipped` is typically empty, since no later step was ever reached.
+
+Cancellation and the campaign budget halt are unchanged by any of this — both still end the chain
+at the boundary exactly as before (see "Campaign identity" below), independent of `on_bail`.
+
+**No `state.json` write on bail.** Per base-template D86
+(`docs/workflows/sdlc-state-vocabulary.md`), a bail (`blocked`) forces no block-status transition.
+None of this mechanism writes `state.json` or authors an edge — `block_status` is a pure read, and
+a chain run containing a bail leaves every repo's `state.json` byte-identical before and after.
+
 ## A bail or a stuck operator hold now writes an escalation and a bails[] entry (`EN.15.G`)
 
 A step that fails on the BAIL path (`execute_step` returns an error) or the HOLD path
@@ -549,12 +647,13 @@ Resolved through the standard four layers (per-run event override > named profil
 | `composer_model_tier` | `sonnet` | The model tier the injected D57 verification-ledger composer seam (see above) runs its `AgentCodeStep` judgment call at. Resolved from a standalone `Partial` type (not `OrchestrationPolicy` itself), read from this same `orchestration.policy`/`orchestration.profiles` section of `planning/harness.json`. |
 | `child_sdlc_flow_policy` | `None` | **`EN.17.F`.** A partial `SdlcPolicy` override object, forwarded verbatim as the `"policy"` key on every `flow` step's composed child event — layer 1 of that child's own four-layer resolution. `None` (the built-in default on every named profile, `baseline` included) leaves the composed child event byte-identical to before this knob existed: no `"policy"` key at all. See "Child policy forwarding" below. |
 | `child_sdlc_task_policy` | `None` | **`EN.17.F`.** The same mechanism as `child_sdlc_flow_policy`, but forwarded only into a `task` step's child event — a `flow` step never sees it and vice versa. |
+| `on_bail` | `stop_chain` | **`EN.17.B`.** Whether a bailed step ends the whole chain (`stop_chain`) or skips only its own dependents while independent steps still run (`skip_dependents`). See "A bail skips only its dependents" above. |
 
 Named profiles (`crates/engine-core/src/workflows/orchestration/graph.rs`):
 
 - **`baseline`** — `2000ms` poll, `default_use_worktree: true`, no hold deadline,
-  `default_auto_pr: true`. Spelled out explicitly rather than left empty, so selecting it is a
-  legible, self-documenting no-op against the built-in default.
+  `default_auto_pr: true`, `on_bail: stop_chain`. Spelled out explicitly rather than left empty,
+  so selecting it is a legible, self-documenting no-op against the built-in default.
 - **`cheap-fast`** — `10000ms` poll (fewer wake-ups; a cleared hold is noticed later),
   `default_use_worktree: true`, a bounded 15-minute hold deadline, `default_auto_pr: false`.
   Cheapness on this profile applies to poll intervals, hold deadlines, and now PR creation — the
