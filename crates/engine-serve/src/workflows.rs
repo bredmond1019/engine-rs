@@ -1068,6 +1068,7 @@ pub fn register_orchestration(dispatcher: &mut Dispatcher) {
         dispatcher,
         repo_registry(),
         Arc::new(engine_core::workflows::orchestration::coord_lane::QueueHoldSource::new()),
+        Arc::new(engine_core::workflows::sweep::NoopOperatorTransport),
     );
 }
 
@@ -1188,6 +1189,7 @@ pub fn register_orchestration_with_registry(
     dispatcher: &mut Dispatcher,
     repo_reg: Option<Arc<RepoRegistry>>,
     hold_source: Arc<dyn engine_core::workflows::orchestration::integrate::HoldSource>,
+    transport: Arc<dyn engine_core::operator::transport::OperatorTransport>,
 ) {
     dispatcher.register(
         engine_core::workflows::orchestration::graph::schema(),
@@ -1361,6 +1363,7 @@ pub fn register_orchestration_with_registry(
                     status
                 }))
                 .with_hold_source(hold_source.clone())
+                .with_operator_transport(transport.clone())
                 .with_cancellation_token(run_token)
                 .with_step_observer(step_observer);
 
@@ -1656,6 +1659,41 @@ pub fn register_builtin_workflows_with_registry(
     register_claim_reaffirm(dispatcher);
     register_sweep(dispatcher);
     register_commander(dispatcher);
+}
+
+/// Register every builtin workflow with a real `OperatorTransport`
+/// (`EN.17.C` task 5) — the entry point bastion's dispatcher build will
+/// call once a production transport (`TelegramTransport`,
+/// `BA.ticket.engine-dispatcher-carries-the-real-operator-transport`)
+/// exists. Registers exactly what [`register_builtin_workflows`] does by
+/// calling the SAME [`register_builtin_workflows_with_registry`] it
+/// already calls internally (its body is not duplicated here), then
+/// re-registers `SWEEP` via the existing [`register_sweep_with`] and
+/// `ORCHESTRATION` via [`register_orchestration_with_registry`], both with
+/// `transport`. Re-registration is safe: [`Dispatcher::register`] is a
+/// `HashMap` insert keyed by `workflow_type` (this block's own `what`), so
+/// the two re-registrations simply replace the Noop-seamed factories
+/// [`register_builtin_workflows_with_registry`] installed a moment
+/// earlier. [`register_builtin_workflows`] itself is UNCHANGED — it keeps
+/// calling the no-transport paths internally, so its own
+/// `dispatch_sweep_builds_a_runnable_workflow_and_writes_a_snapshot` test
+/// passes unmodified with `SWEEP` still using [`NoopOperatorTransport`](engine_core::workflows::sweep::NoopOperatorTransport).
+pub fn register_builtin_workflows_with_operator(
+    dispatcher: &mut Dispatcher,
+    transport: Arc<dyn engine_core::operator::transport::OperatorTransport>,
+) {
+    register_builtin_workflows_with_registry(dispatcher, repo_registry());
+    register_sweep_with(
+        dispatcher,
+        transport.clone(),
+        Arc::new(engine_core::workflows::sweep::NoopLaneWake),
+    );
+    register_orchestration_with_registry(
+        dispatcher,
+        repo_registry(),
+        Arc::new(engine_core::workflows::orchestration::coord_lane::QueueHoldSource::new()),
+        transport,
+    );
 }
 
 #[cfg(test)]
@@ -3461,6 +3499,140 @@ mod tests {
         assert!(dispatcher.is_registered("SWEEP"));
     }
 
+    // ── EN.17.C task 5: register_builtin_workflows_with_operator ──────────
+
+    /// A counting [`engine_core::operator::transport::OperatorTransport`]
+    /// used only to prove a `SWEEP` dispatched from
+    /// `register_builtin_workflows_with_operator` actually routes a
+    /// `notification`-channel escalation through the injected transport.
+    struct CountingOperatorTransport {
+        sends: std::sync::atomic::AtomicUsize,
+    }
+
+    impl CountingOperatorTransport {
+        fn new() -> Self {
+            Self {
+                sends: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl engine_core::operator::transport::OperatorTransport for CountingOperatorTransport {
+        async fn send(
+            &self,
+            _payload: &engine_core::operator::ValidatedOperatorPayload,
+        ) -> Result<
+            engine_core::operator::transport::DeliveredMessage,
+            engine_core::operator::transport::NotifyError,
+        > {
+            self.sends.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(engine_core::operator::transport::DeliveredMessage {
+                transport_message_id: String::new(),
+            })
+        }
+
+        async fn poll_responses(
+            &self,
+            since: Option<engine_core::operator::transport::UpdateCursor>,
+        ) -> Result<
+            (
+                Vec<engine_core::operator::transport::OperatorResponse>,
+                Option<engine_core::operator::transport::UpdateCursor>,
+            ),
+            engine_core::operator::transport::NotifyError,
+        > {
+            Ok((Vec::new(), since))
+        }
+    }
+
+    /// AC: "`register_builtin_workflows_with_operator` registers the same
+    /// set of workflow types as `register_builtin_workflows`."
+    #[test]
+    fn register_builtin_workflows_with_operator_registers_the_same_workflow_types() {
+        let mut plain = Dispatcher::new();
+        register_builtin_workflows(&mut plain);
+
+        let mut with_operator = Dispatcher::new();
+        register_builtin_workflows_with_operator(
+            &mut with_operator,
+            Arc::new(engine_core::workflows::sweep::NoopOperatorTransport),
+        );
+
+        let mut plain_types = plain.registered_types();
+        let mut with_operator_types = with_operator.registered_types();
+        plain_types.sort();
+        with_operator_types.sort();
+
+        assert_eq!(
+            plain_types, with_operator_types,
+            "register_builtin_workflows_with_operator must register exactly the same \
+             workflow_type set as register_builtin_workflows"
+        );
+    }
+
+    /// AC: "A SWEEP dispatched from `register_builtin_workflows_with_operator`
+    /// over a fixture roadmap with one new `notification` escalation calls
+    /// a stub transport's `send` exactly once."
+    #[tokio::test]
+    async fn sweep_from_register_builtin_workflows_with_operator_sends_one_notification() {
+        let root = tempfile::tempdir().unwrap();
+        let roadmap_dir = root.path().join("planning/roadmaps/demo-roadmap");
+        std::fs::create_dir_all(&roadmap_dir).unwrap();
+        std::fs::write(roadmap_dir.join("lane-log.jsonl"), "").unwrap();
+        std::fs::write(
+            roadmap_dir.join("escalations.jsonl"),
+            serde_json::json!({
+                "gate_id": "g1",
+                "kind": "advisory",
+                "channel": "notification",
+                "severity": "advisory",
+                "summary": "something happened",
+                "options": [
+                    {"key": "ack", "label": "Seen"},
+                    {"key": "later", "label": "Later"},
+                ],
+            })
+            .to_string()
+                + "\n",
+        )
+        .unwrap();
+
+        let transport = Arc::new(CountingOperatorTransport::new());
+        let mut dispatcher = Dispatcher::new();
+        register_builtin_workflows_with_operator(&mut dispatcher, transport.clone());
+
+        let workflow = dispatcher
+            .dispatch_with_event(
+                "SWEEP",
+                &serde_json::json!({
+                    "root": root.path().to_string_lossy(),
+                    "roadmap": "demo-roadmap",
+                    "now": "2026-09-08T00:00:00Z",
+                }),
+            )
+            .expect("SWEEP should dispatch to a runnable Workflow");
+
+        let _ctx = workflow
+            .run(
+                serde_json::json!({
+                    "root": root.path().to_string_lossy(),
+                    "roadmap": "demo-roadmap",
+                    "now": "2026-09-08T00:00:00Z",
+                }),
+                Box::new(|_ctx| {}),
+            )
+            .await
+            .expect("SWEEP run itself should not error");
+
+        assert_eq!(
+            transport.sends.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "a fresh notification-channel escalation must route through the injected \
+             transport exactly once"
+        );
+    }
+
     #[test]
     fn resolve_schema_returns_schema_with_recall_start_node() {
         let mut dispatcher = Dispatcher::new();
@@ -3993,6 +4165,7 @@ mod tests {
             &mut dispatcher,
             None,
             Arc::new(engine_core::workflows::orchestration::coord_lane::QueueHoldSource::new()),
+            Arc::new(engine_core::workflows::sweep::NoopOperatorTransport),
         );
 
         let workflow = dispatcher
@@ -4019,6 +4192,7 @@ mod tests {
             &mut dispatcher,
             Some(repo_reg),
             Arc::new(engine_core::workflows::orchestration::integrate::NeverHeld),
+            Arc::new(engine_core::workflows::sweep::NoopOperatorTransport),
         );
 
         let workflow = dispatcher
@@ -4051,7 +4225,12 @@ mod tests {
 
         let dir = orchestration_brain_root(open_block_state_json());
         let mut dispatcher = Dispatcher::new();
-        register_orchestration_with_registry(&mut dispatcher, None, Arc::new(AlwaysHeld));
+        register_orchestration_with_registry(
+            &mut dispatcher,
+            None,
+            Arc::new(AlwaysHeld),
+            Arc::new(engine_core::workflows::sweep::NoopOperatorTransport),
+        );
 
         let workflow = dispatcher.dispatch_with_event(
             "ORCHESTRATION",
@@ -4080,6 +4259,7 @@ mod tests {
             &mut dispatcher,
             None,
             Arc::new(engine_core::workflows::orchestration::integrate::NeverHeld),
+            Arc::new(engine_core::workflows::sweep::NoopOperatorTransport),
         );
 
         let result = dispatcher.dispatch_with_event(
@@ -4140,6 +4320,7 @@ mod tests {
             &mut dispatcher,
             None,
             Arc::new(engine_core::workflows::orchestration::integrate::NeverHeld),
+            Arc::new(engine_core::workflows::sweep::NoopOperatorTransport),
         );
 
         let workflow = dispatcher
