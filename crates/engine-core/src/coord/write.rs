@@ -285,7 +285,10 @@ fn lease_is_stale(existing: &LeaseRecord, now_iso: &str) -> bool {
         // (not stale) rather than risk replacing a live foreign lease.
         return false;
     };
-    let liveness = existing.heartbeat.as_deref().unwrap_or(&existing.acquired_at);
+    let liveness = existing
+        .heartbeat
+        .as_deref()
+        .unwrap_or(&existing.acquired_at);
     let Ok(then) = chrono::DateTime::parse_from_rfc3339(liveness) else {
         return false;
     };
@@ -2016,10 +2019,7 @@ mod tests {
 
         let outcome = unlease_own(dir.path(), "engine-rs", "A")
             .expect("unlease_own over an unreadable lease must not error");
-        assert_eq!(
-            outcome,
-            UnleaseOutcome::Unreadable { path: path.clone() }
-        );
+        assert_eq!(outcome, UnleaseOutcome::Unreadable { path: path.clone() });
         assert!(path.exists(), "an unreadable lease must be left in place");
         let bytes_after = fs::read(&path).expect("lease file must still be readable");
         assert_eq!(

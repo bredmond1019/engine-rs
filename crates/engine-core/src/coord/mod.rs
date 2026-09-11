@@ -965,11 +965,8 @@ mod tests {
         fs::create_dir_all(&flat_inbox).expect("create flat inbox dir");
         fs::write(
             flat_inbox.join("2026-09-03T12-30-00Z-abc123.json"),
-            serde_json::to_string(&message_json(
-                "abc123",
-                "2026-09-03T12:30:00Z",
-            ))
-            .expect("serialize"),
+            serde_json::to_string(&message_json("abc123", "2026-09-03T12:30:00Z"))
+                .expect("serialize"),
         )
         .expect("write legacy flat message");
 

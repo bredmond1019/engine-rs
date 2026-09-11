@@ -24,6 +24,7 @@ use std::time::Duration;
 
 use serde_json::json;
 
+use engine_core::coord::write::{lease as raw_lease, LeaseRequest};
 use engine_core::policy::permission::{GatedAction, PermissionProfile};
 use engine_core::repo_registry::RepoRegistry;
 use engine_core::workflows::orchestration::chain::ChainStep;
@@ -33,7 +34,6 @@ use engine_core::workflows::orchestration::gates::{
     check_permission_gate, make_author_operator_edge, AdmissionGate, OperatorEdgeAuthorConfig,
     PermissionGateError,
 };
-use engine_core::coord::write::{lease as raw_lease, LeaseRequest};
 use engine_core::workflows::orchestration::integrate::{
     integrate_chain_with_coord, CoordOp, IntegrateError, NeverHeld, StepProgress,
 };
@@ -913,8 +913,7 @@ async fn run_chain_fallible(
     runner: &FlowRunner,
     roadmap_dir: &Path,
     coord: Option<&CoordHandle>,
-) -> Result<Vec<engine_core::workflows::orchestration::execute::ExecutionOutcome>, IntegrateError>
-{
+) -> Result<Vec<engine_core::workflows::orchestration::execute::ExecutionOutcome>, IntegrateError> {
     let resolve_engine = |_repo: &str, _id: &str| EngineKind::Flow;
     let resolve_deps = |_repo: &str, _id: &str| Vec::new();
     let is_met = |_repo: &str, _id: &str| true;
@@ -992,8 +991,8 @@ async fn coord_chain_refused_lease_runs_no_step() {
     );
 
     let chain = vec![step("repo-a", "A.1")];
-    let result = run_chain_fallible(&chain, &registry, &runner, roadmap_dir.path(), Some(&coord))
-        .await;
+    let result =
+        run_chain_fallible(&chain, &registry, &runner, roadmap_dir.path(), Some(&coord)).await;
     let _ = &dir; // registry's own temp dir kept alive for the duration of the call above
 
     match result {
@@ -1060,8 +1059,8 @@ async fn coord_chain_refused_lease_leaves_the_foreign_lease_intact() {
     );
 
     let chain = vec![step("repo-a", "A.1")];
-    let result = run_chain_fallible(&chain, &registry, &runner, roadmap_dir.path(), Some(&coord))
-        .await;
+    let result =
+        run_chain_fallible(&chain, &registry, &runner, roadmap_dir.path(), Some(&coord)).await;
     assert!(
         matches!(
             result,
@@ -1109,8 +1108,8 @@ async fn coord_chain_refused_register_runs_nothing() {
     );
 
     let chain = vec![step("repo-a", "A.1")];
-    let result = run_chain_fallible(&chain, &registry, &runner, roadmap_dir.path(), Some(&coord))
-        .await;
+    let result =
+        run_chain_fallible(&chain, &registry, &runner, roadmap_dir.path(), Some(&coord)).await;
     let _ = &dir;
 
     match result {
@@ -1119,9 +1118,7 @@ async fn coord_chain_refused_register_runs_nothing() {
             block_id: None,
             ..
         }) => {}
-        other => panic!(
-            "expected CoordRefused{{op: Register, block_id: None}}, got {other:?}"
-        ),
+        other => panic!("expected CoordRefused{{op: Register, block_id: None}}, got {other:?}"),
     }
 
     assert_eq!(

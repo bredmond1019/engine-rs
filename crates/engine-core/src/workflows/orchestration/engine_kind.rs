@@ -342,11 +342,11 @@ mod tests {
                 ],
             ),
             // `resolve_roadmap_dir` resolves a roadmap slug to its planning directory —
-            // a path lookup, not a runner. `closed`/`bailed`/`cancelled`/`budget_halted`
-            // are `LaneLogEntry` constructors taking a `lane: &str` and a
-            // `note: impl Into<String>` (`EN.11.F` task 4 adds the latter two, same
-            // shape as the existing pair) — building a log line, not selecting or
-            // invoking a runner.
+            // a path lookup, not a runner. `closed`/`bailed`/`cancelled`/`budget_halted`/
+            // `held` are `LaneLogEntry` constructors taking a `lane: &str` and a
+            // `note: impl Into<String>` (`EN.11.F` task 4 adds the first two of the
+            // latter pair; `EN.17.A` task 4 adds `held`, same shape) — building a log
+            // line, not selecting or invoking a runner.
             (
                 "integrate.rs",
                 &[
@@ -355,6 +355,7 @@ mod tests {
                     "bailed",
                     "cancelled",
                     "budget_halted",
+                    "held",
                 ],
             ),
             // Scan-list drift fix (`EN.15.L` Task 5, same class of drift `escalate.rs`'s and
