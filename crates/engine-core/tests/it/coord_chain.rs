@@ -33,8 +33,9 @@ use engine_core::workflows::orchestration::gates::{
     check_permission_gate, make_author_operator_edge, AdmissionGate, OperatorEdgeAuthorConfig,
     PermissionGateError,
 };
+use engine_core::coord::write::{lease as raw_lease, LeaseRequest};
 use engine_core::workflows::orchestration::integrate::{
-    integrate_chain_with_coord, NeverHeld, StepProgress,
+    integrate_chain_with_coord, CoordOp, IntegrateError, NeverHeld, StepProgress,
 };
 
 // ── Shared fixture helpers — mirrors `orchestration::integrate`'s own `mod tests` helpers
@@ -897,5 +898,235 @@ fn a_denied_action_through_check_permission_gate_also_enqueues_a_notification_es
     assert!(
         value["summary"].as_str().unwrap_or_default().len() > 0,
         "the escalation must name the gate: {value:?}"
+    );
+}
+
+// ── (g) `EN.17.A` task 5 — a refused lease/register stops the chain before any step runs,
+//        and never touches a foreign lease it does not own ──────────────────────────────
+
+/// Same shape as [`run_chain`] but returns the `Result` instead of `.expect`-ing success —
+/// every test in this section drives a refusal, so the whole point is inspecting the `Err`.
+#[allow(clippy::too_many_arguments)]
+async fn run_chain_fallible(
+    chain: &[ChainStep],
+    registry: &RepoRegistry,
+    runner: &FlowRunner,
+    roadmap_dir: &Path,
+    coord: Option<&CoordHandle>,
+) -> Result<Vec<engine_core::workflows::orchestration::execute::ExecutionOutcome>, IntegrateError>
+{
+    let resolve_engine = |_repo: &str, _id: &str| EngineKind::Flow;
+    let resolve_deps = |_repo: &str, _id: &str| Vec::new();
+    let is_met = |_repo: &str, _id: &str| true;
+    let admission = AdmissionGate::with_default_policy();
+
+    integrate_chain_with_coord(
+        chain,
+        &resolve_deps,
+        &is_met,
+        &admission,
+        &NeverHeld,
+        Duration::from_millis(1),
+        None,
+        None,
+        None,
+        &resolve_engine,
+        registry,
+        runner,
+        roadmap_dir,
+        None,
+        &|_: &StepProgress| {},
+        false,
+        true,
+        uuid::Uuid::new_v4(),
+        &|_repo: &str, _id: &str| {},
+        coord,
+    )
+    .await
+}
+
+/// Seeds a live (never stale) `Exclusive` lease on `repo`, held by `holder_agent` /
+/// `holder_lane`, directly through the shared write seam (`coord::write::lease`) — the same
+/// seam `CoordHandle::lease` itself calls into, standing in for another agent's lane already
+/// holding the repo when this chain's own `CoordHandle::lease` call is made.
+fn seed_foreign_lease(lock_dir: &Path, repo: &str, holder_agent: &str, holder_lane: &str) {
+    let now = coord_now_iso();
+    let no_blocks: Vec<String> = Vec::new();
+    let req = LeaseRequest {
+        repo,
+        lane: holder_lane,
+        agent: holder_agent,
+        kind: okf_core::LeaseKind::Exclusive,
+        scope: None,
+        host: None,
+        now_iso: &now,
+        window: None,
+        lane_blocks: &no_blocks,
+    };
+    raw_lease(lock_dir, &req).expect("seeding the foreign lease must succeed");
+}
+
+/// A `coord`-driven chain whose step's repo already carries a live lease held by a DIFFERENT
+/// agent: the chain's own `handle.lease(...)` call is refused (`CoordWriteError::LeaseHeld`),
+/// which surfaces as `IntegrateError::CoordRefused { op: CoordOp::Lease, .. }` — and the step
+/// itself never runs at all (the refusal returns BEFORE `StepLeaseGuard`/`execute_step`), so
+/// the dispatcher/stub counter this test's runner tracks stays at 0.
+#[tokio::test]
+async fn coord_chain_refused_lease_runs_no_step() {
+    let (dir, registry) = one_repo_registry();
+    let (runner, calls) = recording_runner();
+    let roadmap_dir = tempfile::tempdir().unwrap();
+    let lock_dir = tempfile::tempdir().unwrap();
+
+    seed_foreign_lease(lock_dir.path(), "repo-a", "agent-a", "other-lane");
+    let lease_path = lock_dir.path().join("leases").join("lease-repo-a.json");
+    let before = std::fs::read_to_string(&lease_path).expect("read seeded lease file");
+
+    // A THIRD agent — distinct from the foreign holder `agent-a` — driving this chain.
+    let coord = CoordHandle::new(
+        lock_dir.path().to_path_buf(),
+        "repo-a",
+        "engine-rs",
+        "engine-rs-1",
+        coord_now_iso,
+    );
+
+    let chain = vec![step("repo-a", "A.1")];
+    let result = run_chain_fallible(&chain, &registry, &runner, roadmap_dir.path(), Some(&coord))
+        .await;
+    let _ = &dir; // registry's own temp dir kept alive for the duration of the call above
+
+    match result {
+        Err(IntegrateError::CoordRefused {
+            op: CoordOp::Lease,
+            block_id,
+            ..
+        }) => {
+            assert_eq!(block_id.as_deref(), Some("A.1"));
+        }
+        other => panic!("expected CoordRefused{{op: Lease}}, got {other:?}"),
+    }
+
+    assert_eq!(
+        calls.lock().unwrap().len(),
+        0,
+        "a refused lease must run zero steps"
+    );
+
+    let lane_log = std::fs::read_to_string(roadmap_dir.path().join("lane-log.jsonl"))
+        .expect("lane-log.jsonl must have been written");
+    let held_lines: Vec<&str> = lane_log
+        .lines()
+        .filter(|l| l.contains("\"status\":\"held\""))
+        .collect();
+    assert_eq!(
+        held_lines.len(),
+        1,
+        "exactly one held lane-log line, got: {lane_log}"
+    );
+    assert!(
+        held_lines[0].contains("agent-a"),
+        "the held line must name the holder: {}",
+        held_lines[0]
+    );
+
+    let after = std::fs::read_to_string(&lease_path).expect("read lease file after the refusal");
+    assert_eq!(
+        before, after,
+        "the foreign lease file must be byte-identical after the refused call"
+    );
+}
+
+/// The regression this whole block exists to fix: before `EN.17.A`, a refused lease's guard
+/// `Drop` deleted the foreign lease it never actually acquired. Same fixture as the previous
+/// test, with the before/after lease-file comparison as its own dedicated assertion.
+#[tokio::test]
+async fn coord_chain_refused_lease_leaves_the_foreign_lease_intact() {
+    let (dir, registry) = one_repo_registry();
+    let (runner, _calls) = recording_runner();
+    let roadmap_dir = tempfile::tempdir().unwrap();
+    let lock_dir = tempfile::tempdir().unwrap();
+
+    seed_foreign_lease(lock_dir.path(), "repo-a", "agent-a", "other-lane");
+    let lease_path = lock_dir.path().join("leases").join("lease-repo-a.json");
+    let before = std::fs::read_to_string(&lease_path).expect("read seeded lease file");
+
+    let coord = CoordHandle::new(
+        lock_dir.path().to_path_buf(),
+        "repo-a",
+        "engine-rs",
+        "engine-rs-1",
+        coord_now_iso,
+    );
+
+    let chain = vec![step("repo-a", "A.1")];
+    let result = run_chain_fallible(&chain, &registry, &runner, roadmap_dir.path(), Some(&coord))
+        .await;
+    assert!(
+        matches!(
+            result,
+            Err(IntegrateError::CoordRefused {
+                op: CoordOp::Lease,
+                ..
+            })
+        ),
+        "expected CoordRefused{{op: Lease}}, got {result:?}"
+    );
+    let _ = &dir; // registry's own temp dir kept alive for the duration of the call above
+
+    let after = std::fs::read_to_string(&lease_path)
+        .expect("the lease file must still exist and be readable after the refusal");
+    assert_eq!(
+        before, after,
+        "a refused lease must leave the pre-existing foreign lease file byte-identical — \
+         before EN.17.A, StepLeaseGuard's Drop deleted it even though this chain never \
+         acquired it"
+    );
+}
+
+/// A refused `register` call — here, `create_dir_all("<lock_dir>/lane-agents")` fails
+/// because a plain FILE already sits at that path — stops the chain before the per-step loop
+/// even begins: no dispatcher/runner call happens at all, and the error surfaces as
+/// `IntegrateError::CoordRefused { op: CoordOp::Register, block_id: None, .. }` (register
+/// runs once for the whole chain, not per step).
+#[tokio::test]
+async fn coord_chain_refused_register_runs_nothing() {
+    let (dir, registry) = one_repo_registry();
+    let (runner, calls) = recording_runner();
+    let roadmap_dir = tempfile::tempdir().unwrap();
+    let lock_dir = tempfile::tempdir().unwrap();
+
+    // A regular file where `register` needs a directory — `create_dir_all` fails with
+    // `CoordWriteError::Io`.
+    std::fs::write(lock_dir.path().join("lane-agents"), b"not a directory").unwrap();
+
+    let coord = CoordHandle::new(
+        lock_dir.path().to_path_buf(),
+        "repo-a",
+        "engine-rs",
+        "engine-rs-1",
+        coord_now_iso,
+    );
+
+    let chain = vec![step("repo-a", "A.1")];
+    let result = run_chain_fallible(&chain, &registry, &runner, roadmap_dir.path(), Some(&coord))
+        .await;
+    let _ = &dir;
+
+    match result {
+        Err(IntegrateError::CoordRefused {
+            op: CoordOp::Register,
+            block_id: None,
+            ..
+        }) => {}
+        other => panic!(
+            "expected CoordRefused{{op: Register, block_id: None}}, got {other:?}"
+        ),
+    }
+
+    assert_eq!(
+        calls.lock().unwrap().len(),
+        0,
+        "a refused register must run zero steps"
     );
 }
