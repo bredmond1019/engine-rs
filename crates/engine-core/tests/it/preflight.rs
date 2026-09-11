@@ -351,6 +351,21 @@ fn preflight_git_output_and_global_options_are_refused() {
 
 #[test]
 fn preflight_ripgrep_config_env_is_not_inherited() {
+    // A guard for this working tree, not a hard dependency: this repo's hosted CI runner has no
+    // `rg` on PATH (unlike local dev machines and the Mac Mini, both of which install it via
+    // Homebrew), and this test's whole point is exercising the REAL cleared-environment runner
+    // against a REAL rg invocation, which a stub can't substitute for. Skip rather than fail when
+    // rg is absent, matching this repo's other environment-dependent tests.
+    if std::process::Command::new("rg")
+        .arg("--version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_err()
+    {
+        eprintln!("skipping preflight_ripgrep_config_env_is_not_inherited: rg not on PATH");
+        return;
+    }
     let dir = tempfile::tempdir().expect("tempdir");
     let marker = dir.path().join("ripgrep-config-marker");
     let script = dir.path().join("marker.sh");
