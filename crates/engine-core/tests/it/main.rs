@@ -44,6 +44,7 @@ mod locale_rate_card;
 mod materialize_doc;
 mod node_invocations;
 mod operator_queue;
+mod operator_reach;
 mod opportunity_loop_e2e;
 mod orchestration;
 mod orchestration_bail;

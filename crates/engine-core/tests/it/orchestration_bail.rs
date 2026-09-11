@@ -70,12 +70,17 @@ use std::time::Duration;
 
 use serde_json::json;
 
+use engine_contract::TaskContext;
+use engine_core::node::Node;
+use engine_core::policy::PolicyConfigSource;
 use engine_core::repo_registry::RepoRegistry;
 use engine_core::workflows::orchestration::chain::ChainStep;
 use engine_core::workflows::orchestration::corpus_gates::{BlockPresence, CorpusGates};
-use engine_core::workflows::orchestration::execute::{EngineKind, FlowRunner};
+use engine_core::workflows::orchestration::execute::{EngineKind, FlowInvocation, FlowRunner};
 use engine_core::workflows::orchestration::gates::{AdmissionGate, DependencyEdge};
-use engine_core::workflows::orchestration::graph::OnBail;
+use engine_core::workflows::orchestration::graph::{
+    resolve_policy_for_run_from, OnBail, OrchestrationRunNode,
+};
 use engine_core::workflows::orchestration::integrate::{
     integrate_chain_with_coord, integrate_chain_with_coord_and_policy, ChainReport, NeverHeld,
     StepProgress,
@@ -231,6 +236,13 @@ async fn run_chain(
         None,
         None,
         on_bail,
+        // `EN.17.C` task 4: this helper's callers all leave the escalation
+        // channel at its built-in default — the new resolution-level
+        // coverage below (`hq_bail_channel_node_run_writes_notification_escalation`)
+        // drives `OrchestrationRunNode` directly instead, since that is the
+        // only path a brain root's `orchestration.policy.bail_channel`
+        // switch actually resolves through.
+        engine_core::workflows::orchestration::graph::BailChannel::Session,
         block_status,
         report,
     )
@@ -758,4 +770,240 @@ async fn orchestration_bail_stop_chain_default_is_unchanged() {
         &["A.1".to_string()],
         "B.1 must never have been dispatched under the built-in default"
     );
+}
+
+// ── `EN.17.C` task 4 — `orchestration.policy.bail_channel` resolution ───
+//
+// Mirrors `hq_orchestration_policy.rs`'s own `on_bail` resolution coverage
+// (`hq_orchestration_policy_node_run_uses_brain_root_policy`): a chain run
+// through `OrchestrationRunNode`, from a fixture brain root, with no inline
+// event `policy` override, composes its bail escalation against whichever
+// `bail_channel` that brain root's own `planning/harness.json` resolves —
+// proving `graph.rs`'s `OrchestrationRunNode::process` now threads the
+// ACTUALLY RESOLVED `OrchestrationPolicy::bail_channel` through
+// `integrate_chain_with_coord_and_policy`, rather than task 2's
+// `BailChannel::Session` placeholder.
+
+/// A tempdir `brain.toml` + one real repo directory (a REAL git repo —
+/// `record_bail_escalation` shells out to `git rev-parse` on the subject
+/// repo to stamp `verified_at_sha`, so a bare empty directory makes it
+/// return early and skip writing the escalation entirely) + the
+/// `planning/roadmaps/<slug>` directory `resolve_roadmap_dir` (Step 1C)
+/// requires to exist up front.
+fn one_repo_brain_root_with_roadmap(slug: &str) -> tempfile::TempDir {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo_a = dir.path().join("repo-a");
+    std::fs::create_dir_all(&repo_a).unwrap();
+    std::fs::create_dir_all(dir.path().join("planning").join("roadmaps").join(slug)).unwrap();
+    std::fs::write(
+        dir.path().join("brain.toml"),
+        "[[repos]]\nslug = \"repo-a\"\nrepo_path = \"repo-a\"\n",
+    )
+    .unwrap();
+
+    fn run_git(cwd: &Path, args: &[&str]) {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .current_dir(cwd)
+            .output()
+            .unwrap_or_else(|e| panic!("failed to spawn `git {}`: {e}", args.join(" ")));
+        assert!(
+            output.status.success(),
+            "`git {}` in {cwd:?} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    run_git(&repo_a, &["init", "-q"]);
+    run_git(
+        &repo_a,
+        &["config", "user.email", "fixture@example.invalid"],
+    );
+    run_git(&repo_a, &["config", "user.name", "EN.17.C Fixture"]);
+    std::fs::write(repo_a.join("README.md"), "initial\n").unwrap();
+    run_git(&repo_a, &["add", "-A"]);
+    run_git(&repo_a, &["commit", "-q", "-m", "initial"]);
+
+    dir
+}
+
+/// Writes `<brain_root>/planning/harness.json` with an
+/// `orchestration.policy.bail_channel` switch — same shape as
+/// `hq_orchestration_policy.rs`'s own `write_on_bail_harness`, no
+/// `orchestration.profiles` section (the PROFILE RULE fixture convention
+/// that file's own doc explains).
+fn write_bail_channel_harness(brain_root: &Path, bail_channel: &str) {
+    let harness = json!({
+        "orchestration": {
+            "policy": { "bail_channel": bail_channel }
+        }
+    });
+    std::fs::create_dir_all(brain_root.join("planning")).unwrap();
+    std::fs::write(
+        brain_root.join("planning").join("harness.json"),
+        serde_json::to_string_pretty(&harness).unwrap(),
+    )
+    .unwrap();
+}
+
+/// `resolve_policy_for_run_from` reads a fixture brain root's
+/// `orchestration.policy.bail_channel: notification` switch (and no
+/// `orchestration.profiles` at all) into `BailChannel::Notification`; a
+/// fixture root with no `orchestration` key at all resolves the built-in
+/// default, `BailChannel::Session`.
+#[test]
+fn hq_bail_channel_fixture_root_resolves_bail_channel() {
+    let dir = one_repo_brain_root_with_roadmap("bail-channel-fixture");
+    write_bail_channel_harness(dir.path(), "notification");
+    let source = PolicyConfigSource::Worktree(dir.path().to_path_buf());
+    let ctx = TaskContext {
+        event: json!({ "brain_root": dir.path() }),
+        nodes: HashMap::new(),
+        metadata: json!({}),
+        node_runs: HashMap::new(),
+    };
+    let resolved = resolve_policy_for_run_from(&ctx, &source).expect("resolves");
+    assert_eq!(
+        resolved.bail_channel,
+        engine_core::workflows::orchestration::graph::BailChannel::Notification
+    );
+
+    let dir_no_switch = one_repo_brain_root_with_roadmap("bail-channel-fixture-default");
+    let source_no_switch = PolicyConfigSource::Worktree(dir_no_switch.path().to_path_buf());
+    let ctx_no_switch = TaskContext {
+        event: json!({ "brain_root": dir_no_switch.path() }),
+        nodes: HashMap::new(),
+        metadata: json!({}),
+        node_runs: HashMap::new(),
+    };
+    let resolved_no_switch = resolve_policy_for_run_from(&ctx_no_switch, &source_no_switch)
+        .expect("resolves with no orchestration key at all");
+    assert_eq!(
+        resolved_no_switch.bail_channel,
+        engine_core::workflows::orchestration::graph::BailChannel::Session
+    );
+}
+
+/// A `FlowRunner` that always fails `A.1` and succeeds (writing a `"done"`
+/// state file) for anything else — mirrors `hq_orchestration_policy.rs`'s
+/// own `run_one_block_chain` pattern, duplicated here per this file's own
+/// module-doc convention.
+fn always_fails_a1_run_flow() -> FlowRunner {
+    Arc::new(move |invocation: FlowInvocation| {
+        Box::pin(async move {
+            if invocation.block_id == "A.1" {
+                return Err(WorkflowError::new("simulated failure for A.1".to_string()));
+            }
+            let dir = invocation
+                .repo_path
+                .join("planning")
+                .join(&invocation.block_id)
+                .join("sdlc");
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(
+                dir.join("sdlc-flow-state.json"),
+                json!({ "status": "done" }).to_string(),
+            )
+            .unwrap();
+            Ok(TaskContext {
+                event: json!({}),
+                nodes: HashMap::new(),
+                metadata: json!({}),
+                node_runs: HashMap::new(),
+            })
+        })
+    })
+}
+
+/// AC2: a fixture brain root whose `planning/harness.json` sets
+/// `orchestration.policy.bail_channel: notification` — with NO inline event
+/// `policy` override — runs a one-block chain through `OrchestrationRunNode`
+/// that bails on `A.1`, and the resulting `escalations.jsonl` line reads
+/// `channel: notification`.
+#[tokio::test]
+async fn hq_bail_channel_node_run_writes_notification_escalation() {
+    let dir = one_repo_brain_root_with_roadmap("bail-channel-notification");
+    write_bail_channel_harness(dir.path(), "notification");
+
+    let node = OrchestrationRunNode::new().with_run_flow(always_fails_a1_run_flow());
+    let ctx = TaskContext {
+        event: json!({
+            "brain_root": dir.path(),
+            "blocks": [{ "repo": "repo-a", "block_id": "A.1" }],
+            "roadmap_slug": "bail-channel-notification",
+        }),
+        nodes: HashMap::new(),
+        metadata: json!({}),
+        node_runs: HashMap::new(),
+    };
+    let err = node
+        .process(ctx)
+        .await
+        .expect_err("A.1 bails, so the node reports the run as failed");
+    assert!(err.message.contains("A.1"));
+
+    let escalations_path = dir
+        .path()
+        .join("planning")
+        .join("roadmaps")
+        .join("bail-channel-notification")
+        .join("escalations.jsonl");
+    let contents = std::fs::read_to_string(&escalations_path).unwrap_or_else(|e| {
+        panic!("expected an escalations.jsonl line at {escalations_path:?}: {e}")
+    });
+    let line = contents.lines().next().expect("one escalation line");
+    let value: serde_json::Value = serde_json::from_str(line).unwrap();
+    assert_eq!(
+        value["channel"],
+        json!("notification"),
+        "resolved bail_channel: notification must compose a notification-channel \
+         escalation, not the session default: {value}"
+    );
+}
+
+/// AC3: a fixture brain root with NO `orchestration` key at all resolves the
+/// built-in default (`BailChannel::Session`), so the same bailing chain's
+/// escalation still reads `channel: session:<lane>` — unchanged from before
+/// this task's threading existed.
+#[tokio::test]
+async fn hq_bail_channel_node_run_defaults_to_session_escalation() {
+    let dir = one_repo_brain_root_with_roadmap("bail-channel-default");
+    // No harness.json written at all — matches `hq_orchestration_policy.rs`'s
+    // own "no orchestration key" fixture convention.
+
+    let node = OrchestrationRunNode::new().with_run_flow(always_fails_a1_run_flow());
+    let ctx = TaskContext {
+        event: json!({
+            "brain_root": dir.path(),
+            "blocks": [{ "repo": "repo-a", "block_id": "A.1" }],
+            "roadmap_slug": "bail-channel-default",
+        }),
+        nodes: HashMap::new(),
+        metadata: json!({}),
+        node_runs: HashMap::new(),
+    };
+    let err = node
+        .process(ctx)
+        .await
+        .expect_err("A.1 bails, so the node reports the run as failed");
+    assert!(err.message.contains("A.1"));
+
+    let escalations_path = dir
+        .path()
+        .join("planning")
+        .join("roadmaps")
+        .join("bail-channel-default")
+        .join("escalations.jsonl");
+    let contents = std::fs::read_to_string(&escalations_path).unwrap_or_else(|e| {
+        panic!("expected an escalations.jsonl line at {escalations_path:?}: {e}")
+    });
+    let line = contents.lines().next().expect("one escalation line");
+    let value: serde_json::Value = serde_json::from_str(line).unwrap();
+    assert_eq!(
+        value["channel"],
+        json!("session:repo-a"),
+        "with no orchestration.policy.bail_channel key at all, the built-in \
+         BailChannel::Session default must still compose channel: session:<lane>: {value}"
+    );
+    assert!(value.get("options").is_none());
 }

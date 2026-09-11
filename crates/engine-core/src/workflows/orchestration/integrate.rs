@@ -84,11 +84,11 @@ use super::corpus_gates::BlockPresence;
 use super::dispatch::{execute_dispatch_step, DispatchStepError};
 use super::escalate::{
     append_bail_line, append_escalation_line, BailEntry, EscalationChannel, EscalationKind,
-    EscalationRecord, EscalationSeverity, NewBailEntry, NewEscalation,
+    EscalationOption, EscalationRecord, EscalationSeverity, NewBailEntry, NewEscalation,
 };
 use super::execute::{execute_step, EngineKind, ExecuteError, ExecutionOutcome, FlowRunner};
 use super::gates::{check_dependencies, AdmissionGate, DependencyEdge, GateError};
-use super::graph::OnBail;
+use super::graph::{BailChannel, OnBail};
 use crate::coord::write::RegisterOutcome;
 use crate::nodes::brain_client::RECALL_NODE_NAME;
 use crate::workflows::get_result;
@@ -304,6 +304,7 @@ fn subject_repo_short_sha(repo_path: &Path) -> Option<String> {
 /// via [`append_escalation_line`]/[`append_bail_line`] — never rewrites or truncates
 /// either file, since agent lanes append their own lines to the same `escalations.jsonl`
 /// by design.
+#[allow(clippy::too_many_arguments)]
 fn record_bail_escalation(
     roadmap_dir: &Path,
     registry: &RepoRegistry,
@@ -312,6 +313,11 @@ fn record_bail_escalation(
     check_id: &str,
     engine: EngineKind,
     err_display: &str,
+    // `EN.17.C` task 2: which channel this bail's escalation is composed
+    // against — `BailChannel::Session` (every call site, until task 4
+    // threads the resolved `OrchestrationPolicy::bail_channel` value
+    // through) keeps this byte-identical to before this parameter existed.
+    bail_channel: BailChannel,
 ) {
     let roadmap = step.roadmap.as_deref().unwrap_or("no-roadmap");
     let gate_id = format!("{roadmap}/{}/{}", step.repo, step.block_id);
@@ -346,7 +352,22 @@ fn record_bail_escalation(
         step.repo, step.block_id
     );
 
-    match EscalationChannel::session(lane) {
+    // `EN.17.C` task 2: `BailChannel::Session` composes the escalation
+    // exactly as before (`EscalationChannel::session(lane)`), a no-op
+    // change — SWEEP's `LaneWake` is a no-op, so this record is written but
+    // never delivered. `BailChannel::Notification` composes exactly two
+    // acknowledgement-only options instead (each label well within
+    // `OPTION_LABEL_MAX_CHARS`), so SWEEP's dedup/permission-profile/budget
+    // pipeline can route the escalation through a real `OperatorTransport`
+    // (wired up by later tasks in this block). Neither option implies an
+    // action nothing consumes — see this block's own out_of_scope.
+    let channel_result = match bail_channel {
+        BailChannel::Session => EscalationChannel::session(lane),
+        BailChannel::Notification => EscalationOption::new("ack", "Seen")
+            .and_then(|ack| Ok((ack, EscalationOption::new("later", "Later")?)))
+            .and_then(|(ack, later)| EscalationChannel::notification(vec![ack, later])),
+    };
+    match channel_result {
         Ok(channel) => match EscalationRecord::new(NewEscalation {
             ts_utc: Utc::now().to_rfc3339(),
             repo: step.repo.clone(),
@@ -1978,6 +1999,7 @@ pub async fn integrate_chain(
         child_sdlc_flow_policy,
         child_sdlc_task_policy,
         OnBail::StopChain,
+        BailChannel::Session,
         &default_block_status,
         &mut ChainReport::default(),
     )
@@ -2043,6 +2065,7 @@ pub async fn integrate_chain_with_journal(
         None,
         None,
         OnBail::StopChain,
+        BailChannel::Session,
         &default_block_status,
         &mut ChainReport::default(),
     )
@@ -2108,6 +2131,7 @@ pub async fn integrate_chain_with_coord(
         child_sdlc_flow_policy,
         child_sdlc_task_policy,
         OnBail::StopChain,
+        BailChannel::Session,
         &default_block_status,
         &mut ChainReport::default(),
     )
@@ -2117,9 +2141,11 @@ pub async fn integrate_chain_with_coord(
 /// `EN.17.B` task 4: identical to [`integrate_chain_with_coord`], plus the
 /// status-aware boundary and skip-dependents seams —
 /// [`super::graph::OrchestrationRunNode::process`] is this function's only
-/// caller, so `on_bail`/`block_status` carry the resolved
+/// caller, so `on_bail`/`bail_channel`/`block_status` carry the resolved
 /// `OrchestrationPolicy` value and the real `CorpusGates::block_status`
-/// closure respectively. `report` accumulates `closed`/`bailed`/`skipped`
+/// closure respectively (`bail_channel` threaded through by `EN.17.C` task
+/// 4 — until then this function hardcoded `BailChannel::Session`
+/// internally). `report` accumulates `closed`/`bailed`/`skipped`
 /// as the loop runs, so it is populated on BOTH the success and the error
 /// return path — a caller reads it after this call returns regardless of
 /// which branch of the `Result` it got, which is what lets `process` stamp
@@ -2155,6 +2181,13 @@ pub async fn integrate_chain_with_coord_and_policy(
     child_sdlc_flow_policy: Option<&serde_json::Value>,
     child_sdlc_task_policy: Option<&serde_json::Value>,
     on_bail: OnBail,
+    // `EN.17.C` task 4: the resolved `OrchestrationPolicy::bail_channel`
+    // switch, forwarded straight through to `integrate_chain_impl_inner`'s
+    // own parameter of the same name — see that parameter's doc. Added
+    // alongside `on_bail` above, threaded the same way (this function's
+    // only caller, `OrchestrationRunNode::process`, resolves both from the
+    // same `policy` value).
+    bail_channel: BailChannel,
     block_status: &dyn Fn(&str, &str) -> BlockPresence,
     report: &mut ChainReport,
 ) -> Result<Vec<ExecutionOutcome>, IntegrateError> {
@@ -2186,6 +2219,7 @@ pub async fn integrate_chain_with_coord_and_policy(
         child_sdlc_flow_policy,
         child_sdlc_task_policy,
         on_bail,
+        bail_channel,
         block_status,
         report,
     )
@@ -2254,6 +2288,7 @@ pub async fn integrate_chain_with_dispatch(
         None,
         None,
         OnBail::StopChain,
+        BailChannel::Session,
         &default_block_status,
         &mut ChainReport::default(),
     )
@@ -2326,6 +2361,7 @@ pub async fn integrate_chain_with_run_record(
         None,
         None,
         OnBail::StopChain,
+        BailChannel::Session,
         &default_block_status,
         &mut ChainReport::default(),
     )
@@ -2400,6 +2436,9 @@ async fn integrate_chain_impl(
     // fields of the same name — see that function's doc for the full
     // status-aware-boundary / skip-dependents contract.
     on_bail: OnBail,
+    // `EN.17.C` task 2: same contract as `integrate_chain_impl_inner`'s own
+    // field of the same name.
+    bail_channel: BailChannel,
     block_status: &dyn Fn(&str, &str) -> BlockPresence,
     report: &mut ChainReport,
 ) -> Result<Vec<ExecutionOutcome>, IntegrateError> {
@@ -2433,6 +2472,7 @@ async fn integrate_chain_impl(
         child_sdlc_flow_policy,
         child_sdlc_task_policy,
         on_bail,
+        bail_channel,
         block_status,
         report,
     )
@@ -2493,6 +2533,15 @@ async fn integrate_chain_impl_inner(
     // step's own failure, an unmet dependency edge, or a closed/absent block
     // status into a `continue` instead — see the per-site comments below.
     on_bail: OnBail,
+    // `EN.17.C` task 2/4: the resolved `OrchestrationPolicy::bail_channel`
+    // switch, forwarded to every `record_bail_escalation` call this loop
+    // makes. `BailChannel::Session` (every caller EXCEPT
+    // `integrate_chain_with_coord_and_policy`, which now threads the
+    // resolved `OrchestrationPolicy::bail_channel` value through from
+    // `graph.rs`'s `OrchestrationRunNode::process`) keeps
+    // `record_bail_escalation`'s output byte-identical to before this
+    // parameter existed — see that function's own doc.
+    bail_channel: BailChannel,
     // `EN.17.B` task 4: `(repo, block_id) -> BlockPresence` — the status-aware
     // boundary seam, consulted at the top of every iteration regardless of
     // `on_bail`. `default_block_status` (every pre-task-4 caller) always
@@ -2874,6 +2923,7 @@ async fn integrate_chain_impl_inner(
                 "operator-hold",
                 resolve_engine(&step.repo, &step.block_id),
                 &err.to_string(),
+                bail_channel,
             );
             bail_or_skip!(step, err);
         }
@@ -2932,6 +2982,7 @@ async fn integrate_chain_impl_inner(
                     "coord-heartbeat-failed",
                     resolve_engine(&step.repo, &step.block_id),
                     &err.to_string(),
+                    bail_channel,
                 );
                 return Err(IntegrateError::CoordRefused {
                     op: CoordOp::Heartbeat,
@@ -2959,6 +3010,7 @@ async fn integrate_chain_impl_inner(
                     "coord-lease-refused",
                     resolve_engine(&step.repo, &step.block_id),
                     &err.to_string(),
+                    bail_channel,
                 );
                 // `EN.17.B` task 4, part 2 explicitly names "a refused
                 // lease (EN.17.A)" as one of the bail points a later
@@ -3177,6 +3229,7 @@ async fn integrate_chain_impl_inner(
                     "orchestration-step",
                     resolve_engine(&step.repo, &step.block_id),
                     &integrate_err.to_string(),
+                    bail_channel,
                 );
                 // `EN.12.D` task 4: no child `ctx` exists for a step whose
                 // `execute_step` call itself failed — the row keys on a
@@ -3380,6 +3433,7 @@ mod tests {
 
     use serde_json::json;
 
+    use super::super::escalate::OPTION_LABEL_MAX_CHARS;
     use super::super::execute::FlowInvocation;
 
     fn step(repo: &str, block_id: &str) -> ChainStep {
@@ -3475,6 +3529,76 @@ mod tests {
             json!({"status": status}).to_string(),
         )
         .unwrap();
+    }
+
+    /// `EN.17.C` task 2: `BailChannel::Session` composes `record_bail_escalation`'s
+    /// escalation exactly as before this parameter existed — `channel:
+    /// session:<lane>`, no `options` field.
+    #[test]
+    fn record_bail_escalation_session_default_is_unchanged() {
+        let (dir, registry) = two_repo_registry();
+        // `record_bail_escalation` shells out to `git rev-parse` on the
+        // subject repo to stamp `verified_at_sha` — needs a real git repo
+        // underneath, not merely an empty directory.
+        let _bare = init_real_git_repo(&dir.path().join("repo-a"));
+        let roadmap_dir = tempfile::tempdir().unwrap();
+        let step = step("repo-a", "A.1");
+
+        record_bail_escalation(
+            roadmap_dir.path(),
+            &registry,
+            &step,
+            "repo-a",
+            "orchestration-step",
+            EngineKind::Flow,
+            "boom",
+            BailChannel::Session,
+        );
+
+        let contents =
+            std::fs::read_to_string(roadmap_dir.path().join("escalations.jsonl")).unwrap();
+        let line = contents.lines().next().expect("one escalation line");
+        let value: serde_json::Value = serde_json::from_str(line).unwrap();
+        assert_eq!(value["channel"], serde_json::json!("session:repo-a"));
+        assert!(value.get("options").is_none());
+    }
+
+    /// `EN.17.C` task 2: `BailChannel::Notification` composes exactly two
+    /// acknowledgement-only options, each label within
+    /// `OPTION_LABEL_MAX_CHARS`.
+    #[test]
+    fn record_bail_escalation_notification_composes_two_options() {
+        let (dir, registry) = two_repo_registry();
+        let _bare = init_real_git_repo(&dir.path().join("repo-a"));
+        let roadmap_dir = tempfile::tempdir().unwrap();
+        let step = step("repo-a", "A.1");
+
+        record_bail_escalation(
+            roadmap_dir.path(),
+            &registry,
+            &step,
+            "repo-a",
+            "orchestration-step",
+            EngineKind::Flow,
+            "boom",
+            BailChannel::Notification,
+        );
+
+        let contents =
+            std::fs::read_to_string(roadmap_dir.path().join("escalations.jsonl")).unwrap();
+        let line = contents.lines().next().expect("one escalation line");
+        let value: serde_json::Value = serde_json::from_str(line).unwrap();
+        assert_eq!(value["channel"], serde_json::json!("notification"));
+        let options = value["options"].as_array().expect("options array");
+        assert_eq!(options.len(), 2, "exactly two options, never a third");
+        for option in options {
+            let label = option["label"].as_str().expect("label string");
+            assert!(
+                label.chars().count() <= OPTION_LABEL_MAX_CHARS,
+                "label {label:?} exceeds OPTION_LABEL_MAX_CHARS"
+            );
+            assert!(!option["key"].as_str().unwrap().is_empty());
+        }
     }
 
     fn outcome_with_engine(
@@ -6770,6 +6894,7 @@ mod tests {
             None,
             None,
             OnBail::SkipDependents,
+            BailChannel::Session,
             &default_block_status,
             &mut report,
         )
@@ -6831,6 +6956,7 @@ mod tests {
             None,
             None,
             OnBail::StopChain,
+            BailChannel::Session,
             &default_block_status,
             &mut report,
         )
@@ -6893,6 +7019,7 @@ mod tests {
             None,
             None,
             OnBail::StopChain,
+            BailChannel::Session,
             &block_status,
             &mut report,
         )

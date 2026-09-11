@@ -127,7 +127,12 @@ fn never_held() -> Arc<dyn HoldSource> {
 /// `Success`.
 async fn run_wired(hold_source: Arc<dyn HoldSource>, event: serde_json::Value) -> Option<String> {
     let mut dispatcher = Dispatcher::new();
-    register_orchestration_with_registry(&mut dispatcher, None, hold_source);
+    register_orchestration_with_registry(
+        &mut dispatcher,
+        None,
+        hold_source,
+        Arc::new(engine_core::workflows::sweep::NoopOperatorTransport),
+    );
     let workflow = dispatcher
         .dispatch_with_event("ORCHESTRATION", &event)
         .expect("ORCHESTRATION should dispatch to a runnable Workflow");
