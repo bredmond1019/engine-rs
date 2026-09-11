@@ -40,6 +40,7 @@ use okf_core::{LeaseKind, LeaseRecord, Message, MessageRecord};
 use crate::coord::resolve_lock_dir;
 use crate::coord::write::{
     self, CoordWriteError, HeartbeatRequest, LeaseRequest, RegisterOutcome, RegisterRequest,
+    UnleaseOutcome,
 };
 
 /// Everything a Rust-driven chain needs to appear on the fleet's shared coordination tree:
@@ -144,10 +145,21 @@ impl CoordHandle {
         write::lease(&self.lock_dir, &req)
     }
 
-    /// Release the lease on this handle's `repo`, if any. Idempotent — an already-absent lease
-    /// returns `Ok(false)` rather than an error.
+    /// Release the lease on this handle's `repo`, if it is held by THIS handle's own `agent`.
+    /// Delegates to [`write::unlease_own`] (`EN.17.A` task 2) rather than the unconditional
+    /// [`write::unlease`], so a foreign lease left behind by a stopped block is never swept
+    /// away by this handle's own release path. `Removed` maps to `Ok(true)`; every other
+    /// outcome — `NotHeld`, `HeldByOther`, `Unreadable` — maps to `Ok(false)`, since none of
+    /// those is this handle's own removal (a foreign lease left in place must never be
+    /// misreported as this call having removed it). Idempotent on an already-absent lease,
+    /// matching the prior `write::unlease`-backed contract.
     pub fn unlease(&self) -> Result<bool, CoordWriteError> {
-        write::unlease(&self.lock_dir, &self.repo)
+        match write::unlease_own(&self.lock_dir, &self.repo, &self.agent)? {
+            UnleaseOutcome::Removed => Ok(true),
+            UnleaseOutcome::NotHeld
+            | UnleaseOutcome::HeldByOther { .. }
+            | UnleaseOutcome::Unreadable { .. } => Ok(false),
+        }
     }
 
     /// Remove this handle's registry claim. Idempotent — an already-absent claim returns
@@ -296,14 +308,35 @@ impl CoordHandle {
 /// [`init_repo_registry_from_env`](../../../../engine_serve/fn.init_repo_registry_from_env.html)
 /// already follows; a `HoldSource` has no channel to fail loudly through in the first place
 /// (`is_held` returns a plain `bool`, not a `Result`).
-#[derive(Debug, Clone, Copy, Default)]
-pub struct QueueHoldSource;
+#[derive(Debug, Clone, Copy)]
+pub struct QueueHoldSource {
+    /// The clock seam `is_held` judges lease staleness against — a real read by default, an
+    /// injected fixed instant in tests. Same discipline as [`CoordHandle::now_iso`]'s module
+    /// doc: never a frozen literal baked into the comparison itself.
+    now_unix: fn() -> f64,
+}
 
 impl QueueHoldSource {
     /// Build a queue-backed hold source. Takes no arguments — see the struct doc for why the
-    /// lock dir is resolved lazily per call rather than injected here.
+    /// lock dir is resolved lazily per call rather than injected here. Its clock defaults to
+    /// [`epoch_seconds`], the same real-time helper this module already uses for
+    /// [`RegisterRequest::now_epoch`].
     pub fn new() -> Self {
-        Self
+        Self {
+            now_unix: epoch_seconds,
+        }
+    }
+
+    /// Build a queue-backed hold source with an injected clock — for tests that must pin "now"
+    /// against a fixture lease's timestamp rather than racing the real wall clock.
+    pub fn with_clock(now_unix: fn() -> f64) -> Self {
+        Self { now_unix }
+    }
+}
+
+impl Default for QueueHoldSource {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -320,10 +353,33 @@ impl super::integrate::HoldSource for QueueHoldSource {
             return false;
         };
         match serde_json::from_str::<LeaseRecord>(&text) {
-            Ok(record) => record.kind == LeaseKind::Exclusive,
+            Ok(record) => {
+                record.kind == LeaseKind::Exclusive
+                    && !lease_record_is_stale(&record, (self.now_unix)())
+            }
             Err(_) => false,
         }
     }
+}
+
+/// Whether `record`'s liveness timestamp (`heartbeat`, falling back to `acquired_at`) is more
+/// than [`crate::coord::LEASE_STALE_THRESHOLD_SECONDS`] older than `now_unix` (epoch seconds).
+/// Mirrors `crate::coord::write`'s own (module-private) `lease_is_stale` comparison — same
+/// RFC 3339 parse, same "older than the threshold" arithmetic — rather than deriving a second,
+/// differently-shaped staleness formula; duplicated only because that helper is not `pub`, the
+/// same precedent [`safe_component`] and [`append_receipt`] already follow in this module. An
+/// unparsable liveness timestamp is treated as NOT stale — fail closed, so a corrupt record can
+/// never be silently reported as un-held.
+fn lease_record_is_stale(record: &LeaseRecord, now_unix: f64) -> bool {
+    let liveness = record
+        .heartbeat
+        .as_deref()
+        .unwrap_or(record.acquired_at.as_str());
+    let Ok(then) = chrono::DateTime::parse_from_rfc3339(liveness) else {
+        return false;
+    };
+    let then_unix = then.timestamp_millis() as f64 / 1000.0;
+    now_unix - then_unix > crate::coord::LEASE_STALE_THRESHOLD_SECONDS
 }
 
 /// Sanitize a path component exactly like `crate::coord::write`'s own (module-private)
@@ -732,7 +788,18 @@ mod tests {
         }
     }
 
+    /// Writes a lease fixture with a LIVE heartbeat (real "now", not a frozen literal) — the
+    /// same clock-seam discipline this module's own doc warns about (a hardcoded timestamp
+    /// "passes for three hours and then fails forever after"). Tests that care about staleness
+    /// use [`write_lease_at`] with an explicit timestamp instead; this helper is for the
+    /// kind/repo-scoping tests below, which must stay unaffected by real wall-clock drift.
     fn write_lease(lock_dir: &Path, repo: &str, kind: LeaseKind) {
+        write_lease_at(lock_dir, repo, kind, &chrono::Utc::now().to_rfc3339());
+    }
+
+    /// Writes a lease fixture with an explicit `heartbeat`/`acquired_at` timestamp, for tests
+    /// that pin an injected clock against a known-fresh or known-stale fixture instant.
+    fn write_lease_at(lock_dir: &Path, repo: &str, kind: LeaseKind, timestamp: &str) {
         let path = lock_dir
             .join("leases")
             .join(format!("lease-{}.json", safe_component(repo)));
@@ -741,9 +808,9 @@ mod tests {
             "repo": repo,
             "lane": "some-other-lane",
             "agent": "some-other-agent",
-            "acquired_at": "2026-09-08T00:00:00Z",
+            "acquired_at": timestamp,
             "kind": kind,
-            "heartbeat": "2026-09-08T00:00:00Z",
+            "heartbeat": timestamp,
         });
         std::fs::write(&path, serde_json::to_string(&record).unwrap()).unwrap();
     }
@@ -816,6 +883,67 @@ mod tests {
             "EN.15.D",
         );
         assert!(!held, "a shared lease must never report held");
+    }
+
+    /// A stale Exclusive lease — its liveness timestamp older than
+    /// `LEASE_STALE_THRESHOLD_SECONDS` measured against the injected clock — must never report
+    /// held. `EN.17.A` task 3.
+    #[test]
+    fn is_held_ignores_a_stale_lease() {
+        let brain_root = tempfile::tempdir().expect("tempdir");
+        let lock_dir = tempfile::tempdir().expect("tempdir");
+        let _guard = EnvGuard::set(brain_root.path(), lock_dir.path());
+        write_lease_at(
+            lock_dir.path(),
+            "engine-rs",
+            LeaseKind::Exclusive,
+            "2026-09-08T00:00:00Z",
+        );
+
+        // Well past LEASE_STALE_THRESHOLD_SECONDS (3h) after the fixture's heartbeat.
+        fn far_future_clock() -> f64 {
+            chrono::DateTime::parse_from_rfc3339("2026-09-08T06:00:00Z")
+                .unwrap()
+                .timestamp_millis() as f64
+                / 1000.0
+        }
+
+        let held = super::super::integrate::HoldSource::is_held(
+            &QueueHoldSource::with_clock(far_future_clock),
+            "engine-rs",
+            "EN.15.D",
+        );
+        assert!(!held, "a stale exclusive lease must never report held");
+    }
+
+    /// A fresh Exclusive lease — its liveness timestamp well inside
+    /// `LEASE_STALE_THRESHOLD_SECONDS` — must report held. `EN.17.A` task 3.
+    #[test]
+    fn is_held_honours_a_fresh_lease() {
+        let brain_root = tempfile::tempdir().expect("tempdir");
+        let lock_dir = tempfile::tempdir().expect("tempdir");
+        let _guard = EnvGuard::set(brain_root.path(), lock_dir.path());
+        write_lease_at(
+            lock_dir.path(),
+            "engine-rs",
+            LeaseKind::Exclusive,
+            "2026-09-08T00:00:00Z",
+        );
+
+        // A few minutes after the fixture's heartbeat — comfortably inside the 3h threshold.
+        fn just_after_clock() -> f64 {
+            chrono::DateTime::parse_from_rfc3339("2026-09-08T00:05:00Z")
+                .unwrap()
+                .timestamp_millis() as f64
+                / 1000.0
+        }
+
+        let held = super::super::integrate::HoldSource::is_held(
+            &QueueHoldSource::with_clock(just_after_clock),
+            "engine-rs",
+            "EN.15.D",
+        );
+        assert!(held, "a fresh exclusive lease must report held");
     }
 
     /// A lease recorded for a DIFFERENT repo must never leak into this repo's hold check.
