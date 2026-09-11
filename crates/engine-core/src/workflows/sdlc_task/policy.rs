@@ -268,6 +268,12 @@ impl SdlcTaskPolicy {
             transport_retry: self.transport_retry,
             review_diff_max_chars: fallback.review_diff_max_chars,
             node_invocation_payload_cap_bytes: self.node_invocation_payload_cap_bytes,
+            // Not a SDLC_TASK-applicable knob (it gates only
+            // `GenerateTasksNode`'s planning-fallback path, which SDLC_TASK
+            // never runs) — left at the fallback (`None`, behavior-stable)
+            // here rather than omitted, so this struct literal compiles
+            // against task 5's new `SdlcPolicy` field.
+            generate_context_max_bytes: fallback.generate_context_max_bytes,
         }
     }
 }

@@ -284,6 +284,11 @@ pub fn thorough() -> PartialPolicy {
         // the built-in default, so this profile's ledger keeps more of a
         // dispatch's output before truncating it.
         node_invocation_payload_cap_bytes: Some(262_144),
+        // The quality ceiling for planning context too: unbounded, matching
+        // the built-in default — a thorough run should see every spec
+        // `.md` file's content in full when generating a task list, never
+        // truncated.
+        generate_context_max_bytes: Some(None),
     }
 }
 

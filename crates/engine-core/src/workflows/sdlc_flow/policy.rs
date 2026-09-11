@@ -357,6 +357,15 @@ pub struct SdlcPolicy {
     /// [`crate::invocations::DEFAULT_PAYLOAD_CAP_BYTES`], so introducing
     /// this knob changes no existing run's ledger.
     pub node_invocation_payload_cap_bytes: u64,
+    /// Per-file-section byte cap `GenerateTasksNode`'s planning-fallback
+    /// path applies when it inlines every spec `.md` file's contents into
+    /// the task-generation prompt via `setup::gather_context`. Built-in
+    /// `None` — unbounded, byte-identical to before this knob existed.
+    /// When set, each file's own section (not the whole concatenated
+    /// output) is truncated at a UTF-8 char boundary at or before the cap
+    /// and a marker naming the file and dropped-byte count is appended, so
+    /// one oversized spec file cannot starve a later, smaller one.
+    pub generate_context_max_bytes: Option<usize>,
 }
 
 impl Default for SdlcPolicy {
@@ -395,6 +404,7 @@ impl Default for SdlcPolicy {
             // criteria and the model's own reasoning.
             review_diff_max_chars: 120_000,
             node_invocation_payload_cap_bytes: crate::invocations::DEFAULT_PAYLOAD_CAP_BYTES,
+            generate_context_max_bytes: None,
         }
     }
 }
@@ -423,6 +433,11 @@ pub struct PartialPolicy {
     pub transport_retry: Option<PartialTransportRetry>,
     pub review_diff_max_chars: Option<u32>,
     pub node_invocation_payload_cap_bytes: Option<u64>,
+    /// Nested `Option` — [`SdlcPolicy::generate_context_max_bytes`] is
+    /// itself `Option<usize>`, so an override layer needs "unset" (fall
+    /// through) distinct from "explicitly clear". Merged via [`merge_opt`],
+    /// mirroring [`PartialModelTiers::implement_final_attempt`].
+    pub generate_context_max_bytes: Option<Option<usize>>,
 }
 
 /// All-optional mirror of [`ModelTiers`] for per-stage partial overrides.
@@ -618,6 +633,10 @@ impl crate::policy::Policy for SdlcPolicy {
             node_invocation_payload_cap_bytes: merge_opt(
                 base.node_invocation_payload_cap_bytes,
                 over.node_invocation_payload_cap_bytes,
+            ),
+            generate_context_max_bytes: merge_opt(
+                base.generate_context_max_bytes,
+                over.generate_context_max_bytes,
             ),
         }
     }
@@ -1731,6 +1750,10 @@ mod tests {
             "node_invocation_payload_cap_bytes",
             "invocations.rs::payload_cap_from_resolved_policy (read UNTYPED off the ResolvedPolicy stamp by node_context, workflow.rs)",
         ),
+        (
+            "generate_context_max_bytes",
+            "setup.rs::gather_context, called from GenerateTasksNode::process",
+        ),
     ];
 
     #[test]
@@ -1759,6 +1782,7 @@ mod tests {
             transport_retry,
             review_diff_max_chars,
             node_invocation_payload_cap_bytes,
+            generate_context_max_bytes,
         );
 
         let mut actual: Vec<&str> = field_names.to_vec();
