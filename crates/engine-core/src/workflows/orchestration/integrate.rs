@@ -87,6 +87,7 @@ use super::escalate::{
 };
 use super::execute::{execute_step, EngineKind, ExecuteError, ExecutionOutcome, FlowRunner};
 use super::gates::{check_dependencies, AdmissionGate, DependencyEdge, GateError};
+use crate::coord::write::RegisterOutcome;
 use crate::nodes::brain_client::RECALL_NODE_NAME;
 use crate::workflows::get_result;
 use crate::workflows::recall::RECALL_WORKFLOW_TYPE;
@@ -744,6 +745,25 @@ impl LaneLogEntry {
         }
     }
 
+    /// `EN.17.A` task 4: a step whose coordination heartbeat or lease call refused — the step
+    /// never ran (see [`IntegrateError::CoordRefused`]), distinct from [`LaneLogEntry::bailed`]
+    /// (the step ran and failed) precisely because nothing here ever executed.
+    #[must_use]
+    pub fn held(step: &ChainStep, lane: &str, note: impl Into<String>) -> Self {
+        Self {
+            ts: Utc::now().into(),
+            lane: lane.to_string(),
+            repo: step.repo.clone(),
+            block: step.block_id.clone(),
+            status: LaneLogStatus::Held,
+            note: note.into(),
+            run_id: None,
+            writer: None,
+            build_sha: None,
+            profile: None,
+        }
+    }
+
     /// The chain stopped at a block boundary on an observed cancellation.
     /// `step` is the block that never started — every block before it in
     /// the chain already has its own `closed` line on disk, untouched by
@@ -1011,6 +1031,42 @@ pub enum IntegrateError {
     /// [`LaneLogEntry::with_permission_profile`] fails loudly here rather
     /// than silently shipping an unauditable record.
     MissingPermissionProfileStamp { repo: String, block_id: String },
+    /// `EN.17.A` task 4: a `coord` handle's `register`/`heartbeat`/`lease` call refused or
+    /// errored — the chain STOPS rather than silently proceeding as though coordination were
+    /// a no-op (see the `coord` parameter's own doc for the `Some`/`None` contract this refusal
+    /// only ever fires under). `op` names which of the three calls refused;
+    /// [`CoordOp::Register`] always carries `block_id: None` (it runs once, before the loop,
+    /// for the whole chain rather than any one step); [`CoordOp::Heartbeat`]/[`CoordOp::Lease`]
+    /// always carry `Some(step.block_id)`. The refusal returns BEFORE `StepLeaseGuard` is
+    /// constructed, so a refused step releases nothing it never acquired.
+    CoordRefused {
+        op: CoordOp,
+        repo: String,
+        block_id: Option<String>,
+        reason: String,
+    },
+}
+
+/// Which of a [`CoordHandle`]'s three write calls produced an
+/// [`IntegrateError::CoordRefused`] — `EN.17.A` task 4. Serialized `snake_case`, never a bare
+/// string, so a journal/escalation record naming this stays a closed vocabulary rather than
+/// free text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CoordOp {
+    Register,
+    Heartbeat,
+    Lease,
+}
+
+impl fmt::Display for CoordOp {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            CoordOp::Register => write!(f, "register"),
+            CoordOp::Heartbeat => write!(f, "heartbeat"),
+            CoordOp::Lease => write!(f, "lease"),
+        }
+    }
 }
 
 impl fmt::Display for IntegrateError {
@@ -1148,6 +1204,21 @@ impl fmt::Display for IntegrateError {
                  closed lane-log record carries no resolved permission-profile stamp \
                  (docs/permission-profiles.md invariant 1)"
             ),
+            IntegrateError::CoordRefused {
+                op,
+                repo,
+                block_id,
+                reason,
+            } => match block_id {
+                Some(block_id) => write!(
+                    f,
+                    "block '{block_id}' (repo '{repo}') coordination {op} refused: {reason}"
+                ),
+                None => write!(
+                    f,
+                    "chain registration (repo '{repo}') coordination {op} refused: {reason}"
+                ),
+            },
         }
     }
 }
@@ -1170,7 +1241,8 @@ impl std::error::Error for IntegrateError {
             | IntegrateError::HoldDeadlineExceeded { .. }
             | IntegrateError::NoDispatcherConfigured { .. }
             | IntegrateError::StepMergeFailed { .. }
-            | IntegrateError::MissingPermissionProfileStamp { .. } => None,
+            | IntegrateError::MissingPermissionProfileStamp { .. }
+            | IntegrateError::CoordRefused { .. } => None,
             IntegrateError::CheckpointWriteFailed(source) => Some(source),
             IntegrateError::Dispatch(err) => Some(err),
         }
@@ -2032,7 +2104,15 @@ struct StepLeaseGuard<'a> {
 impl Drop for StepLeaseGuard<'_> {
     fn drop(&mut self) {
         if let Some(handle) = self.coord {
-            let _ = handle.unlease();
+            // `EN.17.A` task 4: best-effort — an unlease error must never stop or unwind
+            // the chain (this runs on every exit path, including one already unwinding
+            // on a bail); only observed via `tracing::warn!`. `Ok(false)` (nothing of
+            // ours left to release — already released, never held, or foreign-held) is
+            // NOT logged here: it is the documented idempotent/no-op-confirmation case
+            // this guard's own doc comment describes, not an anomaly.
+            if let Err(err) = handle.unlease() {
+                tracing::warn!(repo = %handle.repo, error = %err, "coord: StepLeaseGuard drop's unlease failed");
+            }
         }
     }
 }
@@ -2183,7 +2263,30 @@ async fn integrate_chain_impl_inner(
             .first()
             .and_then(|s| s.roadmap.as_deref())
             .unwrap_or("");
-        let _ = handle.register(roadmap);
+        let first_repo = chain.first().map(|s| s.repo.clone()).unwrap_or_default();
+        match handle.register(roadmap) {
+            Ok(RegisterOutcome {
+                allowed: false,
+                reason,
+                ..
+            }) => {
+                return Err(IntegrateError::CoordRefused {
+                    op: CoordOp::Register,
+                    repo: first_repo,
+                    block_id: None,
+                    reason: reason.unwrap_or_default(),
+                });
+            }
+            Ok(RegisterOutcome { allowed: true, .. }) => {}
+            Err(err) => {
+                return Err(IntegrateError::CoordRefused {
+                    op: CoordOp::Register,
+                    repo: first_repo,
+                    block_id: None,
+                    reason: err.to_string(),
+                });
+            }
+        }
     }
     // Every block id in this chain — the yardstick `CoordHandle::lease`'s
     // per-step `window` is checked against (see `coord::write::lease`'s
@@ -2210,14 +2313,20 @@ async fn integrate_chain_impl_inner(
             for drained in handle.drain().unwrap_or_default() {
                 match drained.record.as_ref().map(|r| r.kind) {
                     Some(okf_core::MessageKind::LeaseRelease) => {
-                        let _ = handle.unlease();
+                        // `EN.17.A` task 4: best-effort, like the guard's own `Drop` —
+                        // must never stop the chain.
+                        if let Err(err) = handle.unlease() {
+                            tracing::warn!(repo = %handle.repo, error = %err, "coord: LEASE_RELEASE-triggered unlease failed");
+                        }
                     }
                     Some(okf_core::MessageKind::Rendezvous) => {
                         if let Some(record) = drained.record.as_ref() {
-                            let _ = handle.reply_rendezvous(
+                            if let Err(err) = handle.reply_rendezvous(
                                 record,
                                 format!("{} answered your RENDEZVOUS", handle.agent),
-                            );
+                            ) {
+                                tracing::warn!(repo = %handle.repo, error = %err, "coord: reply_rendezvous failed");
+                            }
                         }
                     }
                     _ => {}
@@ -2382,9 +2491,57 @@ async fn integrate_chain_impl_inner(
         // dispatch step's `continue`, or falling off the bottom on a
         // normal completion) — see `StepLeaseGuard`'s own doc.
         if let Some(handle) = coord {
-            let _ = handle.heartbeat(Some(step.block_id.as_str()));
+            if let Err(err) = handle.heartbeat(Some(step.block_id.as_str())) {
+                let held_lane = lane.unwrap_or(step.repo.as_str());
+                let entry = LaneLogEntry::held(step, held_lane, err.to_string())
+                    .with_identity(None)
+                    .with_permission_profile(Some(resolved_permission_profile_identifier(
+                        registry,
+                    )));
+                let _ = append_lane_log_line(roadmap_dir, &entry);
+                record_bail_escalation(
+                    roadmap_dir,
+                    registry,
+                    step,
+                    held_lane,
+                    "coord-heartbeat-failed",
+                    resolve_engine(&step.repo, &step.block_id),
+                    &err.to_string(),
+                );
+                return Err(IntegrateError::CoordRefused {
+                    op: CoordOp::Heartbeat,
+                    repo: step.repo.clone(),
+                    block_id: Some(step.block_id.clone()),
+                    reason: err.to_string(),
+                });
+            }
             let window = [step.block_id.clone()];
-            let _ = handle.lease(okf_core::LeaseKind::Exclusive, Some(&window), &lane_blocks);
+            if let Err(err) =
+                handle.lease(okf_core::LeaseKind::Exclusive, Some(&window), &lane_blocks)
+            {
+                let held_lane = lane.unwrap_or(step.repo.as_str());
+                let entry = LaneLogEntry::held(step, held_lane, err.to_string())
+                    .with_identity(None)
+                    .with_permission_profile(Some(resolved_permission_profile_identifier(
+                        registry,
+                    )));
+                let _ = append_lane_log_line(roadmap_dir, &entry);
+                record_bail_escalation(
+                    roadmap_dir,
+                    registry,
+                    step,
+                    held_lane,
+                    "coord-lease-refused",
+                    resolve_engine(&step.repo, &step.block_id),
+                    &err.to_string(),
+                );
+                return Err(IntegrateError::CoordRefused {
+                    op: CoordOp::Lease,
+                    repo: step.repo.clone(),
+                    block_id: Some(step.block_id.clone()),
+                    reason: err.to_string(),
+                });
+            }
         }
         let _step_lease_guard = StepLeaseGuard { coord };
 

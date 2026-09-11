@@ -21,7 +21,10 @@
 //!   fleet, which is the exact failure class this module exists to prevent. Only files sitting
 //!   directly in `<lock_dir>` are read as slots — a same-named file one level deeper (e.g. under
 //!   an accidental `fleet-concurrency/` subdirectory) is never picked up.
-//! - `<lock_dir>/queue/inbox/*.json` — cross-lane messages (`okf_core::coord::Message`).
+//! - `<lock_dir>/queue/<repo>/<lane>/inbox/*.json` — cross-lane messages
+//!   (`okf_core::coord::Message`), written by [`write::send`]. THE RECIPIENT IS THE DIRECTORY:
+//!   `<repo>` and `<lane>` are the two path segments immediately above `inbox/`, never a field
+//!   inside the message envelope itself.
 //! - `<lock_dir>/commander-heartbeats/*.heartbeat` — raw-scalar heartbeat files
 //!   (`okf_core::coord::HeartbeatRecord`), parsed via `HeartbeatValue::parse_raw`, never via
 //!   `serde_json` (see `okf_core::coord::heartbeat`'s own doc comment).
@@ -67,6 +70,13 @@ pub const FLEET_LOCK_DIR_ENV: &str = "FLEET_LOCK_DIR";
 
 /// Name of the lock directory under the brain root when `FLEET_LOCK_DIR` is unset.
 const LOCK_SUBDIR: &str = ".fleet-locks";
+
+/// A lease's liveness timestamp (`heartbeat`, falling back to `acquired_at`) older than this
+/// many seconds is judged stale — a foreign-held lease past this age is replaced rather than
+/// refused (`EN.17.A` task 1). Must equal `mev`'s own `src/brain/lease.rs`
+/// `LEASE_STALE_THRESHOLD_SECONDS` (180 minutes / 3h), the authority this value mirrors, and
+/// must be the ONLY definition of this const name anywhere under `crates/engine-core/src`.
+pub const LEASE_STALE_THRESHOLD_SECONDS: f64 = 180.0 * 60.0;
 
 /// Overall health of a joined [`CoordinationView`].
 ///
@@ -313,8 +323,41 @@ fn read_slots(lock_dir: &Path, reasons: &mut Vec<DegradationReason>) -> Vec<Slot
         .collect()
 }
 
+/// List the immediate subdirectories of `dir` (never recursing further), skipping any entry that
+/// is not itself a directory. A missing `dir` yields an empty list, not an error.
+fn list_subdirs(dir: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let entries = match fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return out,
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            out.push(path);
+        }
+    }
+    out.sort();
+    out
+}
+
+/// Walk every `<lock_dir>/queue/<repo>/<lane>/inbox/*.json` — one level of `<repo>`
+/// subdirectories, one level of `<lane>` subdirectories under each, then that lane's own
+/// `inbox/` (mirroring how [`read_slots`]/[`read_heartbeats`] already use
+/// [`list_files_with_extension`], just nested two levels deeper). A missing `queue/` directory,
+/// or a `queue/<repo>` entry that is not a directory, is silently skipped — not an error, since
+/// an unpopulated or partially-populated queue tree is not itself a fault. The legacy flat
+/// `queue/inbox/*.json` layout is never read here; that migration is the point of this function.
 fn read_messages(lock_dir: &Path, reasons: &mut Vec<DegradationReason>) -> Vec<MessageEntry> {
-    list_files_with_extension(&lock_dir.join("queue").join("inbox"), "json")
+    let queue_dir = lock_dir.join("queue");
+    let mut paths = Vec::new();
+    for repo_dir in list_subdirs(&queue_dir) {
+        for lane_dir in list_subdirs(&repo_dir) {
+            paths.extend(list_files_with_extension(&lane_dir.join("inbox"), "json"));
+        }
+    }
+    paths.sort();
+    paths
         .into_iter()
         .filter_map(|path| {
             let text = match fs::read_to_string(&path) {
@@ -863,6 +906,98 @@ mod tests {
         }
 
         assert_eq!(resolved, brain_root.join(".fleet-locks"));
+    }
+
+    /// A minimal-but-valid message envelope, mirroring `write::send`'s own test fixture.
+    fn message_json(message_id: &str, sent_at: &str) -> serde_json::Value {
+        serde_json::json!({
+            "message_id": message_id,
+            "sender": {
+                "agent_name": "engine-rs-1",
+                "repo": "engine-rs",
+                "lane": "engine-rs",
+                "roadmap": "coordination-layer-port",
+            },
+            "sent_at": sent_at,
+            "kind": "EDGE_RELEASED",
+            "subject": { "repo": "bastion", "block": "BA.21.A" },
+            "body": "bastion:BA.21.A is now unblocked on the engine side.",
+            "durable_home": {
+                "channel": "state-edge",
+                "ref": "bastion/planning/state.json#BA.21.A"
+            },
+            "verified_by": "UNVERIFIED: engine-rs-1"
+        })
+    }
+
+    #[test]
+    fn read_messages_round_trips_send_layout() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let message_id = "70ef6ce8-abcd-4e21-9f10-0000000000aa";
+
+        write::send(
+            dir.path(),
+            "bastion",
+            "bastion-lane",
+            message_json(message_id, "2026-09-08T10:00:00Z"),
+            Some("brain-mini"),
+        )
+        .expect("send must succeed");
+
+        let mut reasons = Vec::new();
+        let messages = read_messages(dir.path(), &mut reasons);
+
+        assert!(reasons.is_empty(), "{reasons:?}");
+        assert_eq!(messages.len(), 1);
+        assert!(
+            messages[0].path.ends_with(format!(
+                "queue/bastion/bastion-lane/inbox/20260908T100000Z-{message_id}.json"
+            )),
+            "unexpected path: {}",
+            messages[0].path.display()
+        );
+    }
+
+    #[test]
+    fn read_messages_ignores_flat_inbox() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let flat_inbox = dir.path().join("queue").join("inbox");
+        fs::create_dir_all(&flat_inbox).expect("create flat inbox dir");
+        fs::write(
+            flat_inbox.join("2026-09-03T12-30-00Z-abc123.json"),
+            serde_json::to_string(&message_json("abc123", "2026-09-03T12:30:00Z"))
+                .expect("serialize"),
+        )
+        .expect("write legacy flat message");
+
+        let mut reasons = Vec::new();
+        let messages = read_messages(dir.path(), &mut reasons);
+
+        assert!(
+            messages.is_empty(),
+            "a message at the legacy flat queue/inbox/ path must not be read: {messages:?}"
+        );
+    }
+
+    #[test]
+    fn message_entry_keys_unchanged() {
+        let entry = MessageEntry {
+            path: PathBuf::from("/tmp/example.json"),
+            message: serde_json::from_value(message_json(
+                "70ef6ce8-abcd-4e21-9f10-0000000000aa",
+                "2026-09-08T10:00:00Z",
+            ))
+            .expect("message must parse"),
+        };
+        let value = serde_json::to_value(&entry).expect("serialize MessageEntry");
+        let mut keys: Vec<&str> = value
+            .as_object()
+            .expect("MessageEntry serializes to an object")
+            .keys()
+            .map(|k| k.as_str())
+            .collect();
+        keys.sort();
+        assert_eq!(keys, vec!["message", "path"]);
     }
 
     #[test]
