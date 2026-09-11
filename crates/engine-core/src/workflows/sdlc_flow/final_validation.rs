@@ -44,8 +44,8 @@ use crate::node::{Node, NodeError};
 
 use super::policy::TestDepth;
 use super::task_loop::{
-    resolve_harness_path, resolved_policy, select_task_checks, worktree_path, CheckResult,
-    TestTaskNode,
+    resolve_harness_path, resolved_policy, select_task_checks, spec_dir_for_baseline,
+    worktree_path, CheckResult, TestTaskNode,
 };
 use super::{put_result, CommandRunner};
 
@@ -180,9 +180,15 @@ impl FinalValidationNode {
             // rather than forking a second executor. This throwaway
             // `TestTaskNode` is only ever used as a handle onto that
             // shared method; it is never `process`ed as a node itself.
+            //
+            // `spec_dir_for_baseline` (`EN.17.G` task 3) locates the same
+            // pre-run baseline snapshot directory `TestTaskNode::process`
+            // does, so this run-level gate reads the identical snapshot a
+            // per-task `baseline-diff` check already read.
+            let spec_dir = spec_dir_for_baseline(ctx, worktree);
             TestTaskNode::new()
                 .with_runner(self.runner.clone())
-                .run_checks(checks, worktree)
+                .run_checks(checks, worktree, &spec_dir)
         };
 
         let all_passed = failed_names.is_empty();

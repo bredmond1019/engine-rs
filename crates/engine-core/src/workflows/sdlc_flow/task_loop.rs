@@ -32,6 +32,7 @@ use crate::routing::Router;
 use super::policy::OutputVerbosity;
 use super::policy::{ModelTier, RetryFeedback, ReviewMode, SdlcPolicy, TestDepth};
 use super::schema::{RunMeta, SDLCState, SDLCTask, SDLCTaskStatus};
+use super::setup::baseline_snapshot_path;
 use super::{
     carry_forward_billing, get_result, parse_structured_or_fenced, put_result, session_baseline,
     sessions_since, CommandOutput, CommandRunner, ModelTransport, TransportSlot,
@@ -374,6 +375,28 @@ pub(crate) fn resolve_harness_path(ctx: &TaskContext, worktree: &Path) -> PathBu
         }
     }
     worktree.join("planning").join("harness.json")
+}
+
+/// `<worktree>/planning/<spec_slug>` — the same path
+/// `setup::spec_dir`/`setup::snapshot_baselines` derive the pre-run
+/// baseline snapshot's directory from (`EN.17.G` task 2), computed here from
+/// what `TestTaskNode`/`FinalValidationNode` already have in hand (`ctx`,
+/// `worktree`) rather than threading `setup`'s own private helper across the
+/// module boundary. Falls back to `<worktree>/planning` when the event
+/// carries no `spec_slug` (or an empty one) — mirrors `resolve_harness_path`'s
+/// same fallback shape immediately above, and matches `setup::spec_dir`'s
+/// own no-`worktree_path`-yet fallback in spirit: no spec slug, no per-spec
+/// subdirectory to look under.
+pub(crate) fn spec_dir_for_baseline(ctx: &TaskContext, worktree: &Path) -> PathBuf {
+    match ctx
+        .event
+        .get("spec_slug")
+        .and_then(|v| v.as_str())
+        .filter(|slug| !slug.is_empty())
+    {
+        Some(spec_slug) => worktree.join("planning").join(spec_slug),
+        None => worktree.join("planning"),
+    }
 }
 
 /// Best-effort `git add -N -A` ("intent to add") in `worktree`, run
@@ -1396,6 +1419,16 @@ pub struct TestTaskNode {
     runner: CommandRunner,
 }
 
+/// Folded into a `baseline-diff` [`CheckResult`]'s `message` whenever
+/// `run_baseline_diff` found no pre-run snapshot file and fell back to
+/// shelling out to `baselineCommand` live, post-implementation — the exact
+/// prior behavior before `EN.17.G` task 2's pre-run snapshot existed. Never
+/// silent: this fires whether the check passed or failed, so a caller
+/// reading only `passed`/`failure_class` still sees that this particular
+/// result carries a self-contaminated (post-implementation) baseline.
+const POST_IMPLEMENTATION_FALLBACK_NOTE: &str =
+    "baseline taken post-implementation (no pre-run snapshot found)";
+
 impl TestTaskNode {
     #[must_use]
     pub fn new() -> Self {
@@ -1564,10 +1597,28 @@ impl TestTaskNode {
         }
     }
 
-    /// `baseline-diff`: run `baselineCommand` and `command`, both expected
-    /// to emit a JSON array; fail on any `command` entry whose `compareKeys`
-    /// projection isn't present in the baseline's.
-    fn run_baseline_diff(&self, check: &serde_json::Value, worktree: &Path) -> CheckResult {
+    /// `baseline-diff`: read the pre-run snapshot `EN.17.G` task 2's
+    /// `setup::snapshot_baselines` took (at
+    /// [`baseline_snapshot_path`]`(spec_dir, check.name)`) before this
+    /// task's implement stage ever ran, and diff `command`'s live output
+    /// against it — both expected to emit a JSON array; fail on any
+    /// `command` entry whose `compareKeys` projection isn't present in the
+    /// baseline's.
+    ///
+    /// **Fallback, and never silently:** when no snapshot file exists — a
+    /// run started before this block, or `baselineCommand` was empty/absent
+    /// when the snapshot was taken — this falls back to today's exact prior
+    /// behavior: shell out to `baselineCommand` live, post-implementation.
+    /// [`POST_IMPLEMENTATION_FALLBACK_NOTE`] is then always folded into
+    /// `message`, whether the check passes or fails, so a caller can never
+    /// mistake a post-implementation (self-contaminated) baseline for a
+    /// true pre-run one.
+    fn run_baseline_diff(
+        &self,
+        check: &serde_json::Value,
+        worktree: &Path,
+        spec_dir: &Path,
+    ) -> CheckResult {
         let name = check
             .get("name")
             .and_then(|v| v.as_str())
@@ -1586,7 +1637,18 @@ impl TestTaskNode {
             .and_then(|v| v.as_str())
             .unwrap_or("");
         let command = check.get("command").and_then(|v| v.as_str()).unwrap_or("");
-        let baseline_stdout = self.shell_out(baseline_command, worktree).stdout;
+
+        let snapshot_path = baseline_snapshot_path(spec_dir, &name);
+        let (baseline_stdout, used_fallback) = if snapshot_path.exists() {
+            match std::fs::read_to_string(&snapshot_path) {
+                Ok(contents) => (contents, false),
+                // Present but unreadable is treated the same as absent —
+                // fall back live rather than error/panic, and say so.
+                Err(_) => (self.shell_out(baseline_command, worktree).stdout, true),
+            }
+        } else {
+            (self.shell_out(baseline_command, worktree).stdout, true)
+        };
         let current_stdout = self.shell_out(command, worktree).stdout;
 
         let baseline_entries: Vec<serde_json::Value> =
@@ -1608,10 +1670,13 @@ impl TestTaskNode {
             .count();
 
         let passed = new_entries == 0;
-        let message = if passed {
-            String::new()
-        } else {
-            format!("{new_entries} net-new violation(s)")
+        let message = match (passed, used_fallback) {
+            (true, false) => String::new(),
+            (true, true) => POST_IMPLEMENTATION_FALLBACK_NOTE.to_string(),
+            (false, false) => format!("{new_entries} net-new violation(s)"),
+            (false, true) => {
+                format!("{new_entries} net-new violation(s); {POST_IMPLEMENTATION_FALLBACK_NOTE}")
+            }
         };
         CheckResult {
             name,
@@ -1965,10 +2030,16 @@ impl TestTaskNode {
     /// skip, `gates` semantics) instead of forking a second copy — it
     /// constructs a throwaway `TestTaskNode` carrying its own runner purely
     /// as a handle onto this method.
+    ///
+    /// `spec_dir` is only consulted by the `baseline-diff` branch (`EN.17.G`
+    /// task 3), to locate that spec's pre-run baseline snapshot directory —
+    /// every other check kind ignores it. Callers compute it via
+    /// [`spec_dir_for_baseline`].
     pub(crate) fn run_checks(
         &self,
         checks: &[serde_json::Value],
         worktree: &Path,
+        spec_dir: &Path,
     ) -> (Vec<CheckResult>, Vec<String>) {
         let mut results = Vec::new();
         let mut failed_names = Vec::new();
@@ -1986,7 +2057,7 @@ impl TestTaskNode {
             let result = match kind.as_str() {
                 "command" => self.run_command_check(check, worktree),
                 "forbidden-pattern-scan" => self.run_forbidden_pattern_scan(check, worktree),
-                "baseline-diff" => self.run_baseline_diff(check, worktree),
+                "baseline-diff" => self.run_baseline_diff(check, worktree, spec_dir),
                 "count-delta" => self.run_count_delta(check, worktree),
                 "warning-scan" => self.run_warning_scan(check, worktree),
                 _ => self.run_unsupported_kind(check, &kind),
@@ -2150,6 +2221,7 @@ impl Node for TestTaskNode {
     async fn process(&self, mut ctx: TaskContext) -> Result<TaskContext, NodeError> {
         let worktree = worktree_path(&ctx)?;
         let worktree = Path::new(&worktree);
+        let spec_dir = spec_dir_for_baseline(&ctx, worktree);
 
         // Depth comes from the resolved policy (task 4 makes `TestTaskNode`
         // policy-strict for the first time — see `resolved_policy`'s doc
@@ -2224,7 +2296,7 @@ impl Node for TestTaskNode {
             } else {
                 let (selected_checks, selection) =
                     select_task_checks(&harness_checks, &task_validation_commands, depth, true);
-                let (results, failed) = self.run_checks(&selected_checks, worktree);
+                let (results, failed) = self.run_checks(&selected_checks, worktree, &spec_dir);
                 (results, failed, selection)
             };
 
@@ -6906,7 +6978,14 @@ pub(crate) mod tests {
         let results = out.nodes["TestTaskNode"]["check_results"]
             .as_array()
             .unwrap();
-        assert_eq!(results[0]["message"], "1 net-new violation(s)");
+        // No pre-run snapshot file exists for this fixture (this test never
+        // runs `setup::snapshot_baselines`), so `run_baseline_diff` falls
+        // back to shelling out live — the fallback note is folded in.
+        assert_eq!(
+            results[0]["message"],
+            "1 net-new violation(s); baseline taken post-implementation (no pre-run snapshot \
+             found)"
+        );
     }
 
     #[tokio::test]
@@ -6930,6 +7009,119 @@ pub(crate) mod tests {
             .await
             .expect("process should succeed");
         assert_eq!(out.nodes["TestTaskNode"]["all_passed"], true);
+    }
+
+    /// `EN.17.G` task 3: a persisted pre-run snapshot is read INSTEAD of
+    /// shelling out to `baselineCommand` live. Here `baselineCommand` is
+    /// deliberately contaminated to echo the exact same (post-change) set as
+    /// `command` — the shape a baseline measured AFTER the task's own change
+    /// would have — so if `run_baseline_diff` used it, the check would
+    /// wrongly pass. The persisted snapshot on disk only ever saw the
+    /// original entry, so reading it instead is what makes this check
+    /// correctly FAIL on the task-introduced net-new entry.
+    #[tokio::test]
+    async fn baseline_diff_reads_persisted_snapshot_over_a_contaminated_live_baseline() {
+        let worktree = temp_worktree();
+        write_harness(
+            &worktree,
+            json!([{
+                "kind": "baseline-diff",
+                "name": "net-new-lint",
+                "gates": true,
+                "compareKeys": ["file", "code"],
+                "baselineCommand": "echo '[{\"file\":\"a.py\",\"code\":\"E1\"},{\"file\":\"b.py\",\"code\":\"E2\"}]'",
+                "command": "echo '[{\"file\":\"a.py\",\"code\":\"E1\"},{\"file\":\"b.py\",\"code\":\"E2\"}]'",
+            }]),
+        );
+        let spec_dir = worktree.join("planning").join("my-spec");
+        let snapshot_path = baseline_snapshot_path(&spec_dir, "net-new-lint");
+        std::fs::create_dir_all(snapshot_path.parent().unwrap()).unwrap();
+        std::fs::write(&snapshot_path, "[{\"file\":\"a.py\",\"code\":\"E1\"}]").unwrap();
+
+        let node = TestTaskNode::new();
+        let out = node
+            .process(ctx_for_worktree(&worktree))
+            .await
+            .expect("process should succeed");
+        assert_eq!(out.nodes["TestTaskNode"]["all_passed"], false);
+        let results = out.nodes["TestTaskNode"]["check_results"]
+            .as_array()
+            .unwrap();
+        // Read from the persisted snapshot, not the (contaminated) live
+        // baselineCommand — no fallback note.
+        assert_eq!(results[0]["message"], "1 net-new violation(s)");
+    }
+
+    /// The identical fixture shape, but with no net-new entry in `command`'s
+    /// output relative to the PERSISTED snapshot — proves the persisted
+    /// snapshot is genuinely being read (a stale `baselineCommand` of `'[]'`
+    /// would fail this check if it were consulted instead).
+    #[tokio::test]
+    async fn baseline_diff_persisted_snapshot_passes_when_no_net_new_entries() {
+        let worktree = temp_worktree();
+        write_harness(
+            &worktree,
+            json!([{
+                "kind": "baseline-diff",
+                "name": "net-new-lint",
+                "gates": true,
+                "compareKeys": ["file", "code"],
+                "baselineCommand": "echo '[]'",
+                "command": "echo '[{\"file\":\"a.py\",\"code\":\"E1\"}]'",
+            }]),
+        );
+        let spec_dir = worktree.join("planning").join("my-spec");
+        let snapshot_path = baseline_snapshot_path(&spec_dir, "net-new-lint");
+        std::fs::create_dir_all(snapshot_path.parent().unwrap()).unwrap();
+        std::fs::write(&snapshot_path, "[{\"file\":\"a.py\",\"code\":\"E1\"}]").unwrap();
+
+        let node = TestTaskNode::new();
+        let out = node
+            .process(ctx_for_worktree(&worktree))
+            .await
+            .expect("process should succeed");
+        assert_eq!(out.nodes["TestTaskNode"]["all_passed"], true);
+        let results = out.nodes["TestTaskNode"]["check_results"]
+            .as_array()
+            .unwrap();
+        assert_eq!(results[0]["message"], "");
+    }
+
+    /// The pre-run snapshot file is absent (deleted, or never taken): the
+    /// check still runs — never errors/panics — falling back to
+    /// `baselineCommand` live, post-implementation, and its `message`
+    /// explicitly states that fact even when the check PASSES.
+    #[tokio::test]
+    async fn baseline_diff_missing_snapshot_falls_back_loudly_when_passing() {
+        let worktree = temp_worktree();
+        write_harness(
+            &worktree,
+            json!([{
+                "kind": "baseline-diff",
+                "name": "net-new-lint",
+                "gates": true,
+                "compareKeys": ["file", "code"],
+                "baselineCommand": "echo '[{\"file\":\"a.py\",\"code\":\"E1\"}]'",
+                "command": "echo '[{\"file\":\"a.py\",\"code\":\"E1\"}]'",
+            }]),
+        );
+        // No snapshot file written at all for this spec — the run's
+        // pre-run snapshot step (`EN.17.G` task 2) never happened for this
+        // fixture.
+
+        let node = TestTaskNode::new();
+        let out = node
+            .process(ctx_for_worktree(&worktree))
+            .await
+            .expect("process should succeed");
+        assert_eq!(out.nodes["TestTaskNode"]["all_passed"], true);
+        let results = out.nodes["TestTaskNode"]["check_results"]
+            .as_array()
+            .unwrap();
+        assert_eq!(
+            results[0]["message"],
+            "baseline taken post-implementation (no pre-run snapshot found)"
+        );
     }
 
     #[tokio::test]
