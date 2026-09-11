@@ -55,6 +55,7 @@ mod policy_baseline;
 mod policy_framework;
 mod policy_profile_matrix;
 mod post_draft;
+mod preflight;
 mod prompt_externalization;
 mod research_agent_contacts_e2e;
 mod research_agent_grounding_e2e;

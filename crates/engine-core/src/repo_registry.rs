@@ -272,6 +272,32 @@ fn is_within_root(candidate: &Path, canonical_root: &Path) -> bool {
     }
 }
 
+/// Read `planning/blocks/<block_id>.json` from `repo`'s resolved root via
+/// `registry`.
+///
+/// Returns `None` — never an error — for every way this can fail to yield a
+/// usable record: an unknown slug, no such file, or a file that fails to
+/// parse as JSON. All three collapse to preflight's `SkippedNoRecord`
+/// outcome (`EN.17.D` Task 2/3): a missing or malformed block record is not
+/// a defect in the preflight seam, and the block proceeds either way. Scoped
+/// to one id, unlike `mev`'s `discover_block_records`
+/// (`core/mev/src/brain/block.rs`), which enumerates every record in a
+/// repo's `planning/blocks/`.
+#[must_use]
+pub fn read_block_record(
+    registry: &RepoRegistry,
+    repo: &str,
+    block_id: &str,
+) -> Option<serde_json::Value> {
+    let root = registry.resolve(repo).ok()?;
+    let path = root
+        .join("planning")
+        .join("blocks")
+        .join(format!("{block_id}.json"));
+    let contents = std::fs::read_to_string(path).ok()?;
+    serde_json::from_str(&contents).ok()
+}
+
 /// Read `ENGINE_REPO_ALLOWLIST`: `None` when unset/empty (no filtering),
 /// `Some(set)` of trimmed, non-empty slugs otherwise.
 fn read_allowlist() -> Option<std::collections::HashSet<String>> {
