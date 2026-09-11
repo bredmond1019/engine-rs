@@ -29,7 +29,7 @@ use crate::policy::PolicyConfigSource;
 use super::policy::{self, PartialPolicy, SdlcPolicy};
 use super::profiles;
 use super::schema::{parse_task_range, SDLCFlowEventSchema, SDLCState, SDLCTask, SDLCTaskStatus};
-use super::task_loop::{apply_policy, resolved_policy, worktree_path, Stage};
+use super::task_loop::{apply_policy, resolve_harness_path, resolved_policy, worktree_path, Stage};
 use super::{
     carry_forward_billing, get_result, parse_structured_or_fenced, put_result,
     DEFAULT_STATE_FILENAME,
@@ -985,6 +985,7 @@ impl Router for SpecExistsRouterNode {
 /// | `None` | — | unchanged: falls through to the four-row table above exactly as before this field existed |
 pub struct LoadTaskStateNode {
     state_filename: &'static str,
+    runner: CommandRunner,
 }
 
 impl LoadTaskStateNode {
@@ -992,6 +993,7 @@ impl LoadTaskStateNode {
     pub fn new() -> Self {
         Self {
             state_filename: DEFAULT_STATE_FILENAME,
+            runner: default_command_runner(),
         }
     }
 
@@ -1002,6 +1004,16 @@ impl LoadTaskStateNode {
     #[must_use]
     pub fn with_state_filename(mut self, filename: &'static str) -> Self {
         self.state_filename = filename;
+        self
+    }
+
+    /// Override the command runner used for the pre-run `baseline-diff`
+    /// snapshot (`EN.17.G` task 2). Tests use this to stub the subprocess so
+    /// the gated suite never shells out. Defaults to
+    /// [`default_command_runner`].
+    #[must_use]
+    pub fn with_runner(mut self, runner: CommandRunner) -> Self {
+        self.runner = runner;
         self
     }
 }
@@ -1121,6 +1133,18 @@ impl Node for LoadTaskStateNode {
         let dir = spec_dir(&ctx, &event.spec_slug);
         let state_path = dir.join("sdlc").join(self.state_filename);
         let tasks_path = dir.join("tasks.json");
+
+        // EN.17.G task 2: pre-run baseline snapshot for every `baseline-diff`
+        // harness check with a `baselineCommand`, taken before the first
+        // task's implement stage ever runs. `LoadTaskStateNode` is the single
+        // node every route through `SpecExistsRouterNode` that finds an
+        // existing spec passes through before the task loop starts (both the
+        // fresh-bootstrap and the resume/restart/retry_task paths below), so
+        // this call is unconditional here and relies entirely on
+        // `snapshot_baselines`'s own resume-safety (an existing baseline file
+        // is never overwritten) to make it a true one-time snapshot across
+        // however many times this node is invoked for the same spec.
+        snapshot_baselines(&self.runner, &ctx, &dir)?;
 
         // Parse the existing state (if any) up front: both the "resume it"
         // and the "archive it" paths need its contents, and a corrupt file
@@ -1265,6 +1289,128 @@ impl Node for LoadTaskStateNode {
     fn name(&self) -> &str {
         "LoadTaskStateNode"
     }
+}
+
+/// `<spec_dir>/sdlc/baseline-<slug>.txt` — the pre-run baseline snapshot file
+/// for one `baseline-diff` harness check, keyed by the check's own `name`.
+/// Reused by `task_loop::run_baseline_diff` (`EN.17.G` task 3) to read the
+/// snapshot this function writes, so the two must agree byte-for-byte on the
+/// path they derive from a given `(spec_dir, check_name)` pair.
+pub(crate) fn baseline_snapshot_path(spec_dir: &Path, check_name: &str) -> PathBuf {
+    spec_dir
+        .join("sdlc")
+        .join(format!("baseline-{}.txt", slugify_check_name(check_name)))
+}
+
+/// Reduce a harness check's `name` to something safe to embed in a filename.
+/// Reuses [`sanitize_path_component`] — the same ASCII-alphanumerics-plus-
+/// `-`/`_`-survive rule this file already applies to `run_id`/`status` when
+/// naming a `.superseded-*.bak` archive — rather than inventing a second
+/// slugging rule for the same purpose.
+fn slugify_check_name(check_name: &str) -> String {
+    sanitize_path_component(check_name)
+}
+
+/// Pre-run baseline snapshot (`EN.17.G` task 2): for every check in
+/// `planning/harness.json`'s (or the per-spec override's, via
+/// [`resolve_harness_path`]) `validation.checks[]` whose `kind` is
+/// `"baseline-diff"` and whose `baselineCommand` is a non-empty string, run
+/// that command once in the pre-implementation worktree and persist its
+/// stdout to [`baseline_snapshot_path`]`(spec_dir, check.name)`.
+///
+/// **Resume-safe by construction**: a baseline file already on disk is never
+/// overwritten, read, or even opened — this function's only observable
+/// effect on an existing file is to leave it alone (same mtime, same
+/// bytes). This is what makes it safe to call unconditionally on every
+/// `LoadTaskStateNode::process` invocation for a given spec (fresh
+/// bootstrap, resume, restart, and `retry_task` alike): only the very first
+/// invocation for a given check ever finds its file absent and actually
+/// shells out.
+///
+/// No harness file, no `checks[]` array, a check of any other `kind`, or an
+/// absent/empty `baselineCommand` all produce no baseline file for that
+/// check — the same behavior-stable defaults `run_baseline_diff` itself
+/// already applies when reading these same keys.
+fn snapshot_baselines(
+    runner: &CommandRunner,
+    ctx: &TaskContext,
+    spec_dir: &Path,
+) -> Result<(), NodeError> {
+    // No `SetupWorktreeNode` output at all (a unit test driving this node in
+    // isolation with no worktree seeded) means there is no worktree to run a
+    // baseline command in — behave as if there were no harness.json, exactly
+    // like today's node did before this snapshot existed.
+    let Ok(worktree) = worktree_path(ctx) else {
+        return Ok(());
+    };
+    let worktree = Path::new(&worktree);
+
+    let harness_path = resolve_harness_path(ctx, worktree);
+    if !harness_path.exists() {
+        return Ok(());
+    }
+
+    let raw = std::fs::read_to_string(&harness_path).map_err(|err| {
+        NodeError::new(format!("failed to read {}: {err}", harness_path.display()))
+    })?;
+    let harness: serde_json::Value = serde_json::from_str(&raw).map_err(|err| {
+        NodeError::new(format!("failed to parse {}: {err}", harness_path.display()))
+    })?;
+    let checks: Vec<serde_json::Value> = harness
+        .get("validation")
+        .and_then(|v| v.get("checks"))
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+
+    for check in &checks {
+        let kind = check
+            .get("kind")
+            .and_then(|v| v.as_str())
+            .unwrap_or("command");
+        if kind != "baseline-diff" {
+            continue;
+        }
+        let baseline_command = check
+            .get("baselineCommand")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if baseline_command.is_empty() {
+            continue;
+        }
+        let name = check
+            .get("name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unnamed");
+
+        let baseline_file = baseline_snapshot_path(spec_dir, name);
+        if baseline_file.exists() {
+            // Resume-safe: an existing snapshot from an earlier invocation
+            // (or an earlier attempt of this same run) is kept untouched.
+            continue;
+        }
+
+        if let Some(parent) = baseline_file.parent() {
+            std::fs::create_dir_all(parent).map_err(|err| {
+                NodeError::new(format!("failed to create {}: {err}", parent.display()))
+            })?;
+        }
+
+        let output = runner("sh", &["-c", baseline_command], worktree).map_err(|err| {
+            NodeError::new(format!(
+                "failed to spawn baseline command for check {name:?}: {err}"
+            ))
+        })?;
+
+        std::fs::write(&baseline_file, &output.stdout).map_err(|err| {
+            NodeError::new(format!(
+                "failed to write {}: {err}",
+                baseline_file.display()
+            ))
+        })?;
+    }
+
+    Ok(())
 }
 
 /// Model output shape expected from `GenerateTasksNode`'s prompt: the task
@@ -2837,6 +2983,207 @@ mod tests {
         let node = LoadTaskStateNode::new();
         let err = node.process(ctx).await.expect_err("should fail");
         assert!(err.message.contains("no state or tasks file found"));
+    }
+
+    // --- LoadTaskStateNode + pre-run baseline snapshot (EN.17.G task 2) ----
+
+    fn recording_baseline_runner(
+        stdout: &'static str,
+    ) -> (CommandRunner, Arc<Mutex<Vec<Vec<String>>>>) {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let recorded = calls.clone();
+        let runner: CommandRunner = Arc::new(move |program, args, _cwd| {
+            recorded.lock().unwrap().push(
+                std::iter::once(program.to_string())
+                    .chain(args.iter().map(|a| a.to_string()))
+                    .collect(),
+            );
+            Ok(CommandOutput {
+                status: 0,
+                stdout: stdout.to_string(),
+                stderr: String::new(),
+            })
+        });
+        (runner, calls)
+    }
+
+    fn write_tasks_json(dir: &Path) {
+        std::fs::write(
+            dir.join("tasks.json"),
+            serde_json::to_string(&json!([
+                { "task_id": 1, "title": "One", "description": "d1" },
+            ]))
+            .unwrap(),
+        )
+        .unwrap();
+    }
+
+    fn write_harness_with_check(worktree: &Path, check: serde_json::Value) {
+        let harness = json!({ "validation": { "checks": [check] } });
+        std::fs::write(
+            worktree.join("planning").join("harness.json"),
+            serde_json::to_string(&harness).unwrap(),
+        )
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn load_snapshots_a_baseline_diff_check_before_the_first_task() {
+        let worktree = temp_dir();
+        let dir = worktree.join("planning").join("my-spec");
+        std::fs::create_dir_all(&dir).unwrap();
+        write_tasks_json(&dir);
+        write_harness_with_check(
+            &worktree,
+            json!({
+                "name": "my-check",
+                "kind": "baseline-diff",
+                "baselineCommand": "echo baseline",
+                "command": "echo '[]'",
+            }),
+        );
+
+        let (runner, calls) = recording_baseline_runner("captured-baseline-stdout");
+        let ctx = ctx_with_worktree("my-spec", &worktree);
+        let node = LoadTaskStateNode::new().with_runner(runner);
+        node.process(ctx).await.expect("load should succeed");
+
+        let baseline_file = baseline_snapshot_path(&dir, "my-check");
+        assert!(
+            baseline_file.exists(),
+            "expected a baseline snapshot file at {}",
+            baseline_file.display()
+        );
+        assert_eq!(
+            std::fs::read_to_string(&baseline_file).unwrap(),
+            "captured-baseline-stdout"
+        );
+        let calls = calls.lock().unwrap();
+        assert_eq!(
+            calls.len(),
+            1,
+            "expected exactly one baselineCommand invocation"
+        );
+        assert_eq!(calls[0], vec!["sh", "-c", "echo baseline"]);
+    }
+
+    #[tokio::test]
+    async fn load_resume_does_not_overwrite_an_existing_baseline_snapshot() {
+        let worktree = temp_dir();
+        let dir = worktree.join("planning").join("my-spec");
+        std::fs::create_dir_all(&dir).unwrap();
+        write_tasks_json(&dir);
+        write_harness_with_check(
+            &worktree,
+            json!({
+                "name": "my-check",
+                "kind": "baseline-diff",
+                "baselineCommand": "echo new-baseline",
+                "command": "echo '[]'",
+            }),
+        );
+
+        let baseline_file = baseline_snapshot_path(&dir, "my-check");
+        std::fs::create_dir_all(baseline_file.parent().unwrap()).unwrap();
+        std::fs::write(&baseline_file, "original-snapshot").unwrap();
+        let original_mtime = std::fs::metadata(&baseline_file)
+            .unwrap()
+            .modified()
+            .unwrap();
+
+        let (runner, calls) = recording_baseline_runner("new-baseline-stdout");
+        let ctx = ctx_with_worktree("my-spec", &worktree);
+        let node = LoadTaskStateNode::new().with_runner(runner);
+        node.process(ctx).await.expect("load should succeed");
+
+        assert_eq!(
+            std::fs::read_to_string(&baseline_file).unwrap(),
+            "original-snapshot",
+            "an existing baseline snapshot must never be overwritten"
+        );
+        assert_eq!(
+            std::fs::metadata(&baseline_file)
+                .unwrap()
+                .modified()
+                .unwrap(),
+            original_mtime,
+            "an existing baseline snapshot's mtime must be unchanged"
+        );
+        assert!(
+            calls.lock().unwrap().is_empty(),
+            "baselineCommand must not be re-run once a snapshot exists"
+        );
+    }
+
+    #[tokio::test]
+    async fn load_produces_no_baseline_file_for_a_non_baseline_diff_check() {
+        let worktree = temp_dir();
+        let dir = worktree.join("planning").join("my-spec");
+        std::fs::create_dir_all(&dir).unwrap();
+        write_tasks_json(&dir);
+        write_harness_with_check(
+            &worktree,
+            json!({
+                "name": "my-check",
+                "kind": "command",
+                "command": "echo '[]'",
+            }),
+        );
+
+        let (runner, calls) = recording_baseline_runner("unused");
+        let ctx = ctx_with_worktree("my-spec", &worktree);
+        let node = LoadTaskStateNode::new().with_runner(runner);
+        node.process(ctx).await.expect("load should succeed");
+
+        assert!(
+            !baseline_snapshot_path(&dir, "my-check").exists(),
+            "a non-baseline-diff check must produce no baseline file"
+        );
+        assert!(calls.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn load_produces_no_baseline_file_when_baseline_command_is_absent() {
+        let worktree = temp_dir();
+        let dir = worktree.join("planning").join("my-spec");
+        std::fs::create_dir_all(&dir).unwrap();
+        write_tasks_json(&dir);
+        write_harness_with_check(
+            &worktree,
+            json!({
+                "name": "my-check",
+                "kind": "baseline-diff",
+                "command": "echo '[]'",
+            }),
+        );
+
+        let (runner, calls) = recording_baseline_runner("unused");
+        let ctx = ctx_with_worktree("my-spec", &worktree);
+        let node = LoadTaskStateNode::new().with_runner(runner);
+        node.process(ctx).await.expect("load should succeed");
+
+        assert!(!baseline_snapshot_path(&dir, "my-check").exists());
+        assert!(calls.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn load_with_no_harness_json_produces_no_baseline_file_and_calls_no_runner() {
+        let worktree = temp_dir();
+        let dir = worktree.join("planning").join("my-spec");
+        std::fs::create_dir_all(&dir).unwrap();
+        write_tasks_json(&dir);
+        // No planning/harness.json written at all.
+
+        let (runner, calls) = recording_baseline_runner("unused");
+        let ctx = ctx_with_worktree("my-spec", &worktree);
+        let node = LoadTaskStateNode::new().with_runner(runner);
+        node.process(ctx).await.expect("load should succeed");
+
+        assert!(
+            !dir.join("sdlc").exists(),
+            "no sdlc dir should be created with no harness.json"
+        );
+        assert!(calls.lock().unwrap().is_empty());
     }
 
     // --- SetupWorktreeNode --------------------------------------------------

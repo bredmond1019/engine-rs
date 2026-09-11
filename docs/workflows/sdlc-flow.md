@@ -214,6 +214,52 @@ something caught in review.
 Full classification of what was ported, dropped, or redirected, stage by stage:
 `planning/EN.ticket.prompt-parity-with-the-js-engines/`.
 
+## Baseline-diff pre-run snapshot and `failureClass: escalate` (`EN.17.G`)
+
+A `baseline-diff` harness check compares its `command`'s output against its `baselineCommand`'s
+output and fails on any net-new entry (matched on `compareKeys`). Naively re-running
+`baselineCommand` inside `TestTaskNode` — after the task's own implement step has already changed
+the tree — makes the check compare the post-change tree against itself: a net-new entry the task
+introduced shows up in both sides and the gate is green on exactly the regression it exists to
+catch.
+
+**When the snapshot is taken.** `LoadTaskStateNode` — the node every route through
+`SpecExistsRouterNode` passes through before the task loop starts, on both the fresh-bootstrap and
+the resume/restart/`retry_task` paths — runs each `baseline-diff` check's `baselineCommand` once,
+before the first task's implement stage ever runs, and persists its stdout. This makes the
+comparison honest: `command`'s output (read later, post-implementation, by `TestTaskNode`) is
+compared against the tree as it stood *before* the run touched anything.
+
+**Where it is persisted.** `<spec_dir>/sdlc/baseline-<slug>.txt`, one file per check, where
+`<slug>` is the check's `name` reduced to filesystem-safe characters. `<spec_dir>` is
+`<worktree>/planning/<spec_slug>` — the same directory the committed `sdlc-flow-state.json` lives
+under.
+
+**Resume-safe by construction.** An existing baseline file is never overwritten, re-read, or even
+opened again — `LoadTaskStateNode` checks whether the file already exists and, if so, leaves it
+untouched. That is what makes it safe to call this snapshot step unconditionally on every
+`LoadTaskStateNode` invocation for a given spec (fresh bootstrap, resume, restart, and
+`retry_task` alike): only the very first invocation for a given check ever finds its file absent
+and actually shells out.
+
+**The fallback.** `TestTaskNode`'s `run_baseline_diff` reads the persisted snapshot instead of
+shelling out to `baselineCommand` again. If no snapshot file exists — a run started before this
+behavior existed, or a check with no `baselineCommand` — it falls back to today's original
+behavior (`baselineCommand` run live, post-implementation) and the `CheckResult.message` states
+explicitly that the baseline was taken post-implementation, appended to any net-new-violation
+message so both facts are visible when both are true. This fallback is never silent.
+
+**`failureClass: escalate`.** A harness check may declare `"failureClass": "escalate"` alongside
+its other keys. `CheckResult` carries a `failure_class` field (`Fixable` by default — an absent
+key, or any value other than `"escalate"`, resolves to `Fixable`, so a `harness.json` written
+before this existed is unaffected). When a task's failed checks include one declaring
+`failureClass: escalate`, `TriageTaskNode` stamps the same `MAJOR_BAIL` shape the
+attempts-exhausted path already produces — routed by the unchanged `TriageRouterNode` `MAJOR_BAIL`
+edge to `WrapUpNode` — on the very first failing attempt, before `max_attempts` is anywhere near
+exhausted, and never invokes the LLM triage transport for that task. The bail's `check_id` is the
+escalating check's declared `name`. A failed check with no `failureClass` (or an explicit
+`"fixable"`) retries exactly as before.
+
 ## How to trigger a run
 
 `engine-rs` has **no standalone CLI** — it's a library/runtime that embeds in the `bastion serve`

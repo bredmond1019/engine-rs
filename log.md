@@ -5,7 +5,7 @@ description: Chronological log of work completed for engine-rs.
 doc_id: log
 layer: [factory]
 status: active
-timestamp: "2026-09-11T00:13:39Z"
+timestamp: "2026-09-11T21:18:30Z"
 keywords: [work log, session history, development log]
 related: [status, context]
 ---
@@ -15,6 +15,54 @@ related: [status, context]
 *Append-only working log. One dated entry per session. Newest entries at the top.*
 
 ## [run: 2026-09-11]
+
+### EN.17.G done — pre-run baseline snapshot + escalate failure class
+
+Ran `/sdlc-flow` on branch `EN.17.G-flow` across all 5 tasks (all passed), PASS review. Task 1
+gave `CheckResult` a `failure_class: FailureClass { Fixable, Escalate }`, parsed from each check's
+`failureClass` key at every construction site in `task_loop.rs` (absent key defaults to `Fixable`,
+behaviour-stable). Task 2 added a pre-run baseline snapshot: `LoadTaskStateNode` now snapshots
+every `baseline-diff` check's `baselineCommand` output once before the first task, resume-safe,
+via a new injectable-runner-backed `snapshot_baselines` helper writing to
+`<spec_dir>/sdlc/baseline-<slug>.txt`. Task 3 rewired `run_baseline_diff` to read that persisted
+snapshot instead of shelling out post-implementation (which previously let a task's own regression
+pass because its "baseline" already contained the change), falling back to the old live-shell
+behavior — with an explicit fallback message — only when no snapshot file exists. Task 4 made
+`TriageTaskNode` bail `MAJOR_BAIL` on the first attempt when a failed check's `failure_class` is
+`escalate`, skipping the LLM triage call and the retry budget entirely; fixable/default checks
+still retry as before. Task 5 added a 6-test `gate_baseline.rs` integration suite exercising the
+snapshot, resume-safety, the fallback message, and `failureClass:escalate` through the public node
+API, ran base-template's fixture-evidence schema check for `failureClass:escalate` (6/6 PASS), and
+updated `docs/workflows/sdlc-flow.md`. Full harness gate green. This closes `EN.17.G`.
+
+Next: `EN.17.I` — Heavy Rust check jobs go through one FIFO queue with per-class limits, a memory
+floor and heartbeat reclaim.
+
+```
+bc68a68 docs: update docs for EN.17.G
+4dad6d8 feat: implement EN.17.G-task5
+03f4891 feat: implement EN.17.G-task4
+809269e feat: implement EN.17.G-task3
+c8622a6 feat: implement EN.17.G-task2
+7a7423d feat: implement EN.17.G-task1
+```
+
+### EN.17.D merged, main reconciled, session closed out
+
+- **What:** Diagnosed and fixed PR #86's CI red (claude-code-rs's `max_turns` field unpushed;
+  `rg` absent on the hosted runner), merged the PR past an already-tracked unrelated pre-existing
+  CI carryover (`hosted-ci-cannot-resolve-fleet-locks-brain-toml`, following the PR #80/#81
+  precedent), then reconciled local `main` with `origin/main` after they diverged in both
+  directions (local held 62 unpushed `EN.17.A/B/C` commits; origin independently gained
+  `EN.15.K`/`EN.15.L`/`EN.17.D` via squash-merges) — merge commit `d7a7a61`, full workspace suite
+  green before committing. Ran a complete `/close-out`: all harness gates green, one flaky test
+  found and filed as carryover (`preflight-command-timeout-is-flaky-under-heavy-parallel-load`),
+  coverage adequate, docs already current.
+- **Why:** `/begin-orchestration --roadmap coordination-layer-port --lane engine-unattended
+  --execute` continuing the lane past EN.17.D; the operator then asked for a clean `/close-out`
+  before ending the session.
+- **Refs:** `planning/orchestration-run/coordination-layer-port/{notes.md,review.md}`,
+  `planning/handoff.md`, PR #86.
 
 `/sdlc-flow` ran `EN.17.D` on branch `EN.17.D-flow` across all 5 tasks (all passed), PASS review.
 Task 1 added `JudgmentNode<T>`: a bounded, schema-constrained claude call over byte-capped
@@ -51,8 +99,6 @@ at the block boundary.
 8ed2db9 feat: implement EN.17.D-task1
 1ae08fb Merge EN.17.C-flow: bail-to-operator via one shared sweep router (bail_channel notification)
 ```
-
-## [run: 2026-09-11]
 
 `/sdlc-flow` ran `EN.17.C` on branch `EN.17.C-flow` across all 7 tasks (all passed). Task 1 added the `BailChannel` (`Session`/`Notification`) knob to `OrchestrationPolicy`; task 2 threaded a `BailChannel` parameter through `record_bail_escalation`, defaulted to `Session` at every wrapper call site; task 3 gave `OrchestrationRunNode` an injectable `OperatorTransport` and called `sweep::run_sweep_pass` exactly once per bailing chain, after `chain_report` is stamped into `ctx`; task 4 resolved `bail_channel` from the run's `OrchestrationPolicy` and threaded it into `integrate_chain_with_coord_and_policy`, closing the real end-to-end switch; task 5 gave `engine-serve` a `register_builtin_workflows_with_operator` entry point wiring a real transport into SWEEP and ORCHESTRATION; task 6 documented the `bail_channel` knob in `docs/workflows/orchestration.md` and both engine-rs's and HQ's `planning/harness.json` (HQ's copy switched `orchestration.policy.bail_channel: notification`); task 7 added `crates/engine-core/tests/it/operator_reach.rs` (5 tests) and extended `hq_orchestration_policy.rs` to assert the real HQ file's switch. Review returned **PARTIAL**: two acceptance criteria are not literally satisfied, though both are documented, reasoned deviations rather than oversights. (1) The AC that a chain with two bailed blocks produces a number of stub `send` calls equal to `chain_report.bailed.len()` is contradicted by the pre-existing, intentional `sweep::route::Budget` cap of one operator-notify per `run_sweep_pass` call — the second bail is recorded as `action:skip-operator-budget, routed:false` rather than sent, which task 7's own commit treats as tension inside the spec's own wording (its "why" text says the per-pass budget stays in `route_escalation`, "never re-implemented here") rather than an implementation bug. (2) The AC that a skipped dependent's id appears in its bailed parent's escalation payload was never implemented — `record_bail_escalation`'s summary is composed from `err_display` alone, and the skip loop never calls it. The run bailed on this PARTIAL verdict rather than looping further fixes, since both gaps are scope/wording questions for a human. Next: a human decides whether to relax the two ACs to match the documented budget/skip-payload behavior or open a follow-up task to close them, then `EN.17.C` can be resumed to close.
 
