@@ -293,7 +293,15 @@ mod tests {
             // by identifier, not a runner-name escape hatch.
             (
                 "corpus_gates.rs",
-                &["resolve_depends_on", "is_edge_met", "is_block_open"],
+                &[
+                    "resolve_depends_on",
+                    "is_edge_met",
+                    "is_block_open",
+                    // `block_status(repo, block_id)` (`EN.17.B` Task 1): the per-step
+                    // boundary read beside `is_edge_met`/`is_block_open` above — a
+                    // repo slug and a block id, not a runner-name escape hatch.
+                    "block_status",
+                ],
             ),
             ("engine_kind.rs", &["from_sdlc_workflow"]),
             // Scan-list drift fix (`EN.15.G` Task 4): `escalate.rs` landed in Task 1 without
