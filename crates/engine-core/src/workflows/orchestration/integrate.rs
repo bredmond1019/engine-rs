@@ -1335,7 +1335,12 @@ pub type ComposeLedgerEntriesFn = dyn Fn(
 /// scope) so the gap survives into `notes.md`, which `EN.15.G` task 3's `run_record_sink`
 /// renders from exactly this accumulator. A candidate the composer proposed but
 /// [`super::ledger::LedgerEntry::compose`] refuses (an invalid shape) is logged and
-/// skipped the same way — refusing one candidate never discards the others.
+/// skipped the same way — refusing one candidate never discards the others. And a
+/// candidate that composes CLEANLY with `call_site: `[`super::ledger::NONE_CALL_SITE`]
+/// (a valid, accepted value — never a refusal) gets the same `GateRefused` journal row
+/// treatment at the point it is composed: it is still written to the ledger, but is also
+/// named as a finding, keeping the composer prompt's own promise that such an entry
+/// "becomes a tracked finding downstream".
 #[allow(clippy::too_many_arguments)]
 async fn compose_and_append_ledger_entries(
     compose_ledger_entries: Option<&ComposeLedgerEntriesFn>,
@@ -1406,7 +1411,38 @@ async fn compose_and_append_ledger_entries(
     let mut composed = Vec::with_capacity(candidates.len());
     for candidate in candidates {
         match super::ledger::LedgerEntry::compose(&step.repo, step.block_id.clone(), candidate) {
-            Ok(entry) => composed.push(entry),
+            Ok(entry) => {
+                // A `call_site: NONE` entry is accepted (not a validation
+                // refusal — see `LedgerEntryError::MissingCallSite`'s doc),
+                // but the composer prompt promises it "becomes a tracked
+                // finding downstream". Nothing else in this function makes
+                // that promise true for an entry that composes cleanly, so
+                // record it here as a `GateRefused` journal row — the same
+                // accumulator EN.15.G's `render_notes_md` renders a run's
+                // `notes.md` findings from — immediately alongside writing
+                // the entry itself.
+                if entry.call_site == super::ledger::NONE_CALL_SITE {
+                    emit_journal(
+                        journal_sink,
+                        campaign_id,
+                        step_run_id,
+                        &step.block_id,
+                        engine_contract::JournalDecisionKind::GateRefused,
+                        format!(
+                            "EN.15.L: verification-ledger entry '{}' for block {} carries \
+                             call_site: NONE — no production caller exists for \"{}\"; \
+                             tracked here as a finding",
+                            entry.id, step.block_id, entry.capability
+                        ),
+                        serde_json::json!({
+                            "gap": "ledger_entry_call_site_none",
+                            "block": step.block_id,
+                            "entry_id": entry.id,
+                        }),
+                    );
+                }
+                composed.push(entry);
+            }
             Err(err) => {
                 tracing::warn!(
                     repo = %step.repo,

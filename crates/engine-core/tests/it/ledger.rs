@@ -16,7 +16,8 @@
 //! 4. [`merging_into_an_existing_ledger_keeps_prior_entries_and_skips_duplicate_ids`] — the
 //!    merge case, seeded with a prior-wave entry the stub composer re-proposes.
 //! 5. [`validation_refusals_are_enforced_through_the_full_chain`] — covered/empty covered_by
-//!    and missing call_site refused; `call_site: "NONE"` accepted.
+//!    and missing call_site refused; `call_site: "NONE"` accepted AND recorded as a
+//!    `GateRefused` journal-row finding.
 //! 6. [`a_composer_error_never_fails_the_chain_and_is_recorded_as_a_journal_gap`] — a composer
 //!    error/unparseable output never fails the chain; the gap is recorded as a `GateRefused`
 //!    journal row (the accumulator `EN.15.G`'s `render_notes_md` renders `notes.md` from).
@@ -553,6 +554,11 @@ async fn validation_refusals_are_enforced_through_the_full_chain() {
         })
     });
 
+    let rows: Arc<Mutex<Vec<engine_contract::JournalRow>>> = Arc::new(Mutex::new(Vec::new()));
+    let sink_rows = rows.clone();
+    let journal_sink: Arc<dyn Fn(engine_contract::JournalRow) + Send + Sync> =
+        Arc::new(move |row: engine_contract::JournalRow| sink_rows.lock().unwrap().push(row));
+
     let chain = resolve_explicit_chain(vec![("repo-a".to_string(), "A.1".to_string())]);
     integrate_chain_with_run_record(
         &chain,
@@ -574,7 +580,7 @@ async fn validation_refusals_are_enforced_through_the_full_chain() {
         true,
         Uuid::new_v4(),
         &noop_close_block,
-        None,
+        Some(journal_sink.as_ref()),
         None,
         None,
         Some(composer.as_ref()),
@@ -588,6 +594,29 @@ async fn validation_refusals_are_enforced_through_the_full_chain() {
         ids,
         vec!["repo-a-none-call-site".to_string()],
         "only the call_site:NONE candidate should survive composition: {ids:?}"
+    );
+
+    // The accepted call_site:NONE entry must still surface as a tracked finding — the
+    // composer prompt's own promise ("it becomes a tracked finding downstream") is kept
+    // by recording a GateRefused journal row alongside writing the entry, not instead of
+    // it.
+    let recorded = rows.lock().unwrap();
+    let finding_row = recorded
+        .iter()
+        .find(|r| r.kind == engine_contract::JournalDecisionKind::GateRefused)
+        .expect(
+            "an accepted call_site:NONE entry must be recorded as a GateRefused journal \
+             row — the same accumulator EN.15.G's render_notes_md renders notes.md's \
+             findings from",
+        );
+    assert!(finding_row.reason.contains("call_site: NONE"));
+    assert_eq!(
+        finding_row.detail["gap"],
+        serde_json::json!("ledger_entry_call_site_none")
+    );
+    assert_eq!(
+        finding_row.detail["entry_id"],
+        serde_json::json!("repo-a-none-call-site")
     );
 }
 

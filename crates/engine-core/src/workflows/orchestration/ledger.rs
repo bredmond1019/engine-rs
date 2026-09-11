@@ -34,6 +34,17 @@ use std::path::Path;
 
 use serde_json::{json, Map, Value};
 
+/// The literal `call_site` value a composer proposes when, after an actual
+/// re-check of the codebase, no production caller exists — accepted by
+/// [`LedgerEntry::compose`]/[`LedgerEntry::new`] (never refused, unlike an
+/// empty/absent `call_site`), but the composer prompt
+/// (`prompts/compose_ledger_entries.md`) documents it as something that
+/// "becomes a tracked finding downstream" — see
+/// `integrate::compose_and_append_ledger_entries`, which emits a
+/// `GateRefused` journal row for every accepted entry carrying this value so
+/// the gap actually surfaces in a run's `notes.md`, keeping that promise.
+pub const NONE_CALL_SITE: &str = "NONE";
+
 /// The six values `docs/sandbox/run-verification-ledger-prompt.md` fixes as
 /// `status_values` — the exact header every `verification-ledger.json`
 /// carries, and the only statuses an entry's `status` field may hold.
