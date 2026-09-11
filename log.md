@@ -16,6 +16,37 @@ related: [status, context]
 
 ## [run: 2026-09-11]
 
+### EN.17.G done — pre-run baseline snapshot + escalate failure class
+
+Ran `/sdlc-flow` on branch `EN.17.G-flow` across all 5 tasks (all passed), PASS review. Task 1
+gave `CheckResult` a `failure_class: FailureClass { Fixable, Escalate }`, parsed from each check's
+`failureClass` key at every construction site in `task_loop.rs` (absent key defaults to `Fixable`,
+behaviour-stable). Task 2 added a pre-run baseline snapshot: `LoadTaskStateNode` now snapshots
+every `baseline-diff` check's `baselineCommand` output once before the first task, resume-safe,
+via a new injectable-runner-backed `snapshot_baselines` helper writing to
+`<spec_dir>/sdlc/baseline-<slug>.txt`. Task 3 rewired `run_baseline_diff` to read that persisted
+snapshot instead of shelling out post-implementation (which previously let a task's own regression
+pass because its "baseline" already contained the change), falling back to the old live-shell
+behavior — with an explicit fallback message — only when no snapshot file exists. Task 4 made
+`TriageTaskNode` bail `MAJOR_BAIL` on the first attempt when a failed check's `failure_class` is
+`escalate`, skipping the LLM triage call and the retry budget entirely; fixable/default checks
+still retry as before. Task 5 added a 6-test `gate_baseline.rs` integration suite exercising the
+snapshot, resume-safety, the fallback message, and `failureClass:escalate` through the public node
+API, ran base-template's fixture-evidence schema check for `failureClass:escalate` (6/6 PASS), and
+updated `docs/workflows/sdlc-flow.md`. Full harness gate green. This closes `EN.17.G`.
+
+Next: `EN.17.I` — Heavy Rust check jobs go through one FIFO queue with per-class limits, a memory
+floor and heartbeat reclaim.
+
+```
+bc68a68 docs: update docs for EN.17.G
+4dad6d8 feat: implement EN.17.G-task5
+03f4891 feat: implement EN.17.G-task4
+809269e feat: implement EN.17.G-task3
+c8622a6 feat: implement EN.17.G-task2
+7a7423d feat: implement EN.17.G-task1
+```
+
 ### EN.17.D merged, main reconciled, session closed out
 
 - **What:** Diagnosed and fixed PR #86's CI red (claude-code-rs's `max_turns` field unpushed;

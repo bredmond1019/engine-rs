@@ -34,6 +34,7 @@ mod cost_parity;
 mod escalate;
 mod evals_slice;
 mod fan_out_aggregate;
+mod gate_baseline;
 mod gate_timeout_fixture;
 mod harvest_gate_e2e;
 mod held_session;
