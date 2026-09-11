@@ -135,7 +135,8 @@ fn merge_sdlc_task_model_tiers(
     if let Some(v) = over.generate {
         base.generate = v;
     }
-    base.implement_final_attempt = merge_opt(base.implement_final_attempt, over.implement_final_attempt);
+    base.implement_final_attempt =
+        merge_opt(base.implement_final_attempt, over.implement_final_attempt);
     base
 }
 
