@@ -364,6 +364,18 @@ fn is_heartbeat_stale(heartbeat: &str, now: DateTime<Utc>) -> Option<bool> {
     heartbeat_age_seconds(heartbeat, now).map(|age| age > REGISTRY_STALE_THRESHOLD_SECONDS)
 }
 
+/// A lease's own staleness bucket — `EN.17.A` task 4: reads the lease constant
+/// (`crate::coord::LEASE_STALE_THRESHOLD_SECONDS`, the same authority
+/// `coord::write::lease`'s holder-conflict refusal and `QueueHoldSource::is_held` measure
+/// against) explicitly, rather than [`REGISTRY_STALE_THRESHOLD_SECONDS`] — a lane-registry
+/// claim and a repo lease are different questions with different authorities, even though
+/// both happen to be pinned to the same 3h value today. [`project_registry_entry`] keeps
+/// using [`is_heartbeat_stale`]/[`REGISTRY_STALE_THRESHOLD_SECONDS`] unchanged.
+fn is_lease_stale(heartbeat: &str, now: DateTime<Utc>) -> Option<bool> {
+    heartbeat_age_seconds(heartbeat, now)
+        .map(|age| age > crate::coord::LEASE_STALE_THRESHOLD_SECONDS)
+}
+
 fn project_registry_entry(
     entry: &coordination::RegistryEntry,
     now: DateTime<Utc>,
@@ -410,7 +422,7 @@ fn project_lease(entry: &coordination::LeaseEntry, now: DateTime<Utc>) -> Projec
                 holder: Some(record.agent.clone()),
                 kind: Some(record.kind),
                 scope: record.scope,
-                stale: is_heartbeat_stale(liveness_ts, now),
+                stale: is_lease_stale(liveness_ts, now),
                 error: None,
             }
         }
