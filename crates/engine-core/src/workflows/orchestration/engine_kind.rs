@@ -293,7 +293,15 @@ mod tests {
             // by identifier, not a runner-name escape hatch.
             (
                 "corpus_gates.rs",
-                &["resolve_depends_on", "is_edge_met", "is_block_open"],
+                &[
+                    "resolve_depends_on",
+                    "is_edge_met",
+                    "is_block_open",
+                    // `block_status(repo, block_id)` (`EN.17.B` Task 1): the per-step
+                    // boundary read beside `is_edge_met`/`is_block_open` above — a
+                    // repo slug and a block id, not a runner-name escape hatch.
+                    "block_status",
+                ],
             ),
             ("engine_kind.rs", &["from_sdlc_workflow"]),
             // Scan-list drift fix (`EN.15.G` Task 4): `escalate.rs` landed in Task 1 without
@@ -342,11 +350,11 @@ mod tests {
                 ],
             ),
             // `resolve_roadmap_dir` resolves a roadmap slug to its planning directory —
-            // a path lookup, not a runner. `closed`/`bailed`/`cancelled`/`budget_halted`
-            // are `LaneLogEntry` constructors taking a `lane: &str` and a
-            // `note: impl Into<String>` (`EN.11.F` task 4 adds the latter two, same
-            // shape as the existing pair) — building a log line, not selecting or
-            // invoking a runner.
+            // a path lookup, not a runner. `closed`/`bailed`/`cancelled`/`budget_halted`/
+            // `held` are `LaneLogEntry` constructors taking a `lane: &str` and a
+            // `note: impl Into<String>` (`EN.11.F` task 4 adds the first two of the
+            // latter pair; `EN.17.A` task 4 adds `held`, same shape) — building a log
+            // line, not selecting or invoking a runner.
             (
                 "integrate.rs",
                 &[
@@ -355,6 +363,7 @@ mod tests {
                     "bailed",
                     "cancelled",
                     "budget_halted",
+                    "held",
                 ],
             ),
             // Scan-list drift fix (`EN.15.L` Task 5, same class of drift `escalate.rs`'s and
@@ -379,6 +388,18 @@ mod tests {
             // (D77 §2) field a draft was authored in — a config value, not a
             // runner-name escape hatch (`EN.12.M` task 1).
             ("post_draft.rs", &["build_post_draft_payload"]),
+            // Scan-list drift fix (`EN.17.D` task 3, same class of drift `escalate.rs`'s,
+            // `ledger.rs`'s and `operator_edge.rs`'s own notes above already name):
+            // `preflight.rs` landed in task 2 without this guard's allowlist being
+            // updated. `test_support::claim_exit_nonzero(text: &str, load_bearing: bool,
+            // argv: Vec<String>)` is a test-only claim-builder fixture (its module is
+            // `#[doc(hidden)] pub mod test_support`, gated to `tests/it/preflight.rs`
+            // reaching across the crate boundary) — a claim's free-text description and
+            // an `argv`, never a runner-name escape hatch. `PreflightRunner::run_for_block`
+            // and `test_support::{claim, run_execute_argv, run_one_claim}` all wrap their
+            // `&str` params onto their own lines (rustfmt), so this single-line scan never
+            // reaches them and there is nothing to allowlist for those.
+            ("preflight.rs", &["claim_exit_nonzero"]),
         ];
 
         let dir =

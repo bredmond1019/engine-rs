@@ -483,6 +483,8 @@ async fn recording_runner_cuts_a_real_branch_per_block_from_origin_main() {
             cancellation_token: None,
             budget: None,
             permission_profile: engine_core::policy::permission::PermissionProfile::Standard,
+            child_sdlc_flow_policy: None,
+            child_sdlc_task_policy: None,
         };
         (flow_runner)(invocation)
             .await
@@ -576,6 +578,8 @@ async fn block_n_plus_1s_tree_contains_block_ns_work() {
         true,
         Uuid::new_v4(),
         &|_repo: &str, _id: &str| {},
+        None,
+        None,
     )
     .await
     .expect("two-block chain over one repo should integrate cleanly");
@@ -744,6 +748,8 @@ async fn a_failed_setup_worktree_step_stops_the_chain_via_execute_step() {
         None,
         engine_core::policy::permission::PermissionProfile::Standard,
         None,
+        None,
+        None,
     )
     .await
     .expect_err("execute_step must fail a step whose node_runs record a failed node");
@@ -810,6 +816,8 @@ async fn a_failed_setup_worktree_step_stops_the_chain_via_execute_step() {
         true,
         Uuid::new_v4(),
         &|_repo: &str, _id: &str| {},
+        None,
+        None,
     )
     .await
     .expect_err("the chain must not report success for a failed SetupWorktreeNode");
@@ -995,6 +1003,8 @@ async fn lane_log_lines_use_the_fixed_ts_lane_repo_block_status_note_shape() {
         true,
         Uuid::new_v4(),
         &|_repo: &str, _id: &str| {},
+        None,
+        None,
     )
     .await
     .expect("two-block chain should close cleanly");
@@ -1024,6 +1034,8 @@ async fn lane_log_lines_use_the_fixed_ts_lane_repo_block_status_note_shape() {
         true,
         Uuid::new_v4(),
         &|_repo: &str, _id: &str| {},
+        None,
+        None,
     )
     .await
     .expect_err("D.3 never writes a state file, so the chain must stop");
@@ -1200,6 +1212,8 @@ async fn abort_between_blocks_leaves_block_one_committed_and_block_two_unstarted
         true,
         Uuid::new_v4(),
         &|_repo: &str, _id: &str| {},
+        None,
+        None,
     )
     .await
     .expect("a cancellation win is Ok, not Err — never rolled back");
@@ -1316,6 +1330,8 @@ async fn campaign_ceiling_below_one_blocks_cost_halts_at_first_boundary() {
         true,
         Uuid::new_v4(),
         &|_repo: &str, _id: &str| {},
+        None,
+        None,
     )
     .await
     .expect("a budget halt is Ok, not Err — never rolled back");
@@ -1436,6 +1452,8 @@ async fn an_unmergeable_step_fails_the_step_and_never_closes_it() {
         true,
         Uuid::new_v4(),
         &|_repo: &str, _id: &str| {},
+        None,
+        None,
     )
     .await
     .expect_err("a merge onto a nonexistent branch must fail the step");
@@ -1530,6 +1548,8 @@ async fn planning_symlink_still_resolves_into_its_vault_after_the_merge_stage() 
         true,
         Uuid::new_v4(),
         &|_repo: &str, _id: &str| {},
+        None,
+        None,
     )
     .await
     .expect("two-block chain over a symlinked planning/ should integrate cleanly");
@@ -1880,6 +1900,8 @@ async fn unstated_policy_event_resolves_to_use_worktree_true_on_the_invocation()
         policy.default_auto_pr,
         Uuid::new_v4(),
         &|_repo: &str, _id: &str| {},
+        None,
+        None,
     )
     .await
     .expect("single-block chain should integrate cleanly");
@@ -1940,6 +1962,8 @@ async fn explicit_false_policy_event_resolves_to_use_worktree_false_on_the_invoc
         policy.default_auto_pr,
         Uuid::new_v4(),
         &|_repo: &str, _id: &str| {},
+        None,
+        None,
     )
     .await
     .expect("single-block chain should integrate cleanly");

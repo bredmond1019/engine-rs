@@ -80,13 +80,17 @@ use super::checkpoint::{
     read_checkpoint, write_checkpoint, Checkpoint, CheckpointStep, ReadCheckpoint,
 };
 use super::coord_lane::CoordHandle;
+use super::corpus_gates::BlockPresence;
 use super::dispatch::{execute_dispatch_step, DispatchStepError};
 use super::escalate::{
     append_bail_line, append_escalation_line, BailEntry, EscalationChannel, EscalationKind,
-    EscalationRecord, EscalationSeverity, NewBailEntry, NewEscalation,
+    EscalationOption, EscalationRecord, EscalationSeverity, NewBailEntry, NewEscalation,
 };
 use super::execute::{execute_step, EngineKind, ExecuteError, ExecutionOutcome, FlowRunner};
 use super::gates::{check_dependencies, AdmissionGate, DependencyEdge, GateError};
+use super::graph::{BailChannel, OnBail};
+use super::preflight::{BlockPreflight, ClaimVerdict, PreflightOutcome};
+use crate::coord::write::RegisterOutcome;
 use crate::nodes::brain_client::RECALL_NODE_NAME;
 use crate::workflows::get_result;
 use crate::workflows::recall::RECALL_WORKFLOW_TYPE;
@@ -301,6 +305,7 @@ fn subject_repo_short_sha(repo_path: &Path) -> Option<String> {
 /// via [`append_escalation_line`]/[`append_bail_line`] — never rewrites or truncates
 /// either file, since agent lanes append their own lines to the same `escalations.jsonl`
 /// by design.
+#[allow(clippy::too_many_arguments)]
 fn record_bail_escalation(
     roadmap_dir: &Path,
     registry: &RepoRegistry,
@@ -309,6 +314,11 @@ fn record_bail_escalation(
     check_id: &str,
     engine: EngineKind,
     err_display: &str,
+    // `EN.17.C` task 2: which channel this bail's escalation is composed
+    // against — `BailChannel::Session` (every call site, until task 4
+    // threads the resolved `OrchestrationPolicy::bail_channel` value
+    // through) keeps this byte-identical to before this parameter existed.
+    bail_channel: BailChannel,
 ) {
     let roadmap = step.roadmap.as_deref().unwrap_or("no-roadmap");
     let gate_id = format!("{roadmap}/{}/{}", step.repo, step.block_id);
@@ -343,7 +353,22 @@ fn record_bail_escalation(
         step.repo, step.block_id
     );
 
-    match EscalationChannel::session(lane) {
+    // `EN.17.C` task 2: `BailChannel::Session` composes the escalation
+    // exactly as before (`EscalationChannel::session(lane)`), a no-op
+    // change — SWEEP's `LaneWake` is a no-op, so this record is written but
+    // never delivered. `BailChannel::Notification` composes exactly two
+    // acknowledgement-only options instead (each label well within
+    // `OPTION_LABEL_MAX_CHARS`), so SWEEP's dedup/permission-profile/budget
+    // pipeline can route the escalation through a real `OperatorTransport`
+    // (wired up by later tasks in this block). Neither option implies an
+    // action nothing consumes — see this block's own out_of_scope.
+    let channel_result = match bail_channel {
+        BailChannel::Session => EscalationChannel::session(lane),
+        BailChannel::Notification => EscalationOption::new("ack", "Seen")
+            .and_then(|ack| Ok((ack, EscalationOption::new("later", "Later")?)))
+            .and_then(|(ack, later)| EscalationChannel::notification(vec![ack, later])),
+    };
+    match channel_result {
         Ok(channel) => match EscalationRecord::new(NewEscalation {
             ts_utc: Utc::now().to_rfc3339(),
             repo: step.repo.clone(),
@@ -680,6 +705,16 @@ pub struct LaneLogEntry {
     /// tri-state discipline above.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile: Option<String>,
+    /// `EN.17.B` task 4: the specific edge (or block status) that held this
+    /// step back, present only on a [`LaneLogStatus::Skipped`] line —
+    /// serialized in the edge's own authored shape
+    /// (`{"type":"block"|"operator"|"approval"|"external", ...}`) for a
+    /// dependency-edge skip, or omitted (`None`) for a status-boundary skip
+    /// (closed/wontfix/superseded/deferred/not-in-tracks), whose `note`
+    /// already names the status. Omitted entirely (never `null`) on every
+    /// other status, matching `run_id`'s own tri-state discipline above.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blocked_by: Option<serde_json::Value>,
 }
 
 /// The closed vocabulary of outcomes a lane-log line can record. No
@@ -706,6 +741,15 @@ pub enum LaneLogStatus {
     /// budget halt is neither, it is the ceiling doing its job. The block
     /// this line names is the one that never started.
     BudgetHalted,
+    /// `EN.17.B` task 4: this step was never dispatched — either its own
+    /// status is closed/wontfix/superseded/deferred/not-in-tracks (the
+    /// status-aware boundary), it named a `depends_on` edge that is unmet,
+    /// or it depends (directly or transitively) on another step that was
+    /// itself `bailed` or `skipped` earlier in this same chain. Distinct
+    /// from [`LaneLogStatus::Bailed`] (this step's own execution failed) —
+    /// nothing here ever ran. See [`LaneLogEntry::blocked_by`] for the
+    /// specific edge or status that held it back.
+    Skipped,
 }
 
 impl LaneLogEntry {
@@ -723,6 +767,7 @@ impl LaneLogEntry {
             writer: None,
             build_sha: None,
             profile: None,
+            blocked_by: None,
         }
     }
 
@@ -741,6 +786,27 @@ impl LaneLogEntry {
             writer: None,
             build_sha: None,
             profile: None,
+            blocked_by: None,
+        }
+    }
+
+    /// `EN.17.A` task 4: a step whose coordination heartbeat or lease call refused — the step
+    /// never ran (see [`IntegrateError::CoordRefused`]), distinct from [`LaneLogEntry::bailed`]
+    /// (the step ran and failed) precisely because nothing here ever executed.
+    #[must_use]
+    pub fn held(step: &ChainStep, lane: &str, note: impl Into<String>) -> Self {
+        Self {
+            ts: Utc::now().into(),
+            lane: lane.to_string(),
+            repo: step.repo.clone(),
+            block: step.block_id.clone(),
+            status: LaneLogStatus::Held,
+            note: note.into(),
+            run_id: None,
+            writer: None,
+            build_sha: None,
+            profile: None,
+            blocked_by: None,
         }
     }
 
@@ -762,6 +828,7 @@ impl LaneLogEntry {
             writer: None,
             build_sha: None,
             profile: None,
+            blocked_by: None,
         }
     }
 
@@ -787,6 +854,34 @@ impl LaneLogEntry {
             writer: None,
             build_sha: None,
             profile: None,
+            blocked_by: None,
+        }
+    }
+
+    /// `EN.17.B` task 4: a step that was never dispatched — see
+    /// [`LaneLogStatus::Skipped`]'s own doc for the three cases this
+    /// covers. `blocked_by` is the specific edge (in its authored shape)
+    /// or `None` for a status-boundary skip, whose `note` already names
+    /// the status.
+    #[must_use]
+    pub fn skipped(
+        step: &ChainStep,
+        lane: &str,
+        note: impl Into<String>,
+        blocked_by: Option<serde_json::Value>,
+    ) -> Self {
+        Self {
+            ts: Utc::now().into(),
+            lane: lane.to_string(),
+            repo: step.repo.clone(),
+            block: step.block_id.clone(),
+            status: LaneLogStatus::Skipped,
+            note: note.into(),
+            run_id: None,
+            writer: None,
+            build_sha: None,
+            profile: None,
+            blocked_by,
         }
     }
 
@@ -819,6 +914,72 @@ impl LaneLogEntry {
     pub fn with_permission_profile(mut self, profile: Option<String>) -> Self {
         self.profile = profile;
         self
+    }
+}
+
+/// `EN.17.B` task 4: one step this chain never dispatched — its own record
+/// in [`ChainReport::skipped`]. `block` is `"{repo}:{block_id}"`, matching
+/// the same identity shape [`ChainReport::closed`]/[`ChainReport::bailed`]
+/// use, so a reader correlating the three lists never has to parse a
+/// nested object. `blocked_by` mirrors [`LaneLogEntry::blocked_by`]
+/// exactly (`None` for a status-boundary skip, `Some` edge-shaped JSON for
+/// a dependency-edge or transitive skip).
+#[derive(Debug, Clone, Serialize)]
+pub struct SkippedStep {
+    pub block: String,
+    pub reason: String,
+    pub blocked_by: Option<serde_json::Value>,
+}
+
+/// `EN.17.B` task 4: the terminal accounting for one chain run —
+/// [`OrchestrationRunNode::process`] stamps this into
+/// `ctx.nodes["OrchestrationRunNode"]["chain_report"]` exactly once, BEFORE
+/// deciding the node's own success/error outcome, on both the success and
+/// the error path (a caller passes `&mut ChainReport` into
+/// [`integrate_chain_impl_inner`], so every push made before an early
+/// `return Err` is still visible in the caller's own copy once the call
+/// returns — this struct is never itself part of the `Result`). Under the
+/// built-in `on_bail` (`OnBail::StopChain`), `bailed` holds at most the one
+/// step that stopped the chain and `skipped` is typically empty (no later
+/// step was ever reached); under `OnBail::SkipDependents`,
+/// `closed.len() + bailed.len() + skipped.len()` always sums to the
+/// chain's own step count (block-kind steps only — a `dispatch` step is
+/// counted in none of the three, matching its own `lane-log.jsonl`
+/// omission).
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct ChainReport {
+    /// `"{repo}:{block_id}"` for every step that finished successfully.
+    pub closed: Vec<String>,
+    /// `"{repo}:{block_id}"` for every step whose own execution failed —
+    /// `execute_step`, `verify_state_write`, the merge stage, an operator
+    /// hold that never cleared, or a refused coordination lease.
+    pub bailed: Vec<String>,
+    pub skipped: Vec<SkippedStep>,
+}
+
+/// Serialize `edge` in its authored shape — the same `{"type": ...}` JSON a
+/// hand-written `depends_on` entry in `state.json` carries — for
+/// [`LaneLogEntry::blocked_by`] and [`SkippedStep::blocked_by`]. `EN.17.B`
+/// task 4.
+fn dependency_edge_to_json(edge: &DependencyEdge) -> serde_json::Value {
+    match edge {
+        DependencyEdge::Block { repo, block_id } => serde_json::json!({
+            "type": "block",
+            "repo": repo,
+            "id": block_id,
+        }),
+        DependencyEdge::Operator { slug } => serde_json::json!({
+            "type": "operator",
+            "slug": slug,
+        }),
+        DependencyEdge::Approval { slug } => serde_json::json!({
+            "type": "approval",
+            "slug": slug,
+        }),
+        DependencyEdge::External { what } => serde_json::json!({
+            "type": "external",
+            "what": what,
+        }),
     }
 }
 
@@ -1011,6 +1172,66 @@ pub enum IntegrateError {
     /// [`LaneLogEntry::with_permission_profile`] fails loudly here rather
     /// than silently shipping an unauditable record.
     MissingPermissionProfileStamp { repo: String, block_id: String },
+    /// `EN.17.A` task 4: a `coord` handle's `register`/`heartbeat`/`lease` call refused or
+    /// errored — the chain STOPS rather than silently proceeding as though coordination were
+    /// a no-op (see the `coord` parameter's own doc for the `Some`/`None` contract this refusal
+    /// only ever fires under). `op` names which of the three calls refused;
+    /// [`CoordOp::Register`] always carries `block_id: None` (it runs once, before the loop,
+    /// for the whole chain rather than any one step); [`CoordOp::Heartbeat`]/[`CoordOp::Lease`]
+    /// always carry `Some(step.block_id)`. The refusal returns BEFORE `StepLeaseGuard` is
+    /// constructed, so a refused step releases nothing it never acquired.
+    CoordRefused {
+        op: CoordOp,
+        repo: String,
+        block_id: Option<String>,
+        reason: String,
+    },
+    /// `EN.17.D` task 3: a load-bearing preflight claim's `argv` exited
+    /// contrary to its `expect` — the block record's premise is false, so
+    /// the step stops BEFORE [`execute_step`] ever runs
+    /// (`check_id: "preflight-premise"`). Under [`OnBail::SkipDependents`]
+    /// this step's transitive dependents are skipped exactly like any
+    /// other bail.
+    PreflightPremiseFailed {
+        repo: String,
+        block_id: String,
+        claim: String,
+        argv: Vec<String>,
+    },
+    /// `EN.17.D` task 3: the preflight judgment call itself failed
+    /// ([`PreflightOutcome::Unjudged`]) and [`OnUnjudged::Bail`] is in
+    /// effect — the step stops rather than dispatching against an
+    /// unverified premise (`check_id: "preflight-unjudged"`). Under the
+    /// built-in [`OnUnjudged::Proceed`] this variant is never constructed;
+    /// the step dispatches and the `JudgmentError` kind is recorded on the
+    /// step's `preflight_report` entry instead.
+    PreflightUnjudged {
+        repo: String,
+        block_id: String,
+        error_kind: String,
+    },
+}
+
+/// Which of a [`CoordHandle`]'s three write calls produced an
+/// [`IntegrateError::CoordRefused`] — `EN.17.A` task 4. Serialized `snake_case`, never a bare
+/// string, so a journal/escalation record naming this stays a closed vocabulary rather than
+/// free text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CoordOp {
+    Register,
+    Heartbeat,
+    Lease,
+}
+
+impl fmt::Display for CoordOp {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            CoordOp::Register => write!(f, "register"),
+            CoordOp::Heartbeat => write!(f, "heartbeat"),
+            CoordOp::Lease => write!(f, "lease"),
+        }
+    }
 }
 
 impl fmt::Display for IntegrateError {
@@ -1148,6 +1369,40 @@ impl fmt::Display for IntegrateError {
                  closed lane-log record carries no resolved permission-profile stamp \
                  (docs/permission-profiles.md invariant 1)"
             ),
+            IntegrateError::CoordRefused {
+                op,
+                repo,
+                block_id,
+                reason,
+            } => match block_id {
+                Some(block_id) => write!(
+                    f,
+                    "block '{block_id}' (repo '{repo}') coordination {op} refused: {reason}"
+                ),
+                None => write!(
+                    f,
+                    "chain registration (repo '{repo}') coordination {op} refused: {reason}"
+                ),
+            },
+            IntegrateError::PreflightPremiseFailed {
+                repo,
+                block_id,
+                claim,
+                argv,
+            } => write!(
+                f,
+                "block '{block_id}' (repo '{repo}') refused: preflight's load-bearing claim \
+                 '{claim}' (argv {argv:?}) did not hold"
+            ),
+            IntegrateError::PreflightUnjudged {
+                repo,
+                block_id,
+                error_kind,
+            } => write!(
+                f,
+                "block '{block_id}' (repo '{repo}') refused: preflight was unjudged ({error_kind}) \
+                 and preflight_on_unjudged is 'bail'"
+            ),
         }
     }
 }
@@ -1170,7 +1425,10 @@ impl std::error::Error for IntegrateError {
             | IntegrateError::HoldDeadlineExceeded { .. }
             | IntegrateError::NoDispatcherConfigured { .. }
             | IntegrateError::StepMergeFailed { .. }
-            | IntegrateError::MissingPermissionProfileStamp { .. } => None,
+            | IntegrateError::MissingPermissionProfileStamp { .. }
+            | IntegrateError::CoordRefused { .. }
+            | IntegrateError::PreflightPremiseFailed { .. }
+            | IntegrateError::PreflightUnjudged { .. } => None,
             IntegrateError::CheckpointWriteFailed(source) => Some(source),
             IntegrateError::Dispatch(err) => Some(err),
         }
@@ -1721,6 +1979,51 @@ fn require_profile_stamp(
 /// (`journal_sink` is always `None` here) so every existing caller keeps
 /// compiling unmodified; [`integrate_chain_with_journal`] is the new entry
 /// point that actually wants journal rows.
+/// The permissive default [`integrate_chain_impl_inner`]'s status-aware
+/// boundary (`EN.17.B` task 4) uses when a caller (every pre-task-4 public
+/// wrapper below) never wires a real one via
+/// [`super::graph::OrchestrationRunNode::with_block_status`] — every block
+/// reports `"open"`, so the boundary check never skips anything, keeping
+/// those wrappers byte-identical to before this parameter existed.
+fn default_block_status(_repo: &str, _block_id: &str) -> BlockPresence {
+    BlockPresence::Row("open".to_string())
+}
+
+/// `EN.17.D` task 3: `(repo, block_id) -> PreflightOutcome` — the preflight
+/// seam, consulted once per BLOCK step (a [`StepKind::Dispatch`] step never
+/// reaches it — see the block's own `out_of_scope`), after admission and
+/// immediately before [`execute_step`]. `default_preflight` (every wrapper
+/// below [`integrate_chain_with_coord_and_policy`], which is the only
+/// caller task 4 wires a real closure into) always reports
+/// [`PreflightOutcome::Disabled`], matching the built-in
+/// `OrchestrationPolicy::preflight_enabled: false` — so the seam is a no-op
+/// for them, exactly like [`default_block_status`] above.
+fn default_preflight(_repo: &str, _block_id: &str) -> PreflightOutcome {
+    PreflightOutcome::Disabled
+}
+
+/// `EN.17.D` task 3: what this loop does when the preflight judgment call
+/// itself failed ([`PreflightOutcome::Unjudged`]) — the call never even
+/// reached a claim, let alone verified one. `Proceed` (the built-in
+/// default, and what every wrapper below [`integrate_chain_with_coord_and_policy`]
+/// hardcodes) dispatches the step anyway and records the `JudgmentError`
+/// kind on this step's `preflight_report` entry; `Bail` stops the step
+/// exactly like a false load-bearing claim, with
+/// `check_id: "preflight-unjudged"`. `OrchestrationPolicy`'s own
+/// `preflight_on_unjudged` knob (task 4) resolves to one of these two
+/// variants.
+///
+/// `EN.17.D` task 4: `Serialize`/`Deserialize` added so this can live on
+/// `OrchestrationPolicy` (which derives both, mirroring `OnBail`/
+/// `BailChannel`) and be stamped straight into a run's `preflight_report`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OnUnjudged {
+    #[default]
+    Proceed,
+    Bail,
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn integrate_chain(
     chain: &[ChainStep],
@@ -1742,6 +2045,12 @@ pub async fn integrate_chain(
     default_auto_pr: bool,
     campaign_id: uuid::Uuid,
     close_block: &CloseBlockFn,
+    // `EN.17.F` task 2: the resolved `OrchestrationPolicy::child_sdlc_flow_policy` /
+    // `child_sdlc_task_policy` knobs, forwarded to every `execute_step` call this
+    // chain makes. `None, None` leaves every emitted child event byte-identical to
+    // before these parameters existed.
+    child_sdlc_flow_policy: Option<&serde_json::Value>,
+    child_sdlc_task_policy: Option<&serde_json::Value>,
 ) -> Result<Vec<ExecutionOutcome>, IntegrateError> {
     integrate_chain_impl(
         chain,
@@ -1768,6 +2077,15 @@ pub async fn integrate_chain(
         None,
         None,
         None,
+        child_sdlc_flow_policy,
+        child_sdlc_task_policy,
+        OnBail::StopChain,
+        BailChannel::Session,
+        &default_block_status,
+        &mut ChainReport::default(),
+        &default_preflight,
+        OnUnjudged::Proceed,
+        &mut Vec::new(),
     )
     .await
 }
@@ -1828,6 +2146,15 @@ pub async fn integrate_chain_with_journal(
         None,
         None,
         None,
+        None,
+        None,
+        OnBail::StopChain,
+        BailChannel::Session,
+        &default_block_status,
+        &mut ChainReport::default(),
+        &default_preflight,
+        OnUnjudged::Proceed,
+        &mut Vec::new(),
     )
     .await
 }
@@ -1859,6 +2186,9 @@ pub async fn integrate_chain_with_coord(
     campaign_id: uuid::Uuid,
     close_block: &CloseBlockFn,
     coord: Option<&CoordHandle>,
+    // `EN.17.F` task 2: same contract as `integrate_chain`'s own new parameters.
+    child_sdlc_flow_policy: Option<&serde_json::Value>,
+    child_sdlc_task_policy: Option<&serde_json::Value>,
 ) -> Result<Vec<ExecutionOutcome>, IntegrateError> {
     integrate_chain_impl(
         chain,
@@ -1885,6 +2215,186 @@ pub async fn integrate_chain_with_coord(
         coord,
         None,
         None,
+        child_sdlc_flow_policy,
+        child_sdlc_task_policy,
+        OnBail::StopChain,
+        BailChannel::Session,
+        &default_block_status,
+        &mut ChainReport::default(),
+        &default_preflight,
+        OnUnjudged::Proceed,
+        &mut Vec::new(),
+    )
+    .await
+}
+
+/// `EN.17.B` task 4: identical to [`integrate_chain_with_coord`], plus the
+/// status-aware boundary and skip-dependents seams —
+/// [`super::graph::OrchestrationRunNode::process`] is this function's only
+/// caller, so `on_bail`/`bail_channel`/`block_status` carry the resolved
+/// `OrchestrationPolicy` value and the real `CorpusGates::block_status`
+/// closure respectively (`bail_channel` threaded through by `EN.17.C` task
+/// 4 — until then this function hardcoded `BailChannel::Session`
+/// internally). `report` accumulates `closed`/`bailed`/`skipped`
+/// as the loop runs, so it is populated on BOTH the success and the error
+/// return path — a caller reads it after this call returns regardless of
+/// which branch of the `Result` it got, which is what lets `process` stamp
+/// `chain_report` into `ctx` even on the error path (see [`ChainReport`]'s
+/// own doc). [`integrate_chain_with_coord`] itself is untouched by this
+/// function's existence: it keeps calling [`integrate_chain_impl`] with
+/// `OnBail::StopChain` and the permissive [`default_block_status`]
+/// internally, so every pre-task-4 caller (including every test in
+/// `tests/it/orchestration.rs`, `orchestration_chain.rs` and
+/// `coord_chain.rs`) is unaffected by this addition.
+#[allow(clippy::too_many_arguments)]
+pub async fn integrate_chain_with_coord_and_policy(
+    chain: &[ChainStep],
+    resolve_depends_on: &dyn Fn(&str, &str) -> Vec<DependencyEdge>,
+    is_edge_met: &dyn Fn(&str, &str) -> bool,
+    admission: &AdmissionGate,
+    hold_source: &dyn HoldSource,
+    poll_interval: Duration,
+    hold_deadline: Option<Duration>,
+    cancellation_token: Option<&crate::cancellation::CancellationToken>,
+    campaign_budget: Option<&Budget>,
+    resolve_engine: &dyn Fn(&str, &str) -> EngineKind,
+    registry: &RepoRegistry,
+    run_flow: &FlowRunner,
+    roadmap_dir: &Path,
+    lane: Option<&str>,
+    step_observer: &StepObserverFn,
+    default_use_worktree: bool,
+    default_auto_pr: bool,
+    campaign_id: uuid::Uuid,
+    close_block: &CloseBlockFn,
+    coord: Option<&CoordHandle>,
+    child_sdlc_flow_policy: Option<&serde_json::Value>,
+    child_sdlc_task_policy: Option<&serde_json::Value>,
+    on_bail: OnBail,
+    // `EN.17.C` task 4: the resolved `OrchestrationPolicy::bail_channel`
+    // switch, forwarded straight through to `integrate_chain_impl_inner`'s
+    // own parameter of the same name — see that parameter's doc. Added
+    // alongside `on_bail` above, threaded the same way (this function's
+    // only caller, `OrchestrationRunNode::process`, resolves both from the
+    // same `policy` value).
+    bail_channel: BailChannel,
+    block_status: &dyn Fn(&str, &str) -> BlockPresence,
+    report: &mut ChainReport,
+) -> Result<Vec<ExecutionOutcome>, IntegrateError> {
+    integrate_chain_impl(
+        chain,
+        resolve_depends_on,
+        is_edge_met,
+        admission,
+        hold_source,
+        poll_interval,
+        hold_deadline,
+        cancellation_token,
+        campaign_budget,
+        resolve_engine,
+        registry,
+        run_flow,
+        roadmap_dir,
+        lane,
+        step_observer,
+        default_use_worktree,
+        default_auto_pr,
+        campaign_id,
+        close_block,
+        None,
+        None,
+        coord,
+        None,
+        None,
+        child_sdlc_flow_policy,
+        child_sdlc_task_policy,
+        on_bail,
+        bail_channel,
+        block_status,
+        report,
+        &default_preflight,
+        OnUnjudged::Proceed,
+        &mut Vec::new(),
+    )
+    .await
+}
+
+/// `EN.17.D` task 3: identical to [`integrate_chain_with_coord_and_policy`],
+/// plus the preflight seam — `preflight`/`on_unjudged`/`preflight_report`.
+/// Task 4 threads `OrchestrationRunNode`'s resolved knobs through THIS
+/// function; [`integrate_chain_with_coord_and_policy`] itself keeps calling
+/// [`integrate_chain_impl`] with [`default_preflight`]/
+/// [`OnUnjudged::Proceed`]/a throwaway `Vec` internally, so its own
+/// existing caller (`OrchestrationRunNode::process` today, before task 4)
+/// is unaffected by this addition — the same "add a new entry point rather
+/// than widen an existing one" shape [`integrate_chain_with_run_record`]
+/// used for `run_record_sink`/`compose_ledger_entries`.
+#[allow(clippy::too_many_arguments)]
+pub async fn integrate_chain_with_preflight(
+    chain: &[ChainStep],
+    resolve_depends_on: &dyn Fn(&str, &str) -> Vec<DependencyEdge>,
+    is_edge_met: &dyn Fn(&str, &str) -> bool,
+    admission: &AdmissionGate,
+    hold_source: &dyn HoldSource,
+    poll_interval: Duration,
+    hold_deadline: Option<Duration>,
+    cancellation_token: Option<&crate::cancellation::CancellationToken>,
+    campaign_budget: Option<&Budget>,
+    resolve_engine: &dyn Fn(&str, &str) -> EngineKind,
+    registry: &RepoRegistry,
+    run_flow: &FlowRunner,
+    roadmap_dir: &Path,
+    lane: Option<&str>,
+    step_observer: &StepObserverFn,
+    default_use_worktree: bool,
+    default_auto_pr: bool,
+    campaign_id: uuid::Uuid,
+    close_block: &CloseBlockFn,
+    coord: Option<&CoordHandle>,
+    child_sdlc_flow_policy: Option<&serde_json::Value>,
+    child_sdlc_task_policy: Option<&serde_json::Value>,
+    on_bail: OnBail,
+    bail_channel: BailChannel,
+    block_status: &dyn Fn(&str, &str) -> BlockPresence,
+    report: &mut ChainReport,
+    preflight: &dyn Fn(&str, &str) -> PreflightOutcome,
+    on_unjudged: OnUnjudged,
+    preflight_report: &mut Vec<BlockPreflight>,
+) -> Result<Vec<ExecutionOutcome>, IntegrateError> {
+    integrate_chain_impl(
+        chain,
+        resolve_depends_on,
+        is_edge_met,
+        admission,
+        hold_source,
+        poll_interval,
+        hold_deadline,
+        cancellation_token,
+        campaign_budget,
+        resolve_engine,
+        registry,
+        run_flow,
+        roadmap_dir,
+        lane,
+        step_observer,
+        default_use_worktree,
+        default_auto_pr,
+        campaign_id,
+        close_block,
+        None,
+        None,
+        coord,
+        None,
+        None,
+        child_sdlc_flow_policy,
+        child_sdlc_task_policy,
+        on_bail,
+        bail_channel,
+        block_status,
+        report,
+        preflight,
+        on_unjudged,
+        preflight_report,
     )
     .await
 }
@@ -1948,6 +2458,15 @@ pub async fn integrate_chain_with_dispatch(
         None,
         None,
         None,
+        None,
+        None,
+        OnBail::StopChain,
+        BailChannel::Session,
+        &default_block_status,
+        &mut ChainReport::default(),
+        &default_preflight,
+        OnUnjudged::Proceed,
+        &mut Vec::new(),
     )
     .await
 }
@@ -2015,6 +2534,15 @@ pub async fn integrate_chain_with_run_record(
         coord,
         run_record_sink,
         compose_ledger_entries,
+        None,
+        None,
+        OnBail::StopChain,
+        BailChannel::Session,
+        &default_block_status,
+        &mut ChainReport::default(),
+        &default_preflight,
+        OnUnjudged::Proceed,
+        &mut Vec::new(),
     )
     .await
 }
@@ -2032,7 +2560,15 @@ struct StepLeaseGuard<'a> {
 impl Drop for StepLeaseGuard<'_> {
     fn drop(&mut self) {
         if let Some(handle) = self.coord {
-            let _ = handle.unlease();
+            // `EN.17.A` task 4: best-effort — an unlease error must never stop or unwind
+            // the chain (this runs on every exit path, including one already unwinding
+            // on a bail); only observed via `tracing::warn!`. `Ok(false)` (nothing of
+            // ours left to release — already released, never held, or foreign-held) is
+            // NOT logged here: it is the documented idempotent/no-op-confirmation case
+            // this guard's own doc comment describes, not an anomaly.
+            if let Err(err) = handle.unlease() {
+                tracing::warn!(repo = %handle.repo, error = %err, "coord: StepLeaseGuard drop's unlease failed");
+            }
         }
     }
 }
@@ -2071,6 +2607,24 @@ async fn integrate_chain_impl(
     coord: Option<&CoordHandle>,
     run_record_sink: Option<&RunRecordSinkFn>,
     compose_ledger_entries: Option<&ComposeLedgerEntriesFn>,
+    // `EN.17.F` task 2: same contract as `integrate_chain_impl_inner`'s own
+    // fields of the same name.
+    child_sdlc_flow_policy: Option<&serde_json::Value>,
+    child_sdlc_task_policy: Option<&serde_json::Value>,
+    // `EN.17.B` task 4: same contract as `integrate_chain_impl_inner`'s own
+    // fields of the same name — see that function's doc for the full
+    // status-aware-boundary / skip-dependents contract.
+    on_bail: OnBail,
+    // `EN.17.C` task 2: same contract as `integrate_chain_impl_inner`'s own
+    // field of the same name.
+    bail_channel: BailChannel,
+    block_status: &dyn Fn(&str, &str) -> BlockPresence,
+    report: &mut ChainReport,
+    // `EN.17.D` task 3: same contract as `integrate_chain_impl_inner`'s own
+    // fields of the same name.
+    preflight: &dyn Fn(&str, &str) -> PreflightOutcome,
+    on_unjudged: OnUnjudged,
+    preflight_report: &mut Vec<BlockPreflight>,
 ) -> Result<Vec<ExecutionOutcome>, IntegrateError> {
     if let Some(sink) = run_record_sink {
         sink(RunRecordLifecycle::Started);
@@ -2099,6 +2653,15 @@ async fn integrate_chain_impl(
         dispatcher,
         coord,
         compose_ledger_entries,
+        child_sdlc_flow_policy,
+        child_sdlc_task_policy,
+        on_bail,
+        bail_channel,
+        block_status,
+        report,
+        preflight,
+        on_unjudged,
+        preflight_report,
     )
     .await;
     if let Some(sink) = run_record_sink {
@@ -2143,9 +2706,66 @@ async fn integrate_chain_impl_inner(
     // reading, or writing anything, so this loop's observable behaviour is byte-identical
     // to before this parameter existed for every existing caller.
     compose_ledger_entries: Option<&ComposeLedgerEntriesFn>,
+    // `EN.17.F` task 2: the resolved `OrchestrationPolicy::child_sdlc_flow_policy` /
+    // `child_sdlc_task_policy` knobs, forwarded straight through to every
+    // [`execute_step`] call this loop makes. `None, None` is byte-identical to
+    // before these parameters existed (no `"policy"` key on either child event).
+    child_sdlc_flow_policy: Option<&serde_json::Value>,
+    child_sdlc_task_policy: Option<&serde_json::Value>,
+    // `EN.17.B` task 4: the resolved `OrchestrationPolicy::on_bail` switch —
+    // `OnBail::StopChain` (every pre-task-4 caller, via `default_block_status`'s
+    // sibling default) keeps this loop's control flow byte-identical to before
+    // this parameter existed: the very first bail still `return Err`s and no
+    // later step is ever reached. `OnBail::SkipDependents` is what turns a
+    // step's own failure, an unmet dependency edge, or a closed/absent block
+    // status into a `continue` instead — see the per-site comments below.
+    on_bail: OnBail,
+    // `EN.17.C` task 2/4: the resolved `OrchestrationPolicy::bail_channel`
+    // switch, forwarded to every `record_bail_escalation` call this loop
+    // makes. `BailChannel::Session` (every caller EXCEPT
+    // `integrate_chain_with_coord_and_policy`, which now threads the
+    // resolved `OrchestrationPolicy::bail_channel` value through from
+    // `graph.rs`'s `OrchestrationRunNode::process`) keeps
+    // `record_bail_escalation`'s output byte-identical to before this
+    // parameter existed — see that function's own doc.
+    bail_channel: BailChannel,
+    // `EN.17.B` task 4: `(repo, block_id) -> BlockPresence` — the status-aware
+    // boundary seam, consulted at the top of every iteration regardless of
+    // `on_bail`. `default_block_status` (every pre-task-4 caller) always
+    // reports `"open"`, so the boundary never skips anything for them.
+    block_status: &dyn Fn(&str, &str) -> BlockPresence,
+    // `EN.17.B` task 4: accumulates `closed`/`bailed`/`skipped` as the loop
+    // runs. A `&mut` (not an owned return value) so every push made before an
+    // early `return Err` below is still visible in the CALLER's own copy once
+    // this function returns — see `ChainReport`'s own doc for why this is
+    // what lets a caller read the report on both the success and the error
+    // path without changing this function's `Result` shape.
+    report: &mut ChainReport,
+    // `EN.17.D` task 3: `(repo, block_id) -> PreflightOutcome` — see
+    // `default_preflight`'s own doc. `&default_preflight` (every wrapper
+    // below `integrate_chain_with_coord_and_policy`) keeps this loop's
+    // observable behaviour byte-identical to before this parameter existed.
+    preflight: &dyn Fn(&str, &str) -> PreflightOutcome,
+    // `EN.17.D` task 3: see `OnUnjudged`'s own doc. `OnUnjudged::Proceed`
+    // (every wrapper below `integrate_chain_with_coord_and_policy`) is a
+    // no-op alongside `default_preflight`, which never produces `Unjudged`.
+    on_unjudged: OnUnjudged,
+    // `EN.17.D` task 3: accumulates one `BlockPreflight` per BLOCK step, in
+    // chain order — a `&mut`, same contract as `report` above, so it is
+    // populated on both the success and the error return path. Task 4
+    // stamps this into `ctx.nodes` as `preflight_report`; this function
+    // only builds and threads it out.
+    preflight_report: &mut Vec<BlockPreflight>,
 ) -> Result<Vec<ExecutionOutcome>, IntegrateError> {
     let total_steps = chain.len();
     let mut outcomes = Vec::with_capacity(chain.len());
+    // `EN.17.B` task 4: every (repo, block_id) that became `bailed` or
+    // `skipped` so far in THIS chain — consulted by the transitive
+    // skip-dependents check at the top of each iteration below. Untouched
+    // under `OnBail::StopChain` (the loop returns on the first bail, so no
+    // later iteration ever runs with a non-empty set).
+    let mut bailed_or_skipped: std::collections::HashSet<(String, String)> =
+        std::collections::HashSet::new();
     // `EN.11.F` task 1/4: accumulates each completed step's spend across
     // the whole campaign, checked at every block boundary below —
     // distinct from `execute_step`'s own per-NODE `BudgetLedger` inside a
@@ -2183,13 +2803,68 @@ async fn integrate_chain_impl_inner(
             .first()
             .and_then(|s| s.roadmap.as_deref())
             .unwrap_or("");
-        let _ = handle.register(roadmap);
+        let first_repo = chain.first().map(|s| s.repo.clone()).unwrap_or_default();
+        match handle.register(roadmap) {
+            Ok(RegisterOutcome {
+                allowed: false,
+                reason,
+                ..
+            }) => {
+                return Err(IntegrateError::CoordRefused {
+                    op: CoordOp::Register,
+                    repo: first_repo,
+                    block_id: None,
+                    reason: reason.unwrap_or_default(),
+                });
+            }
+            Ok(RegisterOutcome { allowed: true, .. }) => {}
+            Err(err) => {
+                return Err(IntegrateError::CoordRefused {
+                    op: CoordOp::Register,
+                    repo: first_repo,
+                    block_id: None,
+                    reason: err.to_string(),
+                });
+            }
+        }
     }
     // Every block id in this chain — the yardstick `CoordHandle::lease`'s
     // per-step `window` is checked against (see `coord::write::lease`'s
     // own doc: a window naming a block absent from `lane_blocks` is
     // refused before anything is written).
     let lane_blocks: Vec<String> = chain.iter().map(|s| s.block_id.clone()).collect();
+    // `EN.17.B` task 4, part 2 — every existing bail point (`wait_for_clearance`
+    // failure, a refused coord heartbeat/lease, `execute_step` failure,
+    // `verify_state_write` failure, merge failure) already appends its own
+    // `bailed` lane-log line and calls `record_bail_escalation` unchanged
+    // above this macro's invocation; this macro only decides what happens
+    // NEXT. Under `OnBail::StopChain` (the built-in default, every
+    // pre-task-4 caller) it `return Err`s exactly as this loop always has —
+    // byte-identical control flow. Under `OnBail::SkipDependents` it instead
+    // records the step into `bailed_or_skipped` (so a later dependent is
+    // itself skipped) and `report.bailed`, then `continue`s to the next
+    // step. Defined here (rather than as a closure) because it needs both
+    // `return` and `continue` on the enclosing `for` loop, which a closure
+    // cannot do.
+    macro_rules! bail_or_skip {
+        ($step:expr, $err_expr:expr) => {{
+            // Recorded regardless of `on_bail` — see `ChainReport`'s own
+            // doc: under `StopChain` this is the one step that stopped the
+            // chain; under `SkipDependents` it is also what makes a later
+            // dependent's transitive-skip check (above) fire.
+            let __step = $step;
+            bailed_or_skipped.insert((__step.repo.clone(), __step.block_id.clone()));
+            report
+                .bailed
+                .push(format!("{}:{}", __step.repo, __step.block_id));
+            match on_bail {
+                OnBail::StopChain => return Err($err_expr),
+                OnBail::SkipDependents => {
+                    continue;
+                }
+            }
+        }};
+    }
     for step in chain {
         // `EN.15.D` task 2: drain this chain's own inbox at EVERY block boundary — the very
         // top of this loop, before anything else for `step` runs (including the
@@ -2210,14 +2885,20 @@ async fn integrate_chain_impl_inner(
             for drained in handle.drain().unwrap_or_default() {
                 match drained.record.as_ref().map(|r| r.kind) {
                     Some(okf_core::MessageKind::LeaseRelease) => {
-                        let _ = handle.unlease();
+                        // `EN.17.A` task 4: best-effort, like the guard's own `Drop` —
+                        // must never stop the chain.
+                        if let Err(err) = handle.unlease() {
+                            tracing::warn!(repo = %handle.repo, error = %err, "coord: LEASE_RELEASE-triggered unlease failed");
+                        }
                     }
                     Some(okf_core::MessageKind::Rendezvous) => {
                         if let Some(record) = drained.record.as_ref() {
-                            let _ = handle.reply_rendezvous(
+                            if let Err(err) = handle.reply_rendezvous(
                                 record,
                                 format!("{} answered your RENDEZVOUS", handle.agent),
-                            );
+                            ) {
+                                tracing::warn!(repo = %handle.repo, error = %err, "coord: reply_rendezvous failed");
+                            }
                         }
                     }
                     _ => {}
@@ -2289,7 +2970,87 @@ async fn integrate_chain_impl_inner(
             break;
         }
 
+        // `EN.17.B` task 4, part 1 — STATUS-AWARE BOUNDARY. Read at the top
+        // of every iteration (never cached from chain resolution), so a
+        // status change made by another lane WHILE this chain is running is
+        // honoured the moment this step's own boundary is reached, not only
+        // at chain start. Unconditional — this check runs regardless of
+        // `on_bail`; `default_block_status` (every pre-task-4 caller)
+        // always reports `"open"`, so it is a no-op for them.
+        let status_skip_reason = match block_status(&step.repo, &step.block_id) {
+            BlockPresence::Row(status)
+                if matches!(
+                    status.as_str(),
+                    "closed" | "wontfix" | "superseded" | "deferred"
+                ) =>
+            {
+                Some(format!("block status is '{status}'; not dispatched"))
+            }
+            BlockPresence::NotInTracks => {
+                Some("block id is not in tracks[]; not dispatched".to_string())
+            }
+            BlockPresence::Row(_) => None,
+        };
+        if let Some(reason) = status_skip_reason {
+            let skip_lane = lane.unwrap_or(step.repo.as_str());
+            let entry = LaneLogEntry::skipped(step, skip_lane, reason.clone(), None)
+                .with_identity(None)
+                .with_permission_profile(Some(resolved_permission_profile_identifier(registry)));
+            let _ = append_lane_log_line(roadmap_dir, &entry);
+            bailed_or_skipped.insert((step.repo.clone(), step.block_id.clone()));
+            report.skipped.push(SkippedStep {
+                block: format!("{}:{}", step.repo, step.block_id),
+                reason,
+                blocked_by: None,
+            });
+            continue;
+        }
+
+        // `EN.17.B` task 4, part 2 — SKIP-DEPENDENTS ON BAIL (transitive).
+        // A step naming a `block`-kind chain edge to another step already
+        // `bailed` or `skipped` earlier in THIS chain is itself skipped,
+        // with `blocked_by` naming that exact edge. `bailed_or_skipped` is
+        // only ever non-empty under `OnBail::SkipDependents` (see its own
+        // doc above), so this is a no-op under the built-in `StopChain`.
+        let chain_edges = resolve_depends_on(&step.repo, &step.block_id);
+        let blocking_chain_edge = chain_edges.iter().find(|edge| match edge {
+            DependencyEdge::Block { repo, block_id } => {
+                bailed_or_skipped.contains(&(repo.clone(), block_id.clone()))
+            }
+            DependencyEdge::Operator { .. }
+            | DependencyEdge::Approval { .. }
+            | DependencyEdge::External { .. } => false,
+        });
+        if let Some(edge) = blocking_chain_edge {
+            let blocked_by = dependency_edge_to_json(edge);
+            let reason = format!(
+                "skipped: blocked by an earlier bailed or skipped step in this chain ({blocked_by})"
+            );
+            let skip_lane = lane.unwrap_or(step.repo.as_str());
+            let entry =
+                LaneLogEntry::skipped(step, skip_lane, reason.clone(), Some(blocked_by.clone()))
+                    .with_identity(None)
+                    .with_permission_profile(Some(resolved_permission_profile_identifier(
+                        registry,
+                    )));
+            let _ = append_lane_log_line(roadmap_dir, &entry);
+            bailed_or_skipped.insert((step.repo.clone(), step.block_id.clone()));
+            report.skipped.push(SkippedStep {
+                block: format!("{}:{}", step.repo, step.block_id),
+                reason,
+                blocked_by: Some(blocked_by),
+            });
+            continue;
+        }
+
         if let Err(err) = check_dependencies(step, resolve_depends_on, is_edge_met) {
+            // `EN.17.B` task 4, part 3 — UNMET EDGE OUTSIDE THE CHAIN. The
+            // unmet edge itself, extracted before `err` is consumed by
+            // `IntegrateError::from` below, is what `blocked_by` serializes
+            // under `SkipDependents`.
+            let unmet_edge = match &err {
+                GateError::UnmetDependency { edge, .. } => edge.clone(),
+            };
             let integrate_err = IntegrateError::from(err);
             emit_journal(
                 journal_sink,
@@ -2300,7 +3061,31 @@ async fn integrate_chain_impl_inner(
                 integrate_err.to_string(),
                 serde_json::json!({}),
             );
-            return Err(integrate_err);
+            match on_bail {
+                OnBail::StopChain => return Err(integrate_err),
+                OnBail::SkipDependents => {
+                    let blocked_by = dependency_edge_to_json(&unmet_edge);
+                    let skip_lane = lane.unwrap_or(step.repo.as_str());
+                    let entry = LaneLogEntry::skipped(
+                        step,
+                        skip_lane,
+                        integrate_err.to_string(),
+                        Some(blocked_by.clone()),
+                    )
+                    .with_identity(None)
+                    .with_permission_profile(Some(
+                        resolved_permission_profile_identifier(registry),
+                    ));
+                    let _ = append_lane_log_line(roadmap_dir, &entry);
+                    bailed_or_skipped.insert((step.repo.clone(), step.block_id.clone()));
+                    report.skipped.push(SkippedStep {
+                        block: format!("{}:{}", step.repo, step.block_id),
+                        reason: integrate_err.to_string(),
+                        blocked_by: Some(blocked_by),
+                    });
+                    continue;
+                }
+            }
         }
 
         // Wait out any operator hold BEFORE touching admission at all —
@@ -2340,8 +3125,9 @@ async fn integrate_chain_impl_inner(
                 "operator-hold",
                 resolve_engine(&step.repo, &step.block_id),
                 &err.to_string(),
+                bail_channel,
             );
-            return Err(err);
+            bail_or_skip!(step, err);
         }
 
         // `wait_for_clearance` can return early on a cancel win (rather
@@ -2382,9 +3168,65 @@ async fn integrate_chain_impl_inner(
         // dispatch step's `continue`, or falling off the bottom on a
         // normal completion) — see `StepLeaseGuard`'s own doc.
         if let Some(handle) = coord {
-            let _ = handle.heartbeat(Some(step.block_id.as_str()));
+            if let Err(err) = handle.heartbeat(Some(step.block_id.as_str())) {
+                let held_lane = lane.unwrap_or(step.repo.as_str());
+                let entry = LaneLogEntry::held(step, held_lane, err.to_string())
+                    .with_identity(None)
+                    .with_permission_profile(Some(resolved_permission_profile_identifier(
+                        registry,
+                    )));
+                let _ = append_lane_log_line(roadmap_dir, &entry);
+                record_bail_escalation(
+                    roadmap_dir,
+                    registry,
+                    step,
+                    held_lane,
+                    "coord-heartbeat-failed",
+                    resolve_engine(&step.repo, &step.block_id),
+                    &err.to_string(),
+                    bail_channel,
+                );
+                return Err(IntegrateError::CoordRefused {
+                    op: CoordOp::Heartbeat,
+                    repo: step.repo.clone(),
+                    block_id: Some(step.block_id.clone()),
+                    reason: err.to_string(),
+                });
+            }
             let window = [step.block_id.clone()];
-            let _ = handle.lease(okf_core::LeaseKind::Exclusive, Some(&window), &lane_blocks);
+            if let Err(err) =
+                handle.lease(okf_core::LeaseKind::Exclusive, Some(&window), &lane_blocks)
+            {
+                let held_lane = lane.unwrap_or(step.repo.as_str());
+                let entry = LaneLogEntry::held(step, held_lane, err.to_string())
+                    .with_identity(None)
+                    .with_permission_profile(Some(resolved_permission_profile_identifier(
+                        registry,
+                    )));
+                let _ = append_lane_log_line(roadmap_dir, &entry);
+                record_bail_escalation(
+                    roadmap_dir,
+                    registry,
+                    step,
+                    held_lane,
+                    "coord-lease-refused",
+                    resolve_engine(&step.repo, &step.block_id),
+                    &err.to_string(),
+                    bail_channel,
+                );
+                // `EN.17.B` task 4, part 2 explicitly names "a refused
+                // lease (EN.17.A)" as one of the bail points a later
+                // dependent must be skipped for.
+                bail_or_skip!(
+                    step,
+                    IntegrateError::CoordRefused {
+                        op: CoordOp::Lease,
+                        repo: step.repo.clone(),
+                        block_id: Some(step.block_id.clone()),
+                        reason: err.to_string(),
+                    }
+                );
+            }
         }
         let _step_lease_guard = StepLeaseGuard { coord };
 
@@ -2526,6 +3368,121 @@ async fn integrate_chain_impl_inner(
             continue;
         }
 
+        // `EN.17.D` task 3 — PREFLIGHT SEAM. Consulted for BLOCK steps only
+        // (a `dispatch` step already `continue`d above; `command` steps
+        // never reach `execute_step` at all today — see the block's own
+        // `out_of_scope`), after admission and immediately before
+        // `execute_step`. `preflight` defaults to `&default_preflight`,
+        // which always reports `Disabled`, so this whole block is a no-op
+        // for every wrapper below `integrate_chain_with_coord_and_policy`.
+        let preflight_outcome = preflight(&step.repo, &step.block_id);
+        let mut preflight_lane_log_note: Option<String> = None;
+
+        if let PreflightOutcome::Judged { claims } = &preflight_outcome {
+            if let Some(bad_claim) = claims
+                .iter()
+                .find(|c| c.load_bearing && matches!(c.verdict, ClaimVerdict::False))
+            {
+                let reason = format!(
+                    "preflight: load-bearing claim '{}' (argv {:?}) did not hold its expectation",
+                    bad_claim.claim, bad_claim.argv
+                );
+                let entry = LaneLogEntry::bailed(step, step_lane, reason.clone())
+                    .with_identity(None)
+                    .with_permission_profile(Some(resolved_permission_profile_identifier(
+                        registry,
+                    )));
+                let _ = append_lane_log_line(roadmap_dir, &entry);
+                let _ = write_checkpoint(roadmap_dir, &checkpoint);
+                // See `record_bail_escalation`'s own doc for why every
+                // effect here is best-effort.
+                record_bail_escalation(
+                    roadmap_dir,
+                    registry,
+                    step,
+                    step_lane,
+                    "preflight-premise",
+                    resolve_engine(&step.repo, &step.block_id),
+                    &reason,
+                    bail_channel,
+                );
+                preflight_report.push(BlockPreflight {
+                    repo: step.repo.clone(),
+                    block_id: step.block_id.clone(),
+                    outcome: preflight_outcome.clone(),
+                    claims: claims.clone(),
+                    claims_dropped: 0,
+                });
+                bail_or_skip!(
+                    step,
+                    IntegrateError::PreflightPremiseFailed {
+                        repo: step.repo.clone(),
+                        block_id: step.block_id.clone(),
+                        claim: bad_claim.claim.clone(),
+                        argv: bad_claim.argv.clone(),
+                    }
+                );
+            }
+        }
+
+        if let PreflightOutcome::Unjudged { error_kind } = &preflight_outcome {
+            if matches!(on_unjudged, OnUnjudged::Bail) {
+                let reason = format!("preflight: unjudged({error_kind})");
+                let entry = LaneLogEntry::bailed(step, step_lane, reason.clone())
+                    .with_identity(None)
+                    .with_permission_profile(Some(resolved_permission_profile_identifier(
+                        registry,
+                    )));
+                let _ = append_lane_log_line(roadmap_dir, &entry);
+                let _ = write_checkpoint(roadmap_dir, &checkpoint);
+                record_bail_escalation(
+                    roadmap_dir,
+                    registry,
+                    step,
+                    step_lane,
+                    "preflight-unjudged",
+                    resolve_engine(&step.repo, &step.block_id),
+                    &reason,
+                    bail_channel,
+                );
+                preflight_report.push(BlockPreflight {
+                    repo: step.repo.clone(),
+                    block_id: step.block_id.clone(),
+                    outcome: preflight_outcome.clone(),
+                    claims: Vec::new(),
+                    claims_dropped: 0,
+                });
+                bail_or_skip!(
+                    step,
+                    IntegrateError::PreflightUnjudged {
+                        repo: step.repo.clone(),
+                        block_id: step.block_id.clone(),
+                        error_kind: error_kind.clone(),
+                    }
+                );
+            }
+            // `OnUnjudged::Proceed` (the built-in default): the step still
+            // dispatches below, but this step's eventual `closed` lane-log
+            // note names the unjudged kind so it is not silently invisible
+            // in the record a step that ran normally otherwise gets.
+            preflight_lane_log_note = Some(format!("preflight: unjudged({error_kind})"));
+        }
+
+        // Neither branch above bailed — record this step's preflight
+        // outcome once, whatever it was (`Judged` with only held/non-load-
+        // bearing-false claims, `Unjudged` under `Proceed`,
+        // `SkippedNoRecord`, or `Disabled`), and fall through to dispatch.
+        preflight_report.push(BlockPreflight {
+            repo: step.repo.clone(),
+            block_id: step.block_id.clone(),
+            claims: match &preflight_outcome {
+                PreflightOutcome::Judged { claims } => claims.clone(),
+                _ => Vec::new(),
+            },
+            outcome: preflight_outcome,
+            claims_dropped: 0,
+        });
+
         // `default_use_worktree` is the resolved `OrchestrationPolicy
         // ::default_use_worktree` fallback, threaded in from
         // `OrchestrationRunNode::process` — the row-3 case of
@@ -2562,6 +3519,8 @@ async fn integrate_chain_impl_inner(
             None,
             parent_permission_profile,
             None,
+            child_sdlc_flow_policy,
+            child_sdlc_task_policy,
         )
         .await
         {
@@ -2587,6 +3546,7 @@ async fn integrate_chain_impl_inner(
                     "orchestration-step",
                     resolve_engine(&step.repo, &step.block_id),
                     &integrate_err.to_string(),
+                    bail_channel,
                 );
                 // `EN.12.D` task 4: no child `ctx` exists for a step whose
                 // `execute_step` call itself failed — the row keys on a
@@ -2600,7 +3560,7 @@ async fn integrate_chain_impl_inner(
                     integrate_err.to_string(),
                     serde_json::json!({}),
                 );
-                return Err(integrate_err);
+                bail_or_skip!(step, integrate_err);
             }
         };
 
@@ -2638,7 +3598,7 @@ async fn integrate_chain_impl_inner(
                 err.to_string(),
                 serde_json::json!({}),
             );
-            return Err(err);
+            bail_or_skip!(step, err);
         }
 
         // `EN.11.C` task 2: the merge stage — the "chains compose" leg.
@@ -2667,17 +3627,22 @@ async fn integrate_chain_impl_inner(
                     err.to_string(),
                     serde_json::json!({}),
                 );
-                return Err(err);
+                bail_or_skip!(step, err);
             }
         }
 
-        let entry = LaneLogEntry::closed(
-            &outcome,
-            step_lane,
-            format!("block {} closed via SDLC_FLOW", step.block_id),
-        )
-        .with_identity(Some(step_run_id.to_string()))
-        .with_permission_profile(Some(resolved_permission_profile_identifier(registry)));
+        // `EN.17.D` task 3: append the preflight-unjudged note (set above
+        // only under `PreflightOutcome::Unjudged` + `OnUnjudged::Proceed`)
+        // to this step's `closed` note — every other path leaves the note
+        // byte-identical to before this parameter existed.
+        let mut closed_note = format!("block {} closed via SDLC_FLOW", step.block_id);
+        if let Some(note) = &preflight_lane_log_note {
+            closed_note.push_str("; ");
+            closed_note.push_str(note);
+        }
+        let entry = LaneLogEntry::closed(&outcome, step_lane, closed_note)
+            .with_identity(Some(step_run_id.to_string()))
+            .with_permission_profile(Some(resolved_permission_profile_identifier(registry)));
         // `EN.12.C` task 3: refuse to integrate a step whose about-to-be-
         // written record carries no resolved permission-profile stamp —
         // see [`IntegrateError::MissingPermissionProfileStamp`]. In
@@ -2758,6 +3723,13 @@ async fn integrate_chain_impl_inner(
         // figure contributes tokens but never a silent `$0`).
         campaign_ledger.record_step(outcome.cost_usd, outcome.total_tokens);
 
+        // `EN.17.B` task 4, part 5: this step's own `ChainReport` entry —
+        // pushed here, at the one place a step is genuinely integrated, so
+        // `closed.len() + bailed.len() + skipped.len()` sums to the
+        // chain's block-step count under `OnBail::SkipDependents`.
+        report
+            .closed
+            .push(format!("{}:{}", step.repo, step.block_id));
         outcomes.push(outcome);
 
         // Called exactly once per completed step, after this step's
@@ -2783,6 +3755,7 @@ mod tests {
 
     use serde_json::json;
 
+    use super::super::escalate::OPTION_LABEL_MAX_CHARS;
     use super::super::execute::FlowInvocation;
 
     fn step(repo: &str, block_id: &str) -> ChainStep {
@@ -2878,6 +3851,76 @@ mod tests {
             json!({"status": status}).to_string(),
         )
         .unwrap();
+    }
+
+    /// `EN.17.C` task 2: `BailChannel::Session` composes `record_bail_escalation`'s
+    /// escalation exactly as before this parameter existed — `channel:
+    /// session:<lane>`, no `options` field.
+    #[test]
+    fn record_bail_escalation_session_default_is_unchanged() {
+        let (dir, registry) = two_repo_registry();
+        // `record_bail_escalation` shells out to `git rev-parse` on the
+        // subject repo to stamp `verified_at_sha` — needs a real git repo
+        // underneath, not merely an empty directory.
+        let _bare = init_real_git_repo(&dir.path().join("repo-a"));
+        let roadmap_dir = tempfile::tempdir().unwrap();
+        let step = step("repo-a", "A.1");
+
+        record_bail_escalation(
+            roadmap_dir.path(),
+            &registry,
+            &step,
+            "repo-a",
+            "orchestration-step",
+            EngineKind::Flow,
+            "boom",
+            BailChannel::Session,
+        );
+
+        let contents =
+            std::fs::read_to_string(roadmap_dir.path().join("escalations.jsonl")).unwrap();
+        let line = contents.lines().next().expect("one escalation line");
+        let value: serde_json::Value = serde_json::from_str(line).unwrap();
+        assert_eq!(value["channel"], serde_json::json!("session:repo-a"));
+        assert!(value.get("options").is_none());
+    }
+
+    /// `EN.17.C` task 2: `BailChannel::Notification` composes exactly two
+    /// acknowledgement-only options, each label within
+    /// `OPTION_LABEL_MAX_CHARS`.
+    #[test]
+    fn record_bail_escalation_notification_composes_two_options() {
+        let (dir, registry) = two_repo_registry();
+        let _bare = init_real_git_repo(&dir.path().join("repo-a"));
+        let roadmap_dir = tempfile::tempdir().unwrap();
+        let step = step("repo-a", "A.1");
+
+        record_bail_escalation(
+            roadmap_dir.path(),
+            &registry,
+            &step,
+            "repo-a",
+            "orchestration-step",
+            EngineKind::Flow,
+            "boom",
+            BailChannel::Notification,
+        );
+
+        let contents =
+            std::fs::read_to_string(roadmap_dir.path().join("escalations.jsonl")).unwrap();
+        let line = contents.lines().next().expect("one escalation line");
+        let value: serde_json::Value = serde_json::from_str(line).unwrap();
+        assert_eq!(value["channel"], serde_json::json!("notification"));
+        let options = value["options"].as_array().expect("options array");
+        assert_eq!(options.len(), 2, "exactly two options, never a third");
+        for option in options {
+            let label = option["label"].as_str().expect("label string");
+            assert!(
+                label.chars().count() <= OPTION_LABEL_MAX_CHARS,
+                "label {label:?} exceeds OPTION_LABEL_MAX_CHARS"
+            );
+            assert!(!option["key"].as_str().unwrap().is_empty());
+        }
     }
 
     fn outcome_with_engine(
@@ -3491,6 +4534,8 @@ mod tests {
             true,
             uuid::Uuid::new_v4(),
             &|_repo: &str, _id: &str| {},
+            None,
+            None,
         )
         .await
         .expect("chain should complete once the hold clears");
@@ -3573,6 +4618,8 @@ mod tests {
             true,
             uuid::Uuid::new_v4(),
             &|_repo: &str, _id: &str| {},
+            None,
+            None,
         );
 
         let checker_fut = async {
@@ -3609,6 +4656,8 @@ mod tests {
                     true,
                     uuid::Uuid::new_v4(),
                     &|_repo: &str, _id: &str| {},
+                    None,
+                    None,
                 ),
             )
             .await
@@ -3724,6 +4773,8 @@ mod tests {
             true,
             uuid::Uuid::new_v4(),
             &|_repo: &str, _id: &str| {},
+            None,
+            None,
         )
         .await
         .expect("chain should complete");
@@ -3776,6 +4827,8 @@ mod tests {
             false,
             uuid::Uuid::new_v4(),
             &|_repo: &str, _id: &str| {},
+            None,
+            None,
         )
         .await
         .expect("chain should complete");
@@ -3826,6 +4879,8 @@ mod tests {
             true,
             uuid::Uuid::new_v4(),
             &|_repo: &str, _id: &str| {},
+            None,
+            None,
         )
         .await
         .expect("chain should complete");
@@ -3890,6 +4945,8 @@ mod tests {
             true,
             uuid::Uuid::new_v4(),
             &close_block,
+            None,
+            None,
         )
         .await
         .expect("chain should complete");
@@ -3953,6 +5010,8 @@ mod tests {
             true,
             uuid::Uuid::new_v4(),
             &close_block,
+            None,
+            None,
         )
         .await
         .expect_err("a failing step must propagate its error");
@@ -4000,6 +5059,8 @@ mod tests {
             true,
             uuid::Uuid::new_v4(),
             &|_repo: &str, _id: &str| {},
+            None,
+            None,
         )
         .await
         .expect("chain should complete");
@@ -4052,6 +5113,8 @@ mod tests {
             true,
             uuid::Uuid::new_v4(),
             &|_repo: &str, _id: &str| {},
+            None,
+            None,
         )
         .await
         .expect("chain should complete");
@@ -4135,6 +5198,8 @@ mod tests {
             true,
             uuid::Uuid::new_v4(),
             &|_repo: &str, _id: &str| {},
+            None,
+            None,
         )
         .await
         .expect_err("a failing step must propagate its error");
@@ -4197,6 +5262,8 @@ mod tests {
             true,
             uuid::Uuid::new_v4(),
             &|_repo: &str, _id: &str| {},
+            None,
+            None,
         )
         .await
         .expect_err("the original step failure must still surface");
@@ -4276,6 +5343,8 @@ mod tests {
             true,
             uuid::Uuid::new_v4(),
             &|_repo: &str, _id: &str| {},
+            None,
+            None,
         )
         .await
         .expect_err("the chain must stop on the first failing step");
@@ -4384,6 +5453,8 @@ mod tests {
             true,
             uuid::Uuid::new_v4(),
             &|_repo: &str, _id: &str| {},
+            None,
+            None,
         )
         .await
         .expect("a budget halt is not an error — it returns Ok with what already integrated");
@@ -4471,6 +5542,8 @@ mod tests {
             true,
             uuid::Uuid::new_v4(),
             &|_repo: &str, _id: &str| {},
+            None,
+            None,
         )
         .await
         .expect("an unreached ceiling must never halt the chain");
@@ -4619,6 +5692,8 @@ mod tests {
             true,
             campaign_id,
             &|_repo: &str, _id: &str| {},
+            None,
+            None,
         )
         .await
         .expect("all three steps should integrate");
@@ -4699,6 +5774,8 @@ mod tests {
             true,
             campaign_id,
             &|_repo: &str, _id: &str| {},
+            None,
+            None,
         )
         .await
         .expect_err("the checkpoint write failure must surface");
@@ -5568,6 +6645,8 @@ mod tests {
             true,
             uuid::Uuid::new_v4(),
             &|_repo: &str, _id: &str| {},
+            None,
+            None,
         )
         .await
         .expect_err("a dispatch step with no Dispatcher configured must fail");
@@ -5719,6 +6798,8 @@ mod tests {
             true,
             uuid::Uuid::new_v4(),
             &|_repo: &str, _id: &str| {},
+            None,
+            None,
         )
         .await
         .expect("chain should complete");
@@ -5776,6 +6857,8 @@ mod tests {
             uuid::Uuid::new_v4(),
             &|_repo: &str, _id: &str| {},
             Some(&coord),
+            None,
+            None,
         )
         .await
         .expect("chain should complete");
@@ -5842,6 +6925,8 @@ mod tests {
             true,
             uuid::Uuid::new_v4(),
             &|_repo: &str, _id: &str| {},
+            None,
+            None,
             None,
         )
         .await
@@ -5967,6 +7052,8 @@ mod tests {
             uuid::Uuid::new_v4(),
             &|_repo: &str, _id: &str| {},
             Some(&coord),
+            None,
+            None,
         )
         .await
         .expect("chain should complete");
@@ -6048,6 +7135,8 @@ mod tests {
             uuid::Uuid::new_v4(),
             &|_repo: &str, _id: &str| {},
             Some(&coord),
+            None,
+            None,
         )
         .await
         .expect("chain should complete");
@@ -6065,5 +7154,210 @@ mod tests {
             .expect("reply inbox must exist")
             .collect();
         assert_eq!(replies.len(), 1, "exactly one reply envelope written");
+    }
+
+    // ── `EN.17.B` task 4: status-aware boundary + skip-dependents ───────
+
+    /// A bailed step's dependent is skipped (with `blocked_by` naming the
+    /// bailed step's own edge), while an independent step in the same
+    /// chain still dispatches — `OnBail::SkipDependents`'s whole point.
+    #[tokio::test]
+    async fn skip_dependents_runs_the_independent_step_after_a_bail() {
+        let (dir, registry) = two_repo_registry();
+        // C.1 is the one step expected to actually integrate — pre-write
+        // its `sdlc-flow-state.json` so `verify_state_write` finds a
+        // matching "done" record, same as every other integration test in
+        // this module (see `write_done_state`'s own call sites above).
+        write_done_state(&dir.path().join("repo-b"), "C.1");
+        let runner = failing_runner("A.1");
+        let resolve_engine = |_repo: &str, _id: &str| EngineKind::Flow;
+        // Only B.1 declares a chain edge, naming A.1 — C.1 is independent.
+        let resolve_deps = |repo: &str, id: &str| -> Vec<DependencyEdge> {
+            if repo == "repo-a" && id == "B.1" {
+                vec![DependencyEdge::Block {
+                    repo: "repo-a".to_string(),
+                    block_id: "A.1".to_string(),
+                }]
+            } else {
+                Vec::new()
+            }
+        };
+        let is_met = |_repo: &str, _id: &str| true;
+        let admission = AdmissionGate::with_default_policy();
+        let roadmap_dir = tempfile::tempdir().unwrap();
+        let chain = vec![
+            step("repo-a", "A.1"),
+            step("repo-a", "B.1"),
+            step("repo-b", "C.1"),
+        ];
+        let mut report = ChainReport::default();
+
+        let outcomes = integrate_chain_with_coord_and_policy(
+            &chain,
+            &resolve_deps,
+            &is_met,
+            &admission,
+            &NeverHeld,
+            Duration::from_millis(1),
+            None,
+            None,
+            None,
+            &resolve_engine,
+            &registry,
+            &runner,
+            roadmap_dir.path(),
+            None,
+            &|_: &StepProgress| {},
+            false,
+            true,
+            uuid::Uuid::new_v4(),
+            &|_repo: &str, _id: &str| {},
+            None,
+            None,
+            None,
+            OnBail::SkipDependents,
+            BailChannel::Session,
+            &default_block_status,
+            &mut report,
+        )
+        .await
+        .expect("SkipDependents keeps the chain going past a bail");
+
+        assert_eq!(outcomes.len(), 1, "only the independent step C.1 ran");
+        assert_eq!(outcomes[0].block_id, "C.1");
+        assert_eq!(report.bailed, vec!["repo-a:A.1".to_string()]);
+        assert_eq!(report.skipped.len(), 1);
+        assert_eq!(report.skipped[0].block, "repo-a:B.1");
+        assert_eq!(
+            report.skipped[0].blocked_by,
+            Some(json!({"type": "block", "repo": "repo-a", "id": "A.1"}))
+        );
+        assert_eq!(report.closed, vec!["repo-b:C.1".to_string()]);
+        assert_eq!(
+            report.closed.len() + report.bailed.len() + report.skipped.len(),
+            3
+        );
+    }
+
+    /// The built-in `OnBail::StopChain` is untouched by this task: the
+    /// first bail still ends the whole chain and no later step — dependent
+    /// or independent — is ever dispatched.
+    #[tokio::test]
+    async fn stop_chain_default_still_ends_the_whole_chain_on_the_first_bail() {
+        let (_dir, registry) = two_repo_registry();
+        let runner = failing_runner("A.1");
+        let resolve_engine = |_repo: &str, _id: &str| EngineKind::Flow;
+        let resolve_deps = |_repo: &str, _id: &str| Vec::new();
+        let is_met = |_repo: &str, _id: &str| true;
+        let admission = AdmissionGate::with_default_policy();
+        let roadmap_dir = tempfile::tempdir().unwrap();
+        let chain = vec![step("repo-a", "A.1"), step("repo-b", "C.1")];
+        let mut report = ChainReport::default();
+
+        let err = integrate_chain_with_coord_and_policy(
+            &chain,
+            &resolve_deps,
+            &is_met,
+            &admission,
+            &NeverHeld,
+            Duration::from_millis(1),
+            None,
+            None,
+            None,
+            &resolve_engine,
+            &registry,
+            &runner,
+            roadmap_dir.path(),
+            None,
+            &|_: &StepProgress| {},
+            false,
+            true,
+            uuid::Uuid::new_v4(),
+            &|_repo: &str, _id: &str| {},
+            None,
+            None,
+            None,
+            OnBail::StopChain,
+            BailChannel::Session,
+            &default_block_status,
+            &mut report,
+        )
+        .await
+        .expect_err("StopChain still ends the chain on the first bail");
+
+        assert!(err.to_string().contains("A.1"));
+        assert_eq!(report.bailed, vec!["repo-a:A.1".to_string()]);
+        assert!(
+            report.closed.is_empty(),
+            "C.1 must never have been dispatched"
+        );
+    }
+
+    /// The status-aware boundary: a block whose `block_status` seam reports
+    /// `closed` is never dispatched, even under the built-in `StopChain` —
+    /// this check is unconditional (see `integrate_chain_impl_inner`'s own
+    /// doc) — while an `open` control step in the same chain still runs.
+    #[tokio::test]
+    async fn status_aware_boundary_skips_a_closed_block_unconditionally() {
+        let (dir, registry) = two_repo_registry();
+        write_done_state(&dir.path().join("repo-b"), "C.1");
+        let (runner, calls) = recording_runner();
+        let resolve_engine = |_repo: &str, _id: &str| EngineKind::Flow;
+        let resolve_deps = |_repo: &str, _id: &str| Vec::new();
+        let is_met = |_repo: &str, _id: &str| true;
+        let admission = AdmissionGate::with_default_policy();
+        let roadmap_dir = tempfile::tempdir().unwrap();
+        let block_status = |_repo: &str, block_id: &str| -> BlockPresence {
+            if block_id == "A.1" {
+                BlockPresence::Row("closed".to_string())
+            } else {
+                BlockPresence::Row("open".to_string())
+            }
+        };
+        let chain = vec![step("repo-a", "A.1"), step("repo-b", "C.1")];
+        let mut report = ChainReport::default();
+
+        let outcomes = integrate_chain_with_coord_and_policy(
+            &chain,
+            &resolve_deps,
+            &is_met,
+            &admission,
+            &NeverHeld,
+            Duration::from_millis(1),
+            None,
+            None,
+            None,
+            &resolve_engine,
+            &registry,
+            &runner,
+            roadmap_dir.path(),
+            None,
+            &|_: &StepProgress| {},
+            false,
+            true,
+            uuid::Uuid::new_v4(),
+            &|_repo: &str, _id: &str| {},
+            None,
+            None,
+            None,
+            OnBail::StopChain,
+            BailChannel::Session,
+            &block_status,
+            &mut report,
+        )
+        .await
+        .expect("a closed block is skipped, not a chain failure");
+
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(outcomes[0].block_id, "C.1");
+        assert_eq!(report.skipped.len(), 1);
+        assert_eq!(report.skipped[0].block, "repo-a:A.1");
+        assert!(report.skipped[0].reason.contains("closed"));
+        assert!(report.skipped[0].blocked_by.is_none());
+        assert!(
+            !calls.lock().unwrap().contains(&"A.1".to_string()),
+            "A.1 must never have been dispatched"
+        );
+        let _ = dir;
     }
 }

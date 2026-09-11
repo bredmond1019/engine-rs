@@ -102,26 +102,34 @@ use uuid::Uuid;
 
 use engine_contract::TaskContext;
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{json, Value};
 
 use crate::cancellation::{stamp_cancelled, CancellationToken};
 use crate::node::{Node, NodeError, NodeRegistry};
 use crate::nodes::terminal::HeldSessionNode;
-use crate::policy::{read_harness_policy_defaults_from, resolve_profile_from, PolicyConfigSource};
+use crate::operator::transport::OperatorTransport;
+use crate::policy::permission::resolve_permission_profile;
+use crate::policy::{
+    read_harness_policy_defaults_from, resolve_profile_from, ModelTier, PolicyConfigSource,
+};
 use crate::repo_registry::RepoRegistry;
 use crate::schema::{NodeConfig, WorkflowSchema};
 use crate::workflow::Workflow;
+use crate::workflows::sweep::{
+    run_sweep_pass, NoopLaneWake, NoopOperatorTransport, DEFAULT_REFIRE_HOURS,
+};
 use term_core::driver::TerminalDriver;
 
 use super::chain::{resolve_explicit_chain, resolve_lane_chain, ChainStep};
 use super::conductor::{ConductorProposalError, DroppedCandidate, ProposalOutcome};
 use super::coord_lane::CoordHandle;
-use super::execute::{default_flow_runner, EngineKind, FlowRunner};
+use super::execute::{default_flow_runner, EngineKind, ExecutionOutcome, FlowRunner};
 use super::gates::{AdmissionGate, DependencyEdge};
 use super::integrate::{
-    integrate_chain_with_coord, resolve_roadmap_dir, CloseBlockFn, HoldSource, JournalSinkFn,
-    NeverHeld, StepProgress,
+    integrate_chain_with_preflight, resolve_roadmap_dir, ChainReport, CloseBlockFn, HoldSource,
+    JournalSinkFn, NeverHeld, OnUnjudged, StepProgress,
 };
+use super::preflight::{BlockPreflight, PreflightOutcome};
 
 /// The registered workflow type string, used both to register the workflow
 /// (`engine-serve`, this task) and as `WorkflowSchema::workflow_type`.
@@ -145,11 +153,60 @@ fn coord_now_iso() -> String {
 
 // ── Policy ───────────────────────────────────────────────────────────────
 
+/// `EN.17.B` Task 2: how the per-step loop
+/// (`integrate::integrate_chain_impl_inner`) reacts when a step bails —
+/// `execute_step` failure, `verify_state_write` failure, merge failure,
+/// `wait_for_clearance` failure, or a refused lease/permission gate.
+///
+/// The built-in default is [`Self::StopChain`] — today's behavior, per
+/// CLAUDE.md standing rule 6 (a new knob must not change what an existing
+/// run does). [`Self::SkipDependents`] is the knob EN.17.B–F add: a bail
+/// records that step `bailed` and skips only the steps that (transitively)
+/// depend on it, via a `block` edge naming it; every independent step still
+/// runs, and the run ends with a terminal `chain_report`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum OnBail {
+    /// The first bailed step ends the whole chain immediately — no later
+    /// step, dependent or independent, is dispatched. Pre-EN.17.B behavior.
+    #[default]
+    StopChain,
+    /// A bailed step skips only the steps that (transitively) depend on it;
+    /// every independent step still runs to completion.
+    SkipDependents,
+}
+
+/// `EN.17.C` Task 1: which [`crate::workflows::sweep::EscalationChannel`] a
+/// bailed block's `notification` escalation is composed against —
+/// `record_bail_escalation`'s channel choice, resolved as a policy knob
+/// instead of the hardcoded `EscalationChannel::session(lane)` it uses today.
+///
+/// The built-in default is [`Self::Session`] — today's behavior, per
+/// CLAUDE.md standing rule 6 (a new knob must not change what an existing
+/// run does): SWEEP routes a session-channel escalation to `LaneWake`, which
+/// is a no-op, so a bail reaches nobody. [`Self::Notification`] is the knob
+/// this block's later tasks wire up: it routes the escalation through
+/// SWEEP's `OperatorTransport` seam instead, so a real transport (bastion's
+/// `TelegramTransport`) can actually deliver it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum BailChannel {
+    /// Compose the escalation against `EscalationChannel::session(lane)` —
+    /// today's behavior. SWEEP's registered `LaneWake` is a no-op, so this
+    /// escalation is recorded but never delivered anywhere.
+    #[default]
+    Session,
+    /// Compose the escalation against `EscalationChannel::notification(..)`
+    /// so SWEEP's dedup/permission-profile/budget pipeline can route it
+    /// through a real `OperatorTransport`.
+    Notification,
+}
+
 /// The fully-resolved, per-run ORCHESTRATION policy: the merge of built-in
 /// defaults, `harness.json`'s `orchestration.policy` defaults, a named
 /// `profile`, and any per-run event override, high->low precedence in that
 /// order (`crate::policy::resolve`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OrchestrationPolicy {
     /// How often [`integrate::wait_for_clearance`] re-polls an operator
     /// hold while the chain is paused.
@@ -232,6 +289,83 @@ pub struct OrchestrationPolicy {
     /// matching the objective's "single repo" cap for the first autonomous
     /// chains. Never consulted for an explicit or `roadmap`+`lane` chain.
     pub conductor_single_repo_only: bool,
+    /// `EN.17.F` Task 1: the partial `sdlc_flow::policy::PartialSdlcPolicy`
+    /// (forwarded opaquely as JSON) this chain's `SDLC_FLOW` children should
+    /// receive as their own event's `policy` override. `None` (the built-in
+    /// default) leaves a child event's `policy` field untouched, so an
+    /// unset override is byte-identical to the pre-Task-1 child event —
+    /// behavior-stable per CLAUDE.md standing rule 6.
+    ///
+    /// This is a raw `serde_json::Value` rather than a typed partial-policy
+    /// struct because this policy lives in `engine-core::workflows::orchestration`
+    /// but the value it forwards targets `sdlc_flow::policy::PartialSdlcPolicy`,
+    /// defined in a sibling module within the same crate that this module
+    /// does not otherwise depend on — forwarding it opaquely as JSON avoids a
+    /// layering dependency; the child event's own policy-resolution layer
+    /// validates/deserializes it.
+    pub child_sdlc_flow_policy: Option<serde_json::Value>,
+    /// `EN.17.F` Task 1: the same forwarding mechanism as
+    /// [`Self::child_sdlc_flow_policy`], but for this chain's `SDLC_TASK`
+    /// children — a partial `sdlc_task::policy::PartialSdlcTaskPolicy`
+    /// forwarded opaquely as JSON for the same layering reason. `None` (the
+    /// built-in default) leaves a child event's `policy` field untouched.
+    pub child_sdlc_task_policy: Option<serde_json::Value>,
+    /// `EN.17.B` Task 2: how the per-step loop reacts to a bail — see
+    /// [`OnBail`]. `OnBail::StopChain` (the built-in default) is today's
+    /// behavior, per CLAUDE.md standing rule 6. The effective switch for a
+    /// real chain lives in HQ's `planning/harness.json`
+    /// (`orchestration.policy.on_bail`), not in this repo's own harness
+    /// file — see the block record's `notes` field for why.
+    pub on_bail: OnBail,
+    /// `EN.17.C` Task 1: which channel a bailed block's `notification`
+    /// escalation is composed against — see [`BailChannel`].
+    /// `BailChannel::Session` (the built-in default) is today's behavior,
+    /// per CLAUDE.md standing rule 6. The effective switch for a real chain
+    /// lives in HQ's `planning/harness.json`
+    /// (`orchestration.policy.bail_channel`), not in this repo's own harness
+    /// file — mirroring `on_bail` above.
+    pub bail_channel: BailChannel,
+    /// `EN.17.D` Task 4: the EFFECTIVE switch — whether the preflight seam
+    /// ([`super::integrate::integrate_chain_impl_inner`], task 3) runs at
+    /// all. `false` (the built-in default) is behaviour-stable per CLAUDE.md
+    /// standing rule 6: a chain with no policy override behaves exactly as
+    /// it did before this knob existed — [`super::integrate::default_preflight`]
+    /// always reports [`PreflightOutcome::Disabled`]. The effective switch
+    /// for a real chain lives in HQ's `planning/harness.json`
+    /// (`orchestration.policy.preflight_enabled`), not in this repo's own
+    /// harness file — see the block record's `notes` field.
+    pub preflight_enabled: bool,
+    /// The [`ModelTier`] preflight's single judgment call runs at. `Haiku`
+    /// (the built-in default) is the cheapest tier — preflight is a light
+    /// premise check, not a load-bearing judgment call.
+    pub preflight_model_tier: ModelTier,
+    /// The most claims one block's preflight judgment call will execute;
+    /// any excess is recorded as `claims_dropped` rather than silently
+    /// dropped with no trace.
+    pub preflight_max_claims: usize,
+    /// `Config.max_turns` forwarded to preflight's `JudgmentSpec`. `None`
+    /// (the built-in default) leaves the call unbounded on turns, matching
+    /// every other judgment call before this knob existed.
+    pub preflight_max_turns: Option<u32>,
+    /// The per-slice byte cap applied to each of the block record's `what`/
+    /// `files`/`acceptance_criteria` excerpts before they reach the
+    /// judgment call.
+    pub preflight_slice_max_bytes: usize,
+    /// Narrows [`super::preflight`]'s compiled-in per-program `argv`
+    /// validator table — it can only INTERSECT that table, never add a
+    /// program or a flag to it (a config-added flag is exactly the bypass
+    /// the validator closes). `None` (the built-in default) leaves the
+    /// whole compiled-in table available.
+    pub preflight_programs: Option<Vec<String>>,
+    /// The per-command timeout [`super::preflight::execute_argv`] enforces
+    /// on every admitted claim's command.
+    pub preflight_command_timeout_ms: u64,
+    /// What the per-step loop does when the preflight judgment call itself
+    /// fails (`PreflightOutcome::Unjudged`) — see [`OnUnjudged`].
+    /// `OnUnjudged::Proceed` (the built-in default) dispatches the step
+    /// anyway and records the failure kind; `OnUnjudged::Bail` stops the
+    /// step exactly like a false load-bearing claim.
+    pub preflight_on_unjudged: OnUnjudged,
 }
 
 impl Default for OrchestrationPolicy {
@@ -252,6 +386,18 @@ impl Default for OrchestrationPolicy {
             campaign_max_total_tokens: None,
             conductor_max_chain_blocks: Some(3),
             conductor_single_repo_only: true,
+            child_sdlc_flow_policy: None,
+            child_sdlc_task_policy: None,
+            on_bail: OnBail::StopChain,
+            bail_channel: BailChannel::Session,
+            preflight_enabled: false,
+            preflight_model_tier: ModelTier::Haiku,
+            preflight_max_claims: 5,
+            preflight_max_turns: None,
+            preflight_slice_max_bytes: 4_000,
+            preflight_programs: None,
+            preflight_command_timeout_ms: 5_000,
+            preflight_on_unjudged: OnUnjudged::Proceed,
         }
     }
 }
@@ -276,6 +422,18 @@ pub struct PartialOrchestrationPolicy {
     pub campaign_max_total_tokens: Option<Option<u64>>,
     pub conductor_max_chain_blocks: Option<Option<usize>>,
     pub conductor_single_repo_only: Option<bool>,
+    pub child_sdlc_flow_policy: Option<Option<serde_json::Value>>,
+    pub child_sdlc_task_policy: Option<Option<serde_json::Value>>,
+    pub on_bail: Option<OnBail>,
+    pub bail_channel: Option<BailChannel>,
+    pub preflight_enabled: Option<bool>,
+    pub preflight_model_tier: Option<ModelTier>,
+    pub preflight_max_claims: Option<usize>,
+    pub preflight_max_turns: Option<Option<u32>>,
+    pub preflight_slice_max_bytes: Option<usize>,
+    pub preflight_programs: Option<Option<Vec<String>>>,
+    pub preflight_command_timeout_ms: Option<u64>,
+    pub preflight_on_unjudged: Option<OnUnjudged>,
 }
 
 impl crate::policy::Policy for OrchestrationPolicy {
@@ -312,6 +470,48 @@ impl crate::policy::Policy for OrchestrationPolicy {
                 self.conductor_single_repo_only,
                 over.conductor_single_repo_only,
             ),
+            child_sdlc_flow_policy: crate::policy::merge_opt(
+                self.child_sdlc_flow_policy,
+                over.child_sdlc_flow_policy.clone(),
+            ),
+            child_sdlc_task_policy: crate::policy::merge_opt(
+                self.child_sdlc_task_policy,
+                over.child_sdlc_task_policy.clone(),
+            ),
+            on_bail: crate::policy::merge_opt(self.on_bail, over.on_bail),
+            bail_channel: crate::policy::merge_opt(self.bail_channel, over.bail_channel),
+            preflight_enabled: crate::policy::merge_opt(
+                self.preflight_enabled,
+                over.preflight_enabled,
+            ),
+            preflight_model_tier: crate::policy::merge_opt(
+                self.preflight_model_tier,
+                over.preflight_model_tier,
+            ),
+            preflight_max_claims: crate::policy::merge_opt(
+                self.preflight_max_claims,
+                over.preflight_max_claims,
+            ),
+            preflight_max_turns: crate::policy::merge_opt(
+                self.preflight_max_turns,
+                over.preflight_max_turns,
+            ),
+            preflight_slice_max_bytes: crate::policy::merge_opt(
+                self.preflight_slice_max_bytes,
+                over.preflight_slice_max_bytes,
+            ),
+            preflight_programs: crate::policy::merge_opt(
+                self.preflight_programs,
+                over.preflight_programs.clone(),
+            ),
+            preflight_command_timeout_ms: crate::policy::merge_opt(
+                self.preflight_command_timeout_ms,
+                over.preflight_command_timeout_ms,
+            ),
+            preflight_on_unjudged: crate::policy::merge_opt(
+                self.preflight_on_unjudged,
+                over.preflight_on_unjudged,
+            ),
         }
     }
 }
@@ -341,6 +541,26 @@ pub fn baseline() -> PartialOrchestrationPolicy {
         campaign_max_total_tokens: Some(None),
         conductor_max_chain_blocks: Some(Some(3)),
         conductor_single_repo_only: Some(true),
+        // EN.17.F Task 1: restate the built-in default verbatim (no
+        // forwarded override) — baseline's no-op contract.
+        child_sdlc_flow_policy: Some(None),
+        child_sdlc_task_policy: Some(None),
+        // EN.17.B Task 2: restate the built-in default verbatim —
+        // baseline's no-op contract.
+        on_bail: Some(OnBail::StopChain),
+        // EN.17.C Task 1: restate the built-in default verbatim —
+        // baseline's no-op contract.
+        bail_channel: Some(BailChannel::Session),
+        // EN.17.D Task 4: restate all eight built-in preflight values
+        // verbatim — baseline's no-op contract extends to preflight too.
+        preflight_enabled: Some(false),
+        preflight_model_tier: Some(ModelTier::Haiku),
+        preflight_max_claims: Some(5),
+        preflight_max_turns: Some(None),
+        preflight_slice_max_bytes: Some(4_000),
+        preflight_programs: Some(None),
+        preflight_command_timeout_ms: Some(5_000),
+        preflight_on_unjudged: Some(OnUnjudged::Proceed),
     }
 }
 
@@ -381,6 +601,20 @@ pub fn cheap_fast() -> PartialOrchestrationPolicy {
         campaign_max_total_tokens: Some(None),
         conductor_max_chain_blocks: Some(Some(2)),
         conductor_single_repo_only: Some(true),
+        // EN.17.F Task 1 PROFILE RULE: `child_sdlc_flow_policy` /
+        // `child_sdlc_task_policy` are deliberately left UNSET here (fall
+        // through to `Default::default()`'s `None` via `#[serde(default)]`),
+        // never restated at any value — see the block record's `notes`
+        // field. HQ's `orchestration.policy` is what actually switches these
+        // on for a real chain; a profile value here would override that
+        // switch.
+        //
+        // EN.17.D Task 4 PROFILE RULE: the same reasoning extends to all
+        // eight preflight knobs — deliberately left UNSET here so an
+        // HQ-set `orchestration.policy.preflight_enabled` still governs a
+        // chain naming this profile. See the block record's own `notes`
+        // field (`PROFILE RULE`).
+        ..Default::default()
     }
 }
 
@@ -412,6 +646,13 @@ pub fn thorough() -> PartialOrchestrationPolicy {
         campaign_max_total_tokens: Some(None),
         conductor_max_chain_blocks: Some(Some(3)),
         conductor_single_repo_only: Some(true),
+        // EN.17.F Task 1 PROFILE RULE: see `cheap_fast`'s comment — these
+        // two knobs are deliberately left UNSET across every built-in
+        // profile, `thorough` included.
+        //
+        // EN.17.D Task 4 PROFILE RULE: same for all eight preflight knobs
+        // — see `cheap_fast`'s own comment.
+        ..Default::default()
     }
 }
 
@@ -449,6 +690,27 @@ pub fn resolve_policy_for_run_from(
         profile.as_ref(),
         event.policy.as_ref(),
     ))
+}
+
+/// `EN.17.D` task 4: the `preflight_report` JSON stamp — the resolved
+/// eight preflight knob values (so `RunTelemetry`/a reader can attribute
+/// an observed cost/outcome to the setting that caused it, per CLAUDE.md
+/// standing rule 6) alongside the accumulated per-block `blocks` array
+/// task 3's loop built. Shared by both the success and the error stamping
+/// path in [`OrchestrationRunNode::process`] so the two can never drift
+/// apart in shape.
+fn preflight_policy_stamp(policy: &OrchestrationPolicy, blocks: &[BlockPreflight]) -> Value {
+    json!({
+        "enabled": policy.preflight_enabled,
+        "model_tier": policy.preflight_model_tier,
+        "max_claims": policy.preflight_max_claims,
+        "max_turns": policy.preflight_max_turns,
+        "slice_max_bytes": policy.preflight_slice_max_bytes,
+        "programs": policy.preflight_programs,
+        "command_timeout_ms": policy.preflight_command_timeout_ms,
+        "on_unjudged": policy.preflight_on_unjudged,
+        "blocks": blocks,
+    })
 }
 
 // ── Event schema ─────────────────────────────────────────────────────────
@@ -606,6 +868,14 @@ type DependsOnFn = Arc<dyn Fn(&str, &str) -> Vec<DependencyEdge> + Send + Sync>;
 type EdgeMetFn = Arc<dyn Fn(&str, &str) -> bool + Send + Sync>;
 type EngineFn = Arc<dyn Fn(&str, &str) -> EngineKind + Send + Sync>;
 type BlockOpenFn = Arc<dyn Fn(&str) -> bool + Send + Sync>;
+/// `EN.17.B` Task 2: `(repo, block_id) -> BlockPresence`, the seam
+/// [`OrchestrationRunNode::with_block_status`] installs —
+/// `corpus_gates::CorpusGates::block_status` in production. Not yet
+/// consulted by `process` (that lands in Task 4).
+type BlockStatusFn = Arc<dyn Fn(&str, &str) -> super::corpus_gates::BlockPresence + Send + Sync>;
+/// `EN.17.D` Task 4: `(repo, block_id) -> PreflightOutcome` — see
+/// [`OrchestrationRunNode::with_preflight`].
+type PreflightFn = Arc<dyn Fn(&str, &str) -> PreflightOutcome + Send + Sync>;
 /// A per-step observer, called once per completed step — see
 /// [`OrchestrationRunNode::with_step_observer`] and
 /// [`integrate::StepProgress`].
@@ -635,6 +905,16 @@ pub struct OrchestrationRunNode {
     is_edge_met: EdgeMetFn,
     resolve_engine: EngineFn,
     is_block_open: BlockOpenFn,
+    /// `EN.17.B` Task 2: the status-aware boundary seam — see
+    /// [`Self::with_block_status`]. Defaults to a permissive
+    /// `BlockPresence::NotInTracks` stand-in
+    /// ([`super::corpus_gates::BlockPresence::NotInTracks`] would itself be
+    /// treated as "not in tracks", not "open", so [`Self::new`] instead
+    /// defaults this to a closure that always reports the block present and
+    /// `"open"` — behavior-stable per CLAUDE.md standing rule 6, matching
+    /// `is_block_open`'s own always-false default). Not yet consulted by
+    /// `process` (Task 4 wires the boundary check itself).
+    block_status: BlockStatusFn,
     hold_source: Arc<dyn HoldSource>,
     admission: AdmissionGate,
     /// `None` (the default) builds a fresh [`default_flow_runner`] per run
@@ -701,6 +981,21 @@ pub struct OrchestrationRunNode {
     /// None` — byte-identical to the pre-task call through plain
     /// [`integrate::integrate_chain`]. See [`Self::with_coord_agent`].
     coord_agent: Option<String>,
+    /// `EN.17.C` task 3: the real [`OperatorTransport`] a bailing chain's
+    /// single post-loop `run_sweep_pass` call routes escalations through —
+    /// see [`Self::with_operator_transport`]. Defaults to
+    /// [`NoopOperatorTransport`] ([`Self::new`]), so an un-injected run's
+    /// sweep pass (still only triggered when `chain_report.bailed` is
+    /// non-empty) routes nothing anywhere, matching `SWEEP`'s own
+    /// `register_sweep` default (`workflows/sweep/mod.rs`).
+    operator_transport: Arc<dyn OperatorTransport>,
+    /// `EN.17.D` Task 4: the production preflight seam — see
+    /// [`Self::with_preflight`]. Defaults to a no-op that always reports
+    /// [`PreflightOutcome::Disabled`] ([`Self::new`]), matching the built-in
+    /// `OrchestrationPolicy::preflight_enabled: false`, so an un-injected
+    /// run behaves exactly as it did before this seam existed (CLAUDE.md
+    /// standing rule 6).
+    preflight: PreflightFn,
 }
 
 impl fmt::Debug for OrchestrationRunNode {
@@ -723,6 +1018,9 @@ impl OrchestrationRunNode {
             is_edge_met: Arc::new(|_repo, _block_id| true),
             resolve_engine: Arc::new(|_repo, _block_id| EngineKind::Flow),
             is_block_open: Arc::new(|_held_until| false),
+            block_status: Arc::new(|_repo, _block_id| {
+                super::corpus_gates::BlockPresence::Row("open".to_string())
+            }),
             hold_source: Arc::new(NeverHeld),
             admission: AdmissionGate::with_default_policy(),
             run_flow: None,
@@ -733,6 +1031,8 @@ impl OrchestrationRunNode {
             conductor: None,
             journal_sink: None,
             coord_agent: None,
+            operator_transport: Arc::new(NoopOperatorTransport),
+            preflight: Arc::new(|_repo, _block_id| PreflightOutcome::Disabled),
         }
     }
 
@@ -757,6 +1057,16 @@ impl OrchestrationRunNode {
     #[must_use]
     pub fn with_is_block_open(mut self, f: BlockOpenFn) -> Self {
         self.is_block_open = f;
+        self
+    }
+
+    /// `EN.17.B` Task 2: install the status-aware boundary seam — production
+    /// registration wires `corpus_gates::CorpusGates::block_status` from the
+    /// same `CorpusGates` instance `with_is_block_open` already draws from.
+    /// Not yet consulted by `process`; Task 4 wires the boundary check.
+    #[must_use]
+    pub fn with_block_status(mut self, f: BlockStatusFn) -> Self {
+        self.block_status = f;
         self
     }
 
@@ -871,6 +1181,33 @@ impl OrchestrationRunNode {
     #[must_use]
     pub fn with_coord_agent(mut self, agent: impl Into<String>) -> Self {
         self.coord_agent = Some(agent.into());
+        self
+    }
+
+    /// Install the real [`OperatorTransport`] a bailing chain's single
+    /// post-loop `run_sweep_pass` call routes escalations through
+    /// (`EN.17.C` task 3) — mirrors [`Self::with_is_block_open`]'s exact
+    /// builder shape. With none installed (the default,
+    /// [`NoopOperatorTransport`]), a bailing chain's sweep pass still runs
+    /// but routes nothing anywhere, matching `SWEEP`'s own placeholder
+    /// default.
+    #[must_use]
+    pub fn with_operator_transport(mut self, transport: Arc<dyn OperatorTransport>) -> Self {
+        self.operator_transport = transport;
+        self
+    }
+
+    /// Install the real preflight seam (`EN.17.D` task 4) — mirrors
+    /// [`Self::with_is_block_open`]'s exact builder shape. With none
+    /// installed (the default, [`Self::new`]'s `Disabled`-always closure),
+    /// preflight is a no-op for every step regardless of the resolved
+    /// `preflight_enabled` policy value — production registration
+    /// (`engine-serve::workflows::register_orchestration_with_registry`)
+    /// always supplies a real one built from the same event's resolved
+    /// [`OrchestrationPolicy`] and [`RepoRegistry`].
+    #[must_use]
+    pub fn with_preflight(mut self, preflight: PreflightFn) -> Self {
+        self.preflight = preflight;
         self
     }
 }
@@ -1045,6 +1382,13 @@ impl Node for OrchestrationRunNode {
         // `bool` is `Copy`, so this crosses the `spawn_blocking` closure
         // by value, no `Arc`/clone needed.
         let default_auto_pr = policy.default_auto_pr;
+        // `EN.17.F` task 2: the resolved child policy overrides, cloned out
+        // of `policy` (not `Copy`, unlike the two `bool` knobs above) so the
+        // clones can move into the `spawn_blocking` closure below by value —
+        // `None` for either leaves the forwarded child event byte-identical
+        // to before this knob existed.
+        let child_sdlc_flow_policy = policy.child_sdlc_flow_policy.clone();
+        let child_sdlc_task_policy = policy.child_sdlc_task_policy.clone();
         // `EN.12.F` Task 5: a conductor-proposed ("autonomous") run gets a
         // real campaign budget ceiling — `integrate::integrate_chain`'s
         // `campaign_budget` parameter has checked this at every block
@@ -1087,6 +1431,13 @@ impl Node for OrchestrationRunNode {
         // `EN.ticket.orchestration-close-block-node-not-wired` task 2:
         // cloned the same way — `Arc` clone, `Send + Sync + 'static`.
         let close_block = self.close_block.clone();
+        // `EN.17.C` task 3: cloned before the `spawn_blocking` closure like
+        // every other owned seam here — `repo_registry` itself is moved
+        // into that closure below, so a second `Arc` clone is kept OUTSIDE
+        // it (mirroring `cancellation_token_for_stamp`'s own pattern) for
+        // the post-loop `run_sweep_pass` call to resolve the run's
+        // permission profile from.
+        let repo_registry_for_sweep = repo_registry.clone();
 
         // `EN.ticket.wire-coord-handle-into-orchestration-run-node`: build
         // the real `CoordHandle` for this run now that `chain` and
@@ -1144,16 +1495,64 @@ impl Node for OrchestrationRunNode {
         // a global default alone would not reach.
         let current_span = tracing::Span::current();
         let current_dispatch = tracing::dispatcher::get_default(|d| d.clone());
-        let outcomes = tokio::task::spawn_blocking(move || {
+        // `EN.17.B` task 4: the resolved policy switch and the status-aware
+        // boundary seam, captured before the `spawn_blocking` closure below
+        // exactly like every other owned seam here — `OnBail` is `Copy`
+        // (crosses by value, no clone needed); `block_status` is an `Arc`
+        // clone, `Send + Sync + 'static`.
+        let on_bail = policy.on_bail;
+        // `EN.17.C` task 4: the resolved `OrchestrationPolicy::bail_channel`
+        // switch, captured alongside `on_bail` above the same way — `Copy`,
+        // no clone needed — and threaded through to
+        // `integrate_chain_with_preflight` below (`EN.17.D` task 4 renamed
+        // this call site's target from `integrate_chain_with_coord_and_policy`)
+        // so `record_bail_escalation` composes against the ACTUALLY
+        // RESOLVED channel instead of task 2's `BailChannel::Session`
+        // placeholder.
+        let bail_channel = policy.bail_channel;
+        let block_status = self.block_status.clone();
+        // `EN.17.D` task 4: the preflight seam and its two knobs, captured
+        // before the `spawn_blocking` closure exactly like `block_status`/
+        // `on_bail` above — `preflight` is an `Arc` clone (`Send + Sync +
+        // 'static`), `preflight_on_unjudged` is `Copy` (crosses by value).
+        let preflight = self.preflight.clone();
+        let preflight_on_unjudged = policy.preflight_on_unjudged;
+        // `NodeError` now carries an optional `node_result` payload (the
+        // `chain_report`-past-revert seam below), which pushes this
+        // closure's `Err` variant past clippy's `result_large_err`
+        // threshold — box it rather than shrink `NodeError` itself, since
+        // every other caller of `NodeError` still wants it by value.
+        #[allow(clippy::type_complexity)]
+        let outcomes_result: Result<
+            (Vec<ExecutionOutcome>, ChainReport, Vec<BlockPreflight>),
+            Box<(NodeError, ChainReport, Vec<BlockPreflight>)>,
+        > = tokio::task::spawn_blocking(move || {
             tracing::dispatcher::with_default(&current_dispatch, || {
                 let _span_guard = current_span.enter();
-                let rt = tokio::runtime::Builder::new_current_thread()
+                let rt = match tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build()
-                    .map_err(|err| {
-                        NodeError::new(format!("failed to start orchestration runtime: {err}"))
-                    })?;
-                rt.block_on(integrate_chain_with_coord(
+                {
+                    Ok(rt) => rt,
+                    Err(err) => {
+                        return Err(Box::new((
+                            NodeError::new(format!("failed to start orchestration runtime: {err}")),
+                            ChainReport::default(),
+                            Vec::new(),
+                        )));
+                    }
+                };
+                // `EN.17.B` task 4, part 5: accumulates `closed`/`bailed`/`skipped`
+                // as `integrate_chain_with_preflight` runs — populated on
+                // BOTH the `Ok` and the `Err` arm below, since it is threaded in
+                // as `&mut` rather than returned, per `ChainReport`'s own doc.
+                let mut chain_report = ChainReport::default();
+                // `EN.17.D` task 4: accumulates one `BlockPreflight` per
+                // block step, in chain order — same threaded-`&mut`
+                // shape as `chain_report` above, for the same reason
+                // (survives the `Err` arm below).
+                let mut preflight_report: Vec<BlockPreflight> = Vec::new();
+                let result = rt.block_on(integrate_chain_with_preflight(
                     &chain,
                     &move |repo, block_id| resolve_depends_on(repo, block_id),
                     &move |repo, block_id| is_edge_met(repo, block_id),
@@ -1194,12 +1593,81 @@ impl Node for OrchestrationRunNode {
                     // `integrate_chain` call this replaces — see the
                     // `coord` binding's own doc above.
                     coord.as_ref(),
-                ))
-                .map_err(|err| NodeError::new(err.to_string()))
+                    // `EN.17.F` task 2: the EFFECTIVE switch — resolved
+                    // from `policy` above, forwarded to every child event
+                    // this chain composes.
+                    child_sdlc_flow_policy.as_ref(),
+                    child_sdlc_task_policy.as_ref(),
+                    // `EN.17.B` task 4: the two new seams, resolved above —
+                    // `default_block_status`-equivalent permissive behaviour
+                    // whenever `block_status` was never wired (matches
+                    // `Self::new`'s own default), `OnBail::StopChain` whenever
+                    // no HQ/profile override resolved anything else.
+                    on_bail,
+                    // `EN.17.C` task 4: the EFFECTIVE switch — resolved from
+                    // `policy` above, exactly like `on_bail` immediately
+                    // above it.
+                    bail_channel,
+                    &move |repo, block_id| block_status(repo, block_id),
+                    &mut chain_report,
+                    // `EN.17.D` task 4: the resolved production preflight
+                    // seam and `preflight_on_unjudged` switch, resolved
+                    // above the same way `on_bail`/`block_status` are.
+                    &move |repo, block_id| preflight(repo, block_id),
+                    preflight_on_unjudged,
+                    &mut preflight_report,
+                ));
+                match result {
+                    Ok(outcomes) => Ok((outcomes, chain_report, preflight_report)),
+                    Err(err) => Err(Box::new((
+                        NodeError::new(err.to_string()),
+                        chain_report,
+                        preflight_report,
+                    ))),
+                }
             })
         })
         .await
-        .map_err(|err| NodeError::new(format!("orchestration task panicked: {err}")))??;
+        .map_err(|err| NodeError::new(format!("orchestration task panicked: {err}")))?;
+
+        // `EN.17.B` task 4, part 5: on the error path, `ctx` itself is still
+        // discarded by the framework once this function returns `Err`
+        // (`NodeError`'s own doc: `node_context` reverts to its pre-call
+        // snapshot). `NodeError::node_result` (the `sessions` seam's
+        // structured-payload counterpart) is what carries the accumulated
+        // report past that revert, so it lands in `ctx.nodes[NODE_NAME]`
+        // exactly like the success path's own stamp below — the error
+        // MESSAGE still names every bailed block too, for a reader who only
+        // sees the message.
+        let (outcomes, chain_report, preflight_report) = match outcomes_result {
+            Ok(triple) => triple,
+            Err(boxed) => {
+                let (err, report, preflight_report) = *boxed;
+                // `EN.17.D` task 4: `preflight_report` must reach
+                // `ctx.nodes` even on this error path (block record part 6
+                // / task 4's own acceptance criteria) — unlike
+                // `chain_report`, which this branch has always stamped
+                // only when a bail actually happened, `preflight_report`
+                // is stamped on EVERY error here, since a run with no
+                // bailed block can still have run preflight on every step.
+                let message = if report.bailed.is_empty() {
+                    err.message.clone()
+                } else {
+                    format!(
+                        "{} (bailed blocks: {})",
+                        err.message,
+                        report.bailed.join(", ")
+                    )
+                };
+                let mut node_result = json!({
+                    "preflight_report": preflight_policy_stamp(&policy, &preflight_report),
+                });
+                if !report.bailed.is_empty() {
+                    node_result["chain_report"] = json!(report);
+                }
+                return Err(NodeError::new(message).with_node_result(node_result));
+            }
+        };
 
         // A cancel win is only real if it actually cut the chain short —
         // `integrate_chain` can return `outcomes.len() == total_steps` even
@@ -1247,10 +1715,29 @@ impl Node for OrchestrationRunNode {
             None => json!({ "cancelled": false }),
         };
 
-        ctx.nodes.insert(
-            NODE_NAME.to_string(),
-            json!({
+        // `EN.17.B` task 4, part 5: decided BEFORE the report is moved into
+        // the `json!` stamp below — under `OnBail::SkipDependents`, the
+        // chain can finish with `Ok` outcomes yet still have bailed steps
+        // (their dependents were merely skipped, not the whole chain
+        // stopped), so the "bailed non-empty" check applies regardless of
+        // which arm `outcomes_result` returned.
+        let bailed_error_message = if chain_report.bailed.is_empty() {
+            None
+        } else {
+            Some(format!(
+                "chain integrated with {} bailed block(s): {}",
+                chain_report.bailed.len(),
+                chain_report.bailed.join(", ")
+            ))
+        };
+
+        let node_result = json!({
                 "steps_integrated": outcomes.len(),
+                "chain_report": chain_report,
+                // `EN.17.D` task 4: put_result ONCE, beside `chain_report`
+                // above — present even on the error path via
+                // `preflight_policy_stamp`'s use above.
+                "preflight_report": preflight_policy_stamp(&policy, &preflight_report),
                 "blocks": outcomes
                     .iter()
                     .map(|o| json!({
@@ -1297,8 +1784,55 @@ impl Node for OrchestrationRunNode {
                         "total_tokens": o.total_tokens,
                     }))
                     .collect::<Vec<_>>(),
-            }),
-        );
+        });
+        ctx.nodes.insert(NODE_NAME.to_string(), node_result.clone());
+        // `EN.17.C` task 3: exactly one best-effort `run_sweep_pass` call
+        // for the whole chain when it bailed — never once per bailed
+        // block, never per skipped dependent or hold poll, and never at
+        // all on a clean chain (`chain_report.bailed` empty). Routing
+        // (dedup, refire-window, permission-profile gating) stays entirely
+        // inside the one router every `SWEEP` caller already shares —
+        // `record_bail_escalation` (task 4) is what actually composes the
+        // per-bailed-block escalation this sweep pass then routes. A
+        // sweep-pass failure is logged and never changes this node's own
+        // Ok/Err outcome or `ctx.nodes` content — it is a layered-on
+        // notification side effect, not part of the chain's result.
+        if !chain_report.bailed.is_empty() {
+            let (profile, _) = resolve_permission_profile(
+                &repo_registry_for_sweep.brain_root().join("brain.toml"),
+            );
+            if let Err(err) = run_sweep_pass(
+                &event.brain_root,
+                &roadmap_slug,
+                chrono::Utc::now(),
+                DEFAULT_REFIRE_HOURS,
+                profile,
+                self.operator_transport.as_ref(),
+                &NoopLaneWake,
+            )
+            .await
+            {
+                tracing::warn!(
+                    error = %err,
+                    roadmap = %roadmap_slug,
+                    "EN.17.C: post-chain run_sweep_pass failed; the chain's own outcome is unaffected"
+                );
+            }
+        }
+        // `EN.17.B` task 4, part 5: the report is now on `ctx` (stamped
+        // above) regardless of which branch this takes; this is what makes
+        // the `bailed`-non-empty check independent of the `Ok`/`Err` arm
+        // `outcomes_result` returned.
+        //
+        // The soft-Err path (outcomes_result `Ok`, but `chain_report.bailed`
+        // non-empty — the `SkipDependents` case this block exists for) must
+        // carry the same payload on the error, because `workflow.rs`'s
+        // `node_context` reverts `ctx` to `pre_call_ctx` on `Err` and
+        // replays only `err.node_result`. Without this the stamp above is
+        // discarded and no `chain_report` reaches `ctx.nodes`.
+        if let Some(message) = bailed_error_message {
+            return Err(NodeError::new(message).with_node_result(node_result));
+        }
         Ok(ctx)
     }
 
@@ -1575,6 +2109,7 @@ pub fn held_session_outcome_status(
 mod tests {
     use super::*;
     use crate::validate::WorkflowValidator;
+    use crate::WorkflowError;
 
     #[test]
     fn schema_passes_validation() {
@@ -1845,6 +2380,36 @@ mod tests {
         }
     }
 
+    /// `EN.17.D` Task 4 acceptance criterion: `baseline()` restates all
+    /// eight built-in preflight values explicitly; `cheap_fast()` and
+    /// `thorough()` leave all eight UNSET (`None`) in the returned
+    /// `PartialOrchestrationPolicy` itself — the PROFILE RULE this block's
+    /// notes describe, so an HQ-set `orchestration.policy.preflight_enabled`
+    /// still governs a run naming either profile.
+    #[test]
+    fn preflight_knobs_follow_the_profile_rule() {
+        let base = baseline();
+        assert_eq!(base.preflight_enabled, Some(false));
+        assert_eq!(base.preflight_model_tier, Some(ModelTier::Haiku));
+        assert_eq!(base.preflight_max_claims, Some(5));
+        assert_eq!(base.preflight_max_turns, Some(None));
+        assert_eq!(base.preflight_slice_max_bytes, Some(4_000));
+        assert_eq!(base.preflight_programs, Some(None));
+        assert_eq!(base.preflight_command_timeout_ms, Some(5_000));
+        assert_eq!(base.preflight_on_unjudged, Some(OnUnjudged::Proceed));
+
+        for profile in [cheap_fast(), thorough()] {
+            assert_eq!(profile.preflight_enabled, None);
+            assert_eq!(profile.preflight_model_tier, None);
+            assert_eq!(profile.preflight_max_claims, None);
+            assert_eq!(profile.preflight_max_turns, None);
+            assert_eq!(profile.preflight_slice_max_bytes, None);
+            assert_eq!(profile.preflight_programs, None);
+            assert_eq!(profile.preflight_command_timeout_ms, None);
+            assert_eq!(profile.preflight_on_unjudged, None);
+        }
+    }
+
     // ── Event parsing ────────────────────────────────────────────────────
 
     fn base_ctx(event: serde_json::Value) -> TaskContext {
@@ -1983,6 +2548,295 @@ mod tests {
         assert_eq!(lines[1]["lane"], lines[1]["repo"]);
         assert_eq!(lines[0]["repo"], "repo-a");
         assert_eq!(lines[1]["repo"], "repo-b");
+    }
+
+    /// `EN.17.D` Task 4: an inline `policy` override resolves every one of
+    /// the eight preflight knobs, and `process` stamps them (plus one
+    /// `BlockPreflight` entry per block step, in chain order) into
+    /// `ctx.nodes[NODE_NAME]["preflight_report"]` — beside `chain_report`,
+    /// exactly as the block record's part 6 describes.
+    #[tokio::test]
+    async fn process_stamps_resolved_preflight_knobs_and_one_entry_per_block_into_preflight_report()
+    {
+        let dir = two_repo_brain_root();
+        write_done_state(&dir.path().join("repo-a"), "A.1");
+        write_done_state(&dir.path().join("repo-b"), "B.1");
+
+        let run_flow: FlowRunner = Arc::new(|_invocation| {
+            Box::pin(async move {
+                Ok(TaskContext {
+                    event: json!({}),
+                    nodes: HashMap::new(),
+                    metadata: json!({}),
+                    node_runs: HashMap::new(),
+                })
+            })
+        });
+
+        // A stub preflight seam — this test asserts the STAMPED KNOB
+        // VALUES and the per-block accumulation shape, not the argv
+        // validator or the judgment call itself (both covered by
+        // `tests/it/preflight.rs` and `tests/it/judgment.rs`).
+        let node = OrchestrationRunNode::new()
+            .with_run_flow(run_flow)
+            .with_preflight(Arc::new(|_repo, _block_id| {
+                PreflightOutcome::SkippedNoRecord
+            }));
+
+        let ctx = base_ctx(json!({
+            "brain_root": dir.path(),
+            "blocks": [
+                { "repo": "repo-a", "block_id": "A.1" },
+                { "repo": "repo-b", "block_id": "B.1" }
+            ],
+            "roadmap_slug": "my-roadmap",
+            "policy": {
+                "preflight_enabled": true,
+                "preflight_model_tier": "opus",
+                "preflight_max_claims": 3,
+                "preflight_max_turns": 7,
+                "preflight_slice_max_bytes": 2_000,
+                "preflight_programs": ["rg", "test"],
+                "preflight_command_timeout_ms": 9_000,
+                "preflight_on_unjudged": "bail",
+            },
+        }));
+
+        let out = node.process(ctx).await.expect("process should succeed");
+        let report = &out.nodes[NODE_NAME]["preflight_report"];
+        assert_eq!(report["enabled"], true);
+        assert_eq!(report["model_tier"], "opus");
+        assert_eq!(report["max_claims"], 3);
+        assert_eq!(report["max_turns"], 7);
+        assert_eq!(report["slice_max_bytes"], 2_000);
+        assert_eq!(report["programs"], json!(["rg", "test"]));
+        assert_eq!(report["command_timeout_ms"], 9_000);
+        assert_eq!(report["on_unjudged"], "bail");
+
+        let blocks = report["blocks"].as_array().expect("blocks is an array");
+        assert_eq!(blocks.len(), 2, "one BlockPreflight per block step");
+        assert_eq!(blocks[0]["repo"], "repo-a");
+        assert_eq!(blocks[0]["block_id"], "A.1");
+        assert_eq!(blocks[1]["repo"], "repo-b");
+        assert_eq!(blocks[1]["block_id"], "B.1");
+    }
+
+    /// Regression for the review finding on `EN.17.B` task 4, part 5: under
+    /// the built-in `OnBail::StopChain` default, a failing step makes
+    /// `integrate_chain_with_coord_and_policy` itself return `Err`, which
+    /// this function's own early-return arm (immediately after the
+    /// `spawn_blocking` join) used to propagate WITHOUT ever reaching the
+    /// `ctx.nodes.insert` stamp further down — so `chain_report` survived
+    /// only inside the error MESSAGE string, never in `ctx` itself. Proves
+    /// `NodeError::node_result` (the `sessions` seam's structured-payload
+    /// counterpart) now carries it past that early return.
+    #[tokio::test]
+    async fn process_hard_err_path_still_carries_chain_report_in_the_node_error() {
+        let dir = two_repo_brain_root();
+        // No done-state written for "A.1" — it never needs one: the runner
+        // itself fails the block before any state write is attempted.
+
+        let run_flow: FlowRunner = Arc::new(|invocation| {
+            Box::pin(async move {
+                Err(WorkflowError::new(format!(
+                    "simulated failure for {}",
+                    invocation.block_id
+                )))
+            })
+        });
+
+        let node = OrchestrationRunNode::new().with_run_flow(run_flow);
+        let ctx = base_ctx(json!({
+            "brain_root": dir.path(),
+            "blocks": [{ "repo": "repo-a", "block_id": "A.1" }],
+            "roadmap_slug": "my-roadmap",
+        }));
+
+        let err = node
+            .process(ctx)
+            .await
+            .expect_err("a failing step under the built-in StopChain default must return Err");
+
+        assert!(
+            err.message.contains("repo-a:A.1"),
+            "the error message should still name the bailed block: {}",
+            err.message
+        );
+        let node_result = err
+            .node_result
+            .as_ref()
+            .expect("NodeError::node_result must be set on the hard-Err path so chain_report survives the ctx revert");
+        assert_eq!(
+            node_result["chain_report"]["bailed"],
+            json!(["repo-a:A.1"]),
+            "chain_report in the carried node_result must name the bailed block"
+        );
+    }
+
+    // ── Node::process — EN.17.C task 3: post-chain run_sweep_pass call ────
+
+    /// A counting [`OperatorTransport`] used only to prove `run_sweep_pass`
+    /// itself ran (or did not). Its `send` is never reached by these tests
+    /// even on a bailing chain — the built-in `BailChannel::Session`
+    /// escalation routes to `LaneWake`, not the transport, and task 4 is
+    /// what finishes threading a resolved `bail_channel: notification`
+    /// through — so these tests assert on the sweep pass's own on-disk
+    /// artifact (`sweeps/<ts>.json`) instead, and this stub exists mainly
+    /// to prove [`OrchestrationRunNode::with_operator_transport`] itself
+    /// compiles, stores, and is threaded all the way into `run_sweep_pass`.
+    struct CountingTransport {
+        sends: std::sync::atomic::AtomicUsize,
+    }
+
+    impl CountingTransport {
+        fn new() -> Self {
+            Self {
+                sends: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::operator::transport::OperatorTransport for CountingTransport {
+        async fn send(
+            &self,
+            _payload: &crate::operator::ValidatedOperatorPayload,
+        ) -> Result<
+            crate::operator::transport::DeliveredMessage,
+            crate::operator::transport::NotifyError,
+        > {
+            self.sends.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(crate::operator::transport::DeliveredMessage {
+                transport_message_id: String::new(),
+            })
+        }
+
+        async fn poll_responses(
+            &self,
+            since: Option<crate::operator::transport::UpdateCursor>,
+        ) -> Result<
+            (
+                Vec<crate::operator::transport::OperatorResponse>,
+                Option<crate::operator::transport::UpdateCursor>,
+            ),
+            crate::operator::transport::NotifyError,
+        > {
+            Ok((Vec::new(), since))
+        }
+    }
+
+    fn sweeps_dir_for(dir: &tempfile::TempDir, roadmap: &str) -> PathBuf {
+        dir.path()
+            .join("planning")
+            .join("roadmaps")
+            .join(roadmap)
+            .join("sweeps")
+    }
+
+    /// AC: "A chain with no bail (`chain_report.bailed` is empty) never
+    /// calls `run_sweep_pass`" — the counting seam here is the absence of
+    /// a `sweeps/` directory at all (a real `run_sweep_pass` call always
+    /// creates and writes into it), plus the transport's own zero send
+    /// count.
+    #[tokio::test]
+    async fn process_with_no_bail_never_calls_run_sweep_pass() {
+        let dir = two_repo_brain_root();
+        write_done_state(&dir.path().join("repo-a"), "A.1");
+        write_done_state(&dir.path().join("repo-b"), "B.1");
+
+        let run_flow: FlowRunner = Arc::new(|invocation| {
+            Box::pin(async move {
+                Ok(TaskContext {
+                    event: json!({}),
+                    nodes: HashMap::new(),
+                    metadata: json!({ "ran": invocation.block_id }),
+                    node_runs: HashMap::new(),
+                })
+            })
+        });
+
+        let transport = Arc::new(CountingTransport::new());
+        let node = OrchestrationRunNode::new()
+            .with_run_flow(run_flow)
+            .with_operator_transport(transport.clone());
+        let ctx = base_ctx(json!({
+            "brain_root": dir.path(),
+            "blocks": [
+                { "repo": "repo-a", "block_id": "A.1" },
+                { "repo": "repo-b", "block_id": "B.1" }
+            ],
+            "roadmap_slug": "my-roadmap",
+        }));
+
+        let out = node.process(ctx).await.expect("a clean chain must succeed");
+        assert_eq!(out.nodes[NODE_NAME]["steps_integrated"], 2);
+        assert_eq!(
+            transport.sends.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a clean chain must never route anything through the operator transport"
+        );
+        assert!(
+            !sweeps_dir_for(&dir, "my-roadmap").exists(),
+            "a clean chain must never call run_sweep_pass at all -- no sweeps/ directory \
+             should exist"
+        );
+    }
+
+    /// AC: "A chain with bailed blocks calls `run_sweep_pass` exactly once
+    /// for the whole chain (not once per bailed block) after `chain_report`
+    /// is stamped into `ctx`." Uses `OnBail::SkipDependents` (inline event
+    /// policy) so a single bailed step, with nothing depending on it,
+    /// finishes the chain on the `Ok` branch — the soft-Err path this
+    /// task's call site sits on, past `ctx.nodes.insert` and this task's
+    /// `run_sweep_pass` call, not the hard-Err early return the built-in
+    /// `OnBail::StopChain` default takes above it.
+    #[tokio::test]
+    async fn process_with_bailed_steps_calls_run_sweep_pass_exactly_once() {
+        let dir = two_repo_brain_root();
+        // No done-state written for "A.1" -- the runner fails it directly,
+        // so `execute_step` itself is the bail point.
+
+        let run_flow: FlowRunner = Arc::new(|invocation| {
+            Box::pin(async move {
+                Err(WorkflowError::new(format!(
+                    "simulated failure for {}",
+                    invocation.block_id
+                )))
+            })
+        });
+
+        let transport = Arc::new(CountingTransport::new());
+        let node = OrchestrationRunNode::new()
+            .with_run_flow(run_flow)
+            .with_operator_transport(transport.clone());
+        let ctx = base_ctx(json!({
+            "brain_root": dir.path(),
+            "blocks": [{ "repo": "repo-a", "block_id": "A.1" }],
+            "roadmap_slug": "my-roadmap",
+            "policy": { "on_bail": "skip_dependents" },
+        }));
+
+        let err = node
+            .process(ctx)
+            .await
+            .expect_err("a bailed step must still surface as the chain's own soft-Err outcome");
+        assert!(
+            err.message.contains("bailed block"),
+            "unexpected error message: {}",
+            err.message
+        );
+
+        let sweeps_dir = sweeps_dir_for(&dir, "my-roadmap");
+        let files: Vec<_> = std::fs::read_dir(&sweeps_dir)
+            .unwrap_or_else(|err| {
+                panic!("expected {sweeps_dir:?} to exist after a bailing chain: {err}")
+            })
+            .collect();
+        assert_eq!(
+            files.len(),
+            1,
+            "run_sweep_pass must run exactly once for the whole chain, not once per bailed block"
+        );
     }
 
     /// `EN.ticket.wire-coord-handle-into-orchestration-run-node`: this is

@@ -16,6 +16,108 @@ related: [status, context]
 
 ## [run: 2026-09-11]
 
+`/sdlc-flow` ran `EN.17.D` on branch `EN.17.D-flow` across all 5 tasks (all passed), PASS review.
+Task 1 added `JudgmentNode<T>`: a bounded, schema-constrained claude call over byte-capped
+`InputSlice`s (UTF-8-safe truncation with a marker), `Config.max_turns` wired in, no retries (one
+billed attempt), returning `JudgmentResult<T>` or a typed `JudgmentError`
+(`Timeout`/`CliError`/`NoStructuredResult`/`SchemaViolation`) without ever writing to the caller's
+`ctx.nodes`. Task 2 added `PreflightRunner`: per-block claim extraction over `JudgmentNode` plus a
+compiled-in, per-program argv validator (`rg`/`git`/`test`/`ls`) with a no-shell, cleared-environment,
+timeout-bounded runner — rejecting `rg --pre`, `git log --output`, path-based programs, and unlisted
+flags, never counting a refusal/timeout as a false claim. Task 3 wired a per-step preflight seam into
+the chain loop in `integrate.rs`, before `execute_step`: a false load-bearing claim bails with
+`check_id preflight-premise`, an unjudged judgment call proceeds by default (or bails per
+`OnUnjudged::Bail`), and every block step's outcome accumulates into a threaded `preflight_report`,
+exposed through a new `integrate_chain_with_preflight` entry point that leaves every pre-existing
+caller untouched. Task 4 gave `OrchestrationPolicy` all eight preflight knobs (built-in defaults,
+restated in `baseline`, unset in `cheap-fast`/`thorough` per the PROFILE RULE), wired
+`OrchestrationRunNode` to a real preflight seam and to stamp resolved knobs plus one `BlockPreflight`
+per block into `ctx.nodes[..]["preflight_report"]` on both success and error paths, and gave
+`engine-serve` a production seam bridging the async `PreflightRunner::run_for_block` onto the seam's
+synchronous signature via a dedicated OS thread with its own fresh tokio runtime. Task 5 added a
+fixture test proving a brain-root `harness.json`'s `preflight_enabled` reaches
+`OrchestrationRunNode` with no inline policy, extended the real-HQ-file test with a soft-skip
+`preflight_enabled` assertion, and documented the full mechanism in `docs/workflows/orchestration.md`.
+The cross-tree HQ `harness.json` write flipping `orchestration.policy.preflight_enabled: true` was
+deliberately left out of scope for this run — it belongs to a separate cross-tree commit per the
+block's own notes. Closes `EN.17.D`. Next: `EN.17.E` — EDGE_RELEASED, FINDING and QUERY are acted on
+at the block boundary.
+
+```
+2051f19 feat: implement EN.17.D-task5
+91e59f0 feat: implement EN.17.D-task4
+5baf2bd feat: implement EN.17.D-task3
+8d6bee6 feat: implement EN.17.D-task2
+8ed2db9 feat: implement EN.17.D-task1
+1ae08fb Merge EN.17.C-flow: bail-to-operator via one shared sweep router (bail_channel notification)
+```
+
+## [run: 2026-09-11]
+
+`/sdlc-flow` ran `EN.17.C` on branch `EN.17.C-flow` across all 7 tasks (all passed). Task 1 added the `BailChannel` (`Session`/`Notification`) knob to `OrchestrationPolicy`; task 2 threaded a `BailChannel` parameter through `record_bail_escalation`, defaulted to `Session` at every wrapper call site; task 3 gave `OrchestrationRunNode` an injectable `OperatorTransport` and called `sweep::run_sweep_pass` exactly once per bailing chain, after `chain_report` is stamped into `ctx`; task 4 resolved `bail_channel` from the run's `OrchestrationPolicy` and threaded it into `integrate_chain_with_coord_and_policy`, closing the real end-to-end switch; task 5 gave `engine-serve` a `register_builtin_workflows_with_operator` entry point wiring a real transport into SWEEP and ORCHESTRATION; task 6 documented the `bail_channel` knob in `docs/workflows/orchestration.md` and both engine-rs's and HQ's `planning/harness.json` (HQ's copy switched `orchestration.policy.bail_channel: notification`); task 7 added `crates/engine-core/tests/it/operator_reach.rs` (5 tests) and extended `hq_orchestration_policy.rs` to assert the real HQ file's switch. Review returned **PARTIAL**: two acceptance criteria are not literally satisfied, though both are documented, reasoned deviations rather than oversights. (1) The AC that a chain with two bailed blocks produces a number of stub `send` calls equal to `chain_report.bailed.len()` is contradicted by the pre-existing, intentional `sweep::route::Budget` cap of one operator-notify per `run_sweep_pass` call — the second bail is recorded as `action:skip-operator-budget, routed:false` rather than sent, which task 7's own commit treats as tension inside the spec's own wording (its "why" text says the per-pass budget stays in `route_escalation`, "never re-implemented here") rather than an implementation bug. (2) The AC that a skipped dependent's id appears in its bailed parent's escalation payload was never implemented — `record_bail_escalation`'s summary is composed from `err_display` alone, and the skip loop never calls it. The run bailed on this PARTIAL verdict rather than looping further fixes, since both gaps are scope/wording questions for a human. Next: a human decides whether to relax the two ACs to match the documented budget/skip-payload behavior or open a follow-up task to close them, then `EN.17.C` can be resumed to close.
+
+```
+ada8655 feat: implement EN.17.C-task7
+1367b96 docs: implement EN.17.C-task6
+8969c67 feat: implement "EN.17.C-task5
+8b07032 feat: implement "EN.17.C-task4
+b55d88a feat: implement "EN.17.C-task3
+dc629c5 feat: implement "EN.17.C-task2
+d623df1 feat: implement EN.17.C-task1
+15b0cb3 Merge EN.17.B-flow: status-aware boundaries, skip-dependents, NodeError payload seam
+```
+
+`/sdlc-flow` resumed on branch `EN.17.B-flow` after the previous bail's wrap-up (`5f1d115`), running two review-fix passes against `EN.17.B`'s PARTIAL verdict. Review pass 1 (`e8f621a`) added the `NodeError.node_result: Option<serde_json::Value>` seam (mirroring the existing `sessions` field's mechanism for surviving the ctx-revert-on-Err framework contract in `node.rs`/`workflow.rs`) and wired `OrchestrationRunNode::process`'s two `Err`-return sites in `graph.rs` to attach the accumulated `chain_report` through it — closing the second of the two review-1 findings (chain_report reaching `ctx` on the hard-`Err` path). Review pass 2 (`458cfed`) made further `graph.rs` adjustments plus added coverage in `hq_orchestration_policy.rs`. The run BAILED again at review (attempt 3 of 3) with a PARTIAL verdict: `docs/workflows/orchestration.md:253-255` still documents `gates::check_permission_gate`/`EN.15.J` as wired into the per-step orchestration loop, but `grep` over `crates/` shows zero production call sites (only `gates.rs`'s own definition and `tests/it/orchestration.rs`) — this premise was explicitly struck by the 2026-09-11 D18 amendment on this same spec and is already tracked as carryover finding `check-permission-gate-never-wired-into-orchestration-loop`. With this being attempt 3 of 3 on a doc that keeps re-asserting the struck behavior, correcting the wording is an authoring/scope decision (delete the claim vs. rewrite as "not yet wired") that belongs with a human rather than another automated retry. Next: a human decides how `docs/workflows/orchestration.md:253-255` should read (delete the `check_permission_gate` claim or rewrite it as "not yet wired"), then `EN.17.B` can be resumed to close.
+
+```
+458cfed fix: review pass 2 for "EN.17.B
+e8f621a fix: review pass 1 for "EN.17.B
+5f1d115 chore: wrap up EN.17.B
+```
+
+## [run: 2026-09-11]
+
+`/sdlc-flow` on branch `EN.17.B-flow` ran tasks 1-6 of `EN.17.B` (a bail skips only its dependents, and every block boundary re-reads the graph) and BAILED at review. Task 1 added `CorpusGates::block_status` (`BlockPresence::Row`/`NotInTracks`) beside `is_edge_met`/`is_block_open`. Task 2 added `OnBail` (`StopChain`/`SkipDependents`) on `OrchestrationPolicy`/`PartialOrchestrationPolicy` with merge/profile wiring, plus `OrchestrationRunNode::with_block_status`. Task 3 wired `register_orchestration_with_registry` to build the new `with_block_status` closure from the same `CorpusGates` instance as `with_is_block_open`. Task 4 made the per-step chain loop in `integrate.rs` re-read each block's `state.json` status at every boundary (skipping closed/wontfix/superseded/deferred/not-in-tracks blocks unconditionally) and, under `OnBail::SkipDependents`, record a bailed or skipped step while letting independent later steps keep dispatching, stamping a `ChainReport` via a new `integrate_chain_with_coord_and_policy` entry point that leaves every pre-existing caller and test untouched. Task 5 documented `on_bail`/skip-dependents/`blocked_by`/`chain_report` in `docs/workflows/orchestration.md` and set the knob in both engine-rs's and HQ's `planning/harness.json` (built-in `stop_chain` here, effective `skip_dependents` at HQ). Task 6 added `orchestration_bail.rs` (10 black-box tests) and 4 new `hq_orchestration_policy.rs` tests against a real HQ `harness.json`, plus a fix for a pre-existing compile break in `tests/it/orchestration.rs` left by task 4's new `LaneLogStatus::Skipped` variant; the full authoritative validation suite (fmt/clippy/nextest --workspace/release build + shell/python test scripts) passed. The run BAILED at the consolidated review with a FAIL verdict: two acceptance criteria require structural changes beyond this task's scope. (1) `gates::check_permission_gate` has no call site in `integrate.rs` (the per-step loop this block modifies) — confirmed by grep, referenced only in `gates.rs` unit tests, a doc comment, and `coord_chain.rs`; task 4's own notes call this "N/A against the current codebase... left unimplemented." (2) `chain_report` cannot reach `ctx` on the hard-`Err` path because `NodeError` has no seam to carry a structured payload past the framework's ctx revert-on-Err (`node.rs`'s documented contract) — task 4's notes say closing this needs "a future task adding a `chain_report` field to `NodeError`." Neither is a coding bug fixable by iteration; both need a re-scoped task adding a new field/wiring point, which is out of bounds for a bounded fix-retry. Next: re-scope a follow-up task (or a new block) to add the `NodeError` `chain_report` seam and wire `check_permission_gate` into `integrate.rs`'s per-step loop, then resume `EN.17.B`.
+
+```
+4b5ab77 feat: implement EN.17.B-task6
+47a5f43 docs: implement EN.17.B-task5
+94b5a66 feat: implement EN.17.B-task4
+beacbf6 feat: implement EN.17.B-task3
+a73866e feat: implement EN.17.B-task2
+6ecaa08 feat: implement EN.17.B-task1
+```
+
+## [run: 2026-09-11]
+
+`/sdlc-flow` on branch `EN.17.F-flow` closed `EN.17.F` — a Rust-driven SDLC child run matches the JS engine's review and escalation shape by default — across 7 tasks, PASS review. Task 1 added `child_sdlc_flow_policy`/`child_sdlc_task_policy` (`Option<serde_json::Value>`, built-in `None`) to `OrchestrationPolicy`, threaded through the partial/merge machinery. Task 2 wired `execute_step` to forward the resolved child policy as the child SDLC_FLOW/SDLC_TASK event's `policy` field only when set, through `integrate_chain`/`integrate_chain_with_coord` (the other three wrapper fns pass `None, None` unchanged). Task 3 added `ModelTiers.implement_final_attempt`, escalating `ImplementTaskNode`'s last fix attempt to a stronger tier (stamped in the node's result), fixing 3 compile-coupled call sites outside its declared files. Task 4 added `SdlcPolicy.max_turns: StageTurnCeilings`, wiring each stage's `Config.max_turns` per-stage (built-in `None`, behavior-stable). Task 5 added `generate_context_max_bytes`, truncating each spec `.md` file's own section in `gather_context` at a UTF-8 boundary with a dropped-bytes marker when set. Task 6 projected all four knobs through SDLC_TASK's `to_sdlc_policy()` where applicable (turn ceilings narrowed to implement/triage/generate, matching the existing `SdlcTaskModelTiers`/`SdlcTaskCallTimeouts` pattern), updated both harness guard tests in place, and set every new knob across `sdlc.profiles`/`sdlc_task.profiles` in `planning/harness.json`. Task 7 added `cost_parity.rs` and `hq_orchestration_policy.rs` integration tests, documented the new knobs in `docs/workflows/sdlc-flow-policy.md`/`docs/workflows/orchestration.md`, and regenerated the two committed policy-baseline fixtures for the new default-null fields; full validation (fmt, clippy `-D warnings`, workspace nextest 4139/4139, release build, hang test, micro-spec test, fleet_build test) passed. Review pass 1 fixed one `cargo fmt --check` line-width violation flagged by task 7 itself. Closes `EN.17.F`. Next: `EN.17.B` — a bail skips only its dependents, and every block boundary re-reads the graph.
+
+```
+44e6fe0 docs: update docs for EN.17.F
+948a6d4 fix: review pass 1 for EN.17.F
+4e1e7da feat: implement EN.17.F-task7
+7872930 feat: implement EN.17.F-task6
+ed664a1 feat: implement EN.17.F-task5
+8d8bd10 feat: implement EN.17.F-task4
+2873c1d feat: implement EN.17.F-task3
+```
+
+## [run: 2026-09-11]
+
+`/sdlc-flow` on branch `EN.17.A-flow` ran tasks 1-7 of `EN.17.A` (a refused or foreign-held lease stops the block, and the coordination reader sees real inboxes) and BAILED at task 7's validation. Task 1 made `coord::write::lease` refuse (`CoordWriteError::LeaseHeld`, HTTP 409 in engine-serve) a live foreign-held lease, replacing only a stale one with a fresh `acquired_at`. Task 2 added `write::unlease_own`, releasing a repo's lease only when the caller holds it (`Removed`/`NotHeld`/`HeldByOther`/`Unreadable`), leaving a foreign or unparseable lease untouched. Task 3 wired `CoordHandle::unlease` through `unlease_own` and gave `QueueHoldSource` an injectable clock so `is_held` ignores a stale Exclusive lease per `LEASE_STALE_THRESHOLD_SECONDS`. Task 4 made `integrate_chain_impl_inner` propagate register/heartbeat/lease coord refusals as `IntegrateError::CoordRefused { op: CoordOp, .. }` (one `held` lane-log line + bail escalation, returning before `StepLeaseGuard` is built), and switched `sweep::snapshot::project_lease` onto the shared lease-staleness constant. Task 5 added three `coord_chain.rs` integration tests proving a refused lease/register stops the chain before any step runs and never touches a foreign lease. Task 6 fixed `coord::read_messages` to walk the real `queue/<repo>/<lane>/inbox/*.json` layout `write::send` produces (ignoring the legacy flat `queue/inbox/` path), moving the healthy fixture to match and adding three unit tests. Task 7 added the lease-threshold source-text parity tests (mev + `check_lane_agents.py`), the one-definition scanner, and the holder-conflict parity case against `fleet_concurrency_check.py register`, but the run BAILED there: `task_validation_1` (`cargo fmt`) found unformatted files (`coord/mod.rs:965`, `coord/write.rs:285+2016`, `coord_chain.rs` import/line order), and `task_validation_3` (`cargo nextest run --workspace`) fails at `engine_kind.rs:446` (`no_string_typed_runner_escape_besides_the_one_sanctioned_mapping_fn`) because task 4's commit `c81a7ab` added `LaneLogEntry::held(...)` to `integrate.rs` without adding it to `engine_kind.rs`'s `SANCTIONED_STRING_TAKING_FNS` allowlist — that file was last touched at `0348745`, before this spec (confirmed via `git log`/`git show`), and is outside task 7's declared `files[]`; task 7's own instructions direct it to stop and report rather than fix an out-of-scope blocking file. Next: fix `engine_kind.rs`'s allowlist (and the unrelated `cargo fmt` drift) in a follow-up task/spec, then resume `EN.17.A` from task 7.
+
+```
+6490842 feat: implement EN.17.A-task7
+9e2928e feat: implement EN.17.A-task6
+0dbc8fe feat: implement EN.17.A-task5
+c81a7ab feat: implement EN.17.A-task4
+8f2f683 feat: implement EN.17.A-task3
+c14fbde feat: implement EN.17.A-task2
+21a6992 feat: implement EN.17.A-task1
+```
+
+## [run: 2026-09-11]
+
 `/sdlc-flow` on branch `EN.15.K-flow` closed `EN.15.K` — CONSOLIDATE — discovery, selection, watermark and disposal.json in Rust — across 6 tasks, PASS review. Task 1 added `discover.rs`'s `discover_participants`, reusing EN.15.H's `roadmap_status::{discover_run_records,realpath_dedup,read_lane_log,repos_from_lane_log}` rather than re-implementing, and documented (without fixing, out of scope) a latent bug where `discover_run_records` silently drops a run record reachable only through a `planning/` symlink. Task 2 added `select.rs`, implementing D57's two-axis `origin_roadmap` selection rule plus a `since_filter`. Task 3 added `watermark.rs`, porting `lane_log_watermark.py`'s drift/backwards checks byte-for-byte onto the shared `consolidation-watermark.json`. Task 4 added `disposal.rs`, writing `disposal.json` for the first time through okf-core's `DisposalFile`/`DisposalRow`, refusing an out-of-enum route at construction (signature deviation logged under D18). Task 5 added `remediation.rs` — idempotent promotion of a failing verification-ledger entry into HQ's `docs/sandbox/remediation.json`/`findings.json`, validated via `check_remediation.py`, writing no repo's `state.json`. Task 6 assembled the `CONSOLIDATE` graph, registered it in `engine-serve`, added 5 acceptance tests in `tests/it/consolidate.rs`, and — across two fix passes touching task 5's files to clear a workspace-wide fmt/clippy/eprintln failure and then to satisfy the work-assertion check — closed a real gap beyond the spec's literal wording: a corpus-wide recursive `state.json` content-hash sweep (with positive controls) replacing the single hardcoded-path no-drift check, covering the remediation stage's external Python writers too. `disposal.json` is now written by an automated workflow for the first time. Next: `EN.17.A` — a refused or foreign-held lease stops the block, and the coordination reader sees real inboxes.
 
 ```

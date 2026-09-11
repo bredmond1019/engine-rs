@@ -1068,6 +1068,7 @@ pub fn register_orchestration(dispatcher: &mut Dispatcher) {
         dispatcher,
         repo_registry(),
         Arc::new(engine_core::workflows::orchestration::coord_lane::QueueHoldSource::new()),
+        Arc::new(engine_core::workflows::sweep::NoopOperatorTransport),
     );
 }
 
@@ -1091,8 +1092,8 @@ pub fn register_orchestration(dispatcher: &mut Dispatcher) {
 /// over that registry and wires
 /// [`OrchestrationRunNode::new`](engine_core::workflows::orchestration::graph::OrchestrationRunNode::new)'s
 /// `with_resolve_depends_on` / `with_is_edge_met` / `with_is_block_open` /
-/// `with_hold_source` seams to it, registers the wired node into a fresh
-/// `NodeRegistry`, and validates.
+/// `with_block_status` / `with_hold_source` seams to it, registers the wired
+/// node into a fresh `NodeRegistry`, and validates.
 ///
 /// Every wired closure checks
 /// [`CorpusGates::take_error`](engine_core::workflows::orchestration::corpus_gates::CorpusGates::take_error)
@@ -1171,6 +1172,90 @@ fn build_close_block_seam(
     })
 }
 
+/// `EN.17.D` task 4: build the production preflight seam from `registry`
+/// and the event's resolved `OrchestrationPolicy`'s eight preflight knobs
+/// — mirrors [`build_close_block_seam`]'s exact shape (a small standalone
+/// factory function, not inlined, so this closure's construction is easy
+/// to reason about independently of the registration closure's own many
+/// other captures).
+///
+/// `OrchestrationRunNode`'s `preflight` seam is a synchronous
+/// `Fn(&str, &str) -> PreflightOutcome` (`graph.rs`'s private `PreflightFn`)
+/// — [`PreflightRunner::run_for_block`] is `async` (it makes a real
+/// `claude` call), and this closure runs from INSIDE
+/// `integrate_chain_impl_inner`'s per-step loop, itself already driven via
+/// `rt.block_on(..)` on a dedicated `spawn_blocking` thread with its OWN
+/// fresh current-thread runtime (`OrchestrationRunNode::process`) —
+/// calling `tokio::runtime::Handle::current().block_on(..)` there would
+/// panic ("Cannot start a runtime from within a runtime"). The fix mirrors
+/// `channel_transport.rs`'s own bridge: spawn a brand-new OS thread
+/// carrying its own fresh current-thread runtime, block on it there, and
+/// `.join()` synchronously — a real thread boundary, not a nested runtime.
+type PreflightSeam = Arc<
+    dyn Fn(&str, &str) -> engine_core::workflows::orchestration::preflight::PreflightOutcome
+        + Send
+        + Sync,
+>;
+
+#[must_use]
+fn build_preflight_seam(
+    registry: Arc<RepoRegistry>,
+    policy: &engine_core::workflows::orchestration::graph::OrchestrationPolicy,
+) -> PreflightSeam {
+    use engine_core::workflows::orchestration::preflight::{
+        PreflightConfig, PreflightOutcome, PreflightRunner,
+    };
+
+    // `preflight_enabled: false` is the built-in default and the common
+    // case for a served run — never construct a `PreflightRunner` (or
+    // spawn a thread per step) when the switch is off.
+    if !policy.preflight_enabled {
+        return Arc::new(|_repo: &str, _block_id: &str| PreflightOutcome::Disabled);
+    }
+
+    let runner = Arc::new(PreflightRunner::new(PreflightConfig::from(policy)));
+    Arc::new(move |repo: &str, block_id: &str| {
+        let runner = runner.clone();
+        let registry = registry.clone();
+        let repo = repo.to_string();
+        let block_id = block_id.to_string();
+        std::thread::spawn(move || {
+            let rt = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(rt) => rt,
+                Err(err) => {
+                    return PreflightOutcome::Unjudged {
+                        error_kind: format!("preflight_runtime_build_failed: {err}"),
+                    };
+                }
+            };
+            // A fresh, minimal `TaskContext` — `JudgmentNode::judge` only
+            // ever reads it as a session/ctx.nodes baseline (it never
+            // writes to the caller's own `ctx.nodes`, per its own doc), so
+            // there is nothing meaningful from the real chain run to carry
+            // in here.
+            let ctx = TaskContext {
+                event: serde_json::json!({}),
+                nodes: HashMap::new(),
+                metadata: serde_json::json!({}),
+                node_runs: HashMap::new(),
+            };
+            rt.block_on(async {
+                runner
+                    .run_for_block(&ctx, &registry, &repo, &block_id)
+                    .await
+                    .outcome
+            })
+        })
+        .join()
+        .unwrap_or_else(|_| PreflightOutcome::Unjudged {
+            error_kind: "preflight_thread_panicked".to_string(),
+        })
+    })
+}
+
 /// The registry-nickname identity a Rust-driven chain registers,
 /// heartbeats, leases, and drains its inbox as
 /// (`EN.ticket.wire-coord-handle-into-orchestration-run-node`) —
@@ -1188,6 +1273,7 @@ pub fn register_orchestration_with_registry(
     dispatcher: &mut Dispatcher,
     repo_reg: Option<Arc<RepoRegistry>>,
     hold_source: Arc<dyn engine_core::workflows::orchestration::integrate::HoldSource>,
+    transport: Arc<dyn engine_core::operator::transport::OperatorTransport>,
 ) {
     dispatcher.register(
         engine_core::workflows::orchestration::graph::schema(),
@@ -1222,6 +1308,29 @@ pub fn register_orchestration_with_registry(
             // `planning/state.json` from this the same way
             // `CloseBlockNode::evaluate` resolves it via `find_brain_root`.
             let close_block_root = orch_event.brain_root.clone();
+            // `EN.17.D` task 4: a clone of the SAME repo registry the
+            // gates above resolve, taken before `gates_repo_registry` is
+            // moved into `CorpusGates::new` — mirrors
+            // `conductor_repo_registry`'s own comment immediately above.
+            // Preflight reads a block record's `planning/blocks/<id>.json`
+            // from this registry (`preflight::read_block_record`, task 2).
+            let preflight_repo_registry = gates_repo_registry.clone();
+            // `EN.17.D` task 4: this event's resolved `OrchestrationPolicy`
+            // — used only to build the eight preflight knobs below. This
+            // factory closure is re-invoked once per dispatched event (see
+            // this function's own module doc), so resolving it here reads
+            // the SAME `orch_event.brain_root`/`policy` override
+            // `OrchestrationRunNode::process` itself resolves independently
+            // once the node actually runs — `event_only_context` (already
+            // used by `register_sdlc_flow_with_registry` above) builds the
+            // minimal `TaskContext` `resolve_policy_for_run_from` needs
+            // from the raw event this closure was invoked with.
+            let preflight_policy =
+                engine_core::workflows::orchestration::graph::resolve_policy_for_run_from(
+                    &event_only_context(event),
+                    &PolicyConfigSource::Worktree(orch_event.brain_root.clone()),
+                )
+                .map_err(|err| err.to_string())?;
 
             let gates = Arc::new(
                 engine_core::workflows::orchestration::corpus_gates::CorpusGates::new(
@@ -1232,6 +1341,7 @@ pub fn register_orchestration_with_registry(
             let depends_on_gates = gates.clone();
             let edge_met_gates = gates.clone();
             let block_open_gates = gates.clone();
+            let block_status_gates = gates.clone();
 
             // `EN.11.F` task 2 follow-up: resolve this run's campaign id
             // HERE, up front — the SAME resolver `OrchestrationRunNode::process`
@@ -1326,10 +1436,19 @@ pub fn register_orchestration_with_registry(
             // integrated/close path).
             let close_block_seam = build_close_block_seam(close_block_root);
 
+            // `EN.17.D` task 4: the production preflight seam — a no-op
+            // `PreflightOutcome::Disabled` when `preflight_policy.preflight_enabled`
+            // is `false` (the built-in default, and the common case), so a
+            // served run never pays for the `PreflightRunner` construction
+            // below unless HQ's `orchestration.policy.preflight_enabled`
+            // switch is actually on.
+            let preflight_seam = build_preflight_seam(preflight_repo_registry, &preflight_policy);
+
             let node = engine_core::workflows::orchestration::graph::OrchestrationRunNode::new()
                 .with_campaign_id(campaign_id)
                 .with_conductor(conductor_seam)
                 .with_close_block(close_block_seam)
+                .with_preflight(preflight_seam)
                 .with_coord_agent(coord_agent_identity())
                 .with_resolve_depends_on(Arc::new(move |repo: &str, block_id: &str| {
                     let edges = depends_on_gates.resolve_depends_on(repo, block_id);
@@ -1352,7 +1471,15 @@ pub fn register_orchestration_with_registry(
                     }
                     open
                 }))
+                .with_block_status(Arc::new(move |repo: &str, block_id: &str| {
+                    let status = block_status_gates.block_status(repo, block_id);
+                    if let Some(err) = block_status_gates.take_error() {
+                        panic!("{err}");
+                    }
+                    status
+                }))
                 .with_hold_source(hold_source.clone())
+                .with_operator_transport(transport.clone())
                 .with_cancellation_token(run_token)
                 .with_step_observer(step_observer);
 
@@ -1648,6 +1775,41 @@ pub fn register_builtin_workflows_with_registry(
     register_claim_reaffirm(dispatcher);
     register_sweep(dispatcher);
     register_commander(dispatcher);
+}
+
+/// Register every builtin workflow with a real `OperatorTransport`
+/// (`EN.17.C` task 5) — the entry point bastion's dispatcher build will
+/// call once a production transport (`TelegramTransport`,
+/// `BA.ticket.engine-dispatcher-carries-the-real-operator-transport`)
+/// exists. Registers exactly what [`register_builtin_workflows`] does by
+/// calling the SAME [`register_builtin_workflows_with_registry`] it
+/// already calls internally (its body is not duplicated here), then
+/// re-registers `SWEEP` via the existing [`register_sweep_with`] and
+/// `ORCHESTRATION` via [`register_orchestration_with_registry`], both with
+/// `transport`. Re-registration is safe: [`Dispatcher::register`] is a
+/// `HashMap` insert keyed by `workflow_type` (this block's own `what`), so
+/// the two re-registrations simply replace the Noop-seamed factories
+/// [`register_builtin_workflows_with_registry`] installed a moment
+/// earlier. [`register_builtin_workflows`] itself is UNCHANGED — it keeps
+/// calling the no-transport paths internally, so its own
+/// `dispatch_sweep_builds_a_runnable_workflow_and_writes_a_snapshot` test
+/// passes unmodified with `SWEEP` still using [`NoopOperatorTransport`](engine_core::workflows::sweep::NoopOperatorTransport).
+pub fn register_builtin_workflows_with_operator(
+    dispatcher: &mut Dispatcher,
+    transport: Arc<dyn engine_core::operator::transport::OperatorTransport>,
+) {
+    register_builtin_workflows_with_registry(dispatcher, repo_registry());
+    register_sweep_with(
+        dispatcher,
+        transport.clone(),
+        Arc::new(engine_core::workflows::sweep::NoopLaneWake),
+    );
+    register_orchestration_with_registry(
+        dispatcher,
+        repo_registry(),
+        Arc::new(engine_core::workflows::orchestration::coord_lane::QueueHoldSource::new()),
+        transport,
+    );
 }
 
 #[cfg(test)]
@@ -3453,6 +3615,140 @@ mod tests {
         assert!(dispatcher.is_registered("SWEEP"));
     }
 
+    // ── EN.17.C task 5: register_builtin_workflows_with_operator ──────────
+
+    /// A counting [`engine_core::operator::transport::OperatorTransport`]
+    /// used only to prove a `SWEEP` dispatched from
+    /// `register_builtin_workflows_with_operator` actually routes a
+    /// `notification`-channel escalation through the injected transport.
+    struct CountingOperatorTransport {
+        sends: std::sync::atomic::AtomicUsize,
+    }
+
+    impl CountingOperatorTransport {
+        fn new() -> Self {
+            Self {
+                sends: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl engine_core::operator::transport::OperatorTransport for CountingOperatorTransport {
+        async fn send(
+            &self,
+            _payload: &engine_core::operator::ValidatedOperatorPayload,
+        ) -> Result<
+            engine_core::operator::transport::DeliveredMessage,
+            engine_core::operator::transport::NotifyError,
+        > {
+            self.sends.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(engine_core::operator::transport::DeliveredMessage {
+                transport_message_id: String::new(),
+            })
+        }
+
+        async fn poll_responses(
+            &self,
+            since: Option<engine_core::operator::transport::UpdateCursor>,
+        ) -> Result<
+            (
+                Vec<engine_core::operator::transport::OperatorResponse>,
+                Option<engine_core::operator::transport::UpdateCursor>,
+            ),
+            engine_core::operator::transport::NotifyError,
+        > {
+            Ok((Vec::new(), since))
+        }
+    }
+
+    /// AC: "`register_builtin_workflows_with_operator` registers the same
+    /// set of workflow types as `register_builtin_workflows`."
+    #[test]
+    fn register_builtin_workflows_with_operator_registers_the_same_workflow_types() {
+        let mut plain = Dispatcher::new();
+        register_builtin_workflows(&mut plain);
+
+        let mut with_operator = Dispatcher::new();
+        register_builtin_workflows_with_operator(
+            &mut with_operator,
+            Arc::new(engine_core::workflows::sweep::NoopOperatorTransport),
+        );
+
+        let mut plain_types = plain.registered_types();
+        let mut with_operator_types = with_operator.registered_types();
+        plain_types.sort();
+        with_operator_types.sort();
+
+        assert_eq!(
+            plain_types, with_operator_types,
+            "register_builtin_workflows_with_operator must register exactly the same \
+             workflow_type set as register_builtin_workflows"
+        );
+    }
+
+    /// AC: "A SWEEP dispatched from `register_builtin_workflows_with_operator`
+    /// over a fixture roadmap with one new `notification` escalation calls
+    /// a stub transport's `send` exactly once."
+    #[tokio::test]
+    async fn sweep_from_register_builtin_workflows_with_operator_sends_one_notification() {
+        let root = tempfile::tempdir().unwrap();
+        let roadmap_dir = root.path().join("planning/roadmaps/demo-roadmap");
+        std::fs::create_dir_all(&roadmap_dir).unwrap();
+        std::fs::write(roadmap_dir.join("lane-log.jsonl"), "").unwrap();
+        std::fs::write(
+            roadmap_dir.join("escalations.jsonl"),
+            serde_json::json!({
+                "gate_id": "g1",
+                "kind": "advisory",
+                "channel": "notification",
+                "severity": "advisory",
+                "summary": "something happened",
+                "options": [
+                    {"key": "ack", "label": "Seen"},
+                    {"key": "later", "label": "Later"},
+                ],
+            })
+            .to_string()
+                + "\n",
+        )
+        .unwrap();
+
+        let transport = Arc::new(CountingOperatorTransport::new());
+        let mut dispatcher = Dispatcher::new();
+        register_builtin_workflows_with_operator(&mut dispatcher, transport.clone());
+
+        let workflow = dispatcher
+            .dispatch_with_event(
+                "SWEEP",
+                &serde_json::json!({
+                    "root": root.path().to_string_lossy(),
+                    "roadmap": "demo-roadmap",
+                    "now": "2026-09-08T00:00:00Z",
+                }),
+            )
+            .expect("SWEEP should dispatch to a runnable Workflow");
+
+        let _ctx = workflow
+            .run(
+                serde_json::json!({
+                    "root": root.path().to_string_lossy(),
+                    "roadmap": "demo-roadmap",
+                    "now": "2026-09-08T00:00:00Z",
+                }),
+                Box::new(|_ctx| {}),
+            )
+            .await
+            .expect("SWEEP run itself should not error");
+
+        assert_eq!(
+            transport.sends.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "a fresh notification-channel escalation must route through the injected \
+             transport exactly once"
+        );
+    }
+
     #[test]
     fn resolve_schema_returns_schema_with_recall_start_node() {
         let mut dispatcher = Dispatcher::new();
@@ -3985,6 +4281,7 @@ mod tests {
             &mut dispatcher,
             None,
             Arc::new(engine_core::workflows::orchestration::coord_lane::QueueHoldSource::new()),
+            Arc::new(engine_core::workflows::sweep::NoopOperatorTransport),
         );
 
         let workflow = dispatcher
@@ -4011,6 +4308,7 @@ mod tests {
             &mut dispatcher,
             Some(repo_reg),
             Arc::new(engine_core::workflows::orchestration::integrate::NeverHeld),
+            Arc::new(engine_core::workflows::sweep::NoopOperatorTransport),
         );
 
         let workflow = dispatcher
@@ -4043,7 +4341,12 @@ mod tests {
 
         let dir = orchestration_brain_root(open_block_state_json());
         let mut dispatcher = Dispatcher::new();
-        register_orchestration_with_registry(&mut dispatcher, None, Arc::new(AlwaysHeld));
+        register_orchestration_with_registry(
+            &mut dispatcher,
+            None,
+            Arc::new(AlwaysHeld),
+            Arc::new(engine_core::workflows::sweep::NoopOperatorTransport),
+        );
 
         let workflow = dispatcher.dispatch_with_event(
             "ORCHESTRATION",
@@ -4072,6 +4375,7 @@ mod tests {
             &mut dispatcher,
             None,
             Arc::new(engine_core::workflows::orchestration::integrate::NeverHeld),
+            Arc::new(engine_core::workflows::sweep::NoopOperatorTransport),
         );
 
         let result = dispatcher.dispatch_with_event(
@@ -4132,6 +4436,7 @@ mod tests {
             &mut dispatcher,
             None,
             Arc::new(engine_core::workflows::orchestration::integrate::NeverHeld),
+            Arc::new(engine_core::workflows::sweep::NoopOperatorTransport),
         );
 
         let workflow = dispatcher

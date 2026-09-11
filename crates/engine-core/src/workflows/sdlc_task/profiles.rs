@@ -45,11 +45,20 @@ pub fn baseline() -> PartialSdlcTaskPolicy {
             implement: Some(d.model_tiers.implement),
             triage: Some(d.model_tiers.triage),
             generate: Some(d.model_tiers.generate),
+            // Restates the built-in default verbatim — baseline's no-op
+            // contract (EN.17.F task 6). No escalation.
+            implement_final_attempt: Some(d.model_tiers.implement_final_attempt),
         }),
         timeouts: Some(super::policy::PartialSdlcTaskCallTimeouts {
             implement: d.timeouts.implement,
             triage: d.timeouts.triage,
             generate: d.timeouts.generate,
+        }),
+        // Restates the built-in default verbatim (EN.17.F task 6).
+        max_turns: Some(super::policy::PartialSdlcTaskTurnCeilings {
+            implement: d.max_turns.implement,
+            triage: d.max_turns.triage,
+            generate: d.max_turns.generate,
         }),
         local: Some(crate::policy::PartialLocalConfig::default()),
         llm_triage: Some(d.llm_triage),
@@ -65,6 +74,9 @@ pub fn baseline() -> PartialSdlcTaskPolicy {
         // Restates the built-in default verbatim — baseline's no-op
         // contract (EN.14.G).
         node_invocation_payload_cap_bytes: Some(d.node_invocation_payload_cap_bytes),
+        // Restates the built-in default verbatim (EN.17.F task 6):
+        // unbounded, matching baseline's no-op contract.
+        generate_context_max_bytes: Some(d.generate_context_max_bytes),
     }
 }
 
@@ -87,11 +99,22 @@ pub fn cheap_fast() -> PartialSdlcTaskPolicy {
             implement: Some(super::policy::ModelTier::Haiku),
             triage: Some(super::policy::ModelTier::Haiku),
             generate: Some(super::policy::ModelTier::Haiku),
+            // No escalation for the cost/latency floor — a final-attempt
+            // bump to a pricier tier cuts against this profile's own reason
+            // for existing.
+            implement_final_attempt: None,
         }),
         timeouts: Some(super::policy::PartialSdlcTaskCallTimeouts {
             implement: Some(120),
             triage: Some(60),
             generate: Some(120),
+        }),
+        // The cost/latency floor for tool-call turns too, mirroring
+        // `timeouts` above (EN.17.F task 6).
+        max_turns: Some(super::policy::PartialSdlcTaskTurnCeilings {
+            implement: Some(20),
+            triage: Some(10),
+            generate: Some(20),
         }),
         local: Some(crate::policy::PartialLocalConfig::default()),
         llm_triage: Some(false),
@@ -107,6 +130,10 @@ pub fn cheap_fast() -> PartialSdlcTaskPolicy {
         // The cost/latency floor for retained payloads too (EN.14.G):
         // below the built-in default.
         node_invocation_payload_cap_bytes: Some(8_192),
+        // The cost/latency floor for planning context too (EN.17.F task 6):
+        // a tight cap on how much of a spec's `.md` content reaches the
+        // task-generation prompt.
+        generate_context_max_bytes: Some(Some(20_000)),
     }
 }
 
@@ -130,11 +157,25 @@ pub fn thorough() -> PartialSdlcTaskPolicy {
             implement: Some(super::policy::ModelTier::Opus),
             triage: Some(super::policy::ModelTier::Sonnet),
             generate: Some(super::policy::ModelTier::Opus),
+            // Already Opus on every attempt via `implement` above, so this
+            // never changes the tier used — set explicitly anyway, matching
+            // this bundle's own "every field set explicitly" contract
+            // (EN.17.F task 6).
+            implement_final_attempt: Some(Some(super::policy::ModelTier::Opus)),
         }),
         timeouts: Some(super::policy::PartialSdlcTaskCallTimeouts {
             implement: Some(900),
             triage: Some(600),
             generate: Some(900),
+        }),
+        // Generous per-stage turn ceiling, mirroring `timeouts` above: the
+        // quality ceiling favors letting a slow, thorough call use as many
+        // tool-call turns as it needs over cutting it off early, while
+        // still bounding the pathological runaway case (EN.17.F task 6).
+        max_turns: Some(super::policy::PartialSdlcTaskTurnCeilings {
+            implement: Some(80),
+            triage: Some(80),
+            generate: Some(80),
         }),
         local: Some(crate::policy::PartialLocalConfig::default()),
         llm_triage: Some(true),
@@ -150,6 +191,11 @@ pub fn thorough() -> PartialSdlcTaskPolicy {
         // The quality ceiling for retained payloads too (EN.14.G): above
         // the built-in default.
         node_invocation_payload_cap_bytes: Some(262_144),
+        // The quality ceiling for planning context too (EN.17.F task 6):
+        // unbounded, matching the built-in default — a thorough run should
+        // see every spec `.md` file's content in full when generating a
+        // task list, never truncated.
+        generate_context_max_bytes: Some(None),
     }
 }
 
@@ -259,6 +305,22 @@ mod tests {
             .collect();
         assert!(!all_keys.is_empty());
 
+        // `generate_context_max_bytes` (EN.17.F task 6) is the one
+        // top-level field whose type is a NESTED `Option<Option<T>>`
+        // (`SdlcTaskPolicy::generate_context_max_bytes` is itself
+        // `Option<usize>`, so an override layer needs "unset" distinct from
+        // "explicitly clear" — see the field's doc comment). Its
+        // behavior-stable built-in value IS `None` (unbounded), so even the
+        // deliberate, explicit choice to restate that default serializes as
+        // JSON `null` — indistinguishable, at the JSON level, from never
+        // having set the key at all. Mirrors `sdlc_flow::profiles`' own
+        // `thorough_sets_every_partial_policy_field_explicitly`, which
+        // excludes this same field (and `implement_final_attempt`) from its
+        // analogous non-null check for the identical reason. Presence of
+        // the KEY is still required below — only the non-null requirement
+        // is relaxed for this one field.
+        const NULLABLE_BY_DESIGN: &[&str] = &["generate_context_max_bytes"];
+
         for (name, profile) in [
             ("baseline", baseline()),
             ("cheap-fast", cheap_fast()),
@@ -267,6 +329,14 @@ mod tests {
             let json = serde_json::to_value(&profile).unwrap();
             let obj = json.as_object().unwrap();
             for key in &all_keys {
+                if NULLABLE_BY_DESIGN.contains(&key.as_str()) {
+                    assert!(
+                        obj.contains_key(key),
+                        "profile `{name}` omits knob `{key}` entirely (even a deliberate \
+                         null restatement must set the key)"
+                    );
+                    continue;
+                }
                 assert!(
                     obj.get(key).is_some_and(|v| !v.is_null()),
                     "profile `{name}` leaves knob `{key}` unset (null)"

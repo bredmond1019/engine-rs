@@ -118,6 +118,18 @@
 //! tmux session with no sends and no waits. `identity` (task 1) is the pure
 //! session-naming helper plus the per-struct `session_input: InputBinding`
 //! field/builder convention the module's nodes follow.
+//!
+//! `judgment` (`EN.17.D` task 1) is `JudgmentNode` — a reusable, bounded,
+//! schema-constrained `claude` call: byte-capped input slices (truncated at
+//! a UTF-8 boundary, with a marker naming the slice and bytes dropped), a
+//! model tier via `policy::apply_model_tier`, an optional `Config.max_turns`
+//! ceiling, and a typed `JudgmentError` for every way the call can fail
+//! without a usable verdict (`Timeout`, `CliError`, `NoStructuredResult`,
+//! `SchemaViolation`). Follows `claim_reaffirm::judge::JudgeClaimNode`'s
+//! composed-`AgentCodeStep`-over-`TransportSlot` shape, but returns its
+//! result to the caller instead of writing `ctx.nodes` itself, since a
+//! repeat call would overwrite the one node-result slot. Preflight
+//! (`EN.17.D` task 2) is its first consumer.
 
 pub mod agent_code_step;
 pub mod aggregate;
@@ -130,6 +142,7 @@ pub mod harvest_approve;
 pub mod harvest_gate;
 pub mod http_post;
 pub mod http_request;
+pub mod judgment;
 pub mod materialize_doc;
 pub mod merge_contacts;
 pub mod openai_compat_transport;
@@ -159,6 +172,7 @@ pub use harvest_approve::HarvestApproveNode;
 pub use harvest_gate::{pending_harvest_record, HarvestDecision, HarvestGate, HarvestMode};
 pub use http_post::{http_post_live, HttpPost, HttpPostResponse, ReqwestHttpPost, StubHttpPost};
 pub use http_request::HttpRequestNode;
+pub use judgment::{InputSlice, JudgmentError, JudgmentNode, JudgmentResult, JudgmentSpec};
 pub use materialize_doc::MaterializeDocNode;
 pub use merge_contacts::MergeContactsNode;
 pub use openai_compat_transport::{

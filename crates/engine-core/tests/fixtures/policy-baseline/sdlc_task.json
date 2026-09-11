@@ -1,4 +1,5 @@
 {
+  "generate_context_max_bytes": null,
   "llm_triage": false,
   "local": {
     "constrained_json": false,
@@ -6,9 +7,15 @@
     "model": "qwen2.5-coder:7b"
   },
   "max_attempts": 3,
+  "max_turns": {
+    "generate": null,
+    "implement": null,
+    "triage": null
+  },
   "model_tiers": {
     "generate": "opus",
     "implement": "sonnet",
+    "implement_final_attempt": null,
     "triage": "sonnet"
   },
   "node_invocation_payload_cap_bytes": 65536,

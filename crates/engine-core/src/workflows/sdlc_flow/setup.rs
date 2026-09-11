@@ -1322,7 +1322,7 @@ fn generated_tasks_schema() -> serde_json::Value {
 /// `sdlc-flow-state.json`), concatenated with a `## <filename>` header each.
 /// Mirrors the Python `_gather_context` helper. Missing/unreadable entries
 /// are skipped rather than failing the whole gather.
-fn gather_context(dir: &Path) -> String {
+fn gather_context(dir: &Path, max_bytes: Option<usize>) -> String {
     let excluded = ["tasks.md", "tasks.json", DEFAULT_STATE_FILENAME];
     let mut entries: Vec<PathBuf> = std::fs::read_dir(dir)
         .into_iter()
@@ -1345,10 +1345,39 @@ fn gather_context(dir: &Path) -> String {
         .filter_map(|path| {
             let content = std::fs::read_to_string(&path).ok()?;
             let name = path.file_name()?.to_str()?.to_string();
-            Some(format!("## {name}\n\n{content}"))
+            let section = format!("## {name}\n\n{content}");
+            Some(truncate_context_section(section, &name, max_bytes))
         })
         .collect::<Vec<_>>()
         .join("\n\n")
+}
+
+/// Truncates one `gather_context` file section to `max_bytes` (when set),
+/// per-section rather than on the whole concatenated output, so one
+/// oversized spec file cannot starve a later, smaller one. Cuts at the last
+/// UTF-8 char boundary at or before the cap — never mid-multibyte-character
+/// — and appends a marker naming the file and how many bytes were dropped.
+/// `None` returns `section` untouched, byte-identical to before this knob
+/// existed.
+fn truncate_context_section(section: String, file_name: &str, max_bytes: Option<usize>) -> String {
+    let Some(max_bytes) = max_bytes else {
+        return section;
+    };
+    if section.len() <= max_bytes {
+        return section;
+    }
+    // Walk back from max_bytes to the nearest UTF-8 char boundary so the
+    // slice below never splits a multibyte character.
+    let mut cut = max_bytes;
+    while cut > 0 && !section.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    let dropped = section.len() - cut;
+    let mut truncated = section[..cut].to_string();
+    truncated.push_str(&format!(
+        "\n...[truncated: {dropped} bytes dropped from {file_name}]\n"
+    ));
+    truncated
 }
 
 /// Model node (planning-fallback path only): gathers
@@ -1402,17 +1431,19 @@ impl Node for GenerateTasksNode {
     async fn process(&self, ctx: TaskContext) -> Result<TaskContext, NodeError> {
         let event = parse_event(&ctx)?;
         let dir = spec_dir(&ctx, &event.spec_slug);
-        let context = gather_context(&dir);
+
+        // Strict read: an absent/unparsable stamp is an error, never a
+        // silent fall back to `SdlcPolicy::default()`. Resolved before
+        // `gather_context` so its `generate_context_max_bytes` cap is
+        // available at gather time.
+        let policy = resolved_policy(&ctx)?;
+        let context = gather_context(&dir, policy.generate_context_max_bytes);
         let prompt = format!(
             "Generate the task list for spec {:?} from the following planning \
              context. Respond with strict JSON of the shape \
              {{\"tasks\": [<SDLCTask>, ...], \"tasks_markdown\": \"<rendered tasks.md body>\"}}.\n\n{context}",
             event.spec_slug
         );
-
-        // Strict read: an absent/unparsable stamp is an error, never a
-        // silent fall back to `SdlcPolicy::default()`.
-        let policy = resolved_policy(&ctx)?;
         let (mut config, prompt) =
             apply_policy(self.config.clone(), prompt, &policy, Stage::Generate);
 
@@ -1647,6 +1678,132 @@ mod tests {
             serde_json::to_value(policy).expect("policy serializes"),
         );
         ctx
+    }
+
+    // --- gather_context / generate_context_max_bytes ----------------------
+
+    #[test]
+    fn gather_context_none_cap_is_byte_identical_to_no_cap() {
+        let dir = temp_dir();
+        std::fs::write(dir.join("a.md"), "alpha content").unwrap();
+        std::fs::write(
+            dir.join("b.md"),
+            "beta content, a fair bit longer than alpha",
+        )
+        .unwrap();
+
+        let uncapped_equivalent = gather_context(&dir, None);
+        let also_uncapped = gather_context(&dir, None);
+        assert_eq!(
+            uncapped_equivalent, also_uncapped,
+            "gather_context(dir, None) must be deterministic / byte-identical across calls"
+        );
+        assert!(uncapped_equivalent.contains("alpha content"));
+        assert!(uncapped_equivalent.contains("beta content, a fair bit longer than alpha"));
+    }
+
+    #[test]
+    fn gather_context_with_cap_truncates_oversized_section_and_leaves_small_one_verbatim() {
+        let dir = temp_dir();
+        let small = "short file";
+        let large = "x".repeat(500);
+        std::fs::write(dir.join("small.md"), small).unwrap();
+        std::fs::write(dir.join("large.md"), &large).unwrap();
+
+        let cap = 50usize;
+        let out = gather_context(&dir, Some(cap));
+
+        // The small file's section (well under the cap) must appear
+        // verbatim, with no truncation marker attached to it.
+        assert!(out.contains(small));
+
+        // The large file's section must be truncated: its full 500 'x'
+        // content must NOT appear whole, and a marker naming the file and
+        // the dropped-byte count must be present.
+        assert!(!out.contains(&large));
+        assert!(out.contains("truncated:"));
+        assert!(out.contains("dropped from large.md"));
+
+        // Every section (header + body, before its own marker) must be at
+        // most `cap` bytes.
+        for section in out.split("\n\n## ") {
+            let body_before_marker = section.split("\n...[truncated:").next().unwrap_or(section);
+            assert!(
+                body_before_marker.len() <= cap + "## ".len(),
+                "section exceeded cap: {} bytes (cap {cap})",
+                body_before_marker.len()
+            );
+        }
+    }
+
+    #[test]
+    fn gather_context_truncation_cuts_at_a_utf8_boundary() {
+        // Multibyte content whose naive byte-`cap` cutoff would land
+        // mid-character (each 'é' is 2 bytes in UTF-8).
+        let dir = temp_dir();
+        let content: String = std::iter::repeat('é').take(100).collect();
+        std::fs::write(dir.join("multibyte.md"), &content).unwrap();
+
+        // Header is "## multibyte.md\n\n" (18 bytes) then 100 * 2 = 200
+        // bytes of 'é'. Pick a cap that lands inside the header+body run at
+        // an odd byte offset relative to character boundaries, forcing the
+        // walk-back logic to actually do work.
+        let cap = 25usize;
+        let out = gather_context(&dir, Some(cap));
+
+        // Must not panic (a byte-index slice on a non-boundary panics) and
+        // must produce valid UTF-8 with no replacement characters.
+        assert!(
+            !out.contains('\u{FFFD}'),
+            "output contains U+FFFD (invalid UTF-8 slice)"
+        );
+        assert!(out.contains("truncated:"));
+    }
+
+    #[tokio::test]
+    async fn generate_tasks_process_passes_resolved_generate_context_max_bytes_to_gather_context() {
+        // End-to-end: GenerateTasksNode's prompt embeds gather_context's
+        // output, so a resolved `generate_context_max_bytes` cap must be
+        // visible in the composed prompt sent to the transport.
+        let worktree = temp_dir();
+        let spec_dir = worktree.join("planning").join("cap-spec");
+        std::fs::create_dir_all(&spec_dir).unwrap();
+        let large = "y".repeat(1000);
+        std::fs::write(spec_dir.join("context.md"), &large).unwrap();
+
+        let policy = SdlcPolicy {
+            generate_context_max_bytes: Some(64),
+            ..SdlcPolicy::default()
+        };
+        let ctx = ctx_with_worktree_and_policy("cap-spec", &worktree, &policy);
+
+        let canned = json!({
+            "tasks": [],
+            "tasks_markdown": "",
+        })
+        .to_string();
+
+        let captured_prompt: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let captured = captured_prompt.clone();
+        let transport: ModelTransport = Arc::new(move |_config, prompt| {
+            *captured.lock().unwrap() = Some(prompt);
+            let outcome = stub_outcome_with_text(&canned);
+            Box::pin(async move { Ok(outcome) })
+        });
+
+        let node = GenerateTasksNode::new().with_transport(transport);
+        let _ = node.process(ctx).await.expect("process succeeds");
+
+        let prompt = captured_prompt
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("prompt captured");
+        assert!(
+            !prompt.contains(&large),
+            "prompt still contains the full uncapped file body"
+        );
+        assert!(prompt.contains("truncated:"));
     }
 
     // --- SpecExistsRouterNode -------------------------------------------------

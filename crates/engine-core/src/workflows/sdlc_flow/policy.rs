@@ -84,6 +84,12 @@ pub struct ModelTiers {
     /// model string that node was hardcoded to before it was onboarded to
     /// the policy path.
     pub docs: ModelTier,
+    /// The model tier `ImplementTaskNode` escalates to on a task's LAST fix
+    /// attempt (`attempt_count + 1 == max_attempts`), matching the JS engine's
+    /// `ESCALATION_MODEL` behavior (`sdlc-flow.js`). Built-in `None` —
+    /// behavior-stable: every attempt uses [`Self::implement`] as today. Every
+    /// earlier attempt is unaffected regardless of this setting.
+    pub implement_final_attempt: Option<ModelTier>,
 }
 
 impl Default for ModelTiers {
@@ -108,6 +114,7 @@ impl Default for ModelTiers {
             triage: ModelTier::Sonnet,
             generate: ModelTier::Opus,
             docs: ModelTier::Sonnet,
+            implement_final_attempt: None,
         }
     }
 }
@@ -139,6 +146,28 @@ pub struct CallTimeouts {
     pub review: Option<u64>,
     pub generate: Option<u64>,
     pub docs: Option<u64>,
+}
+
+/// Per-stage in-turn tool-call ceiling, forwarded to
+/// `claude_code_rs::Config.max_turns` (added by
+/// `CC.ticket.config-max-turns-passthrough`). Bounds a single stage's tool
+/// loop rather than the whole-call wall-clock timeout [`CallTimeouts`]
+/// already covers — the two are independent axes (a stage can time out
+/// having made only a handful of turns, or exhaust its turn budget well
+/// inside the timeout).
+///
+/// Mirrors [`CallTimeouts`]'s exact shape and derive set: all-`None` is the
+/// derived `Default`, so hand-writing it would only add a place to get it
+/// wrong. `claude-code-rs`'s own `Config::default()` leaves `max_turns` at
+/// `None` (unbounded), so all-`None` here is behavior-stable per CLAUDE.md
+/// standing rule 6.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StageTurnCeilings {
+    pub implement: Option<u32>,
+    pub review: Option<u32>,
+    pub triage: Option<u32>,
+    pub generate: Option<u32>,
+    pub docs: Option<u32>,
 }
 
 /// Whether (and how much of) the previous attempt's failure output is fed
@@ -252,6 +281,10 @@ pub struct SdlcPolicy {
     /// Per-stage whole-call timeout in seconds; all-`None` (no override) by
     /// default, i.e. `claude-code-rs`'s own 300s default applies.
     pub timeouts: CallTimeouts,
+    /// Per-stage in-turn tool-call ceiling; all-`None` (no override) by
+    /// default, i.e. `claude-code-rs`'s own unbounded `max_turns` applies.
+    /// See [`StageTurnCeilings`].
+    pub max_turns: StageTurnCeilings,
     /// Configuration for the `local` model tier, when any stage uses it.
     pub local: LocalConfig,
     // `simple_task_max_files` was the selector for a simple-task path
@@ -324,6 +357,15 @@ pub struct SdlcPolicy {
     /// [`crate::invocations::DEFAULT_PAYLOAD_CAP_BYTES`], so introducing
     /// this knob changes no existing run's ledger.
     pub node_invocation_payload_cap_bytes: u64,
+    /// Per-file-section byte cap `GenerateTasksNode`'s planning-fallback
+    /// path applies when it inlines every spec `.md` file's contents into
+    /// the task-generation prompt via `setup::gather_context`. Built-in
+    /// `None` — unbounded, byte-identical to before this knob existed.
+    /// When set, each file's own section (not the whole concatenated
+    /// output) is truncated at a UTF-8 char boundary at or before the cap
+    /// and a marker naming the file and dropped-byte count is appended, so
+    /// one oversized spec file cannot starve a later, smaller one.
+    pub generate_context_max_bytes: Option<usize>,
 }
 
 impl Default for SdlcPolicy {
@@ -342,6 +384,7 @@ impl Default for SdlcPolicy {
             test_depth: TestDepth::Full,
             model_tiers: ModelTiers::default(),
             timeouts: CallTimeouts::default(),
+            max_turns: StageTurnCeilings::default(),
             local: LocalConfig::default(),
             llm_triage: false,
             max_attempts: 3,
@@ -361,6 +404,7 @@ impl Default for SdlcPolicy {
             // criteria and the model's own reasoning.
             review_diff_max_chars: 120_000,
             node_invocation_payload_cap_bytes: crate::invocations::DEFAULT_PAYLOAD_CAP_BYTES,
+            generate_context_max_bytes: None,
         }
     }
 }
@@ -380,6 +424,7 @@ pub struct PartialPolicy {
     pub test_depth: Option<TestDepth>,
     pub model_tiers: Option<PartialModelTiers>,
     pub timeouts: Option<PartialCallTimeouts>,
+    pub max_turns: Option<PartialStageTurnCeilings>,
     pub local: Option<PartialLocalConfig>,
     pub llm_triage: Option<bool>,
     pub max_attempts: Option<u32>,
@@ -388,6 +433,11 @@ pub struct PartialPolicy {
     pub transport_retry: Option<PartialTransportRetry>,
     pub review_diff_max_chars: Option<u32>,
     pub node_invocation_payload_cap_bytes: Option<u64>,
+    /// Nested `Option` — [`SdlcPolicy::generate_context_max_bytes`] is
+    /// itself `Option<usize>`, so an override layer needs "unset" (fall
+    /// through) distinct from "explicitly clear". Merged via [`merge_opt`],
+    /// mirroring [`PartialModelTiers::implement_final_attempt`].
+    pub generate_context_max_bytes: Option<Option<usize>>,
 }
 
 /// All-optional mirror of [`ModelTiers`] for per-stage partial overrides.
@@ -400,6 +450,11 @@ pub struct PartialModelTiers {
     pub triage: Option<ModelTier>,
     pub generate: Option<ModelTier>,
     pub docs: Option<ModelTier>,
+    /// Nested `Option` — [`ModelTiers::implement_final_attempt`] is itself
+    /// `Option<ModelTier>`, so an override layer needs "unset" (fall through)
+    /// distinct from "explicitly clear". Merged via [`merge_opt`], not the
+    /// hand-written field-by-field arms the other tiers use.
+    pub implement_final_attempt: Option<Option<ModelTier>>,
 }
 
 /// All-optional mirror of [`CallTimeouts`] for per-stage partial overrides.
@@ -412,6 +467,19 @@ pub struct PartialCallTimeouts {
     pub review: Option<u64>,
     pub generate: Option<u64>,
     pub docs: Option<u64>,
+}
+
+/// All-optional mirror of [`StageTurnCeilings`] for per-stage partial
+/// overrides. Mirrors [`PartialCallTimeouts`]' derive set exactly — notably
+/// **no** `Copy`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PartialStageTurnCeilings {
+    pub implement: Option<u32>,
+    pub review: Option<u32>,
+    pub triage: Option<u32>,
+    pub generate: Option<u32>,
+    pub docs: Option<u32>,
 }
 
 fn merge_model_tiers(mut base: ModelTiers, over: &PartialModelTiers) -> ModelTiers {
@@ -433,6 +501,8 @@ fn merge_model_tiers(mut base: ModelTiers, over: &PartialModelTiers) -> ModelTie
     if let Some(v) = over.docs {
         base.docs = v;
     }
+    base.implement_final_attempt =
+        merge_opt(base.implement_final_attempt, over.implement_final_attempt);
     base
 }
 
@@ -441,6 +511,32 @@ fn merge_model_tiers(mut base: ModelTiers, over: &PartialModelTiers) -> ModelTie
 /// (itself possibly `None`) untouched — so an absent override never turns a
 /// timeout *off*, it just declines to set one.
 fn merge_call_timeouts(mut base: CallTimeouts, over: &PartialCallTimeouts) -> CallTimeouts {
+    if let Some(v) = over.implement {
+        base.implement = Some(v);
+    }
+    if let Some(v) = over.triage {
+        base.triage = Some(v);
+    }
+    if let Some(v) = over.review {
+        base.review = Some(v);
+    }
+    if let Some(v) = over.generate {
+        base.generate = Some(v);
+    }
+    if let Some(v) = over.docs {
+        base.docs = Some(v);
+    }
+    base
+}
+
+/// Merge one `PartialStageTurnCeilings` override layer over a
+/// `StageTurnCeilings` base, field by field. Mirrors [`merge_call_timeouts`]:
+/// an absent override never turns a ceiling *off*, it just declines to set
+/// one.
+fn merge_stage_turn_ceilings(
+    mut base: StageTurnCeilings,
+    over: &PartialStageTurnCeilings,
+) -> StageTurnCeilings {
     if let Some(v) = over.implement {
         base.implement = Some(v);
     }
@@ -511,6 +607,10 @@ impl crate::policy::Policy for SdlcPolicy {
                 Some(t) => merge_call_timeouts(base.timeouts, t),
                 None => base.timeouts,
             },
+            max_turns: match &over.max_turns {
+                Some(t) => merge_stage_turn_ceilings(base.max_turns, t),
+                None => base.max_turns,
+            },
             local: match &over.local {
                 Some(l) => base.local.overlay(l),
                 None => base.local,
@@ -533,6 +633,10 @@ impl crate::policy::Policy for SdlcPolicy {
             node_invocation_payload_cap_bytes: merge_opt(
                 base.node_invocation_payload_cap_bytes,
                 over.node_invocation_payload_cap_bytes,
+            ),
+            generate_context_max_bytes: merge_opt(
+                base.generate_context_max_bytes,
+                over.generate_context_max_bytes,
             ),
         }
     }
@@ -659,6 +763,21 @@ mod tests {
         assert_eq!(timeouts, CallTimeouts::default());
     }
 
+    /// Change-detector mirroring `builtin_default_timeouts_are_none`: the
+    /// whole point of this knob is that adding it did not change what an
+    /// existing run does. All-`None` means every stage's `Config.max_turns`
+    /// stays `None`, i.e. `claude-code-rs`'s unbounded default.
+    #[test]
+    fn builtin_default_max_turns_are_none() {
+        let max_turns = SdlcPolicy::default().max_turns;
+        assert_eq!(max_turns.implement, None);
+        assert_eq!(max_turns.triage, None);
+        assert_eq!(max_turns.review, None);
+        assert_eq!(max_turns.generate, None);
+        assert_eq!(max_turns.docs, None);
+        assert_eq!(max_turns, StageTurnCeilings::default());
+    }
+
     /// Change-detector for the `docs` tier: `Sonnet` is exactly the model
     /// `PatchDocsNode` was hardcoded to before it consumed this field, so
     /// onboarding it changed nothing for a run that sets no tier.
@@ -709,6 +828,32 @@ mod tests {
         let merged = merge_model_tiers(base, &over);
         assert_eq!(merged.generate, ModelTier::Sonnet);
         assert_eq!(merged.docs, ModelTier::Sonnet);
+    }
+
+    /// `implement_final_attempt`'s built-in default is `None`; an absent
+    /// override layer leaves it there, and a `Some(Some(..))` override layer
+    /// sets it — mirroring `merge_model_tiers_overrides_generate_and_docs_
+    /// independently`'s coverage for this knob.
+    #[test]
+    fn merge_model_tiers_sets_implement_final_attempt_when_overridden() {
+        let base = ModelTiers::default();
+        assert_eq!(base.implement_final_attempt, None);
+
+        // No override layer: falls through, untouched.
+        let over = PartialModelTiers::default();
+        let merged = merge_model_tiers(base, &over);
+        assert_eq!(merged.implement_final_attempt, None);
+
+        // Override layer sets it.
+        let over = PartialModelTiers {
+            implement_final_attempt: Some(Some(ModelTier::Opus)),
+            ..Default::default()
+        };
+        let merged = merge_model_tiers(base, &over);
+        assert_eq!(merged.implement_final_attempt, Some(ModelTier::Opus));
+        // Every other tier stays untouched.
+        assert_eq!(merged.implement, ModelTier::Sonnet);
+        assert_eq!(merged.generate, ModelTier::Opus);
     }
 
     #[test]
@@ -1113,6 +1258,80 @@ mod tests {
     }
 
     #[test]
+    fn merge_stage_turn_ceilings_overrides_only_the_fields_it_sets() {
+        let base = StageTurnCeilings {
+            implement: Some(12),
+            triage: Some(4),
+            review: None,
+            ..Default::default()
+        };
+        let over = PartialStageTurnCeilings {
+            implement: Some(20),
+            triage: None,
+            review: Some(8),
+            ..Default::default()
+        };
+        let merged = merge_stage_turn_ceilings(base, &over);
+        assert_eq!(merged.implement, Some(20));
+        // `None` in the override leaves the base value alone.
+        assert_eq!(merged.triage, Some(4));
+        assert_eq!(merged.review, Some(8));
+    }
+
+    #[test]
+    fn max_turns_resolve_through_all_four_layers_in_precedence_order() {
+        let harness = PartialPolicy {
+            max_turns: Some(PartialStageTurnCeilings {
+                implement: Some(10),
+                triage: Some(5),
+                review: Some(3),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let profile = PartialPolicy {
+            max_turns: Some(PartialStageTurnCeilings {
+                implement: Some(20),
+                triage: Some(12),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let event = PartialPolicy {
+            max_turns: Some(PartialStageTurnCeilings {
+                implement: Some(30),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let resolved = resolve(
+            SdlcPolicy::default(),
+            Some(&harness),
+            Some(&profile),
+            Some(&event),
+        );
+        // event > profile > harness > builtin(None).
+        assert_eq!(resolved.max_turns.implement, Some(30));
+        assert_eq!(resolved.max_turns.triage, Some(12));
+        assert_eq!(resolved.max_turns.review, Some(3));
+
+        // Nothing anywhere -> still the built-in all-`None`.
+        let untouched = resolve(SdlcPolicy::default(), None, None, None);
+        assert_eq!(untouched.max_turns, StageTurnCeilings::default());
+    }
+
+    #[test]
+    fn deserializes_partial_stage_turn_ceilings_from_harness_json_shape() {
+        let json = r#"{ "max_turns": { "implement": 15 } }"#;
+        let partial: PartialPolicy = serde_json::from_str(json).expect("valid PartialPolicy JSON");
+        let max_turns = partial.max_turns.as_ref().expect("max_turns present");
+        assert_eq!(max_turns.implement, Some(15));
+        // Absent fields stay `None` and fall through on merge.
+        assert_eq!(max_turns.triage, None);
+        assert_eq!(max_turns.review, None);
+    }
+
+    #[test]
     fn test_depth_serde_wire_contract_is_snake_case() {
         assert_eq!(
             serde_json::to_value(TestDepth::Full).unwrap(),
@@ -1429,6 +1648,35 @@ mod tests {
                 parsed.max_review_attempts.is_some(),
                 "{name} must set max_review_attempts"
             );
+            // EN.17.F task 6: the three knobs tasks 3/4/5 added must be
+            // advertised by every profile too — a profile that omits one
+            // silently falls back to the built-in default rather than the
+            // deliberate choice its own doc comment claims to make. Checked
+            // against the RAW JSON object, not the typed `parsed` value:
+            // `implement_final_attempt`/`generate_context_max_bytes` are
+            // both `Option<Option<T>>` on the typed side, and serde's plain
+            // derive collapses a JSON `null` straight to the OUTER `None`
+            // (it cannot tell "absent" from "present as null" without a
+            // custom `deserialize_with`) — so a typed `.is_some()` check
+            // would wrongly fail on exactly the common built-in-value case
+            // this assertion exists to require.
+            let bundle_obj = bundle.as_object().expect("profile bundle is a JSON object");
+            let model_tiers_obj = bundle_obj
+                .get("model_tiers")
+                .and_then(serde_json::Value::as_object)
+                .expect("model_tiers is a JSON object");
+            assert!(
+                model_tiers_obj.contains_key("implement_final_attempt"),
+                "{name} must set model_tiers.implement_final_attempt (even if to null)"
+            );
+            assert!(
+                bundle_obj.contains_key("max_turns"),
+                "{name} must set max_turns (even if every field inside it is null)"
+            );
+            assert!(
+                bundle_obj.contains_key("generate_context_max_bytes"),
+                "{name} must set generate_context_max_bytes (even if to null)"
+            );
         }
     }
 
@@ -1499,6 +1747,10 @@ mod tests {
             "task_loop.rs::timeout_for_stage (all five stages), docs.rs, setup.rs (GenerateTasksNode)",
         ),
         (
+            "max_turns",
+            "task_loop.rs::apply_policy_config (all five stages via stage_turn_ceiling), docs.rs (via apply_policy_config)",
+        ),
+        (
             "local",
             "task_loop.rs::apply_model_tier (local model string), graph.rs (openai_compat_meta_transport_live)",
         ),
@@ -1527,6 +1779,10 @@ mod tests {
             "node_invocation_payload_cap_bytes",
             "invocations.rs::payload_cap_from_resolved_policy (read UNTYPED off the ResolvedPolicy stamp by node_context, workflow.rs)",
         ),
+        (
+            "generate_context_max_bytes",
+            "setup.rs::gather_context, called from GenerateTasksNode::process",
+        ),
     ];
 
     #[test]
@@ -1546,6 +1802,7 @@ mod tests {
             test_depth,
             model_tiers,
             timeouts,
+            max_turns,
             local,
             llm_triage,
             max_attempts,
@@ -1554,6 +1811,7 @@ mod tests {
             transport_retry,
             review_diff_max_chars,
             node_invocation_payload_cap_bytes,
+            generate_context_max_bytes,
         );
 
         let mut actual: Vec<&str> = field_names.to_vec();

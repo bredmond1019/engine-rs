@@ -68,20 +68,23 @@
       "properties": {
         "repo": {
           "type": "string",
-          "description": "Repo slug this message concerns, as registered in brain.toml.",
-          "pattern": "^[a-z0-9][a-z0-9-]*$"
+          "description": "Repo slug this message concerns, as registered in brain.toml. CAP RULE (BT.ticket.message-envelope-field-caps): measured 2026-09-10 over every envelope under the live lock dir's queue/*/*/{inbox,processing,done}/ (66 files) -- `subject.repo` count=66 max=13 p99=13. Cap = ceil(2 x measured max / 100) x 100, applied uniformly to every capped field. 2 x 13 = 26 -> 100.",
+          "pattern": "^[a-z0-9][a-z0-9-]*$",
+          "maxLength": 100
         },
         "block": {
           "type": "string",
-          "description": "Optional block id this message concerns (e.g. 'BT.6.A'), when the message is about a specific block rather than the repo as a whole.",
-          "minLength": 1
+          "description": "Optional block id this message concerns (e.g. 'BT.6.A'), when the message is about a specific block rather than the repo as a whole. CAP RULE (BT.ticket.message-envelope-field-caps): measured 2026-09-10, same queue walk -- `subject.block` count=21 max=57 p99=57. Cap = ceil(2 x measured max / 100) x 100. 2 x 57 = 114 -> 200.",
+          "minLength": 1,
+          "maxLength": 200
         }
       }
     },
     "body": {
       "type": "string",
-      "description": "The message content itself. Free text; for LEASE_RELEASE this is where taking vs releasing is discriminated.",
-      "minLength": 1
+      "description": "The message content itself. Free text; for LEASE_RELEASE this is where taking vs releasing is discriminated. CAP RULE (BT.ticket.message-envelope-field-caps): measured 2026-09-10 over every envelope under the live lock dir's queue/*/*/{inbox,processing,done}/ (66 files) -- `body` count=66 max=2855 p99=2324. Cap = ceil(2 x measured max / 100) x 100, applied uniformly to every capped field (doubles the observed max for headroom against growth beyond this snapshot, then rounds up to a clean number). 2 x 2855 = 5710 -> 5800.",
+      "minLength": 1,
+      "maxLength": 5800
     },
     "durable_home": {
       "type": "object",
@@ -91,21 +94,24 @@
       "properties": {
         "channel": {
           "type": "string",
-          "description": "Which durable-record kind holds this item.",
-          "enum": ["lane-log", "state-edge", "carryover", "run-record"]
+          "description": "Which durable-record kind holds this item. CAP RULE (BT.ticket.message-envelope-field-caps): measured 2026-09-10, same queue walk -- `durable_home.channel` count=66 max=10 p99=10. Cap = ceil(2 x measured max / 100) x 100. 2 x 10 = 20 -> 100.",
+          "enum": ["lane-log", "state-edge", "carryover", "run-record"],
+          "maxLength": 100
         },
         "ref": {
           "type": "string",
-          "description": "A locator within that channel (e.g. a lane-log line id, a state.json edge slug, a carryover slug, or a run-record path) precise enough for a receiver to go find the durable item itself.",
-          "minLength": 1
+          "description": "A locator within that channel (e.g. a lane-log line id, a state.json edge slug, a carryover slug, or a run-record path) precise enough for a receiver to go find the durable item itself. CAP RULE (BT.ticket.message-envelope-field-caps): measured 2026-09-10, same queue walk -- `durable_home.ref` count=66 max=184 p99=147. Cap = ceil(2 x measured max / 100) x 100. 2 x 184 = 368 -> 400.",
+          "minLength": 1,
+          "maxLength": 400
         }
       }
     },
     "verified_by": {
       "type": "string",
       "minLength": 1,
-      "description": "Evidence backing this envelope's claim, so a relay's evidence travels with the claim instead of being replaced by an adjective (BT.ticket.messages-must-carry-verified-by). Two accepted shapes, both enforced by pattern: a block containing the literal command that was run and its real output (a command line, then its output on a following line), or the string `UNVERIFIED: <who claimed it>` naming the claimant when the sender is relaying rather than independently checking. Neither an empty string nor a bare adjective such as `measured` satisfies this field -- that is the exact defect this field exists to catch (three relays were caught wrong by their receivers on that word alone; see the block's `why`). An envelope written before this field existed lacks it and fails validation the same as any other envelope missing a required field -- the migration path for the seven pre-existing envelopes is stated, not executed (out of scope).",
-      "pattern": "^(UNVERIFIED: \\S[\\s\\S]*|[\\s\\S]*\\S[\\s\\S]*\\n[\\s\\S]*\\S[\\s\\S]*)$"
+      "description": "Evidence backing this envelope's claim, so a relay's evidence travels with the claim instead of being replaced by an adjective (BT.ticket.messages-must-carry-verified-by). Two accepted shapes, both enforced by pattern: a block containing the literal command that was run and its real output (a command line, then its output on a following line), or the string `UNVERIFIED: <who claimed it>` naming the claimant when the sender is relaying rather than independently checking. Neither an empty string nor a bare adjective such as `measured` satisfies this field -- that is the exact defect this field exists to catch (three relays were caught wrong by their receivers on that word alone; see the block's `why`). An envelope written before this field existed lacks it and fails validation the same as any other envelope missing a required field -- the migration path for the seven pre-existing envelopes is stated, not executed (out of scope). CAP RULE (BT.ticket.message-envelope-field-caps): measured 2026-09-10 over every envelope under the live lock dir's queue/*/*/{inbox,processing,done}/ (66 files, 49 carrying this required-since field) -- `verified_by` count=49 max=944 p99=944. Cap = ceil(2 x measured max / 100) x 100. 2 x 944 = 1888 -> 1900.",
+      "pattern": "^(UNVERIFIED: \\S[\\s\\S]*|[\\s\\S]*\\S[\\s\\S]*\\n[\\s\\S]*\\S[\\s\\S]*)$",
+      "maxLength": 1900
     },
     "host": {
       "type": "string",

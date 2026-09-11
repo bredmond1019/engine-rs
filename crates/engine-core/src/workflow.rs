@@ -792,6 +792,14 @@ async fn node_context(
             for session in err.sessions.iter().cloned() {
                 crate::sessions::append_session(&mut err_ctx.metadata, session);
             }
+            // Same revert-survival seam as `sessions` above, but for a
+            // node's own structured result (`NodeError::node_result`): write
+            // it into the reverted snapshot's `ctx.nodes` map under this
+            // node's identity, so a caller inspecting `ctx.nodes` sees the
+            // node's terminal report even though `process` returned `Err`.
+            if let Some(node_result) = err.node_result.clone() {
+                err_ctx.nodes.insert(identity.clone(), node_result);
+            }
             if let Some(run) = err_ctx.node_runs.get_mut(&identity) {
                 run.status = NodeRunStatus::Failed;
                 run.completed_at = Some(Utc::now());
@@ -1145,6 +1153,68 @@ mod tests {
              the billed session — this is what task 2's fix at the real \
              wrapper sites prevents by attaching sessions_since(..) instead"
         );
+    }
+
+    // --- `NodeError::node_result`: the same revert-survival seam as
+    // `sessions` above, but for a node's own structured `ctx.nodes[identity]`
+    // payload (the `OrchestrationRunNode`/`chain_report` fix) -------------
+
+    /// Fails after attaching a `node_result` payload — the exact shape
+    /// `OrchestrationRunNode::process`'s hard-`Err` path now uses to carry
+    /// `chain_report` past the context revert.
+    struct FailsCarryingNodeResultNode {
+        payload: serde_json::Value,
+    }
+
+    #[async_trait::async_trait]
+    impl Node for FailsCarryingNodeResultNode {
+        async fn process(&self, ctx: TaskContext) -> Result<TaskContext, NodeError> {
+            let _ = ctx;
+            Err(NodeError::new("failed with a structured payload")
+                .with_node_result(self.payload.clone()))
+        }
+
+        fn name(&self) -> &str {
+            "FailsCarryingNodeResultNode"
+        }
+    }
+
+    /// POSITIVE: `node_result` lands in `ctx.nodes[identity]` even though
+    /// the node returned `Err` and its `TaskContext` was otherwise reverted
+    /// to the pre-call snapshot.
+    #[tokio::test]
+    async fn node_context_retains_a_node_result_across_a_wrapper_failure() {
+        let payload = serde_json::json!({ "chain_report": { "closed": [], "bailed": ["repo-a:A.1"], "skipped": [] } });
+        let node = FailsCarryingNodeResultNode {
+            payload: payload.clone(),
+        };
+        let ctx = empty_context();
+        let mut on_progress: OnProgress<'_> = Box::new(|_c: &TaskContext| {});
+
+        let (out, failed) = node_context(&node, ctx, &mut on_progress).await;
+
+        assert!(failed);
+        assert_eq!(
+            out.nodes.get("FailsCarryingNodeResultNode"),
+            Some(&payload),
+            "a NodeError::node_result must survive into ctx.nodes[identity] \
+             despite the context revert on Err"
+        );
+    }
+
+    /// NEGATIVE: a bare `NodeError::new` (no `.with_node_result(..)`) must
+    /// not fabricate an entry — `ctx.nodes` stays exactly as it was before
+    /// the call.
+    #[tokio::test]
+    async fn node_context_leaves_nodes_untouched_when_a_failure_carries_no_result() {
+        let node = FailsWithoutBillingNode;
+        let ctx = empty_context();
+
+        let mut on_progress: OnProgress<'_> = Box::new(|_c: &TaskContext| {});
+        let (out, failed) = node_context(&node, ctx, &mut on_progress).await;
+
+        assert!(failed);
+        assert!(!out.nodes.contains_key("FailsWithoutBillingNode"));
     }
 
     #[tokio::test]
