@@ -647,11 +647,10 @@ fn log_noop_commit(label: &str, output: &CommandOutput) {
 #[cfg(test)]
 mod tests {
     use super::{
-        admitted_command_runner, commit_all, default_command_runner, default_spec_runner,
-        is_noop_commit, strip_json_fence, CommandOutput, CommandRunner, CommandSpec,
-        CommitOutcome, SpecCommandRunner,
+        commit_all, default_command_runner, default_spec_runner, is_noop_commit,
+        strip_json_fence, CommandOutput, CommandRunner, CommandSpec, CommitOutcome,
     };
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
 
     /// A runner whose `git commit` returns the given exit code/stderr and
     /// whose every other invocation succeeds.
@@ -848,36 +847,6 @@ mod tests {
     }
 
     #[test]
-    fn admitted_command_runner_passes_fleet_build_preadmitted_env() {
-        let captured: Arc<Mutex<Vec<(String, String)>>> = Arc::new(Mutex::new(Vec::new()));
-        let captured_clone = Arc::clone(&captured);
-        let stub: SpecCommandRunner = Arc::new(move |spec: &CommandSpec| {
-            *captured_clone.lock().unwrap() = spec
-                .env
-                .iter()
-                .map(|(k, v)| (k.to_string(), v.to_string()))
-                .collect();
-            Ok(CommandOutput {
-                status: 0,
-                stdout: String::new(),
-                stderr: String::new(),
-            })
-        });
-
-        let runner = admitted_command_runner(stub);
-        let tmp = std::env::temp_dir();
-        let output = runner("echo", &["hi"], &tmp).expect("stub runner should not error");
-        assert_eq!(output.status, 0);
-
-        let seen = captured.lock().unwrap();
-        assert!(
-            seen.iter()
-                .any(|(k, v)| k == "FLEET_BUILD_PREADMITTED" && v == "1"),
-            "expected FLEET_BUILD_PREADMITTED=1 in captured env, got: {seen:?}"
-        );
-    }
-
-    #[test]
     fn is_noop_commit_classifies_nothing_to_commit_as_a_noop() {
         assert!(is_noop_commit("nothing to commit, working tree clean", ""));
     }
@@ -906,5 +875,46 @@ mod tests {
             "error: pathspec did not match any files",
             ""
         ));
+    }
+}
+
+/// Named separately from `mod tests` (rather than nested inside it) so that
+/// the fully-qualified test path is `workflows::admitted_command_runner_tests::…`
+/// — a substring of `workflows::admitted_command_runner`, which is exactly the
+/// `cargo nextest run` filter this task's own validation command uses. Mirrors
+/// the `session_delta_tests` precedent above in this same file.
+#[cfg(test)]
+mod admitted_command_runner_tests {
+    use super::{admitted_command_runner, CommandOutput, CommandSpec, SpecCommandRunner};
+    use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn admitted_command_runner_passes_fleet_build_preadmitted_env() {
+        let captured: Arc<Mutex<Vec<(String, String)>>> = Arc::new(Mutex::new(Vec::new()));
+        let captured_clone = Arc::clone(&captured);
+        let stub: SpecCommandRunner = Arc::new(move |spec: &CommandSpec| {
+            *captured_clone.lock().unwrap() = spec
+                .env
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect();
+            Ok(CommandOutput {
+                status: 0,
+                stdout: String::new(),
+                stderr: String::new(),
+            })
+        });
+
+        let runner = admitted_command_runner(stub);
+        let tmp = std::env::temp_dir();
+        let output = runner("echo", &["hi"], &tmp).expect("stub runner should not error");
+        assert_eq!(output.status, 0);
+
+        let seen = captured.lock().unwrap();
+        assert!(
+            seen.iter()
+                .any(|(k, v)| k == "FLEET_BUILD_PREADMITTED" && v == "1"),
+            "expected FLEET_BUILD_PREADMITTED=1 in captured env, got: {seen:?}"
+        );
     }
 }
