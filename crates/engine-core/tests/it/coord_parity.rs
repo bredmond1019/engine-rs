@@ -496,3 +496,436 @@ fn a_spawn_of_a_nonexistent_interpreter_is_treated_as_unavailable_not_a_panic() 
         "expected ErrorKind::NotFound for a nonexistent interpreter, got: {result:?}"
     );
 }
+
+// ---------------------------------------------------------------------------------------------
+// `EN.17.A` task 7 — lease-threshold source-text parity, the one-definition scanner, and the
+// holder-conflict parity case against `fleet_concurrency_check.py register`.
+//
+// Same discipline as the TTL section above: every threshold compared below is parsed out of its
+// AUTHORITY's own source text at test time, never read from this crate's own constant on the
+// "trust me, it matches" side of the comparison, and never hand-copied as a literal into this
+// file. [`threshold_parser_detects_an_altered_product`] proves the parser is load-bearing the
+// same way [`ttl_edit_in_a_fixture_copy_is_detected_as_a_disagreement`] does above.
+// ---------------------------------------------------------------------------------------------
+
+/// `<brain_root>/core/mev/src/brain/lease.rs` — the authority for
+/// `engine_core::coord::LEASE_STALE_THRESHOLD_SECONDS`.
+fn mev_lease_source_path(brain_root: &Path) -> PathBuf {
+    brain_root
+        .join("core")
+        .join("mev")
+        .join("src")
+        .join("brain")
+        .join("lease.rs")
+}
+
+/// `<brain_root>/base-template/scripts/check_lane_agents.py` — the authority for
+/// `crate::workflows::sweep::snapshot::REGISTRY_STALE_THRESHOLD_SECONDS`.
+fn check_lane_agents_source_path(brain_root: &Path) -> PathBuf {
+    brain_root
+        .join("base-template")
+        .join("scripts")
+        .join("check_lane_agents.py")
+}
+
+/// Resolve `<brain_root>`, or `None` with a loud `eprintln!` naming `test_name` when this
+/// checkout has no sibling vault to find one in — the brain-root half of
+/// [`require_parity_environment`]'s skip contract, reused by the threshold/scanner tests below
+/// that need a sibling repo but not `python3`.
+fn find_brain_root_or_skip(test_name: &str) -> Option<PathBuf> {
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let Some(brain_root) = find_brain_root(manifest_dir) else {
+        eprintln!(
+            "SKIPPING {test_name}: no brain.toml found walking up from {} \
+             (this checkout has no sibling vault to locate the authority source in)",
+            manifest_dir.display()
+        );
+        return None;
+    };
+    Some(brain_root)
+}
+
+/// Resolve `path` as an authority source file for `test_name`, or `None` with a loud `eprintln!`
+/// when it is absent (a brain root exists but the specific sibling repo/file was never checked
+/// out here).
+fn require_source_file(path: &Path, test_name: &str) -> Option<()> {
+    if !path.is_file() {
+        eprintln!(
+            "SKIPPING {test_name}: authority source not found at {}",
+            path.display()
+        );
+        return None;
+    }
+    Some(())
+}
+
+/// Parse a `<const_name> = <number> * <number>` (Rust: `pub const NAME: f64 = 180.0 * 60.0;`;
+/// Python: `NAME = 180 * 60`) product out of `source`'s own text. Deliberately line-oriented and
+/// requiring an `=` on the SAME line as `const_name`, so a doc comment that merely mentions the
+/// const's name (every threshold const in this crate is referenced that way in multiple doc
+/// comments — see `coord/mod.rs`, `coord/write.rs`, `coord_lane.rs`, `sweep/snapshot.rs`) is
+/// never mistaken for its declaration.
+fn parse_threshold_product(source: &str, const_name: &str) -> f64 {
+    for line in source.lines() {
+        let Some(name_idx) = line.find(const_name) else {
+            continue;
+        };
+        let after_name = &line[name_idx + const_name.len()..];
+        let Some(eq_idx) = after_name.find('=') else {
+            continue;
+        };
+        let expr = &after_name[eq_idx + 1..];
+        let expr = expr.split(';').next().unwrap_or(expr);
+        let expr = expr.split("//").next().unwrap_or(expr);
+        let expr = expr.split('#').next().unwrap_or(expr);
+        let parts: Vec<&str> = expr.split('*').map(str::trim).collect();
+        if parts.len() == 2 && !parts[0].is_empty() && !parts[1].is_empty() {
+            let a: f64 = parts[0].parse().unwrap_or_else(|e| {
+                panic!(
+                    "could not parse '{}' as f64 in `{const_name}` product: {e}",
+                    parts[0]
+                )
+            });
+            let b: f64 = parts[1].parse().unwrap_or_else(|e| {
+                panic!(
+                    "could not parse '{}' as f64 in `{const_name}` product: {e}",
+                    parts[1]
+                )
+            });
+            return a * b;
+        }
+    }
+    panic!("could not find a `{const_name} = <number> * <number>` line in the given source text");
+}
+
+#[test]
+fn parse_threshold_product_reads_a_rust_style_product() {
+    let source = "pub const LEASE_STALE_THRESHOLD_SECONDS: f64 = 180.0 * 60.0;\n";
+    assert_eq!(
+        parse_threshold_product(source, "LEASE_STALE_THRESHOLD_SECONDS"),
+        10_800.0
+    );
+}
+
+#[test]
+fn parse_threshold_product_reads_a_python_style_product() {
+    let source = "STALE_THRESHOLD_SECONDS = 180 * 60\n";
+    assert_eq!(
+        parse_threshold_product(source, "STALE_THRESHOLD_SECONDS"),
+        10_800.0
+    );
+}
+
+#[test]
+fn parse_threshold_product_ignores_a_doc_comment_mentioning_the_name_without_an_assignment() {
+    let source = "\
+/// See `LEASE_STALE_THRESHOLD_SECONDS` below.\n\
+pub const LEASE_STALE_THRESHOLD_SECONDS: f64 = 180.0 * 60.0;\n";
+    assert_eq!(
+        parse_threshold_product(source, "LEASE_STALE_THRESHOLD_SECONDS"),
+        10_800.0
+    );
+}
+
+/// The proof obligation for this section, mirroring
+/// [`ttl_edit_in_a_fixture_copy_is_detected_as_a_disagreement`] above: the SAME parser, fed a
+/// source string with a different product than the real constant, must report a mismatch rather
+/// than silently agreeing because nothing actually looked.
+#[test]
+fn threshold_parser_detects_an_altered_product() {
+    let real = parse_threshold_product(
+        "pub const LEASE_STALE_THRESHOLD_SECONDS: f64 = 180.0 * 60.0;\n",
+        "LEASE_STALE_THRESHOLD_SECONDS",
+    );
+    let altered = parse_threshold_product(
+        "pub const LEASE_STALE_THRESHOLD_SECONDS: f64 = 90.0 * 60.0;\n",
+        "LEASE_STALE_THRESHOLD_SECONDS",
+    );
+    assert_ne!(
+        real, altered,
+        "a hand-edited product must produce a detectable disagreement — it did not"
+    );
+}
+
+/// `engine_core::coord::LEASE_STALE_THRESHOLD_SECONDS` must equal mev's own
+/// `LEASE_STALE_THRESHOLD_SECONDS` (`core/mev/src/brain/lease.rs`), parsed from that file's
+/// current source text at test time — never a literal copied into this test.
+#[test]
+fn lease_threshold_matches_mev_source() {
+    let Some(brain_root) = find_brain_root_or_skip("lease_threshold_matches_mev_source") else {
+        return;
+    };
+    let path = mev_lease_source_path(&brain_root);
+    if require_source_file(&path, "lease_threshold_matches_mev_source").is_none() {
+        return;
+    }
+    let source = fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("could not read {}: {e}", path.display()));
+    let mev_value = parse_threshold_product(&source, "LEASE_STALE_THRESHOLD_SECONDS");
+    assert_eq!(
+        mev_value,
+        engine_core::coord::LEASE_STALE_THRESHOLD_SECONDS,
+        "engine-rs's LEASE_STALE_THRESHOLD_SECONDS has drifted from its authority at {}",
+        path.display()
+    );
+}
+
+/// `crate::workflows::sweep::snapshot::REGISTRY_STALE_THRESHOLD_SECONDS` must equal
+/// `base-template/scripts/check_lane_agents.py`'s `STALE_THRESHOLD_SECONDS`, parsed from that
+/// file's current source text at test time.
+#[test]
+fn registry_threshold_matches_check_lane_agents_source() {
+    let Some(brain_root) =
+        find_brain_root_or_skip("registry_threshold_matches_check_lane_agents_source")
+    else {
+        return;
+    };
+    let path = check_lane_agents_source_path(&brain_root);
+    if require_source_file(&path, "registry_threshold_matches_check_lane_agents_source").is_none() {
+        return;
+    }
+    let source = fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("could not read {}: {e}", path.display()));
+    let python_value = parse_threshold_product(&source, "STALE_THRESHOLD_SECONDS");
+    assert_eq!(
+        python_value,
+        engine_core::workflows::sweep::snapshot::REGISTRY_STALE_THRESHOLD_SECONDS,
+        "engine-rs's REGISTRY_STALE_THRESHOLD_SECONDS has drifted from its authority at {}",
+        path.display()
+    );
+}
+
+/// Walk every `.rs` file under `root`, recursively. Byte-identical logic to
+/// `prompt_externalization.rs`'s own `collect_rs_files` helper (kept as a separate copy per-file,
+/// matching this module's own documented precedent of not sharing cross-test-module code).
+fn collect_rs_files(root: &Path, out: &mut Vec<PathBuf>) {
+    let entries =
+        fs::read_dir(root).unwrap_or_else(|e| panic!("failed to read dir {}: {e}", root.display()));
+    for entry in entries {
+        let entry = entry.expect("failed to read dir entry");
+        let path = entry.path();
+        if path.is_dir() {
+            collect_rs_files(&path, out);
+        } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
+            out.push(path);
+        }
+    }
+}
+
+/// Count lines, across every `.rs` file under `root` plus any EXTRA in-memory source texts
+/// supplied, that declare `const <const_name>` (i.e. contain the literal substring
+/// `const <const_name>`). `extra_sources` is what
+/// [`lease_threshold_has_exactly_one_definition`] uses to prove this scanner actually counts
+/// rather than always reporting a hardcoded `1` regardless of what is on disk.
+fn count_const_declarations(root: &Path, const_name: &str, extra_sources: &[&str]) -> usize {
+    let needle = format!("const {const_name}");
+    let mut files = Vec::new();
+    collect_rs_files(root, &mut files);
+    let on_disk = files
+        .iter()
+        .filter_map(|f| fs::read_to_string(f).ok())
+        .flat_map(|s| s.lines().map(str::to_string).collect::<Vec<_>>())
+        .filter(|line| line.contains(&needle))
+        .count();
+    let in_memory = extra_sources
+        .iter()
+        .flat_map(|s| s.lines())
+        .filter(|line| line.contains(&needle))
+        .count();
+    on_disk + in_memory
+}
+
+/// `crates/engine-core/src` — the crate's own source root, resolved from `CARGO_MANIFEST_DIR`
+/// exactly as `prompt_externalization.rs`'s `workflows_root()` resolves its own scan root.
+fn engine_core_src_root() -> PathBuf {
+    let manifest_dir =
+        std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR must be set by cargo");
+    Path::new(&manifest_dir).join("src")
+}
+
+/// There must be exactly one `const LEASE_STALE_THRESHOLD_SECONDS` declaration anywhere under
+/// `crates/engine-core/src` (task 1 landed it in `coord/mod.rs`; every OTHER mention across
+/// `coord/write.rs`, `coord_lane.rs` and `sweep/snapshot.rs` is a doc-comment reference, never a
+/// second declaration). `REGISTRY_STALE_THRESHOLD_SECONDS` (known present, singly, in
+/// `sweep/snapshot.rs`) is the positive control proving the scanner can find a real declaration
+/// at all, not merely fail to find a false one. Fed an extra in-memory source string declaring a
+/// second `LEASE_STALE_THRESHOLD_SECONDS`, the same scanner must report 2.
+#[test]
+fn lease_threshold_has_exactly_one_definition() {
+    let root = engine_core_src_root();
+    let lease_count = count_const_declarations(&root, "LEASE_STALE_THRESHOLD_SECONDS", &[]);
+    assert_eq!(
+        lease_count, 1,
+        "expected exactly one `const LEASE_STALE_THRESHOLD_SECONDS` declaration under {}, found {lease_count}",
+        root.display()
+    );
+
+    let registry_count = count_const_declarations(&root, "REGISTRY_STALE_THRESHOLD_SECONDS", &[]);
+    assert_eq!(
+        registry_count, 1,
+        "positive control failed: expected exactly one `const REGISTRY_STALE_THRESHOLD_SECONDS` \
+         declaration (known present in sweep/snapshot.rs), found {registry_count}"
+    );
+
+    let extra_source = "pub const LEASE_STALE_THRESHOLD_SECONDS: f64 = 90.0 * 60.0;\n";
+    let with_extra =
+        count_const_declarations(&root, "LEASE_STALE_THRESHOLD_SECONDS", &[extra_source]);
+    assert_eq!(
+        with_extra, 2,
+        "scanner fed an extra in-memory declaration must report 2, got {with_extra}"
+    );
+}
+
+/// One `<lock_dir>/leases/lease-<repo>.json` fixture, written directly as JSON in
+/// `okf_core::LeaseRecord`'s own shape — matching what both `coord::write::lease` and
+/// `fleet_concurrency_check.py register`'s `_find_blocking_exclusive_lease` read, so neither
+/// side needs the other to have produced the file first.
+fn write_fixture_lease(lock_dir: &Path, repo: &str, agent: &str, liveness_iso: &str) {
+    let leases_dir = lock_dir.join("leases");
+    fs::create_dir_all(&leases_dir)
+        .unwrap_or_else(|e| panic!("create_dir_all {}: {e}", leases_dir.display()));
+    let path = leases_dir.join(format!("lease-{repo}.json"));
+    let body = serde_json::json!({
+        "repo": repo,
+        "lane": format!("{repo}-lane"),
+        "agent": agent,
+        "acquired_at": liveness_iso,
+        "kind": "exclusive",
+        "heartbeat": liveness_iso,
+    });
+    fs::write(&path, body.to_string())
+        .unwrap_or_else(|e| panic!("write fixture lease {}: {e}", path.display()));
+}
+
+/// Recursively copy `src` into `dst` (`dst` need not exist yet) — gives each side of the
+/// holder-conflict parity case its OWN independent copy of the fixture lock dir, so an ALLOWED
+/// call on one side (which writes a new lease record) can never be the reason the other side's
+/// answer differs, and the acceptance criterion's "ordering between the two sides is irrelevant"
+/// is actually true rather than accidentally true.
+fn copy_dir_recursive(src: &Path, dst: &Path) {
+    fs::create_dir_all(dst).unwrap_or_else(|e| panic!("create_dir_all {}: {e}", dst.display()));
+    for entry in fs::read_dir(src).unwrap_or_else(|e| panic!("read_dir {}: {e}", src.display())) {
+        let entry = entry.expect("dir entry");
+        let src_path = entry.path();
+        let dst_path = dst.join(entry.file_name());
+        if src_path.is_dir() {
+            copy_dir_recursive(&src_path, &dst_path);
+        } else {
+            fs::copy(&src_path, &dst_path).unwrap_or_else(|e| {
+                panic!("copy {} -> {}: {e}", src_path.display(), dst_path.display())
+            });
+        }
+    }
+}
+
+/// Run `python3 <script> register --repo <repo> --agent <agent> --lock-dir <lock_dir>` and
+/// return whether it was allowed, per `main()`'s own documented contract (exit 0 allowed, exit 3
+/// refused). Any OTHER exit code is a genuine test failure, not a third outcome to paper over.
+fn run_python_register(script: &Path, lock_dir: &Path, repo: &str, agent: &str) -> bool {
+    let output = Command::new("python3")
+        .arg(script)
+        .arg("register")
+        .arg("--repo")
+        .arg(repo)
+        .arg("--agent")
+        .arg(agent)
+        .arg("--lock-dir")
+        .arg(lock_dir)
+        .output()
+        .unwrap_or_else(|e| panic!("failed to spawn python3 {}: {e}", script.display()));
+    match output.status.code() {
+        Some(0) => true,
+        Some(3) => false,
+        other => panic!(
+            "fleet_concurrency_check.py register exited unexpectedly ({other:?}):\nstdout={}\nstderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        ),
+    }
+}
+
+/// Run Rust `coord::write::lease` for `agent`/`repo` against `lock_dir` and return whether it
+/// was allowed (`Ok(())`) or refused (`Err(_)`) — the Rust half of one holder-conflict parity
+/// case.
+fn run_rust_lease(lock_dir: &Path, repo: &str, agent: &str) -> bool {
+    let now_iso = chrono::Utc::now().to_rfc3339();
+    let no_blocks: Vec<String> = Vec::new();
+    let req = engine_core::coord::write::LeaseRequest {
+        repo,
+        lane: "test-lane",
+        agent,
+        kind: okf_core::LeaseKind::Exclusive,
+        scope: None,
+        host: None,
+        now_iso: &now_iso,
+        window: None,
+        lane_blocks: &no_blocks,
+    };
+    engine_core::coord::write::lease(lock_dir, &req).is_ok()
+}
+
+/// The holder-conflict parity case: for a live foreign Exclusive lease, a stale foreign
+/// Exclusive lease, and a same-agent lease, `fleet_concurrency_check.py register` and Rust
+/// `coord::write::lease` must reach the SAME allow/refuse decision. Each side reads its own
+/// independent temp copy of the fixture tree (never the same directory both sides read/write),
+/// so ordering between the two calls cannot be the reason they agree or disagree. Skips cleanly
+/// when the Python oracle is unavailable, exactly as `reader_and_python_agree_on_active_heavy_lanes_for_a_healthy_tree`
+/// above already does.
+#[test]
+fn lease_holder_conflict_matches_fleet_concurrency_check() {
+    let Some(script) = require_parity_environment() else {
+        return;
+    };
+
+    struct Case {
+        name: &'static str,
+        holder_agent: &'static str,
+        liveness_age_seconds: f64,
+        requester_agent: &'static str,
+    }
+
+    let cases = [
+        Case {
+            name: "live foreign Exclusive lease",
+            holder_agent: "agent-a",
+            liveness_age_seconds: 60.0, // a minute old — comfortably live.
+            requester_agent: "agent-b",
+        },
+        Case {
+            name: "stale foreign Exclusive lease",
+            holder_agent: "agent-a",
+            liveness_age_seconds: engine_core::coord::LEASE_STALE_THRESHOLD_SECONDS + 3600.0,
+            requester_agent: "agent-b",
+        },
+        Case {
+            name: "same-agent lease (a renewal, not a conflict)",
+            holder_agent: "agent-a",
+            liveness_age_seconds: 60.0, // fresh AND same agent — must allow either way.
+            requester_agent: "agent-a",
+        },
+    ];
+
+    for case in cases {
+        let repo = "engine-rs";
+        let base = tempfile::tempdir().expect("tempdir");
+        let liveness = chrono::Utc::now()
+            - chrono::Duration::milliseconds((case.liveness_age_seconds * 1000.0) as i64);
+        write_fixture_lease(base.path(), repo, case.holder_agent, &liveness.to_rfc3339());
+
+        let python_dir = tempfile::tempdir().expect("tempdir");
+        copy_dir_recursive(base.path(), python_dir.path());
+        let rust_dir = tempfile::tempdir().expect("tempdir");
+        copy_dir_recursive(base.path(), rust_dir.path());
+
+        let python_allowed =
+            run_python_register(&script, python_dir.path(), repo, case.requester_agent);
+        let rust_allowed = run_rust_lease(rust_dir.path(), repo, case.requester_agent);
+
+        assert_eq!(
+            python_allowed, rust_allowed,
+            "case `{}`: fleet_concurrency_check.py register allowed={python_allowed} but \
+             write::lease allowed={rust_allowed} — holder-conflict parity broken",
+            case.name
+        );
+    }
+}
