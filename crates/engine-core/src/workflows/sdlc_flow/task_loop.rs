@@ -1354,6 +1354,32 @@ pub struct CheckResult {
     output: String,
     #[serde(default)]
     message: String,
+    #[serde(default)]
+    failure_class: FailureClass,
+}
+
+/// How a task loop should treat a failed check: retry it like any other
+/// (`Fixable`, the behavior-stable default) or bail the task on the first
+/// failure without spending further fix attempts (`Escalate`). Read from a
+/// harness check's `failureClass` key via [`failure_class_of`] — an absent
+/// key, or any value other than `"escalate"`, resolves to `Fixable` so a
+/// harness.json written before this existed is unaffected (standing rule 6).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FailureClass {
+    #[default]
+    Fixable,
+    Escalate,
+}
+
+/// Reads a check's `failureClass` key, mapping `"escalate"` to
+/// [`FailureClass::Escalate`] and anything else — including the key's
+/// absence — to [`FailureClass::Fixable`], the behavior-stable default.
+fn failure_class_of(check: &serde_json::Value) -> FailureClass {
+    match check.get("failureClass").and_then(|v| v.as_str()) {
+        Some("escalate") => FailureClass::Escalate,
+        _ => FailureClass::Fixable,
+    }
 }
 
 /// Deterministic node: runs the worktree's `planning/harness.json`
@@ -1432,6 +1458,7 @@ impl TestTaskNode {
                     passed,
                     output,
                     message,
+                    failure_class: failure_class_of(check),
                 }
             }
             Err(err) => CheckResult {
@@ -1440,6 +1467,7 @@ impl TestTaskNode {
                 passed: false,
                 output: String::new(),
                 message: format!("failed to spawn check: {err}"),
+                failure_class: failure_class_of(check),
             },
         }
     }
@@ -1532,6 +1560,7 @@ impl TestTaskNode {
             passed,
             output: output_parts.join("\n"),
             message,
+            failure_class: failure_class_of(check),
         }
     }
 
@@ -1590,6 +1619,7 @@ impl TestTaskNode {
             passed,
             output: current_stdout,
             message,
+            failure_class: failure_class_of(check),
         }
     }
 
@@ -1638,6 +1668,7 @@ impl TestTaskNode {
             passed,
             output: stdout,
             message,
+            failure_class: failure_class_of(check),
         }
     }
 
@@ -1684,6 +1715,7 @@ impl TestTaskNode {
             passed,
             output: combined,
             message,
+            failure_class: failure_class_of(check),
         }
     }
 
@@ -1702,6 +1734,7 @@ impl TestTaskNode {
                 "check kind {kind:?} is not yet supported by TestTaskNode \
                  (TODO(EN.3.B+): richer harness kinds)"
             ),
+            failure_class: failure_class_of(check),
         }
     }
 
@@ -1876,6 +1909,7 @@ impl TestTaskNode {
                      \"expects_writes\": false on it in tasks.json.",
                     task.task_id
                 ),
+                failure_class: FailureClass::Fixable,
             });
         }
 
@@ -1899,6 +1933,7 @@ impl TestTaskNode {
                      intentional, add '{deleted_path}' to this task's files[].",
                     task.task_id, task.files
                 ),
+                failure_class: FailureClass::Fixable,
             });
         }
 
@@ -1918,6 +1953,7 @@ impl TestTaskNode {
                      is not enough; the diff must intersect what this task said it would do.",
                     task.task_id, task.files
                 ),
+                failure_class: FailureClass::Fixable,
             });
         }
 
@@ -2174,6 +2210,7 @@ impl Node for TestTaskNode {
                          is a gating failure rather than a silent pass",
                         harness_path.display()
                     ),
+                    failure_class: FailureClass::Fixable,
                 };
                 (
                     vec![result.clone()],
@@ -6766,6 +6803,83 @@ pub(crate) mod tests {
         let (program, args) = &recorded[0];
         assert_eq!(program, "grep");
         assert_eq!(args, &vec!["-rnE", "open\\(", "app/", "lib/"]);
+    }
+
+    #[test]
+    fn failure_class_of_defaults_to_fixable_when_key_absent() {
+        let check = json!({ "name": "no-key", "kind": "command", "command": "true" });
+        assert_eq!(failure_class_of(&check), FailureClass::Fixable);
+    }
+
+    #[test]
+    fn failure_class_of_reads_escalate() {
+        let check = json!({
+            "name": "escalating",
+            "kind": "command",
+            "command": "true",
+            "failureClass": "escalate",
+        });
+        assert_eq!(failure_class_of(&check), FailureClass::Escalate);
+    }
+
+    #[test]
+    fn failure_class_of_treats_unrecognized_value_as_fixable() {
+        let check = json!({
+            "name": "typo",
+            "kind": "command",
+            "command": "true",
+            "failureClass": "esclate",
+        });
+        assert_eq!(failure_class_of(&check), FailureClass::Fixable);
+    }
+
+    #[tokio::test]
+    async fn command_check_stamps_escalate_failure_class_from_the_check() {
+        let worktree = temp_worktree();
+        write_harness(
+            &worktree,
+            json!([{
+                "kind": "command",
+                "name": "escalating-check",
+                "gates": true,
+                "command": "false",
+                "failureClass": "escalate",
+            }]),
+        );
+
+        let node = TestTaskNode::new();
+        let out = node
+            .process(ctx_for_worktree(&worktree))
+            .await
+            .expect("process should succeed");
+        let results = out.nodes["TestTaskNode"]["check_results"]
+            .as_array()
+            .unwrap();
+        assert_eq!(results[0]["failure_class"], "escalate");
+    }
+
+    #[tokio::test]
+    async fn command_check_defaults_fixable_failure_class_when_key_absent() {
+        let worktree = temp_worktree();
+        write_harness(
+            &worktree,
+            json!([{
+                "kind": "command",
+                "name": "ordinary-check",
+                "gates": true,
+                "command": "false",
+            }]),
+        );
+
+        let node = TestTaskNode::new();
+        let out = node
+            .process(ctx_for_worktree(&worktree))
+            .await
+            .expect("process should succeed");
+        let results = out.nodes["TestTaskNode"]["check_results"]
+            .as_array()
+            .unwrap();
+        assert_eq!(results[0]["failure_class"], "fixable");
     }
 
     #[tokio::test]
