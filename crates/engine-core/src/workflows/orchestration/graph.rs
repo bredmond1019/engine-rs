@@ -1451,9 +1451,7 @@ impl Node for OrchestrationRunNode {
             ))
         };
 
-        ctx.nodes.insert(
-            NODE_NAME.to_string(),
-            json!({
+        let node_result = json!({
                 "steps_integrated": outcomes.len(),
                 "chain_report": chain_report,
                 "blocks": outcomes
@@ -1502,14 +1500,21 @@ impl Node for OrchestrationRunNode {
                         "total_tokens": o.total_tokens,
                     }))
                     .collect::<Vec<_>>(),
-            }),
-        );
+        });
+        ctx.nodes.insert(NODE_NAME.to_string(), node_result.clone());
         // `EN.17.B` task 4, part 5: the report is now on `ctx` (stamped
         // above) regardless of which branch this takes; this is what makes
         // the `bailed`-non-empty check independent of the `Ok`/`Err` arm
         // `outcomes_result` returned.
+        //
+        // The soft-Err path (outcomes_result `Ok`, but `chain_report.bailed`
+        // non-empty — the `SkipDependents` case this block exists for) must
+        // carry the same payload on the error, because `workflow.rs`'s
+        // `node_context` reverts `ctx` to `pre_call_ctx` on `Err` and
+        // replays only `err.node_result`. Without this the stamp above is
+        // discarded and no `chain_report` reaches `ctx.nodes`.
         if let Some(message) = bailed_error_message {
-            return Err(NodeError::new(message));
+            return Err(NodeError::new(message).with_node_result(node_result));
         }
         Ok(ctx)
     }

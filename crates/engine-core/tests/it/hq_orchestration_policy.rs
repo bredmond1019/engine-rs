@@ -359,6 +359,25 @@ async fn hq_orchestration_policy_node_run_uses_brain_root_policy() {
         .expect_err("A.1 bails, so the node itself reports the run as failed");
     assert!(err.message.contains("A.1"));
 
+    // `EN.17.B`: the SOFT-Err path — `integrate_chain` returned `Ok`
+    // (skip_dependents let C.1 run), but `chain_report.bailed` is non-empty,
+    // so `process` returns `Err`. `workflow.rs`'s `node_context` reverts
+    // `ctx` on `Err` and replays only `err.node_result`, so the report must
+    // ride out on the error itself or it never reaches `ctx.nodes`.
+    let node_result = err
+        .node_result
+        .as_ref()
+        .expect("the soft-Err path must carry node_result so chain_report survives the ctx revert");
+    assert_eq!(
+        node_result["chain_report"]["bailed"],
+        json!(["repo-a:A.1"]),
+        "chain_report in the carried node_result must name the bailed block"
+    );
+    assert_eq!(
+        node_result["steps_integrated"], json!(1),
+        "the carried payload is the full success-path stamp, not a chain_report-only stub: {node_result}"
+    );
+
     let dispatched: Vec<String> = calls
         .lock()
         .unwrap()
