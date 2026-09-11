@@ -250,9 +250,11 @@ bailed/skipped set stays empty whenever the chain would already have returned `E
 returns from the chain. Under `skip_dependents`, the step is `Skipped` with `blocked_by` set to
 the unmet `DependencyEdge` in its authored shape (`block`, `operator`, `approval` or `external`),
 and the chain continues to the next step. Under `stop_chain` this is unchanged: the first unmet
-edge still returns `Err` immediately. A step refused by `gates::check_permission_gate` (the
-permission-denied HOLD outcome, `EN.15.J`) is treated the same way — a stop for its own
-dependents, never for the chain's independent steps, under `skip_dependents`.
+edge still returns `Err` immediately. `gates::check_permission_gate` is NOT currently called from
+this loop (`EN.15.J`'s scope was the HOLD/operator-edge path via `wait_for_clearance`, not this
+gate) — wiring it in, and deciding how a refusal should interact with `skip_dependents`, is tracked
+as carryover `check-permission-gate-never-wired-into-orchestration-loop`, not implemented by this
+block.
 
 **`blocked_by`.** `LaneLogEntry` gains an additive, optional `blocked_by: Option<serde_json::Value>`
 field (omitted, never `null`, on every status but `Skipped`) — see "The lane-log contract" above
