@@ -2504,6 +2504,41 @@ impl Node for TriageTaskNode {
             return Ok(ctx);
         }
 
+        // An `Escalate`-class failed check bails the task on the attempt it
+        // failed — even attempt 1, unlike the `max_attempts` exhaustion path
+        // below — and never reaches the LLM triage call at all. Read straight
+        // out of the raw `check_results[]` JSON (matching how
+        // `first_failure_detail` above already reads this same array) rather
+        // than deserializing into `CheckResult`, since only `name` and
+        // `failure_class` are needed here.
+        if let Some(escalating) = test_result
+            .get("check_results")
+            .and_then(|v| v.as_array())
+            .and_then(|checks| {
+                checks.iter().find(|check| {
+                    check.get("passed").and_then(|v| v.as_bool()) == Some(false)
+                        && check.get("failure_class").and_then(|v| v.as_str()) == Some("escalate")
+                })
+            })
+        {
+            let check_name = escalating
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("<unnamed check>");
+            put_result(
+                &mut ctx,
+                "TriageTaskNode",
+                json!({
+                    "verdict": "MAJOR_BAIL",
+                    "reason": format!(
+                        "Check '{check_name}' declared failureClass: escalate and failed; \
+                         bailing without retry."
+                    ),
+                }),
+            );
+            return Ok(ctx);
+        }
+
         if attempt_count >= max_attempts {
             let task_id = task.task_id;
             let mut reason = format!(
@@ -4321,6 +4356,87 @@ pub(crate) mod tests {
         // transport call.
         let node = TriageTaskNode::new().with_transport(panicking_transport());
         let ctx = ctx_with_test_result(false, &task);
+        let out = node.process(ctx).await.expect("process should succeed");
+        assert_eq!(out.nodes["TriageTaskNode"]["verdict"], "RETRYABLE");
+    }
+
+    /// EN.17.G task 4: a failed check declaring `failureClass: escalate`
+    /// bails on the FIRST attempt — before `max_attempts` is anywhere near
+    /// exhausted — and never invokes the LLM triage transport
+    /// (`panicking_transport` proves that: any call panics the test).
+    #[tokio::test]
+    async fn triage_escalate_class_bails_without_retry_or_llm_call() {
+        let mut task = SDLCTask::new(3, "Three", "d3");
+        task.max_attempts = 3;
+        task.attempt_count = 0; // first attempt — not exhausted
+
+        let state = state_with_tasks(vec![task.clone()]);
+        let mut ctx = ctx_with_current_task(&state, &task);
+        ctx.nodes.insert(
+            "TestTaskNode".to_string(),
+            json!({
+                "all_passed": false,
+                "failure_summary": "1 check failed",
+                "check_results": [{
+                    "name": "cargo audit",
+                    "kind": "command",
+                    "passed": false,
+                    "output": "vulnerable dependency found",
+                    "message": "exit code 1",
+                    "failure_class": "escalate",
+                }],
+            }),
+        );
+
+        let node = TriageTaskNode::new().with_transport(panicking_transport());
+        let out = node
+            .process(ctx)
+            .await
+            .expect("process should succeed without ever reaching the LLM");
+
+        assert_eq!(out.nodes["TriageTaskNode"]["verdict"], "MAJOR_BAIL");
+        let reason = out.nodes["TriageTaskNode"]["reason"]
+            .as_str()
+            .expect("reason is a string");
+        assert!(
+            reason.contains("cargo audit"),
+            "bail reason must name the escalating check: {reason}"
+        );
+        assert!(
+            reason.contains("escalate"),
+            "bail reason should state why it bailed without retry: {reason}"
+        );
+    }
+
+    /// Companion to the above: a failed check with no `failure_class` (the
+    /// default `Fixable`) retries exactly as today — under budget with
+    /// `llm_triage` off (the default), it is `RETRYABLE`, never `MAJOR_BAIL`,
+    /// even though the check itself failed.
+    #[tokio::test]
+    async fn triage_fixable_default_still_retries() {
+        let mut task = SDLCTask::new(4, "Four", "d4");
+        task.max_attempts = 3;
+        task.attempt_count = 0;
+
+        let state = state_with_tasks(vec![task.clone()]);
+        let mut ctx = ctx_with_current_task(&state, &task);
+        ctx.nodes.insert(
+            "TestTaskNode".to_string(),
+            json!({
+                "all_passed": false,
+                "failure_summary": "1 check failed",
+                "check_results": [{
+                    "name": "cargo nextest run --workspace",
+                    "kind": "command",
+                    "passed": false,
+                    "output": "1 test failed",
+                    "message": "exit code 100",
+                    "failure_class": "fixable",
+                }],
+            }),
+        );
+
+        let node = TriageTaskNode::new().with_transport(panicking_transport());
         let out = node.process(ctx).await.expect("process should succeed");
         assert_eq!(out.nodes["TriageTaskNode"]["verdict"], "RETRYABLE");
     }
