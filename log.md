@@ -14,6 +14,21 @@ related: [status, context]
 
 *Append-only working log. One dated entry per session. Newest entries at the top.*
 
+## [run: 2026-09-11]
+
+`/sdlc-flow` on branch `EN.15.K-flow` closed `EN.15.K` — CONSOLIDATE — discovery, selection, watermark and disposal.json in Rust — across 6 tasks, PASS review. Task 1 added `discover.rs`'s `discover_participants`, reusing EN.15.H's `roadmap_status::{discover_run_records,realpath_dedup,read_lane_log,repos_from_lane_log}` rather than re-implementing, and documented (without fixing, out of scope) a latent bug where `discover_run_records` silently drops a run record reachable only through a `planning/` symlink. Task 2 added `select.rs`, implementing D57's two-axis `origin_roadmap` selection rule plus a `since_filter`. Task 3 added `watermark.rs`, porting `lane_log_watermark.py`'s drift/backwards checks byte-for-byte onto the shared `consolidation-watermark.json`. Task 4 added `disposal.rs`, writing `disposal.json` for the first time through okf-core's `DisposalFile`/`DisposalRow`, refusing an out-of-enum route at construction (signature deviation logged under D18). Task 5 added `remediation.rs` — idempotent promotion of a failing verification-ledger entry into HQ's `docs/sandbox/remediation.json`/`findings.json`, validated via `check_remediation.py`, writing no repo's `state.json`. Task 6 assembled the `CONSOLIDATE` graph, registered it in `engine-serve`, added 5 acceptance tests in `tests/it/consolidate.rs`, and — across two fix passes touching task 5's files to clear a workspace-wide fmt/clippy/eprintln failure and then to satisfy the work-assertion check — closed a real gap beyond the spec's literal wording: a corpus-wide recursive `state.json` content-hash sweep (with positive controls) replacing the single hardcoded-path no-drift check, covering the remediation stage's external Python writers too. `disposal.json` is now written by an automated workflow for the first time. Next: `EN.17.A` — a refused or foreign-held lease stops the block, and the coordination reader sees real inboxes.
+
+```
+681b488 docs: update docs for EN.15.K
+73fd51d fix: fix pass 2 for EN.15.K-task6
+3950a47 fix: fix pass 1 for EN.15.K-task6
+dd61f2d feat: implement EN.15.K-task6
+b83f8ad feat: implement EN.15.K-task5
+9260441 feat: implement EN.15.K-task4
+be5c419 feat: implement EN.15.K-task3
+5fc697b feat: implement EN.15.K-task2
+```
+
 ## [run: 2026-09-10]
 
 `/sdlc-flow` on branch `EN.15.L-flow` closed `EN.15.L` — the D57 verification-ledger seam for ORCHESTRATION — across 5 tasks, PASS review. Task 1 added `crates/engine-core/src/workflows/orchestration/ledger.rs`: a typed `LedgerEntry` (compile-time-unrepresentable `finding` field, remediation only valid on failed/blocked), `create_ledger_if_absent` (json + OKF-frontmatter md wrapper), and a read-modify-write `merge_append_entries` that is id-collision-safe. Task 2 wired the append into `integrate_chain_with_run_record` between the lane-log "closed" line and `close_block`, behind an injected `ComposeLedgerEntriesFn` seam, so a bail on the next step still leaves the just-closed block's entries on disk; a composer error is caught and recorded as a non-fatal `GateRefused` journal row rather than failing the chain. Task 3 gave `engine-serve`'s `journal.rs` a real production `AgentCodeStep`-based composer, resolving its model tier through a new `orchestration.policy.composer_model_tier` harness knob (sonnet/haiku/opus across baseline/cheap-fast/thorough) — and confirmed via `escalate.rs`'s `BailEntry` that no production path files a remediation ticket today, so the composer answers `call_site: NONE` and the gap is recorded as an open finding in `coordination-layer-port/notes.md` rather than inventing a caller. Task 4 documented the new knob in `planning/harness.json`. Task 5 added `crates/engine-core/tests/it/ledger.rs` (6 chain-level tests: bail-proves-per-close, happy path, create-if-absent, merge/dedupe, validation refusals, composer-error-is-non-fatal) and fixed a pre-existing `engine_kind.rs` scan-list drift (`ledger.rs` missing from the sanctioned-string-fn allowlist) that was failing the workspace-wide `cargo nextest run --workspace` gate independent of this spec's own changes. `docs/workflows/orchestration.md` updated. Next: EN.17.A — a refused or foreign-held lease stops the block, and the coordination reader sees real inboxes.
