@@ -78,7 +78,7 @@ alone — never by guessing at payload contents:
 
 ## The workflows
 
-Twenty registered types, grouped by what you'd use them for. The registration list in
+Twenty-one registered types, grouped by what you'd use them for. The registration list in
 `crates/engine-serve/src/workflows.rs` (`register_builtin_workflows`) is the source of truth; this
 table is a reader's copy.
 
@@ -117,6 +117,7 @@ table is a reader's copy.
 | `HARVEST_APPROVE` | Presents a queued Brain write for a human yes/no before it lands. | [`../harvest-gate.md`](../harvest-gate.md) |
 | `APPROVE_AND_RUN` | Takes an approved decision and actually executes the thing it authorized, recording one ledger row. | [approve-and-run.md](approve-and-run.md) |
 | `TERMINAL_PROBE` | Opens (or reattaches to) a tmux session and reads its pane back. A diagnostic for the terminal stack, not business work. | [terminal-probe.md](terminal-probe.md) |
+| `HELD_SESSION` | Opens a tmux session and keeps it alive across a whole workflow's node boundaries via a background renewal loop, instead of a per-node lease that lapses between calls. For a chain that needs the SAME session across a long gap (an operator thinking, a cross-repo lane running for hours). | [coordination.md](coordination.md) |
 
 ### Maintaining the Brain
 

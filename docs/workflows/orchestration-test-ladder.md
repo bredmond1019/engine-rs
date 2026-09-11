@@ -118,6 +118,56 @@ curl -sf -X POST "$BASTION_SERVE_ADDR/events/" -H "X-API-Key: $BASTION_ENGINE_AP
 | Success | One real, non-fixture block closes, chosen and justified by the engine, not named by you — this is the actual test `EN.ticket.first-real-orchestration-run` and `planning/objective.md`'s own "Done when" checklist are waiting on |
 | If it doesn't work | Same troubleshooting as Tiers 1–3, applied to whatever `CONDUCTOR` picked — read the journal row first to see *what* it picked before debugging *why* it failed |
 
+## Tier 7 — the coordination-native workflows, each dispatched alone
+
+Proves each of the three coordination workflows runs standalone, outside any `ORCHESTRATION`
+chain. Full mechanics for each: [commander.md](commander.md), [sweep.md](sweep.md),
+[consolidate.md](consolidate.md).
+
+| Workflow | Trigger | Success |
+|---|---|---|
+| `COMMANDER` | `curl -sf -X POST "$BASTION_SERVE_ADDR/events/" -H "X-API-Key: $BASTION_ENGINE_API_KEY" -H 'Content-Type: application/json' -d '{"workflow_type":"COMMANDER","data":{"root":"<brain-root>","repo":"<repo>","agent":"<agent-id>"}}'` | The run's journal shows the drain step, then the triage step; `<brain-root>/planning/roadmaps/*/lane-log.jsonl`... no new content is required — a drain over an empty queue is a normal, successful no-op |
+| `SWEEP` | `curl -sf -X POST "$BASTION_SERVE_ADDR/events/" -H "X-API-Key: $BASTION_ENGINE_API_KEY" -H 'Content-Type: application/json' -d '{"workflow_type":"SWEEP","data":{"root":"<brain-root>","roadmap":"<roadmap-slug>"}}'` | A new file appears at `<roadmap-dir>/sweeps/<ts>.json`; run it twice and confirm the second run's `diff` against the first is empty when nothing changed in between |
+| `CONSOLIDATE` | `curl -sf -X POST "$BASTION_SERVE_ADDR/events/" -H "X-API-Key: $BASTION_ENGINE_API_KEY" -H 'Content-Type: application/json' -d '{"workflow_type":"CONSOLIDATE","data":{"brain_root":"<brain-root>","roadmap_slug":"<roadmap-slug>"}}'` | `disposal.json` is written (or updated) for that roadmap; the watermark advances — confirm via a second run producing no new rows |
+
+**If it doesn't work:** any of the three returns `404` on trigger → same check as Tier 1, items
+1–3. `SWEEP` writes an empty diff on a roadmap you know changed → confirm you pointed `root` at the
+brain root (`agentic-portfolio/`), not this repo — `roadmap` alone is not enough to locate the
+snapshot history.
+
+## Tier 8 — `HELD_SESSION` survives a gap between node calls
+
+Full mechanics: [coordination.md § HELD_SESSION](coordination.md#held_session--a-tmux-session-that-survives-a-workflows-own-gaps).
+
+**Trigger:**
+```bash
+curl -sf -X POST "$BASTION_SERVE_ADDR/events/" -H "X-API-Key: $BASTION_ENGINE_API_KEY" \
+  -H 'Content-Type: application/json' -d '{"workflow_type":"HELD_SESSION","data":{}}'
+```
+
+| | |
+|---|---|
+| Watch for | The run acquires a real tmux session (check `tmux ls` on the host for a new session name) |
+| Success | A second dispatch against the same session identity reuses it rather than creating a new tmux session; killing the tmux server mid-run (`tmux kill-server`) surfaces a bounded-time `session_lost` error in the run's result, not a hang |
+| If it doesn't work | No tmux session appears at all → `tmux` isn't on PATH where `bastion serve` runs, or the held-session lease directory (`coord::resolve_lock_dir`) isn't writable. Run hangs past a few seconds after `tmux kill-server` → the abandoned-lease reclaim path regressed; this is exactly what `real_tmux_external_kill_surfaces_a_node_error_within_a_bounded_time_not_a_hang` gates in CI, so check that test first before debugging live |
+
+## Tier 9 — `SDLC_FLOW`'s pre-run baseline snapshot and `failureClass: escalate` (`EN.17.G`)
+
+Proves the test-stage gate mechanics, not `ORCHESTRATION` — run this against a plain `SDLC_FLOW`
+dispatch. Full mechanics: [sdlc-flow.md § Baseline-diff pre-run snapshot](sdlc-flow.md#baseline-diff-pre-run-snapshot-and-failureclass-escalate-en17g).
+
+| Case | How to produce it | Watch for |
+|---|---|---|
+| **Baseline snapshot catches a task's own regression** | Give a fixture spec's `harness.json` a `baseline-diff` check with a `baselineCommand`, and a task that adds one net-new entry to that command's output | The check FAILS on that task — confirming the pre-run snapshot (not a post-implementation one) is what it's judged against; re-run the identical fixture with no net-new entry and confirm it passes |
+| **`failureClass: escalate` skips retries** | Mark one check `"failureClass": "escalate"` in the fixture `harness.json`, and make it fail on task 1's first attempt | The task bails on the FIRST attempt (`max_attempts` never consumed past 1); its bail `check_id` equals the check's declared `name`, not a generic label |
+
+**If it doesn't work:** the net-new entry passes anyway → confirm a baseline file actually exists at
+`<spec_dir>/sdlc/baseline-<check-name-slug>.txt` before the first task ran; if absent, the run
+fell back to the pre-`EN.17.G` post-implementation behavior (not a bug, just the documented
+fallback — the `CheckResult.message` states this explicitly). The escalate case still retries →
+confirm the check's `failureClass` key is spelled exactly `escalate` (any other value, including a
+typo, is `Fixable`, behavior-stable per CLAUDE.md standing rule 6).
+
 ## Optional — true $0 coordination testing
 
 Tiers 2 and 4 only need coordination/budget mechanics, not a real code change. A `StepKind::Dispatch`
@@ -134,3 +184,6 @@ the trivial fixture's cost adds up.
 | Full `CONDUCTOR` mechanics — caps, profiles, the pre-flight | [orchestration.md § CONDUCTOR](orchestration.md#conductor-picking-tonights-chain-en12f) |
 | Env vars, health check, how to read a campaign back | [trigger-and-monitor.md](trigger-and-monitor.md) |
 | The escalation/bail record shape | [orchestration.md § A bail or a stuck operator hold](orchestration.md#a-bail-or-a-stuck-operator-hold-now-writes-an-escalation-and-a-bails-entry-en15g) |
+| The `/api/coordination/*` HTTP read/write surface | [coordination.md](coordination.md) |
+| `COMMANDER`/`SWEEP`/`CONSOLIDATE` full mechanics | [commander.md](commander.md) · [sweep.md](sweep.md) · [consolidate.md](consolidate.md) |
+| Baseline-diff snapshot and `failureClass: escalate` full mechanics | [sdlc-flow.md § Baseline-diff pre-run snapshot](sdlc-flow.md#baseline-diff-pre-run-snapshot-and-failureclass-escalate-en17g) |
