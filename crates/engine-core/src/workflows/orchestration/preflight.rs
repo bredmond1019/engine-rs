@@ -42,7 +42,7 @@
 use std::path::{Component, Path};
 use std::time::{Duration, Instant};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use engine_contract::TaskContext;
@@ -151,7 +151,11 @@ fn slice_text(record: &Value, key: &str) -> String {
 
 /// A judged claim's verdict once its `argv` has been validated and (when
 /// admitted) executed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// `EN.17.D` task 4: `Serialize` added so a [`BlockPreflight`] can be
+/// stamped straight into `ctx.nodes[NODE_NAME]["preflight_report"]`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ClaimVerdict {
     /// The command ran and its outcome matched `expect`.
     Held,
@@ -164,7 +168,9 @@ pub enum ClaimVerdict {
 
 /// One claim's full record: what was claimed, what was run, and the
 /// resulting verdict.
-#[derive(Debug, Clone)]
+///
+/// `EN.17.D` task 4: `Serialize` added — see [`ClaimVerdict`]'s own doc.
+#[derive(Debug, Clone, Serialize)]
 pub struct ClaimResult {
     pub claim: String,
     pub argv: Vec<String>,
@@ -178,7 +184,10 @@ pub struct ClaimResult {
 }
 
 /// One block step's preflight outcome.
-#[derive(Debug, Clone)]
+///
+/// `EN.17.D` task 4: `Serialize` added — see [`ClaimVerdict`]'s own doc.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum PreflightOutcome {
     /// The judgment call succeeded; `claims` is every claim actually
     /// executed (bounded by `PreflightConfig::max_claims`).
@@ -197,7 +206,9 @@ pub enum PreflightOutcome {
 
 /// One block step's accumulated preflight record — one of these per block
 /// step, in chain order, forms the run's `preflight_report`.
-#[derive(Debug, Clone)]
+///
+/// `EN.17.D` task 4: `Serialize` added — see [`ClaimVerdict`]'s own doc.
+#[derive(Debug, Clone, Serialize)]
 pub struct BlockPreflight {
     pub repo: String,
     pub block_id: String,
@@ -709,6 +720,24 @@ impl PreflightRunner {
                 claims: Vec::new(),
                 claims_dropped: 0,
             },
+        }
+    }
+}
+
+/// `EN.17.D` task 4: build a [`PreflightConfig`] from the resolved
+/// `OrchestrationPolicy`'s eight preflight knobs — the shape
+/// [`PreflightRunner`] consumes, kept a `From` conversion at this module's
+/// own boundary so `graph.rs`'s production wiring never has to name (or
+/// duplicate) `PreflightConfig`'s field list itself.
+impl From<&super::graph::OrchestrationPolicy> for PreflightConfig {
+    fn from(policy: &super::graph::OrchestrationPolicy) -> Self {
+        Self {
+            model_tier: policy.preflight_model_tier,
+            max_claims: policy.preflight_max_claims,
+            max_turns: policy.preflight_max_turns,
+            slice_max_bytes: policy.preflight_slice_max_bytes,
+            programs: policy.preflight_programs.clone(),
+            command_timeout_ms: policy.preflight_command_timeout_ms,
         }
     }
 }

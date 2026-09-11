@@ -2012,7 +2012,12 @@ fn default_preflight(_repo: &str, _block_id: &str) -> PreflightOutcome {
 /// `check_id: "preflight-unjudged"`. `OrchestrationPolicy`'s own
 /// `preflight_on_unjudged` knob (task 4) resolves to one of these two
 /// variants.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+///
+/// `EN.17.D` task 4: `Serialize`/`Deserialize` added so this can live on
+/// `OrchestrationPolicy` (which derives both, mirroring `OnBail`/
+/// `BailChannel`) and be stamped straight into a run's `preflight_report`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum OnUnjudged {
     #[default]
     Proceed,
