@@ -112,10 +112,15 @@ pub(super) fn apply_policy(
 pub(super) fn apply_policy_config(config: Config, policy: &SdlcPolicy, stage: Stage) -> Config {
     let tier = stage_model_tier(policy, stage);
     let timeout_secs = stage_call_timeout(policy, stage);
+    let max_turns = stage_turn_ceiling(policy, stage);
     let config = crate::policy::apply_model_tier(config, tier, &policy.local.model);
     let config =
         crate::policy::apply_prompt_cache(config, policy.prompt_cache, STABLE_SYSTEM_PROMPT);
-    crate::policy::apply_call_timeout(config, timeout_secs)
+    let mut config = crate::policy::apply_call_timeout(config, timeout_secs);
+    if let Some(turns) = max_turns {
+        config.max_turns = Some(turns);
+    }
+    config
 }
 
 /// The resolved [`ModelTier`] for `stage`.
@@ -140,6 +145,20 @@ pub(super) fn stage_call_timeout(policy: &SdlcPolicy, stage: Stage) -> Option<u6
         Stage::Review => policy.timeouts.review,
         Stage::Generate => policy.timeouts.generate,
         Stage::Docs => policy.timeouts.docs,
+    }
+}
+
+/// The resolved in-turn tool-call ceiling for `stage`, `None` when the run
+/// set none (`Config.max_turns` then stays `None`, i.e. `claude-code-rs`'s
+/// own unbounded default). Mirrors [`stage_call_timeout`].
+#[must_use]
+pub(super) fn stage_turn_ceiling(policy: &SdlcPolicy, stage: Stage) -> Option<u32> {
+    match stage {
+        Stage::Implement => policy.max_turns.implement,
+        Stage::Triage => policy.max_turns.triage,
+        Stage::Review => policy.max_turns.review,
+        Stage::Generate => policy.max_turns.generate,
+        Stage::Docs => policy.max_turns.docs,
     }
 }
 
@@ -1209,8 +1228,32 @@ impl Node for ImplementTaskNode {
             prompt.push_str(&feedback);
         }
 
-        let (mut config, prompt) =
-            apply_policy(self.config.clone(), prompt, &policy, Stage::Implement);
+        // Escalate to `model_tiers.implement_final_attempt` (default `None`,
+        // behavior-stable) on the task's LAST attempt only — matching the JS
+        // engine's `ESCALATION_MODEL` behavior. `current_task_state` reads
+        // the *live* durable state, the same authority `TriageTaskNode` uses
+        // for this same attempt/max_attempts pair. The attempt about to run
+        // is `attempt_count + 1` (`attempt_count` counts RETRIES, not
+        // attempts — see [`bump_task_attempt`]'s doc comment), so this is
+        // final when that equals `max_attempts`.
+        let task_state = current_task_state(&ctx, "ImplementTaskNode")?;
+        let is_final_attempt =
+            u64::from(task_state.attempt_count) + 1 >= u64::from(task_state.max_attempts);
+        let mut effective_policy = policy.clone();
+        let mut model_tier_used = policy.model_tiers.implement;
+        if is_final_attempt {
+            if let Some(escalated) = policy.model_tiers.implement_final_attempt {
+                effective_policy.model_tiers.implement = escalated;
+                model_tier_used = escalated;
+            }
+        }
+
+        let (mut config, prompt) = apply_policy(
+            self.config.clone(),
+            prompt,
+            &effective_policy,
+            Stage::Implement,
+        );
         // Scope the model's session to the actual worktree so it edits the
         // right checkout rather than inheriting the host process's ambient
         // cwd. Best-effort: a ctx driven directly (no `SetupWorktreeNode`
@@ -1259,6 +1302,10 @@ impl Node for ImplementTaskNode {
             "summary": parsed.summary,
             "modified_files": parsed.modified_files,
             "tests_added": parsed.tests_added,
+            // Stamp the resolved tier so `RunTelemetry`/`PolicyAggregate` can
+            // attribute this call's cost to the setting that caused it
+            // (standing rule 6) — mirrors `docs.rs`'s `"model_tier"` stamp.
+            "model_tier": model_tier_used,
         });
         // Nested under `"state"`, not instead of the payload above: this
         // result is also what the write-verification guard reads
@@ -3901,6 +3948,98 @@ pub(crate) mod tests {
             Stage::Implement,
         );
         assert_eq!(config.timeout, Some(std::time::Duration::from_secs(1800)));
+    }
+
+    /// The behavior-stability guarantee for `max_turns`, mirroring
+    /// `apply_policy_leaves_timeout_none_for_every_stage_by_default`: an
+    /// unconfigured policy leaves `Config.max_turns` at `None` for every
+    /// stage, so `claude-code-rs`'s own unbounded default applies.
+    #[test]
+    fn apply_policy_leaves_max_turns_none_for_every_stage_by_default() {
+        let policy = SdlcPolicy::default();
+        for stage in [
+            Stage::Implement,
+            Stage::Triage,
+            Stage::Review,
+            Stage::Generate,
+            Stage::Docs,
+        ] {
+            let config = apply_policy_config(Config::default(), &policy, stage);
+            assert_eq!(
+                config.max_turns, None,
+                "stage {stage:?} should set no turn ceiling"
+            );
+        }
+    }
+
+    /// Each of implement/review/triage/generate/docs is independently
+    /// wired — setting one field never affects another stage's `Config`.
+    #[test]
+    fn apply_policy_sets_the_resolved_per_stage_turn_ceiling() {
+        let policy = SdlcPolicy {
+            max_turns: crate::workflows::sdlc_flow::policy::StageTurnCeilings {
+                implement: Some(12),
+                triage: Some(3),
+                review: Some(7),
+                generate: Some(25),
+                docs: Some(4),
+            },
+            ..SdlcPolicy::default()
+        };
+
+        let implement = apply_policy_config(Config::default(), &policy, Stage::Implement);
+        assert_eq!(implement.max_turns, Some(12));
+
+        let triage = apply_policy_config(Config::default(), &policy, Stage::Triage);
+        assert_eq!(triage.max_turns, Some(3));
+
+        let review = apply_policy_config(Config::default(), &policy, Stage::Review);
+        assert_eq!(review.max_turns, Some(7));
+
+        let generate = apply_policy_config(Config::default(), &policy, Stage::Generate);
+        assert_eq!(generate.max_turns, Some(25));
+
+        let docs = apply_policy_config(Config::default(), &policy, Stage::Docs);
+        assert_eq!(docs.max_turns, Some(4));
+    }
+
+    /// A per-stage `None` inside an otherwise-configured `max_turns` block is
+    /// still a no-op for that stage — the knob is opt-in stage by stage.
+    /// Mirrors `apply_policy_timeout_is_per_stage_not_global`.
+    #[test]
+    fn apply_policy_max_turns_is_per_stage_not_global() {
+        let policy = SdlcPolicy {
+            max_turns: crate::workflows::sdlc_flow::policy::StageTurnCeilings {
+                implement: Some(12),
+                ..Default::default()
+            },
+            ..SdlcPolicy::default()
+        };
+        let triage = apply_policy_config(Config::default(), &policy, Stage::Triage);
+        assert_eq!(triage.max_turns, None);
+        let review = apply_policy_config(Config::default(), &policy, Stage::Review);
+        assert_eq!(review.max_turns, None);
+    }
+
+    /// End-to-end through the real four-layer resolver, mirroring
+    /// `event_override_timeout_resolves_through_to_config`: an event-level
+    /// `policy.max_turns.implement` override reaches the built `Config`.
+    #[test]
+    fn event_override_max_turns_resolves_through_to_config() {
+        use crate::workflows::sdlc_flow::policy::{
+            resolve, PartialPolicy, PartialStageTurnCeilings,
+        };
+
+        let event = PartialPolicy {
+            max_turns: Some(PartialStageTurnCeilings {
+                implement: Some(15),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let policy = resolve(SdlcPolicy::default(), None, None, Some(&event));
+        let config = apply_policy_config(Config::default(), &policy, Stage::Implement);
+        assert_eq!(config.max_turns, Some(15));
     }
 
     // --- TaskQueueRouterNode -----------------------------------------------
@@ -7460,6 +7599,88 @@ pub(crate) mod tests {
             .clone()
             .expect("transport should have been called");
         assert_eq!(config.model.as_deref(), Some("claude-haiku-4-5"));
+    }
+
+    // --- implement_final_attempt (EN.17.F task 3) --------------------------
+
+    /// Drive `ImplementTaskNode` for one attempt with `implement_final_attempt`
+    /// set, asserting on the `Config` the stub transport actually saw and on
+    /// the tier stamped into the node's transport result.
+    async fn implement_attempt_config(
+        attempt_count: u32,
+        max_attempts: u32,
+        implement_final_attempt: Option<ModelTier>,
+    ) -> (Config, serde_json::Value) {
+        let mut task = SDLCTask::new(1, "One", "d1");
+        task.attempt_count = attempt_count;
+        task.max_attempts = max_attempts;
+        let state = state_with_tasks(vec![task.clone()]);
+        let ctx = ctx_with_current_task(&state, &task);
+
+        let policy = SdlcPolicy {
+            model_tiers: ModelTiers {
+                implement: ModelTier::Sonnet,
+                implement_final_attempt,
+                ..ModelTiers::default()
+            },
+            ..SdlcPolicy::default()
+        };
+        let ctx = ctx_with_policy(ctx, &policy);
+
+        let seen_config: Arc<Mutex<Option<Config>>> = Arc::new(Mutex::new(None));
+        let seen_config_clone = seen_config.clone();
+        let transport: ModelTransport = Arc::new(move |config, _prompt| {
+            *seen_config_clone.lock().unwrap() = Some(config);
+            let outcome = canned_outcome(json!({ "summary": "done" }).to_string());
+            Box::pin(async move { Ok(outcome) })
+        });
+
+        let node = ImplementTaskNode::new().with_transport(transport);
+        let ctx = node.process(ctx).await.expect("process should succeed");
+
+        let config = seen_config
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("transport should have been called");
+        let result = ctx
+            .nodes
+            .get("ImplementTaskNode")
+            .cloned()
+            .expect("ImplementTaskNode stamped a result");
+        (config, result)
+    }
+
+    /// With `implement_final_attempt: Some(Opus)` and `max_attempts: 3`, an
+    /// attempt that is NOT the task's last (`attempt_count: 0`, about to run
+    /// attempt 1 of 3) dispatches on the ordinary `implement` tier, and
+    /// stamps that tier — not the escalated one — into the transport result.
+    #[tokio::test]
+    async fn implement_final_attempt_tier_unused_before_the_last_attempt() {
+        let (config, result) = implement_attempt_config(0, 3, Some(ModelTier::Opus)).await;
+        assert_eq!(config.model.as_deref(), Some("claude-sonnet-4-5"));
+        assert_eq!(result["model_tier"], json!("sonnet"));
+    }
+
+    /// With `implement_final_attempt: Some(Opus)` and `max_attempts: 3`, the
+    /// task's LAST attempt (`attempt_count: 2`, about to run attempt 3 of 3)
+    /// dispatches on the escalated Opus tier, stamped into the transport
+    /// result.
+    #[tokio::test]
+    async fn implement_final_attempt_escalates_on_the_last_attempt() {
+        let (config, result) = implement_attempt_config(2, 3, Some(ModelTier::Opus)).await;
+        assert_eq!(config.model.as_deref(), Some("claude-opus-4-8"));
+        assert_eq!(result["model_tier"], json!("opus"));
+    }
+
+    /// With `implement_final_attempt: None` (the built-in default), every
+    /// attempt — including the task's last — uses the `implement` tier
+    /// exactly as today.
+    #[tokio::test]
+    async fn implement_final_attempt_none_leaves_every_attempt_on_implement_tier() {
+        let (config, result) = implement_attempt_config(2, 3, None).await;
+        assert_eq!(config.model.as_deref(), Some("claude-sonnet-4-5"));
+        assert_eq!(result["model_tier"], json!("sonnet"));
     }
 
     // --- transport_retry (EN.ticket.sdlc-flow-dead-policy-knobs task 3) ----

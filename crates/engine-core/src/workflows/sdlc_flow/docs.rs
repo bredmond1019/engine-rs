@@ -264,6 +264,7 @@ impl Node for PatchDocsNode {
                 // to the settings that caused it (standing rule 6).
                 "model_tier": policy.model_tiers.docs,
                 "call_timeout_secs": policy.timeouts.docs,
+                "max_turns": policy.max_turns.docs,
             }),
         );
 
@@ -694,6 +695,36 @@ mod tests {
         assert_eq!(config.timeout, Some(std::time::Duration::from_secs(900)));
     }
 
+    /// A `max_turns.docs` override reaches `config.max_turns`; the built-in
+    /// default leaves it `None`.
+    #[tokio::test]
+    async fn resolved_docs_max_turns_reaches_the_config() {
+        let policy = SdlcPolicy {
+            max_turns: crate::workflows::sdlc_flow::policy::StageTurnCeilings {
+                docs: Some(6),
+                ..Default::default()
+            },
+            ..SdlcPolicy::default()
+        };
+        let captured = Arc::new(std::sync::Mutex::new(None));
+        let node = PatchDocsNode::new().with_transport(capturing_transport(captured.clone()));
+
+        node.process(ctx_with_policy(&policy))
+            .await
+            .expect("process should succeed");
+
+        let (config, _) = captured.lock().unwrap().clone().expect("transport called");
+        assert_eq!(config.max_turns, Some(6));
+
+        let captured = Arc::new(std::sync::Mutex::new(None));
+        let node = PatchDocsNode::new().with_transport(capturing_transport(captured.clone()));
+        node.process(ctx_with_policy(&SdlcPolicy::default()))
+            .await
+            .expect("process should succeed");
+        let (config, _) = captured.lock().unwrap().clone().expect("transport called");
+        assert_eq!(config.max_turns, None);
+    }
+
     /// The prompt half of the shaping is applied INSIDE the
     /// `with_prompt_builder` closure — the verbosity directive lands on the
     /// built prompt, while the cached `system_prompt` prefix stays
@@ -750,6 +781,10 @@ mod tests {
                 docs: Some(120),
                 ..Default::default()
             },
+            max_turns: crate::workflows::sdlc_flow::policy::StageTurnCeilings {
+                docs: Some(9),
+                ..Default::default()
+            },
             ..SdlcPolicy::default()
         };
         let node = PatchDocsNode::new().with_transport(stub_transport(json!({
@@ -763,6 +798,7 @@ mod tests {
         let result = out.nodes.get("PatchDocsNode").expect("output present");
         assert_eq!(result["model_tier"], json!("haiku"));
         assert_eq!(result["call_timeout_secs"], json!(120));
+        assert_eq!(result["max_turns"], json!(9));
     }
 
     #[tokio::test]

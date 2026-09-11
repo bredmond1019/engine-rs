@@ -64,6 +64,8 @@ fn baseline_profile_resolves_to_documented_policy() {
             // no-op against the built-in default by contract.
             generate: ModelTier::Opus,
             docs: ModelTier::Sonnet,
+            // No escalation: baseline's no-op contract.
+            implement_final_attempt: None,
         }
     );
     assert_eq!(resolved.review_mode, ReviewMode::PerTask);

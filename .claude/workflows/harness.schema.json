@@ -193,6 +193,11 @@
           "description": "forbidden-pattern-scan only: source patterns that must NOT appear. Any rule that matches is a violation.",
           "items": { "$ref": "#/$defs/rule" }
         },
+        "failureClass": {
+          "type": "string",
+          "enum": ["fixable", "escalate"],
+          "description": "Absent means 'fixable'. 'escalate' means a failure of this check is not addressable by editing code (a flaky external tool, a missing credential, an upstream advisory), so an engine that honours the key should bail rather than spend fix retries on it."
+        },
         "observed_red": {
           "type": "object",
           "additionalProperties": false,

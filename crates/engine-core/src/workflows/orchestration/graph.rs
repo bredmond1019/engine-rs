@@ -149,7 +149,7 @@ fn coord_now_iso() -> String {
 /// defaults, `harness.json`'s `orchestration.policy` defaults, a named
 /// `profile`, and any per-run event override, high->low precedence in that
 /// order (`crate::policy::resolve`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OrchestrationPolicy {
     /// How often [`integrate::wait_for_clearance`] re-polls an operator
     /// hold while the chain is paused.
@@ -232,6 +232,27 @@ pub struct OrchestrationPolicy {
     /// matching the objective's "single repo" cap for the first autonomous
     /// chains. Never consulted for an explicit or `roadmap`+`lane` chain.
     pub conductor_single_repo_only: bool,
+    /// `EN.17.F` Task 1: the partial `sdlc_flow::policy::PartialSdlcPolicy`
+    /// (forwarded opaquely as JSON) this chain's `SDLC_FLOW` children should
+    /// receive as their own event's `policy` override. `None` (the built-in
+    /// default) leaves a child event's `policy` field untouched, so an
+    /// unset override is byte-identical to the pre-Task-1 child event —
+    /// behavior-stable per CLAUDE.md standing rule 6.
+    ///
+    /// This is a raw `serde_json::Value` rather than a typed partial-policy
+    /// struct because this policy lives in `engine-core::workflows::orchestration`
+    /// but the value it forwards targets `sdlc_flow::policy::PartialSdlcPolicy`,
+    /// defined in a sibling module within the same crate that this module
+    /// does not otherwise depend on — forwarding it opaquely as JSON avoids a
+    /// layering dependency; the child event's own policy-resolution layer
+    /// validates/deserializes it.
+    pub child_sdlc_flow_policy: Option<serde_json::Value>,
+    /// `EN.17.F` Task 1: the same forwarding mechanism as
+    /// [`Self::child_sdlc_flow_policy`], but for this chain's `SDLC_TASK`
+    /// children — a partial `sdlc_task::policy::PartialSdlcTaskPolicy`
+    /// forwarded opaquely as JSON for the same layering reason. `None` (the
+    /// built-in default) leaves a child event's `policy` field untouched.
+    pub child_sdlc_task_policy: Option<serde_json::Value>,
 }
 
 impl Default for OrchestrationPolicy {
@@ -252,6 +273,8 @@ impl Default for OrchestrationPolicy {
             campaign_max_total_tokens: None,
             conductor_max_chain_blocks: Some(3),
             conductor_single_repo_only: true,
+            child_sdlc_flow_policy: None,
+            child_sdlc_task_policy: None,
         }
     }
 }
@@ -276,6 +299,8 @@ pub struct PartialOrchestrationPolicy {
     pub campaign_max_total_tokens: Option<Option<u64>>,
     pub conductor_max_chain_blocks: Option<Option<usize>>,
     pub conductor_single_repo_only: Option<bool>,
+    pub child_sdlc_flow_policy: Option<Option<serde_json::Value>>,
+    pub child_sdlc_task_policy: Option<Option<serde_json::Value>>,
 }
 
 impl crate::policy::Policy for OrchestrationPolicy {
@@ -312,6 +337,14 @@ impl crate::policy::Policy for OrchestrationPolicy {
                 self.conductor_single_repo_only,
                 over.conductor_single_repo_only,
             ),
+            child_sdlc_flow_policy: crate::policy::merge_opt(
+                self.child_sdlc_flow_policy,
+                over.child_sdlc_flow_policy.clone(),
+            ),
+            child_sdlc_task_policy: crate::policy::merge_opt(
+                self.child_sdlc_task_policy,
+                over.child_sdlc_task_policy.clone(),
+            ),
         }
     }
 }
@@ -341,6 +374,10 @@ pub fn baseline() -> PartialOrchestrationPolicy {
         campaign_max_total_tokens: Some(None),
         conductor_max_chain_blocks: Some(Some(3)),
         conductor_single_repo_only: Some(true),
+        // EN.17.F Task 1: restate the built-in default verbatim (no
+        // forwarded override) — baseline's no-op contract.
+        child_sdlc_flow_policy: Some(None),
+        child_sdlc_task_policy: Some(None),
     }
 }
 
@@ -381,6 +418,14 @@ pub fn cheap_fast() -> PartialOrchestrationPolicy {
         campaign_max_total_tokens: Some(None),
         conductor_max_chain_blocks: Some(Some(2)),
         conductor_single_repo_only: Some(true),
+        // EN.17.F Task 1 PROFILE RULE: `child_sdlc_flow_policy` /
+        // `child_sdlc_task_policy` are deliberately left UNSET here (fall
+        // through to `Default::default()`'s `None` via `#[serde(default)]`),
+        // never restated at any value — see the block record's `notes`
+        // field. HQ's `orchestration.policy` is what actually switches these
+        // on for a real chain; a profile value here would override that
+        // switch.
+        ..Default::default()
     }
 }
 
@@ -412,6 +457,10 @@ pub fn thorough() -> PartialOrchestrationPolicy {
         campaign_max_total_tokens: Some(None),
         conductor_max_chain_blocks: Some(Some(3)),
         conductor_single_repo_only: Some(true),
+        // EN.17.F Task 1 PROFILE RULE: see `cheap_fast`'s comment — these
+        // two knobs are deliberately left UNSET across every built-in
+        // profile, `thorough` included.
+        ..Default::default()
     }
 }
 
@@ -1045,6 +1094,13 @@ impl Node for OrchestrationRunNode {
         // `bool` is `Copy`, so this crosses the `spawn_blocking` closure
         // by value, no `Arc`/clone needed.
         let default_auto_pr = policy.default_auto_pr;
+        // `EN.17.F` task 2: the resolved child policy overrides, cloned out
+        // of `policy` (not `Copy`, unlike the two `bool` knobs above) so the
+        // clones can move into the `spawn_blocking` closure below by value —
+        // `None` for either leaves the forwarded child event byte-identical
+        // to before this knob existed.
+        let child_sdlc_flow_policy = policy.child_sdlc_flow_policy.clone();
+        let child_sdlc_task_policy = policy.child_sdlc_task_policy.clone();
         // `EN.12.F` Task 5: a conductor-proposed ("autonomous") run gets a
         // real campaign budget ceiling — `integrate::integrate_chain`'s
         // `campaign_budget` parameter has checked this at every block
@@ -1194,6 +1250,11 @@ impl Node for OrchestrationRunNode {
                     // `integrate_chain` call this replaces — see the
                     // `coord` binding's own doc above.
                     coord.as_ref(),
+                    // `EN.17.F` task 2: the EFFECTIVE switch — resolved
+                    // from `policy` above, forwarded to every child event
+                    // this chain composes.
+                    child_sdlc_flow_policy.as_ref(),
+                    child_sdlc_task_policy.as_ref(),
                 ))
                 .map_err(|err| NodeError::new(err.to_string()))
             })

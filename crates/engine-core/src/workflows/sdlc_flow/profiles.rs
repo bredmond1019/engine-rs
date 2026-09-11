@@ -10,7 +10,7 @@
 
 use super::policy::{
     ModelTier, OutputVerbosity, PartialCallTimeouts, PartialModelTiers, PartialPolicy,
-    PartialRetryFeedback, PartialTransportRetry, ReviewMode, TestDepth,
+    PartialRetryFeedback, PartialStageTurnCeilings, PartialTransportRetry, ReviewMode, TestDepth,
 };
 use crate::policy::PartialLocalConfig;
 
@@ -31,6 +31,9 @@ pub fn baseline() -> PartialPolicy {
             // exactly, or selecting it would silently downgrade the stage.
             generate: Some(ModelTier::Opus),
             docs: Some(ModelTier::Sonnet),
+            // Restates the built-in default verbatim — baseline's no-op
+            // contract. No escalation.
+            implement_final_attempt: Some(None),
         }),
         review_mode: Some(ReviewMode::PerTask),
         llm_triage: Some(false),
@@ -202,6 +205,11 @@ pub fn thorough() -> PartialPolicy {
             triage: Some(ModelTier::Opus),
             generate: Some(ModelTier::Opus),
             docs: Some(ModelTier::Opus),
+            // The quality ceiling: already Opus on every attempt via
+            // `implement` above, so this never changes the tier used — set
+            // explicitly anyway, matching this bundle's own doc comment
+            // ("every field on `PartialPolicy` is set explicitly").
+            implement_final_attempt: Some(Some(ModelTier::Opus)),
         }),
         timeouts: Some(PartialCallTimeouts {
             // Generous per-stage ceiling rather than the built-in
@@ -219,6 +227,21 @@ pub fn thorough() -> PartialPolicy {
             // sdlc_policy_and_profile`'s hard pin in `policy.rs`. Restated
             // as explicit `None` here, not omitted, so the choice reads as
             // deliberate rather than an oversight.
+            generate: None,
+            docs: None,
+        }),
+        max_turns: Some(PartialStageTurnCeilings {
+            // Generous per-stage turn ceiling, mirroring `timeouts` above:
+            // the quality ceiling favors letting a slow, thorough call use
+            // as many tool-call turns as it needs over cutting it off
+            // early, while still bounding the pathological runaway case
+            // (the 156-tool-call-in-one-turn bella run this knob exists
+            // for). `implement`/`triage`/`review` mirror `timeouts`'
+            // three wired stages; `generate`/`docs` restated `None` for the
+            // same reason `timeouts.generate`/`.docs` are.
+            implement: Some(80),
+            triage: Some(80),
+            review: Some(80),
             generate: None,
             docs: None,
         }),
@@ -261,6 +284,11 @@ pub fn thorough() -> PartialPolicy {
         // the built-in default, so this profile's ledger keeps more of a
         // dispatch's output before truncating it.
         node_invocation_payload_cap_bytes: Some(262_144),
+        // The quality ceiling for planning context too: unbounded, matching
+        // the built-in default — a thorough run should see every spec
+        // `.md` file's content in full when generating a task list, never
+        // truncated.
+        generate_context_max_bytes: Some(None),
     }
 }
 

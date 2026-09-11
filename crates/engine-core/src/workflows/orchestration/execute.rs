@@ -176,6 +176,20 @@ pub struct FlowInvocation {
     /// `TaskContext::metadata`, matching what `campaign_id`'s doc comment
     /// already requires of itself.
     pub permission_profile: PermissionProfile,
+    /// The resolved `OrchestrationPolicy::child_sdlc_flow_policy` knob
+    /// (`EN.17.F` task 1/2), forwarded verbatim as this run's `SDLC_FLOW`
+    /// child event `policy` override when this invocation's
+    /// [`Self::engine`] is [`EngineKind::Flow`] — never consulted for a
+    /// [`EngineKind::Task`] invocation, matching
+    /// [`Self::child_sdlc_task_policy`]'s own one-way routing. `None`
+    /// leaves [`sdlc_flow_event`]'s emitted JSON byte-identical to before
+    /// this field existed (no `"policy"` key at all), per standing rule 6.
+    pub child_sdlc_flow_policy: Option<serde_json::Value>,
+    /// The resolved `OrchestrationPolicy::child_sdlc_task_policy` knob,
+    /// mirroring [`Self::child_sdlc_flow_policy`] but forwarded only into
+    /// [`sdlc_task_event`]'s `"policy"` key for an [`EngineKind::Task`]
+    /// invocation. `None` leaves the emitted JSON unchanged, same as above.
+    pub child_sdlc_task_policy: Option<serde_json::Value>,
 }
 
 /// A step's requested permission profile would WIDEN relative to its
@@ -604,6 +618,8 @@ pub async fn execute_step(
     budget: Option<Budget>,
     parent_profile: PermissionProfile,
     requested_profile: Option<PermissionProfile>,
+    child_sdlc_flow_policy: Option<&serde_json::Value>,
+    child_sdlc_task_policy: Option<&serde_json::Value>,
 ) -> Result<ExecutionOutcome, ExecuteError> {
     if step.kind != StepKind::Block {
         return Err(ExecuteError::WrongStepKind {
@@ -664,6 +680,8 @@ pub async fn execute_step(
         cancellation_token,
         budget,
         permission_profile,
+        child_sdlc_flow_policy: child_sdlc_flow_policy.cloned(),
+        child_sdlc_task_policy: child_sdlc_task_policy.cloned(),
     };
     let ctx = run_flow(invocation)
         .await
@@ -722,14 +740,21 @@ pub async fn execute_step(
 /// (`locked` / `standard` / `unrestricted`), the same contract
 /// `permission.rs` already tests exhaustively — nothing here re-derives it.
 fn sdlc_flow_event(invocation: &FlowInvocation) -> serde_json::Value {
-    json!({
+    let mut event = json!({
         "repo": invocation.repo,
         "spec_slug": invocation.block_id,
         "use_worktree": invocation.use_worktree,
         "auto_pr": invocation.auto_pr,
         "campaign_id": invocation.campaign_id,
         "permission_profile": invocation.permission_profile,
-    })
+    });
+    // `EN.17.F` task 2: omit the `"policy"` key entirely when unset, so an
+    // invocation with no forwarded override leaves this event byte-for-byte
+    // identical to before this field existed — never seed a `null`.
+    if let Some(policy) = &invocation.child_sdlc_flow_policy {
+        event["policy"] = policy.clone();
+    }
+    event
 }
 
 /// Build the `SDLC_TASK` event JSON for one resolved [`FlowInvocation`] —
@@ -741,13 +766,20 @@ fn sdlc_flow_event(invocation: &FlowInvocation) -> serde_json::Value {
 /// ceremony), so there is nothing here to set. `permission_profile` is
 /// seeded for the same reason as in [`sdlc_flow_event`].
 fn sdlc_task_event(invocation: &FlowInvocation) -> serde_json::Value {
-    json!({
+    let mut event = json!({
         "repo": invocation.repo,
         "spec_slug": invocation.block_id,
         "use_worktree": invocation.use_worktree,
         "campaign_id": invocation.campaign_id,
         "permission_profile": invocation.permission_profile,
-    })
+    });
+    // `EN.17.F` task 2: same "omit when None" contract as `sdlc_flow_event`,
+    // but routed from the invocation's OWN `child_sdlc_task_policy` field —
+    // an SDLC_TASK invocation never reads `child_sdlc_flow_policy`.
+    if let Some(policy) = &invocation.child_sdlc_task_policy {
+        event["policy"] = policy.clone();
+    }
+    event
 }
 
 /// The production [`FlowRunner`]: for each [`FlowInvocation`], builds a
@@ -918,6 +950,8 @@ mod tests {
             None,
             PermissionProfile::Standard,
             None,
+            None,
+            None,
         )
         .await
         .expect("step a should execute");
@@ -932,6 +966,8 @@ mod tests {
             None,
             None,
             PermissionProfile::Standard,
+            None,
+            None,
             None,
         )
         .await
@@ -974,6 +1010,8 @@ mod tests {
             None,
             PermissionProfile::Standard,
             None,
+            None,
+            None,
         )
         .await
         .expect("flow-engine step should execute");
@@ -1010,6 +1048,8 @@ mod tests {
             None,
             None,
             PermissionProfile::Standard,
+            None,
+            None,
             None,
         )
         .await
@@ -1076,6 +1116,8 @@ mod tests {
             None,
             PermissionProfile::Standard,
             None,
+            None,
+            None,
         )
         .await
         .unwrap_err();
@@ -1113,6 +1155,8 @@ mod tests {
             None,
             None,
             PermissionProfile::Standard,
+            None,
+            None,
             None,
         )
         .await
@@ -1152,6 +1196,8 @@ mod tests {
             None,
             None,
             PermissionProfile::Standard,
+            None,
+            None,
             None,
         )
         .await
@@ -1204,6 +1250,8 @@ mod tests {
             None,
             None,
             PermissionProfile::Standard,
+            None,
+            None,
             None,
         )
         .await
@@ -1268,6 +1316,8 @@ mod tests {
             None,
             PermissionProfile::Standard,
             None,
+            None,
+            None,
         )
         .await
         .expect_err("a child with a failed node_run must fail the step");
@@ -1316,6 +1366,8 @@ mod tests {
             None,
             None,
             PermissionProfile::Standard,
+            None,
+            None,
             None,
         )
         .await
@@ -1385,6 +1437,8 @@ mod tests {
             None,
             PermissionProfile::Standard,
             None,
+            None,
+            None,
         )
         .await
         .expect("step should execute");
@@ -1415,6 +1469,8 @@ mod tests {
             None,
             None,
             PermissionProfile::Standard,
+            None,
+            None,
             None,
         )
         .await
@@ -1532,6 +1588,8 @@ mod tests {
             cancellation_token: None,
             budget: None,
             permission_profile: PermissionProfile::Standard,
+            child_sdlc_flow_policy: None,
+            child_sdlc_task_policy: None,
         };
         assert_eq!(
             sdlc_flow_event(&invocation_true)["use_worktree"],
@@ -1546,6 +1604,144 @@ mod tests {
         assert_eq!(
             sdlc_flow_event(&invocation_false)["use_worktree"],
             json!(false)
+        );
+    }
+
+    // ── FlowInvocation.{child_sdlc_flow_policy,child_sdlc_task_policy} ──
+    // `EN.17.F` task 2.
+
+    fn base_invocation(engine: EngineKind) -> FlowInvocation {
+        FlowInvocation {
+            repo: "repo-a".to_string(),
+            repo_path: PathBuf::from("/tmp/repo-a"),
+            block_id: "A.1".to_string(),
+            use_worktree: false,
+            auto_pr: true,
+            campaign_id: Uuid::new_v4(),
+            engine,
+            cancellation_token: None,
+            budget: None,
+            permission_profile: PermissionProfile::Standard,
+            child_sdlc_flow_policy: None,
+            child_sdlc_task_policy: None,
+        }
+    }
+
+    /// The decisive regression for task 2's "omit the key when None" rule:
+    /// with no forwarded override, `sdlc_flow_event`'s emitted JSON is
+    /// byte-for-byte identical (as a literal key-set comparison, never a
+    /// `null`-valued `"policy"` key) to the shape before this field
+    /// existed.
+    #[test]
+    fn sdlc_flow_event_omits_the_policy_key_without_an_override() {
+        let invocation = base_invocation(EngineKind::Flow);
+        let event = sdlc_flow_event(&invocation);
+        assert_eq!(
+            event,
+            json!({
+                "repo": "repo-a",
+                "spec_slug": "A.1",
+                "use_worktree": false,
+                "auto_pr": true,
+                "campaign_id": invocation.campaign_id,
+                "permission_profile": "standard",
+            }),
+            "sdlc_flow_event must not emit a \"policy\" key at all when \
+             child_sdlc_flow_policy is None — got: {event}"
+        );
+        assert!(event.get("policy").is_none());
+    }
+
+    /// Mirror of the above for `sdlc_task_event`.
+    #[test]
+    fn sdlc_task_event_omits_the_policy_key_without_an_override() {
+        let invocation = base_invocation(EngineKind::Task);
+        let event = sdlc_task_event(&invocation);
+        assert_eq!(
+            event,
+            json!({
+                "repo": "repo-a",
+                "spec_slug": "A.1",
+                "use_worktree": false,
+                "campaign_id": invocation.campaign_id,
+                "permission_profile": "standard",
+            }),
+            "sdlc_task_event must not emit a \"policy\" key at all when \
+             child_sdlc_task_policy is None — got: {event}"
+        );
+        assert!(event.get("policy").is_none());
+    }
+
+    #[test]
+    fn sdlc_flow_event_includes_policy_when_child_sdlc_flow_policy_is_some() {
+        let mut invocation = base_invocation(EngineKind::Flow);
+        invocation.child_sdlc_flow_policy = Some(json!({"review_mode": "end_only"}));
+        let event = sdlc_flow_event(&invocation);
+        assert_eq!(event["policy"], json!({"review_mode": "end_only"}));
+    }
+
+    /// Setting `child_sdlc_flow_policy` must never leak into
+    /// `sdlc_task_event`'s output, and vice versa (task 2's own AC:
+    /// "setting one never sets the other").
+    #[test]
+    fn setting_one_child_policy_never_seeds_the_other_events_key() {
+        let mut flow_only = base_invocation(EngineKind::Flow);
+        flow_only.child_sdlc_flow_policy = Some(json!({"review_mode": "end_only"}));
+        assert!(sdlc_task_event(&flow_only).get("policy").is_none());
+
+        let mut task_only = base_invocation(EngineKind::Task);
+        task_only.child_sdlc_task_policy =
+            Some(json!({"model_tiers": {"implement_final_attempt": "opus"}}));
+        assert_eq!(
+            sdlc_task_event(&task_only)["policy"],
+            json!({"model_tiers": {"implement_final_attempt": "opus"}})
+        );
+        assert!(sdlc_flow_event(&task_only).get("policy").is_none());
+    }
+
+    /// `OrchestrationRunNode::process` must forward the resolved
+    /// `policy.child_sdlc_flow_policy`/`child_sdlc_task_policy`, never a
+    /// hardcoded `None` — asserted here at the narrower `execute_step`
+    /// seam this module owns (the `graph.rs`-level threading is covered by
+    /// `cost_parity.rs`'s own integration tests, per this block's own
+    /// testing_strategy).
+    #[tokio::test]
+    async fn execute_step_forwards_child_policies_into_the_invocation() {
+        let (dir, registry) = two_repo_registry();
+        let _ = &dir;
+        let (runner, calls) = recording_runner();
+        let resolve_engine = |_repo: &str, _id: &str| EngineKind::Flow;
+        let s = step("repo-a", "A.1");
+        let flow_override = json!({"review_mode": "end_only"});
+        let task_override = json!({"model_tiers": {"implement_final_attempt": "opus"}});
+
+        execute_step(
+            &s,
+            &resolve_engine,
+            &registry,
+            &runner,
+            false,
+            true,
+            Uuid::new_v4(),
+            None,
+            None,
+            PermissionProfile::Standard,
+            None,
+            Some(&flow_override),
+            Some(&task_override),
+        )
+        .await
+        .expect("execute_step should succeed");
+
+        let recorded = calls.lock().expect("lock calls");
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(
+            recorded[0].child_sdlc_flow_policy,
+            Some(flow_override.clone())
+        );
+        assert_eq!(
+            recorded[0].child_sdlc_task_policy,
+            Some(task_override.clone())
         );
     }
 
@@ -1565,6 +1761,8 @@ mod tests {
             cancellation_token: None,
             budget: None,
             permission_profile: PermissionProfile::Standard,
+            child_sdlc_flow_policy: None,
+            child_sdlc_task_policy: None,
         };
         assert_eq!(
             sdlc_flow_event(&invocation)["campaign_id"],
@@ -1615,6 +1813,8 @@ mod tests {
             None,
             PermissionProfile::Standard,
             None,
+            None,
+            None,
         )
         .await
         .expect("ordinary step should execute");
@@ -1629,6 +1829,8 @@ mod tests {
             None,
             None,
             PermissionProfile::Standard,
+            None,
+            None,
             None,
         )
         .await
@@ -1714,6 +1916,8 @@ mod tests {
             None,
             PermissionProfile::Standard,
             None,
+            None,
+            None,
         )
         .await
         .expect("unnarrowed step should inherit the parent's profile");
@@ -1745,6 +1949,8 @@ mod tests {
             None,
             PermissionProfile::Unrestricted,
             Some(PermissionProfile::Locked),
+            None,
+            None,
         )
         .await
         .expect("narrowing to a tighter profile must succeed");
@@ -1778,6 +1984,8 @@ mod tests {
             None,
             PermissionProfile::Locked,
             Some(PermissionProfile::Unrestricted),
+            None,
+            None,
         )
         .await
         .unwrap_err();
@@ -1871,6 +2079,8 @@ mod tests {
             cancellation_token: None,
             budget: None,
             permission_profile: PermissionProfile::Locked,
+            child_sdlc_flow_policy: None,
+            child_sdlc_task_policy: None,
         };
 
         let event = sdlc_flow_event(&invocation);
@@ -1891,6 +2101,8 @@ mod tests {
             cancellation_token: None,
             budget: None,
             permission_profile: PermissionProfile::Unrestricted,
+            child_sdlc_flow_policy: None,
+            child_sdlc_task_policy: None,
         };
 
         let event = sdlc_task_event(&invocation);
@@ -1918,6 +2130,8 @@ mod tests {
             cancellation_token: None,
             budget: None,
             permission_profile: PermissionProfile::Standard,
+            child_sdlc_flow_policy: None,
+            child_sdlc_task_policy: None,
         };
         assert_eq!(sdlc_flow_event(&invocation_true)["auto_pr"], json!(true));
 
@@ -1944,6 +2158,8 @@ mod tests {
             cancellation_token: None,
             budget: None,
             permission_profile: PermissionProfile::Standard,
+            child_sdlc_flow_policy: None,
+            child_sdlc_task_policy: None,
         };
 
         let event = sdlc_task_event(&invocation);
@@ -1994,6 +2210,8 @@ mod tests {
             None,
             PermissionProfile::Standard,
             None,
+            None,
+            None,
         )
         .await
         .expect("execute_step should succeed");
@@ -2038,6 +2256,8 @@ mod tests {
             cancellation_token: None,
             budget: None,
             permission_profile: PermissionProfile::Standard,
+            child_sdlc_flow_policy: None,
+            child_sdlc_task_policy: None,
         };
 
         let event = sdlc_flow_event(&invocation);

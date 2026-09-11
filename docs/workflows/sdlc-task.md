@@ -181,9 +181,12 @@ stage and no docs stage, so neither node is registered in its graph.
 | `model_tiers.implement` | `Sonnet` | `ImplementTaskNode` |
 | `model_tiers.triage` | `Sonnet` | `TriageTaskNode` |
 | `model_tiers.generate` | `Opus` | `GenerateTasksNode` |
+| `model_tiers.implement_final_attempt` | `None` | **`EN.17.F`.** Escalates `ImplementTaskNode` to this tier on a task's LAST attempt only; every earlier attempt still uses `model_tiers.implement`. Mirrors `sdlc_flow::policy::ModelTiers::implement_final_attempt` — see [sdlc-flow-policy.md](sdlc-flow-policy.md) for the full mechanism |
 | `timeouts.implement` | `None` (unconfigured 300s) | `ImplementTaskNode`'s call timeout |
 | `timeouts.triage` | `None` | `TriageTaskNode`'s call timeout |
 | `timeouts.generate` | `None` | `GenerateTasksNode`'s call timeout |
+| `max_turns.{implement,triage,generate}` | `None` (unconfigured — no turn ceiling) | **`EN.17.F`.** Per-stage in-turn tool-call ceiling, passed to `claude_code_rs::Config::max_turns`. `max_turns.review`/`max_turns.docs` are not carried — SDLC_TASK registers no review or docs node — so `to_sdlc_policy()` projects those two from `SdlcPolicy::default()`, never from this policy |
+| `generate_context_max_bytes` | `None` (unbounded) | **`EN.17.F`.** Caps each spec `.md` file `GenerateTasksNode`'s planning-fallback `gather_context` inlines into its prompt; a file over the cap is truncated at a UTF-8 boundary with a marker. Mirrors `sdlc_flow::policy::SdlcPolicy::generate_context_max_bytes` |
 | `local` | `LocalConfig::default()` | Whichever stage above resolves to the `local` model tier |
 | `llm_triage` | `false` | `TriageTaskNode`'s model-triage branch |
 | `max_attempts` | `3` | The task-loop retry ceiling (a task-declared value always wins; this is the default for a task that omits it) |

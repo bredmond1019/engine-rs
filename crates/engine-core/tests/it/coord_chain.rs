@@ -181,6 +181,8 @@ async fn run_chain(
         uuid::Uuid::new_v4(),
         &|_repo: &str, _id: &str| {},
         coord,
+        None,
+        None,
     )
     .await
     .expect("chain should complete")
@@ -940,6 +942,8 @@ async fn run_chain_fallible(
         uuid::Uuid::new_v4(),
         &|_repo: &str, _id: &str| {},
         coord,
+        None,
+        None,
     )
     .await
 }
