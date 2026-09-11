@@ -10,7 +10,7 @@
 
 use super::policy::{
     ModelTier, OutputVerbosity, PartialCallTimeouts, PartialModelTiers, PartialPolicy,
-    PartialRetryFeedback, PartialTransportRetry, ReviewMode, TestDepth,
+    PartialRetryFeedback, PartialStageTurnCeilings, PartialTransportRetry, ReviewMode, TestDepth,
 };
 use crate::policy::PartialLocalConfig;
 
@@ -227,6 +227,21 @@ pub fn thorough() -> PartialPolicy {
             // sdlc_policy_and_profile`'s hard pin in `policy.rs`. Restated
             // as explicit `None` here, not omitted, so the choice reads as
             // deliberate rather than an oversight.
+            generate: None,
+            docs: None,
+        }),
+        max_turns: Some(PartialStageTurnCeilings {
+            // Generous per-stage turn ceiling, mirroring `timeouts` above:
+            // the quality ceiling favors letting a slow, thorough call use
+            // as many tool-call turns as it needs over cutting it off
+            // early, while still bounding the pathological runaway case
+            // (the 156-tool-call-in-one-turn bella run this knob exists
+            // for). `implement`/`triage`/`review` mirror `timeouts`'
+            // three wired stages; `generate`/`docs` restated `None` for the
+            // same reason `timeouts.generate`/`.docs` are.
+            implement: Some(80),
+            triage: Some(80),
+            review: Some(80),
             generate: None,
             docs: None,
         }),

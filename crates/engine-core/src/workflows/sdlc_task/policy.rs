@@ -254,6 +254,12 @@ impl SdlcTaskPolicy {
                 generate: self.timeouts.generate,
                 docs: fallback.timeouts.docs,
             },
+            // Not yet a SDLC_TASK-applicable knob until task 6 decides (per
+            // its own scoping note) — left at the fallback (`None`,
+            // behavior-stable) here rather than omitted, so this struct
+            // literal compiles against task 4's new `SdlcPolicy` field.
+            // Mirrors `implement_final_attempt` above.
+            max_turns: fallback.max_turns,
             local: self.local.clone(),
             llm_triage: self.llm_triage,
             max_attempts: self.max_attempts,

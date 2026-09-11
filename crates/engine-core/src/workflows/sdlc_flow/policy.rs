@@ -148,6 +148,28 @@ pub struct CallTimeouts {
     pub docs: Option<u64>,
 }
 
+/// Per-stage in-turn tool-call ceiling, forwarded to
+/// `claude_code_rs::Config.max_turns` (added by
+/// `CC.ticket.config-max-turns-passthrough`). Bounds a single stage's tool
+/// loop rather than the whole-call wall-clock timeout [`CallTimeouts`]
+/// already covers — the two are independent axes (a stage can time out
+/// having made only a handful of turns, or exhaust its turn budget well
+/// inside the timeout).
+///
+/// Mirrors [`CallTimeouts`]'s exact shape and derive set: all-`None` is the
+/// derived `Default`, so hand-writing it would only add a place to get it
+/// wrong. `claude-code-rs`'s own `Config::default()` leaves `max_turns` at
+/// `None` (unbounded), so all-`None` here is behavior-stable per CLAUDE.md
+/// standing rule 6.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StageTurnCeilings {
+    pub implement: Option<u32>,
+    pub review: Option<u32>,
+    pub triage: Option<u32>,
+    pub generate: Option<u32>,
+    pub docs: Option<u32>,
+}
+
 /// Whether (and how much of) the previous attempt's failure output is fed
 /// back into `ImplementTaskNode`'s prompt on a retry.
 ///
@@ -259,6 +281,10 @@ pub struct SdlcPolicy {
     /// Per-stage whole-call timeout in seconds; all-`None` (no override) by
     /// default, i.e. `claude-code-rs`'s own 300s default applies.
     pub timeouts: CallTimeouts,
+    /// Per-stage in-turn tool-call ceiling; all-`None` (no override) by
+    /// default, i.e. `claude-code-rs`'s own unbounded `max_turns` applies.
+    /// See [`StageTurnCeilings`].
+    pub max_turns: StageTurnCeilings,
     /// Configuration for the `local` model tier, when any stage uses it.
     pub local: LocalConfig,
     // `simple_task_max_files` was the selector for a simple-task path
@@ -349,6 +375,7 @@ impl Default for SdlcPolicy {
             test_depth: TestDepth::Full,
             model_tiers: ModelTiers::default(),
             timeouts: CallTimeouts::default(),
+            max_turns: StageTurnCeilings::default(),
             local: LocalConfig::default(),
             llm_triage: false,
             max_attempts: 3,
@@ -387,6 +414,7 @@ pub struct PartialPolicy {
     pub test_depth: Option<TestDepth>,
     pub model_tiers: Option<PartialModelTiers>,
     pub timeouts: Option<PartialCallTimeouts>,
+    pub max_turns: Option<PartialStageTurnCeilings>,
     pub local: Option<PartialLocalConfig>,
     pub llm_triage: Option<bool>,
     pub max_attempts: Option<u32>,
@@ -426,6 +454,19 @@ pub struct PartialCallTimeouts {
     pub docs: Option<u64>,
 }
 
+/// All-optional mirror of [`StageTurnCeilings`] for per-stage partial
+/// overrides. Mirrors [`PartialCallTimeouts`]' derive set exactly — notably
+/// **no** `Copy`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PartialStageTurnCeilings {
+    pub implement: Option<u32>,
+    pub review: Option<u32>,
+    pub triage: Option<u32>,
+    pub generate: Option<u32>,
+    pub docs: Option<u32>,
+}
+
 fn merge_model_tiers(mut base: ModelTiers, over: &PartialModelTiers) -> ModelTiers {
     if let Some(v) = over.implement {
         base.implement = v;
@@ -455,6 +496,32 @@ fn merge_model_tiers(mut base: ModelTiers, over: &PartialModelTiers) -> ModelTie
 /// (itself possibly `None`) untouched — so an absent override never turns a
 /// timeout *off*, it just declines to set one.
 fn merge_call_timeouts(mut base: CallTimeouts, over: &PartialCallTimeouts) -> CallTimeouts {
+    if let Some(v) = over.implement {
+        base.implement = Some(v);
+    }
+    if let Some(v) = over.triage {
+        base.triage = Some(v);
+    }
+    if let Some(v) = over.review {
+        base.review = Some(v);
+    }
+    if let Some(v) = over.generate {
+        base.generate = Some(v);
+    }
+    if let Some(v) = over.docs {
+        base.docs = Some(v);
+    }
+    base
+}
+
+/// Merge one `PartialStageTurnCeilings` override layer over a
+/// `StageTurnCeilings` base, field by field. Mirrors [`merge_call_timeouts`]:
+/// an absent override never turns a ceiling *off*, it just declines to set
+/// one.
+fn merge_stage_turn_ceilings(
+    mut base: StageTurnCeilings,
+    over: &PartialStageTurnCeilings,
+) -> StageTurnCeilings {
     if let Some(v) = over.implement {
         base.implement = Some(v);
     }
@@ -524,6 +591,10 @@ impl crate::policy::Policy for SdlcPolicy {
             timeouts: match &over.timeouts {
                 Some(t) => merge_call_timeouts(base.timeouts, t),
                 None => base.timeouts,
+            },
+            max_turns: match &over.max_turns {
+                Some(t) => merge_stage_turn_ceilings(base.max_turns, t),
+                None => base.max_turns,
             },
             local: match &over.local {
                 Some(l) => base.local.overlay(l),
@@ -671,6 +742,21 @@ mod tests {
         assert_eq!(timeouts.generate, None);
         assert_eq!(timeouts.docs, None);
         assert_eq!(timeouts, CallTimeouts::default());
+    }
+
+    /// Change-detector mirroring `builtin_default_timeouts_are_none`: the
+    /// whole point of this knob is that adding it did not change what an
+    /// existing run does. All-`None` means every stage's `Config.max_turns`
+    /// stays `None`, i.e. `claude-code-rs`'s unbounded default.
+    #[test]
+    fn builtin_default_max_turns_are_none() {
+        let max_turns = SdlcPolicy::default().max_turns;
+        assert_eq!(max_turns.implement, None);
+        assert_eq!(max_turns.triage, None);
+        assert_eq!(max_turns.review, None);
+        assert_eq!(max_turns.generate, None);
+        assert_eq!(max_turns.docs, None);
+        assert_eq!(max_turns, StageTurnCeilings::default());
     }
 
     /// Change-detector for the `docs` tier: `Sonnet` is exactly the model
@@ -1153,6 +1239,80 @@ mod tests {
     }
 
     #[test]
+    fn merge_stage_turn_ceilings_overrides_only_the_fields_it_sets() {
+        let base = StageTurnCeilings {
+            implement: Some(12),
+            triage: Some(4),
+            review: None,
+            ..Default::default()
+        };
+        let over = PartialStageTurnCeilings {
+            implement: Some(20),
+            triage: None,
+            review: Some(8),
+            ..Default::default()
+        };
+        let merged = merge_stage_turn_ceilings(base, &over);
+        assert_eq!(merged.implement, Some(20));
+        // `None` in the override leaves the base value alone.
+        assert_eq!(merged.triage, Some(4));
+        assert_eq!(merged.review, Some(8));
+    }
+
+    #[test]
+    fn max_turns_resolve_through_all_four_layers_in_precedence_order() {
+        let harness = PartialPolicy {
+            max_turns: Some(PartialStageTurnCeilings {
+                implement: Some(10),
+                triage: Some(5),
+                review: Some(3),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let profile = PartialPolicy {
+            max_turns: Some(PartialStageTurnCeilings {
+                implement: Some(20),
+                triage: Some(12),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let event = PartialPolicy {
+            max_turns: Some(PartialStageTurnCeilings {
+                implement: Some(30),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let resolved = resolve(
+            SdlcPolicy::default(),
+            Some(&harness),
+            Some(&profile),
+            Some(&event),
+        );
+        // event > profile > harness > builtin(None).
+        assert_eq!(resolved.max_turns.implement, Some(30));
+        assert_eq!(resolved.max_turns.triage, Some(12));
+        assert_eq!(resolved.max_turns.review, Some(3));
+
+        // Nothing anywhere -> still the built-in all-`None`.
+        let untouched = resolve(SdlcPolicy::default(), None, None, None);
+        assert_eq!(untouched.max_turns, StageTurnCeilings::default());
+    }
+
+    #[test]
+    fn deserializes_partial_stage_turn_ceilings_from_harness_json_shape() {
+        let json = r#"{ "max_turns": { "implement": 15 } }"#;
+        let partial: PartialPolicy = serde_json::from_str(json).expect("valid PartialPolicy JSON");
+        let max_turns = partial.max_turns.as_ref().expect("max_turns present");
+        assert_eq!(max_turns.implement, Some(15));
+        // Absent fields stay `None` and fall through on merge.
+        assert_eq!(max_turns.triage, None);
+        assert_eq!(max_turns.review, None);
+    }
+
+    #[test]
     fn test_depth_serde_wire_contract_is_snake_case() {
         assert_eq!(
             serde_json::to_value(TestDepth::Full).unwrap(),
@@ -1539,6 +1699,10 @@ mod tests {
             "task_loop.rs::timeout_for_stage (all five stages), docs.rs, setup.rs (GenerateTasksNode)",
         ),
         (
+            "max_turns",
+            "task_loop.rs::apply_policy_config (all five stages via stage_turn_ceiling), docs.rs (via apply_policy_config)",
+        ),
+        (
             "local",
             "task_loop.rs::apply_model_tier (local model string), graph.rs (openai_compat_meta_transport_live)",
         ),
@@ -1586,6 +1750,7 @@ mod tests {
             test_depth,
             model_tiers,
             timeouts,
+            max_turns,
             local,
             llm_triage,
             max_attempts,
