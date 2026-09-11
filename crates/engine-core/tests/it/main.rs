@@ -38,6 +38,7 @@ mod gate_timeout_fixture;
 mod harvest_gate_e2e;
 mod held_session;
 mod hq_orchestration_policy;
+mod judgment;
 mod ledger;
 mod linkedin_post_e2e;
 mod locale_rate_card;
