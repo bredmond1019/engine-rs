@@ -291,6 +291,67 @@ at the boundary exactly as before (see "Campaign identity" below), independent o
 None of this mechanism writes `state.json` or authors an edge — `block_status` is a pure read, and
 a chain run containing a bail leaves every repo's `state.json` byte-identical before and after.
 
+## A chain's bail reaches the operator through the one sweep router (`EN.17.C`)
+
+Before this block, a bailed step's escalation was composed but never actually delivered anywhere a
+human would see it: `record_bail_escalation` always wrote `EscalationChannel::session(lane)`, and
+`register_sweep` — the only place SWEEP is registered from `bastion serve`'s dispatcher — passes
+`NoopOperatorTransport`/`NoopLaneWake`. A chain that bailed overnight left a record on disk and woke
+nobody.
+
+**The knob: `bail_channel`.** `OrchestrationPolicy.bail_channel` is a closed two-variant enum
+(`crates/engine-core/src/workflows/orchestration/graph.rs`), resolved the same four-layer way as
+every other policy knob and threaded alongside `on_bail` into `integrate_chain_impl_inner`:
+
+- **`session`** (built-in default, per CLAUDE.md standing rule 6) — `record_bail_escalation` keeps
+  writing `EscalationChannel::session(lane)` exactly as before this block; today's behavior,
+  unchanged.
+- **`notification`** — `record_bail_escalation` instead composes `EscalationChannel::notification`
+  with exactly two `EscalationOption`s (`EscalationOptions::pair`) — an acknowledgement (`ack` /
+  `Seen`) and a defer (`later` / `Later`), each label within `OPTION_LABEL_MAX_CHARS` (20). These
+  are acknowledgement-only by design: nothing in this block consumes the operator's reply.
+
+**THE EFFECTIVE SWITCH LIVES IN HQ'S OWN `harness.json`, not this repo's** — the same reasoning as
+`on_bail` above: `OrchestrationRunNode` resolves policy from `PolicyConfigSource::Worktree(event.
+brain_root)`, and the engine-mounted `bastion serve` that drives a real chain runs with
+`ENGINE_BRAIN_ROOT` pointed at HQ. HQ's `planning/harness.json` sets
+`orchestration.policy.bail_channel: "notification"` and adds no `orchestration.profiles` section
+(same PROFILE RULE as `on_bail`: `resolve_profile_from` returns a named bundle WHOLE, with no merge
+onto the built-in bundle of the same name, so an HQ profile section would silently drop every other
+built-in knob in it). This repo's own `planning/harness.json` documents `bail_channel` at its
+built-in value (`session`) only, with the same "not effective for a real chain" caveat. Of the three
+built-in named profiles, only `baseline` restates `bail_channel` (verbatim `session`, its no-op
+contract) — `cheap-fast` and `thorough` leave it unset, so HQ's brain-root value governs any run
+naming them.
+
+**One router, never reimplemented.** `OrchestrationRunNode` gains `with_operator_transport`
+(mirroring `with_is_block_open`'s builder shape, defaulting to `NoopOperatorTransport` when never
+called). After `chain_report` is stamped into `ctx.nodes` and before the node decides its own
+success/error outcome, if `chain_report.bailed` is non-empty, `process` calls
+`engine_core::workflows::sweep::run_sweep_pass` **exactly once** for the whole chain's roadmap —
+never once per bailed block, never per skipped dependent, never on a hold poll, and never on a clean
+chain. Routing this way, instead of delivering a bail notification directly from the orchestration
+loop, keeps refire-window dedup, permission-profile gating (`GatedAction::Notify`/`suppressed_by_
+profile`) and the per-pass budget in the single router every SWEEP caller already shares — a
+hand-woken `SWEEP` dispatch and the `CONDUCTOR` path are the other two callers. A `run_sweep_pass`
+failure is logged via `tracing::warn!` and never changes the chain's own `Ok`/`Err` outcome — it is
+a best-effort notification side effect layered on top of a run that has already finished.
+
+**Registration.** `engine-serve`'s `register_builtin_workflows` is unchanged — its SWEEP still uses
+`NoopOperatorTransport`, and its own `dispatch_sweep_builds_a_runnable_workflow_and_writes_a_
+snapshot` test passes unmodified. A new `register_builtin_workflows_with_operator(dispatcher,
+transport)` registers the same workflow set via the existing `register_builtin_workflows_with_
+registry`, then re-registers SWEEP (`register_sweep_with`, already existed) and ORCHESTRATION
+(`register_orchestration_with_registry`, now transport-parameterized) with the real transport —
+re-registration is safe because `Dispatcher::register` is a `HashMap` insert keyed by
+`workflow_type`. Consumed by bastion's own half of this work
+(`BA.ticket.engine-dispatcher-carries-the-real-operator-transport`), which wires bastion's
+`TelegramTransport` — the only production `OperatorTransport` in the fleet — into this entry point.
+
+**Out of scope**, per this block's record: a production `LaneWake` (SWEEP keeps `NoopLaneWake`
+here); acting on the operator's reply to a bail notification; scheduling SWEEP; and a real
+`session:<slug>` tmux name (`EN.15.I`).
+
 ## A bail or a stuck operator hold now writes an escalation and a bails[] entry (`EN.15.G`)
 
 A step that fails on the BAIL path (`execute_step` returns an error) or the HOLD path
@@ -648,6 +709,7 @@ Resolved through the standard four layers (per-run event override > named profil
 | `child_sdlc_flow_policy` | `None` | **`EN.17.F`.** A partial `SdlcPolicy` override object, forwarded verbatim as the `"policy"` key on every `flow` step's composed child event — layer 1 of that child's own four-layer resolution. `None` (the built-in default on every named profile, `baseline` included) leaves the composed child event byte-identical to before this knob existed: no `"policy"` key at all. See "Child policy forwarding" below. |
 | `child_sdlc_task_policy` | `None` | **`EN.17.F`.** The same mechanism as `child_sdlc_flow_policy`, but forwarded only into a `task` step's child event — a `flow` step never sees it and vice versa. |
 | `on_bail` | `stop_chain` | **`EN.17.B`.** Whether a bailed step ends the whole chain (`stop_chain`) or skips only its own dependents while independent steps still run (`skip_dependents`). See "A bail skips only its dependents" above. |
+| `bail_channel` | `session` | **`EN.17.C`.** Which escalation channel a bailed step's `record_bail_escalation` composes against — `session` (unchanged `session:<lane>`) or `notification` (a two-option ack/defer escalation, routed to the operator's phone via the one shared sweep router). See "A chain's bail reaches the operator through the one sweep router" above. |
 
 Named profiles (`crates/engine-core/src/workflows/orchestration/graph.rs`):
 
