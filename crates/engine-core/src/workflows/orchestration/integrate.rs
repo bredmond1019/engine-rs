@@ -2141,9 +2141,11 @@ pub async fn integrate_chain_with_coord(
 /// `EN.17.B` task 4: identical to [`integrate_chain_with_coord`], plus the
 /// status-aware boundary and skip-dependents seams —
 /// [`super::graph::OrchestrationRunNode::process`] is this function's only
-/// caller, so `on_bail`/`block_status` carry the resolved
+/// caller, so `on_bail`/`bail_channel`/`block_status` carry the resolved
 /// `OrchestrationPolicy` value and the real `CorpusGates::block_status`
-/// closure respectively. `report` accumulates `closed`/`bailed`/`skipped`
+/// closure respectively (`bail_channel` threaded through by `EN.17.C` task
+/// 4 — until then this function hardcoded `BailChannel::Session`
+/// internally). `report` accumulates `closed`/`bailed`/`skipped`
 /// as the loop runs, so it is populated on BOTH the success and the error
 /// return path — a caller reads it after this call returns regardless of
 /// which branch of the `Result` it got, which is what lets `process` stamp
@@ -2179,6 +2181,13 @@ pub async fn integrate_chain_with_coord_and_policy(
     child_sdlc_flow_policy: Option<&serde_json::Value>,
     child_sdlc_task_policy: Option<&serde_json::Value>,
     on_bail: OnBail,
+    // `EN.17.C` task 4: the resolved `OrchestrationPolicy::bail_channel`
+    // switch, forwarded straight through to `integrate_chain_impl_inner`'s
+    // own parameter of the same name — see that parameter's doc. Added
+    // alongside `on_bail` above, threaded the same way (this function's
+    // only caller, `OrchestrationRunNode::process`, resolves both from the
+    // same `policy` value).
+    bail_channel: BailChannel,
     block_status: &dyn Fn(&str, &str) -> BlockPresence,
     report: &mut ChainReport,
 ) -> Result<Vec<ExecutionOutcome>, IntegrateError> {
@@ -2210,7 +2219,7 @@ pub async fn integrate_chain_with_coord_and_policy(
         child_sdlc_flow_policy,
         child_sdlc_task_policy,
         on_bail,
-        BailChannel::Session,
+        bail_channel,
         block_status,
         report,
     )
@@ -2524,11 +2533,13 @@ async fn integrate_chain_impl_inner(
     // step's own failure, an unmet dependency edge, or a closed/absent block
     // status into a `continue` instead — see the per-site comments below.
     on_bail: OnBail,
-    // `EN.17.C` task 2: the resolved `OrchestrationPolicy::bail_channel`
+    // `EN.17.C` task 2/4: the resolved `OrchestrationPolicy::bail_channel`
     // switch, forwarded to every `record_bail_escalation` call this loop
-    // makes. `BailChannel::Session` (every caller until task 4 threads the
-    // resolved policy value through `integrate_chain_with_coord_and_policy`)
-    // keeps `record_bail_escalation`'s output byte-identical to before this
+    // makes. `BailChannel::Session` (every caller EXCEPT
+    // `integrate_chain_with_coord_and_policy`, which now threads the
+    // resolved `OrchestrationPolicy::bail_channel` value through from
+    // `graph.rs`'s `OrchestrationRunNode::process`) keeps
+    // `record_bail_escalation`'s output byte-identical to before this
     // parameter existed — see that function's own doc.
     bail_channel: BailChannel,
     // `EN.17.B` task 4: `(repo, block_id) -> BlockPresence` — the status-aware
@@ -6883,6 +6894,7 @@ mod tests {
             None,
             None,
             OnBail::SkipDependents,
+            BailChannel::Session,
             &default_block_status,
             &mut report,
         )
@@ -6944,6 +6956,7 @@ mod tests {
             None,
             None,
             OnBail::StopChain,
+            BailChannel::Session,
             &default_block_status,
             &mut report,
         )
@@ -7006,6 +7019,7 @@ mod tests {
             None,
             None,
             OnBail::StopChain,
+            BailChannel::Session,
             &block_status,
             &mut report,
         )

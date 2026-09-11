@@ -563,6 +563,7 @@ async fn hq_orchestration_policy_real_hq_file_sets_the_switches() {
         None,
         None,
         resolved.on_bail,
+        resolved.bail_channel,
         &block_status,
         &mut report,
     )

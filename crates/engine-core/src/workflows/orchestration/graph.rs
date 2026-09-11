@@ -1344,6 +1344,13 @@ impl Node for OrchestrationRunNode {
         // (crosses by value, no clone needed); `block_status` is an `Arc`
         // clone, `Send + Sync + 'static`.
         let on_bail = policy.on_bail;
+        // `EN.17.C` task 4: the resolved `OrchestrationPolicy::bail_channel`
+        // switch, captured alongside `on_bail` above the same way — `Copy`,
+        // no clone needed — and threaded through to
+        // `integrate_chain_with_coord_and_policy` below so
+        // `record_bail_escalation` composes against the ACTUALLY RESOLVED
+        // channel instead of task 2's `BailChannel::Session` placeholder.
+        let bail_channel = policy.bail_channel;
         let block_status = self.block_status.clone();
         // `NodeError` now carries an optional `node_result` payload (the
         // `chain_report`-past-revert seam below), which pushes this
@@ -1425,6 +1432,10 @@ impl Node for OrchestrationRunNode {
                     // `Self::new`'s own default), `OnBail::StopChain` whenever
                     // no HQ/profile override resolved anything else.
                     on_bail,
+                    // `EN.17.C` task 4: the EFFECTIVE switch — resolved from
+                    // `policy` above, exactly like `on_bail` immediately
+                    // above it.
+                    bail_channel,
                     &move |repo, block_id| block_status(repo, block_id),
                     &mut chain_report,
                 ));
