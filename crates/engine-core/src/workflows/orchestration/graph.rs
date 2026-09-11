@@ -107,10 +107,15 @@ use serde_json::json;
 use crate::cancellation::{stamp_cancelled, CancellationToken};
 use crate::node::{Node, NodeError, NodeRegistry};
 use crate::nodes::terminal::HeldSessionNode;
+use crate::operator::transport::OperatorTransport;
+use crate::policy::permission::resolve_permission_profile;
 use crate::policy::{read_harness_policy_defaults_from, resolve_profile_from, PolicyConfigSource};
 use crate::repo_registry::RepoRegistry;
 use crate::schema::{NodeConfig, WorkflowSchema};
 use crate::workflow::Workflow;
+use crate::workflows::sweep::{
+    run_sweep_pass, NoopLaneWake, NoopOperatorTransport, DEFAULT_REFIRE_HOURS,
+};
 use term_core::driver::TerminalDriver;
 
 use super::chain::{resolve_explicit_chain, resolve_lane_chain, ChainStep};
@@ -841,6 +846,14 @@ pub struct OrchestrationRunNode {
     /// None` — byte-identical to the pre-task call through plain
     /// [`integrate::integrate_chain`]. See [`Self::with_coord_agent`].
     coord_agent: Option<String>,
+    /// `EN.17.C` task 3: the real [`OperatorTransport`] a bailing chain's
+    /// single post-loop `run_sweep_pass` call routes escalations through —
+    /// see [`Self::with_operator_transport`]. Defaults to
+    /// [`NoopOperatorTransport`] ([`Self::new`]), so an un-injected run's
+    /// sweep pass (still only triggered when `chain_report.bailed` is
+    /// non-empty) routes nothing anywhere, matching `SWEEP`'s own
+    /// `register_sweep` default (`workflows/sweep/mod.rs`).
+    operator_transport: Arc<dyn OperatorTransport>,
 }
 
 impl fmt::Debug for OrchestrationRunNode {
@@ -876,6 +889,7 @@ impl OrchestrationRunNode {
             conductor: None,
             journal_sink: None,
             coord_agent: None,
+            operator_transport: Arc::new(NoopOperatorTransport),
         }
     }
 
@@ -1024,6 +1038,19 @@ impl OrchestrationRunNode {
     #[must_use]
     pub fn with_coord_agent(mut self, agent: impl Into<String>) -> Self {
         self.coord_agent = Some(agent.into());
+        self
+    }
+
+    /// Install the real [`OperatorTransport`] a bailing chain's single
+    /// post-loop `run_sweep_pass` call routes escalations through
+    /// (`EN.17.C` task 3) — mirrors [`Self::with_is_block_open`]'s exact
+    /// builder shape. With none installed (the default,
+    /// [`NoopOperatorTransport`]), a bailing chain's sweep pass still runs
+    /// but routes nothing anywhere, matching `SWEEP`'s own placeholder
+    /// default.
+    #[must_use]
+    pub fn with_operator_transport(mut self, transport: Arc<dyn OperatorTransport>) -> Self {
+        self.operator_transport = transport;
         self
     }
 }
@@ -1247,6 +1274,13 @@ impl Node for OrchestrationRunNode {
         // `EN.ticket.orchestration-close-block-node-not-wired` task 2:
         // cloned the same way — `Arc` clone, `Send + Sync + 'static`.
         let close_block = self.close_block.clone();
+        // `EN.17.C` task 3: cloned before the `spawn_blocking` closure like
+        // every other owned seam here — `repo_registry` itself is moved
+        // into that closure below, so a second `Arc` clone is kept OUTSIDE
+        // it (mirroring `cancellation_token_for_stamp`'s own pattern) for
+        // the post-loop `run_sweep_pass` call to resolve the run's
+        // permission profile from.
+        let repo_registry_for_sweep = repo_registry.clone();
 
         // `EN.ticket.wire-coord-handle-into-orchestration-run-node`: build
         // the real `CoordHandle` for this run now that `chain` and
@@ -1542,6 +1576,39 @@ impl Node for OrchestrationRunNode {
                     .collect::<Vec<_>>(),
         });
         ctx.nodes.insert(NODE_NAME.to_string(), node_result.clone());
+        // `EN.17.C` task 3: exactly one best-effort `run_sweep_pass` call
+        // for the whole chain when it bailed — never once per bailed
+        // block, never per skipped dependent or hold poll, and never at
+        // all on a clean chain (`chain_report.bailed` empty). Routing
+        // (dedup, refire-window, permission-profile gating) stays entirely
+        // inside the one router every `SWEEP` caller already shares —
+        // `record_bail_escalation` (task 4) is what actually composes the
+        // per-bailed-block escalation this sweep pass then routes. A
+        // sweep-pass failure is logged and never changes this node's own
+        // Ok/Err outcome or `ctx.nodes` content — it is a layered-on
+        // notification side effect, not part of the chain's result.
+        if !chain_report.bailed.is_empty() {
+            let (profile, _) = resolve_permission_profile(
+                &repo_registry_for_sweep.brain_root().join("brain.toml"),
+            );
+            if let Err(err) = run_sweep_pass(
+                &event.brain_root,
+                &roadmap_slug,
+                chrono::Utc::now(),
+                DEFAULT_REFIRE_HOURS,
+                profile,
+                self.operator_transport.as_ref(),
+                &NoopLaneWake,
+            )
+            .await
+            {
+                tracing::warn!(
+                    error = %err,
+                    roadmap = %roadmap_slug,
+                    "EN.17.C: post-chain run_sweep_pass failed; the chain's own outcome is unaffected"
+                );
+            }
+        }
         // `EN.17.B` task 4, part 5: the report is now on `ctx` (stamped
         // above) regardless of which branch this takes; this is what makes
         // the `bailed`-non-empty check independent of the `Ok`/`Err` arm
@@ -2292,6 +2359,172 @@ mod tests {
             node_result["chain_report"]["bailed"],
             json!(["repo-a:A.1"]),
             "chain_report in the carried node_result must name the bailed block"
+        );
+    }
+
+    // ── Node::process — EN.17.C task 3: post-chain run_sweep_pass call ────
+
+    /// A counting [`OperatorTransport`] used only to prove `run_sweep_pass`
+    /// itself ran (or did not). Its `send` is never reached by these tests
+    /// even on a bailing chain — the built-in `BailChannel::Session`
+    /// escalation routes to `LaneWake`, not the transport, and task 4 is
+    /// what finishes threading a resolved `bail_channel: notification`
+    /// through — so these tests assert on the sweep pass's own on-disk
+    /// artifact (`sweeps/<ts>.json`) instead, and this stub exists mainly
+    /// to prove [`OrchestrationRunNode::with_operator_transport`] itself
+    /// compiles, stores, and is threaded all the way into `run_sweep_pass`.
+    struct CountingTransport {
+        sends: std::sync::atomic::AtomicUsize,
+    }
+
+    impl CountingTransport {
+        fn new() -> Self {
+            Self {
+                sends: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::operator::transport::OperatorTransport for CountingTransport {
+        async fn send(
+            &self,
+            _payload: &crate::operator::ValidatedOperatorPayload,
+        ) -> Result<
+            crate::operator::transport::DeliveredMessage,
+            crate::operator::transport::NotifyError,
+        > {
+            self.sends.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(crate::operator::transport::DeliveredMessage {
+                transport_message_id: String::new(),
+            })
+        }
+
+        async fn poll_responses(
+            &self,
+            since: Option<crate::operator::transport::UpdateCursor>,
+        ) -> Result<
+            (
+                Vec<crate::operator::transport::OperatorResponse>,
+                Option<crate::operator::transport::UpdateCursor>,
+            ),
+            crate::operator::transport::NotifyError,
+        > {
+            Ok((Vec::new(), since))
+        }
+    }
+
+    fn sweeps_dir_for(dir: &tempfile::TempDir, roadmap: &str) -> PathBuf {
+        dir.path()
+            .join("planning")
+            .join("roadmaps")
+            .join(roadmap)
+            .join("sweeps")
+    }
+
+    /// AC: "A chain with no bail (`chain_report.bailed` is empty) never
+    /// calls `run_sweep_pass`" — the counting seam here is the absence of
+    /// a `sweeps/` directory at all (a real `run_sweep_pass` call always
+    /// creates and writes into it), plus the transport's own zero send
+    /// count.
+    #[tokio::test]
+    async fn process_with_no_bail_never_calls_run_sweep_pass() {
+        let dir = two_repo_brain_root();
+        write_done_state(&dir.path().join("repo-a"), "A.1");
+        write_done_state(&dir.path().join("repo-b"), "B.1");
+
+        let run_flow: FlowRunner = Arc::new(|invocation| {
+            Box::pin(async move {
+                Ok(TaskContext {
+                    event: json!({}),
+                    nodes: HashMap::new(),
+                    metadata: json!({ "ran": invocation.block_id }),
+                    node_runs: HashMap::new(),
+                })
+            })
+        });
+
+        let transport = Arc::new(CountingTransport::new());
+        let node = OrchestrationRunNode::new()
+            .with_run_flow(run_flow)
+            .with_operator_transport(transport.clone());
+        let ctx = base_ctx(json!({
+            "brain_root": dir.path(),
+            "blocks": [
+                { "repo": "repo-a", "block_id": "A.1" },
+                { "repo": "repo-b", "block_id": "B.1" }
+            ],
+            "roadmap_slug": "my-roadmap",
+        }));
+
+        let out = node.process(ctx).await.expect("a clean chain must succeed");
+        assert_eq!(out.nodes[NODE_NAME]["steps_integrated"], 2);
+        assert_eq!(
+            transport.sends.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a clean chain must never route anything through the operator transport"
+        );
+        assert!(
+            !sweeps_dir_for(&dir, "my-roadmap").exists(),
+            "a clean chain must never call run_sweep_pass at all -- no sweeps/ directory \
+             should exist"
+        );
+    }
+
+    /// AC: "A chain with bailed blocks calls `run_sweep_pass` exactly once
+    /// for the whole chain (not once per bailed block) after `chain_report`
+    /// is stamped into `ctx`." Uses `OnBail::SkipDependents` (inline event
+    /// policy) so a single bailed step, with nothing depending on it,
+    /// finishes the chain on the `Ok` branch — the soft-Err path this
+    /// task's call site sits on, past `ctx.nodes.insert` and this task's
+    /// `run_sweep_pass` call, not the hard-Err early return the built-in
+    /// `OnBail::StopChain` default takes above it.
+    #[tokio::test]
+    async fn process_with_bailed_steps_calls_run_sweep_pass_exactly_once() {
+        let dir = two_repo_brain_root();
+        // No done-state written for "A.1" -- the runner fails it directly,
+        // so `execute_step` itself is the bail point.
+
+        let run_flow: FlowRunner = Arc::new(|invocation| {
+            Box::pin(async move {
+                Err(WorkflowError::new(format!(
+                    "simulated failure for {}",
+                    invocation.block_id
+                )))
+            })
+        });
+
+        let transport = Arc::new(CountingTransport::new());
+        let node = OrchestrationRunNode::new()
+            .with_run_flow(run_flow)
+            .with_operator_transport(transport.clone());
+        let ctx = base_ctx(json!({
+            "brain_root": dir.path(),
+            "blocks": [{ "repo": "repo-a", "block_id": "A.1" }],
+            "roadmap_slug": "my-roadmap",
+            "policy": { "on_bail": "skip_dependents" },
+        }));
+
+        let err = node
+            .process(ctx)
+            .await
+            .expect_err("a bailed step must still surface as the chain's own soft-Err outcome");
+        assert!(
+            err.message.contains("bailed block"),
+            "unexpected error message: {}",
+            err.message
+        );
+
+        let sweeps_dir = sweeps_dir_for(&dir, "my-roadmap");
+        let files: Vec<_> = std::fs::read_dir(&sweeps_dir)
+            .unwrap_or_else(|err| {
+                panic!("expected {sweeps_dir:?} to exist after a bailing chain: {err}")
+            })
+            .collect();
+        assert_eq!(
+            files.len(),
+            1,
+            "run_sweep_pass must run exactly once for the whole chain, not once per bailed block"
         );
     }
 
