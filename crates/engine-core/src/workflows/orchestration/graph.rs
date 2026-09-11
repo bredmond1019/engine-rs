@@ -168,6 +168,32 @@ pub enum OnBail {
     SkipDependents,
 }
 
+/// `EN.17.C` Task 1: which [`crate::workflows::sweep::EscalationChannel`] a
+/// bailed block's `notification` escalation is composed against —
+/// `record_bail_escalation`'s channel choice, resolved as a policy knob
+/// instead of the hardcoded `EscalationChannel::session(lane)` it uses today.
+///
+/// The built-in default is [`Self::Session`] — today's behavior, per
+/// CLAUDE.md standing rule 6 (a new knob must not change what an existing
+/// run does): SWEEP routes a session-channel escalation to `LaneWake`, which
+/// is a no-op, so a bail reaches nobody. [`Self::Notification`] is the knob
+/// this block's later tasks wire up: it routes the escalation through
+/// SWEEP's `OperatorTransport` seam instead, so a real transport (bastion's
+/// `TelegramTransport`) can actually deliver it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum BailChannel {
+    /// Compose the escalation against `EscalationChannel::session(lane)` —
+    /// today's behavior. SWEEP's registered `LaneWake` is a no-op, so this
+    /// escalation is recorded but never delivered anywhere.
+    #[default]
+    Session,
+    /// Compose the escalation against `EscalationChannel::notification(..)`
+    /// so SWEEP's dedup/permission-profile/budget pipeline can route it
+    /// through a real `OperatorTransport`.
+    Notification,
+}
+
 /// The fully-resolved, per-run ORCHESTRATION policy: the merge of built-in
 /// defaults, `harness.json`'s `orchestration.policy` defaults, a named
 /// `profile`, and any per-run event override, high->low precedence in that
@@ -283,6 +309,14 @@ pub struct OrchestrationPolicy {
     /// (`orchestration.policy.on_bail`), not in this repo's own harness
     /// file — see the block record's `notes` field for why.
     pub on_bail: OnBail,
+    /// `EN.17.C` Task 1: which channel a bailed block's `notification`
+    /// escalation is composed against — see [`BailChannel`].
+    /// `BailChannel::Session` (the built-in default) is today's behavior,
+    /// per CLAUDE.md standing rule 6. The effective switch for a real chain
+    /// lives in HQ's `planning/harness.json`
+    /// (`orchestration.policy.bail_channel`), not in this repo's own harness
+    /// file — mirroring `on_bail` above.
+    pub bail_channel: BailChannel,
 }
 
 impl Default for OrchestrationPolicy {
@@ -306,6 +340,7 @@ impl Default for OrchestrationPolicy {
             child_sdlc_flow_policy: None,
             child_sdlc_task_policy: None,
             on_bail: OnBail::StopChain,
+            bail_channel: BailChannel::Session,
         }
     }
 }
@@ -333,6 +368,7 @@ pub struct PartialOrchestrationPolicy {
     pub child_sdlc_flow_policy: Option<Option<serde_json::Value>>,
     pub child_sdlc_task_policy: Option<Option<serde_json::Value>>,
     pub on_bail: Option<OnBail>,
+    pub bail_channel: Option<BailChannel>,
 }
 
 impl crate::policy::Policy for OrchestrationPolicy {
@@ -378,6 +414,7 @@ impl crate::policy::Policy for OrchestrationPolicy {
                 over.child_sdlc_task_policy.clone(),
             ),
             on_bail: crate::policy::merge_opt(self.on_bail, over.on_bail),
+            bail_channel: crate::policy::merge_opt(self.bail_channel, over.bail_channel),
         }
     }
 }
@@ -414,6 +451,9 @@ pub fn baseline() -> PartialOrchestrationPolicy {
         // EN.17.B Task 2: restate the built-in default verbatim —
         // baseline's no-op contract.
         on_bail: Some(OnBail::StopChain),
+        // EN.17.C Task 1: restate the built-in default verbatim —
+        // baseline's no-op contract.
+        bail_channel: Some(BailChannel::Session),
     }
 }
 
