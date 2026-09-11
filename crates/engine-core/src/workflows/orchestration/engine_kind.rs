@@ -358,6 +358,15 @@ mod tests {
                 ],
             ),
             ("mod.rs", &[]),
+            // Scan-list drift fix (`EN.15.J` Task 3, same class of drift `escalate.rs`'s
+            // own note above already names): `operator_edge.rs` landed in Task 1 without
+            // this guard's allowlist being updated. Its one `pub fn`,
+            // `make_author_operator_edge`, takes an owned `OperatorEdgeAuthorConfig`
+            // struct, not a bare runner-name `&str`/`String` — and its multi-line
+            // signature (rustfmt-wrapped past the line-length limit) never lands
+            // `&str`/`: String` on the same source line as `pub fn` in the first place,
+            // so there is nothing to allowlist.
+            ("operator_edge.rs", &[]),
             // `build_post_draft_payload`'s `language: &str` is the `"en"`/`"pt-BR"`
             // (D77 §2) field a draft was authored in — a config value, not a
             // runner-name escape hatch (`EN.12.M` task 1).
