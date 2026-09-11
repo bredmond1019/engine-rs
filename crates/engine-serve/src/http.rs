@@ -1071,6 +1071,15 @@ fn coord_write_error_response(err: engine_core::coord::write::CoordWriteError) -
         CoordWriteError::Io { .. } => HttpResponse::InternalServerError().json(serde_json::json!({
             "error": err.to_string(),
         })),
+        CoordWriteError::LeaseHeld {
+            ref holder_agent,
+            ref holder_lane,
+            ..
+        } => HttpResponse::Conflict().json(serde_json::json!({
+            "error": err.to_string(),
+            "holder_agent": holder_agent,
+            "holder_lane": holder_lane,
+        })),
     }
 }
 
@@ -1601,6 +1610,55 @@ mod tests {
         let req = test::TestRequest::get().uri("/health").to_request();
         let resp = test::call_service(&app, req).await;
         assert_eq!(resp.status(), 200);
+    }
+
+    /// `EN.17.A` task 1: a second agent's `POST /api/coordination/lease` against a repo whose
+    /// lease is already live-held by a different agent answers `409`, mirroring
+    /// `coord_write_error_response`'s new `LeaseHeld` arm.
+    #[actix_web::test]
+    async fn coord_lease_route_answers_409_for_a_foreign_lease() {
+        let fixture = tempfile::tempdir().expect("tempdir");
+        std::env::set_var("FLEET_LOCK_DIR", fixture.path().join(".fleet-locks"));
+
+        let state = test_app_state();
+        let app = test::init_service(
+            App::new()
+                .app_data(web::Data::new(state))
+                .configure(configure),
+        )
+        .await;
+
+        let first = test::TestRequest::post()
+            .uri("/api/coordination/lease")
+            .set_json(serde_json::json!({
+                "repo": "engine-rs",
+                "lane": "engine-rs",
+                "agent": "agent-a",
+                "kind": "exclusive",
+            }))
+            .to_request();
+        let first_resp = test::call_service(&app, first).await;
+        assert_eq!(first_resp.status(), 200, "the first lease must succeed");
+
+        let second = test::TestRequest::post()
+            .uri("/api/coordination/lease")
+            .set_json(serde_json::json!({
+                "repo": "engine-rs",
+                "lane": "engine-rs",
+                "agent": "agent-b",
+                "kind": "exclusive",
+            }))
+            .to_request();
+        let second_resp = test::call_service(&app, second).await;
+        assert_eq!(
+            second_resp.status(),
+            409,
+            "a live foreign-held lease must be refused with 409"
+        );
+        let body: serde_json::Value = test::read_body_json(second_resp).await;
+        assert_eq!(body["holder_agent"], "agent-a");
+
+        std::env::remove_var("FLEET_LOCK_DIR");
     }
 
     // --- EN.15.H task 2: GET /api/roadmaps/{slug}/status ---------------------

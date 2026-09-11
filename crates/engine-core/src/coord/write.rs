@@ -75,6 +75,18 @@ pub enum CoordWriteError {
         #[source]
         source: std::io::Error,
     },
+    /// `lease` was refused because a DIFFERENT agent already holds a live (not stale) lease on
+    /// `repo` — nothing was written. `EN.17.A` task 1.
+    #[error(
+        "lease on repo `{repo}` is held by agent `{holder_agent}` (lane `{holder_lane}`) at \
+         {path}"
+    )]
+    LeaseHeld {
+        path: PathBuf,
+        repo: String,
+        holder_agent: String,
+        holder_lane: String,
+    },
 }
 
 /// Write one coordination JSON record through the seam: schema-validate `value` against `T`,
@@ -258,6 +270,26 @@ where
     let text = fs::read_to_string(path).ok()?;
     let coord: Coord<T> = serde_json::from_str(&text).ok()?;
     coord.typed().cloned()
+}
+
+/// Whether `existing`'s liveness timestamp (`heartbeat`, falling back to `acquired_at`) is more
+/// than [`super::LEASE_STALE_THRESHOLD_SECONDS`] older than `now_iso` — both parsed as RFC 3339
+/// via the REQUEST's own clock (`now_iso`), never `Utc::now()`, so staleness here is judged on
+/// exactly the timeline the caller supplied rather than this process's wall clock. Only the
+/// EXISTING record's timestamp can fail to parse (`now_iso` is this seam's own trusted input);
+/// an unparsable existing timestamp is treated as LIVE — i.e. NOT stale — fail closed, so a
+/// corrupt liveness field can never be used to silently take over a foreign lease.
+fn lease_is_stale(existing: &LeaseRecord, now_iso: &str) -> bool {
+    let Ok(now) = chrono::DateTime::parse_from_rfc3339(now_iso) else {
+        // The request's own clock failed to parse — cannot judge staleness at all; fail closed
+        // (not stale) rather than risk replacing a live foreign lease.
+        return false;
+    };
+    let liveness = existing.heartbeat.as_deref().unwrap_or(&existing.acquired_at);
+    let Ok(then) = chrono::DateTime::parse_from_rfc3339(liveness) else {
+        return false;
+    };
+    (now - then).num_milliseconds() as f64 / 1000.0 > super::LEASE_STALE_THRESHOLD_SECONDS
 }
 
 /// Every non-stale slot record at `<lock_dir>/*.json` (flat root, never recursing) whose
@@ -541,17 +573,29 @@ pub fn lease(lock_dir: &Path, req: &LeaseRequest) -> Result<(), CoordWriteError>
     }
 
     let existing = read_typed::<LeaseRecord>(&path);
+    if let Some(existing) = existing.as_ref() {
+        if existing.agent != req.agent && !lease_is_stale(existing, req.now_iso) {
+            return Err(CoordWriteError::LeaseHeld {
+                path,
+                repo: req.repo.to_string(),
+                holder_agent: existing.agent.clone(),
+                holder_lane: existing.lane.clone(),
+            });
+        }
+    }
+    // A foreign-held lease reaches here only when stale — it is replaced with a FRESH
+    // `acquired_at` (the requester's own `now_iso`), never the dead holder's. A same-agent
+    // existing record is a renewal and keeps its `acquired_at`, matching `register`'s own
+    // `started_at` discipline.
+    let acquired_at = match existing.as_ref() {
+        Some(l) if l.agent == req.agent => l.acquired_at.clone(),
+        _ => req.now_iso.to_string(),
+    };
     let record = LeaseRecord {
         repo: req.repo.to_string(),
         lane: req.lane.to_string(),
         agent: req.agent.to_string(),
-        // `acquired_at` is an acquisition timestamp, set once: a renewal keeps the FIRST
-        // lease's value rather than re-stamping it — same discipline as `register`'s
-        // `started_at`.
-        acquired_at: existing
-            .as_ref()
-            .map(|l| l.acquired_at.clone())
-            .unwrap_or_else(|| req.now_iso.to_string()),
+        acquired_at,
         kind: req.kind,
         heartbeat: Some(req.now_iso.to_string()),
         scope: req.scope,
@@ -1692,6 +1736,88 @@ mod tests {
             "acquired_at is set once and must never be re-stamped by a renewal"
         );
         assert_eq!(record.heartbeat.as_deref(), Some("2026-09-08T11:30:00Z"));
+    }
+
+    #[test]
+    fn lease_refuses_a_live_foreign_lease_and_writes_nothing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let no_blocks: Vec<String> = Vec::new();
+        let first = lease_req(
+            "engine-rs",
+            "engine-rs",
+            "agent-a",
+            "2026-09-08T10:00:00Z",
+            None,
+            &no_blocks,
+        );
+        lease(dir.path(), &first).expect("first lease must succeed");
+
+        let path = lease_path(dir.path(), "engine-rs");
+        let before = fs::read_to_string(&path).expect("read lease file before the refusal");
+
+        // Just past the acquisition, well inside LEASE_STALE_THRESHOLD_SECONDS (3h) — still live.
+        let second = lease_req(
+            "engine-rs",
+            "engine-rs",
+            "agent-b",
+            "2026-09-08T10:05:00Z",
+            None,
+            &no_blocks,
+        );
+        let err = lease(dir.path(), &second).expect_err("a live foreign lease must be refused");
+        match err {
+            CoordWriteError::LeaseHeld {
+                holder_agent,
+                holder_lane,
+                ..
+            } => {
+                assert_eq!(holder_agent, "agent-a");
+                assert_eq!(holder_lane, "engine-rs");
+            }
+            other => panic!("expected CoordWriteError::LeaseHeld, got {other:?}"),
+        }
+
+        let after = fs::read_to_string(&path).expect("read lease file after the refusal");
+        assert_eq!(
+            before, after,
+            "a refused lease must leave the existing lease file byte-identical"
+        );
+    }
+
+    #[test]
+    fn lease_replaces_a_stale_foreign_lease_with_a_fresh_acquired_at() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let no_blocks: Vec<String> = Vec::new();
+        let first = lease_req(
+            "engine-rs",
+            "engine-rs",
+            "agent-a",
+            "2026-09-08T10:00:00Z",
+            None,
+            &no_blocks,
+        );
+        lease(dir.path(), &first).expect("first lease must succeed");
+
+        // Just past LEASE_STALE_THRESHOLD_SECONDS (3h) after the first lease's heartbeat.
+        let second = lease_req(
+            "engine-rs",
+            "engine-rs",
+            "agent-b",
+            "2026-09-08T13:00:01Z",
+            None,
+            &no_blocks,
+        );
+        lease(dir.path(), &second).expect("a stale foreign lease must be replaced");
+
+        let record: LeaseRecord =
+            read_typed(&lease_path(dir.path(), "engine-rs")).expect("record must be readable");
+        assert_eq!(record.agent, "agent-b");
+        assert_eq!(
+            record.acquired_at, "2026-09-08T13:00:01Z",
+            "a stale foreign lease's acquired_at must be replaced with the requester's now_iso, \
+             never the dead holder's"
+        );
+        assert_eq!(record.heartbeat.as_deref(), Some("2026-09-08T13:00:01Z"));
     }
 
     #[test]

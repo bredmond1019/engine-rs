@@ -68,6 +68,13 @@ pub const FLEET_LOCK_DIR_ENV: &str = "FLEET_LOCK_DIR";
 /// Name of the lock directory under the brain root when `FLEET_LOCK_DIR` is unset.
 const LOCK_SUBDIR: &str = ".fleet-locks";
 
+/// A lease's liveness timestamp (`heartbeat`, falling back to `acquired_at`) older than this
+/// many seconds is judged stale — a foreign-held lease past this age is replaced rather than
+/// refused (`EN.17.A` task 1). Must equal `mev`'s own `src/brain/lease.rs`
+/// `LEASE_STALE_THRESHOLD_SECONDS` (180 minutes / 3h), the authority this value mirrors, and
+/// must be the ONLY definition of this const name anywhere under `crates/engine-core/src`.
+pub const LEASE_STALE_THRESHOLD_SECONDS: f64 = 180.0 * 60.0;
+
 /// Overall health of a joined [`CoordinationView`].
 ///
 /// Exhaustive: this is a plain two-state read-side classification (something didn't parse or
