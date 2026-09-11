@@ -76,6 +76,35 @@ fn write_notes(dir: &Path, lifecycle: &str) {
     );
 }
 
+/// Content-hash EVERY `state.json` under `root`, recursively, returned sorted by path.
+///
+/// Task 6's acceptance criterion is "zero `state.json` content-hash changes anywhere in the
+/// fixture corpus" — hashing one known path only proves that path was left alone, and would miss
+/// both an unexpected write to a sibling repo's file and a brand-new `state.json` appearing. The
+/// returned vector carries the path set as well as the hashes, so comparing two snapshots catches
+/// a creation or deletion as well as an edit.
+fn hash_all_state_json(root: &Path) -> Vec<(PathBuf, String)> {
+    fn walk(dir: &Path, out: &mut Vec<(PathBuf, String)>) {
+        let Ok(entries) = fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                walk(&path, out);
+            } else if path.file_name().is_some_and(|n| n == "state.json") {
+                let mut hasher = sha2::Sha256::new();
+                hasher.update(fs::read(&path).expect("state.json readable"));
+                out.push((path, format!("{:x}", hasher.finalize())));
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(root, &mut out);
+    out.sort();
+    out
+}
+
 fn ctx_with_event(event: Value) -> TaskContext {
     TaskContext {
         event,
@@ -250,9 +279,19 @@ async fn full_pipeline_produces_a_disposal_json_matching_task_4_shape_with_no_st
     });
     write_ledger(&dir, "demo", vec![row]);
 
-    let state_json_path = root.join("engine-rs/planning/state.json");
-    write(&state_json_path, "{\"tracks\": []}\n");
-    let state_before = fs::read(&state_json_path).unwrap();
+    // Two of them, in different repos, so the sweep below is a real positive control: it must be
+    // known to FIND state.json files, otherwise an empty-vs-empty comparison would pass vacuously.
+    write(
+        &root.join("engine-rs/planning/state.json"),
+        "{\"tracks\": []}\n",
+    );
+    write(&root.join("mev/planning/state.json"), "{\"tracks\": []}\n");
+    let state_before = hash_all_state_json(root);
+    assert_eq!(
+        state_before.len(),
+        2,
+        "positive control: the sweep must actually find the fixture's state.json files"
+    );
 
     let node = ConsolidateRunNode::new();
     let ctx = ctx_with_event(json!({
@@ -275,10 +314,10 @@ async fn full_pipeline_produces_a_disposal_json_matching_task_4_shape_with_no_st
     assert_eq!(file.rows[0].owner_repo, "engine-rs");
     assert!(file.conventions.get("ungrounded_excludes").is_some());
 
-    let state_after = fs::read(&state_json_path).unwrap();
+    let state_after = hash_all_state_json(root);
     assert_eq!(
         state_before, state_after,
-        "CONSOLIDATE must never touch a state.json"
+        "CONSOLIDATE must never create, delete, or touch a state.json anywhere in the corpus"
     );
 }
 
@@ -415,6 +454,17 @@ async fn remediation_promotion_through_the_full_graph_is_idempotent() {
         "hq_root": hq_root.to_string_lossy(),
     });
 
+    // Remediation promotion is the ONE stage that hands work to external writers (the real
+    // `check_remediation.py` / `render_*.py`), so it is the only place a state.json could
+    // plausibly be mutated behind the node's back. Snapshot both trees, not just the fixture.
+    let hq_state_before = hash_all_state_json(hq_root);
+    assert_eq!(
+        hq_state_before.len(),
+        1,
+        "positive control: the hermetic HQ carries exactly one state.json to watch"
+    );
+    let fixture_state_before = hash_all_state_json(root);
+
     let node = ConsolidateRunNode::new();
     let ctx = node
         .process(ctx_with_event(event.clone()))
@@ -450,5 +500,16 @@ async fn remediation_promotion_through_the_full_graph_is_idempotent() {
         rem_doc_after["remediations"].as_array().unwrap().len(),
         1,
         "idempotent: no duplicate remediation entry written"
+    );
+
+    assert_eq!(
+        hq_state_before,
+        hash_all_state_json(hq_root),
+        "remediation promotion must never touch a state.json in the HQ tree"
+    );
+    assert_eq!(
+        fixture_state_before,
+        hash_all_state_json(root),
+        "remediation promotion must never touch a state.json in the fixture corpus"
     );
 }
