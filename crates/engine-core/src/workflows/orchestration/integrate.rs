@@ -1299,6 +1299,140 @@ pub type RunRecordSinkFn = dyn Fn(RunRecordLifecycle) + Send + Sync;
 /// recording stub instead.
 pub type CloseBlockFn = dyn Fn(&str, &str) + Send + Sync;
 
+/// `EN.15.L` task 2: the injected "propose candidate D57 verification-ledger entries for
+/// the step that just integrated" seam. Mirrors [`RunRecordSinkFn`]'s injection rationale
+/// exactly: `engine-core` has no model client of its own — the composer is a bounded
+/// judgment step (an `AgentCodeStep`, per that block's `why`), wired only in
+/// `engine-serve`/a workflow graph — so it is injected here rather than called directly.
+/// Takes the just-finished step's [`ExecutionOutcome`] and returns candidate entries in
+/// [`super::ledger::NewLedgerEntry`] shape, unstamped and unvalidated: every deterministic
+/// rule (the `<repo>-` id prefix, `status: untested`, the `block` id, every validation
+/// refusal) is [`super::ledger::LedgerEntry::compose`]'s job, called only after this seam
+/// returns — never this seam's own. Returns `Err(String)` for a composer failure or
+/// unparseable output; the caller ([`compose_and_append_ledger_entries`]) treats that
+/// exactly like an empty `Ok(vec![])` plus a logged, recorded gap — it never fails the
+/// chain or blocks [`CloseBlockFn`]. `None` is a true no-op: nothing is invoked, created,
+/// read, or written, so every existing caller of [`integrate_chain_impl`] that does not
+/// pass this seam is behavior-identical to before it existed.
+pub type ComposeLedgerEntriesFn = dyn Fn(
+        &ExecutionOutcome,
+    )
+        -> futures::future::BoxFuture<'static, Result<Vec<super::ledger::NewLedgerEntry>, String>>
+    + Send
+    + Sync;
+
+/// `EN.15.L` task 2: compose (if a seam is wired) and best-effort append this
+/// just-integrated step's verification-ledger entries. Called on the genuinely-integrated
+/// path only, AFTER the lane-log `closed` line is on disk and BEFORE [`CloseBlockFn`]
+/// fires — so a bail on the NEXT step still leaves THIS step's entries written, the
+/// load-bearing per-close-not-batched property this block exists for.
+///
+/// A composer error or unparseable output NEVER fails the chain or blocks `close_block`:
+/// it is logged via `tracing::warn!` and additionally recorded as a journal row (reusing
+/// the existing `GateRefused` decision kind — this file cannot introduce a new
+/// [`engine_contract::JournalDecisionKind`] variant without also touching
+/// `engine-contract`'s exhaustive render match in `engine-serve`, out of this task's file
+/// scope) so the gap survives into `notes.md`, which `EN.15.G` task 3's `run_record_sink`
+/// renders from exactly this accumulator. A candidate the composer proposed but
+/// [`super::ledger::LedgerEntry::compose`] refuses (an invalid shape) is logged and
+/// skipped the same way — refusing one candidate never discards the others.
+#[allow(clippy::too_many_arguments)]
+async fn compose_and_append_ledger_entries(
+    compose_ledger_entries: Option<&ComposeLedgerEntriesFn>,
+    roadmap_dir: &Path,
+    step: &ChainStep,
+    step_lane: &str,
+    outcome: &ExecutionOutcome,
+    journal_sink: Option<&JournalSinkFn>,
+    campaign_id: uuid::Uuid,
+    step_run_id: uuid::Uuid,
+) {
+    let Some(compose) = compose_ledger_entries else {
+        return;
+    };
+    let roadmap = step.roadmap.as_deref().unwrap_or("no-roadmap");
+
+    let candidates = match compose(outcome).await {
+        Ok(candidates) => candidates,
+        Err(err) => {
+            tracing::warn!(
+                repo = %step.repo,
+                block_id = %step.block_id,
+                error = %err,
+                "EN.15.L: verification-ledger composer failed or returned unparseable \
+                 output; no ledger entries composed for this block"
+            );
+            emit_journal(
+                journal_sink,
+                campaign_id,
+                step_run_id,
+                &step.block_id,
+                engine_contract::JournalDecisionKind::GateRefused,
+                format!(
+                    "EN.15.L: verification-ledger composer failed for block {}: {err} — \
+                     no entries composed for this block",
+                    step.block_id
+                ),
+                serde_json::json!({
+                    "gap": "ledger_composer_error",
+                    "block": step.block_id,
+                }),
+            );
+            return;
+        }
+    };
+
+    if candidates.is_empty() {
+        return;
+    }
+
+    if let Err(err) = super::ledger::create_ledger_if_absent(
+        roadmap_dir,
+        roadmap,
+        &step.repo,
+        step_lane,
+        &Utc::now().to_rfc3339(),
+    ) {
+        tracing::warn!(
+            repo = %step.repo,
+            block_id = %step.block_id,
+            error = %err,
+            "EN.15.L: failed to create verification-ledger.json/.md; skipping ledger \
+             append for this block"
+        );
+        return;
+    }
+
+    let mut composed = Vec::with_capacity(candidates.len());
+    for candidate in candidates {
+        match super::ledger::LedgerEntry::compose(&step.repo, step.block_id.clone(), candidate) {
+            Ok(entry) => composed.push(entry),
+            Err(err) => {
+                tracing::warn!(
+                    repo = %step.repo,
+                    block_id = %step.block_id,
+                    error = %err,
+                    "EN.15.L: a candidate verification-ledger entry was refused at \
+                     composition; not written"
+                );
+            }
+        }
+    }
+    if composed.is_empty() {
+        return;
+    }
+
+    let ledger_path = roadmap_dir.join("verification-ledger.json");
+    if let Err(err) = super::ledger::merge_append_entries(&ledger_path, &composed) {
+        tracing::warn!(
+            repo = %step.repo,
+            block_id = %step.block_id,
+            error = %err,
+            "EN.15.L: failed to append verification-ledger entries for this block"
+        );
+    }
+}
+
 /// Build one [`engine_contract::JournalRow`] and forward it to
 /// `journal_sink`, if any. A `None` sink (the default via
 /// [`integrate_chain`]) is a true no-op: no row is even constructed.
@@ -1597,6 +1731,7 @@ pub async fn integrate_chain(
         None,
         None,
         None,
+        None,
     )
     .await
 }
@@ -1656,6 +1791,7 @@ pub async fn integrate_chain_with_journal(
         None,
         None,
         None,
+        None,
     )
     .await
 }
@@ -1711,6 +1847,7 @@ pub async fn integrate_chain_with_coord(
         None,
         None,
         coord,
+        None,
         None,
     )
     .await
@@ -1774,6 +1911,7 @@ pub async fn integrate_chain_with_dispatch(
         Some(dispatcher),
         None,
         None,
+        None,
     )
     .await
 }
@@ -1784,6 +1922,12 @@ pub async fn integrate_chain_with_dispatch(
 /// self-healing across a kill mid-run. See [`RunRecordSinkFn`]'s own doc for why this is
 /// injected rather than `engine-core` calling `render_notes_md`/`render_review_md` directly.
 /// `run_record_sink: None` is behavior-identical to [`integrate_chain_with_coord`] itself.
+///
+/// `compose_ledger_entries` (`EN.15.L` task 2) is the composer seam
+/// [`compose_and_append_ledger_entries`] fires on the genuinely-integrated path, right
+/// alongside `run_record_sink`'s own `notes.md`/`review.md` accumulator — see
+/// [`ComposeLedgerEntriesFn`]'s own doc. `None` is a true no-op, same as every other
+/// optional seam here.
 #[allow(clippy::too_many_arguments)]
 pub async fn integrate_chain_with_run_record(
     chain: &[ChainStep],
@@ -1808,6 +1952,7 @@ pub async fn integrate_chain_with_run_record(
     journal_sink: Option<&JournalSinkFn>,
     coord: Option<&CoordHandle>,
     run_record_sink: Option<&RunRecordSinkFn>,
+    compose_ledger_entries: Option<&ComposeLedgerEntriesFn>,
 ) -> Result<Vec<ExecutionOutcome>, IntegrateError> {
     integrate_chain_impl(
         chain,
@@ -1833,6 +1978,7 @@ pub async fn integrate_chain_with_run_record(
         None,
         coord,
         run_record_sink,
+        compose_ledger_entries,
     )
     .await
 }
@@ -1888,6 +2034,7 @@ async fn integrate_chain_impl(
     dispatcher: Option<&Dispatcher>,
     coord: Option<&CoordHandle>,
     run_record_sink: Option<&RunRecordSinkFn>,
+    compose_ledger_entries: Option<&ComposeLedgerEntriesFn>,
 ) -> Result<Vec<ExecutionOutcome>, IntegrateError> {
     if let Some(sink) = run_record_sink {
         sink(RunRecordLifecycle::Started);
@@ -1915,6 +2062,7 @@ async fn integrate_chain_impl(
         journal_sink,
         dispatcher,
         coord,
+        compose_ledger_entries,
     )
     .await;
     if let Some(sink) = run_record_sink {
@@ -1954,6 +2102,11 @@ async fn integrate_chain_impl_inner(
     // `StepLeaseGuard`'s `Drop`) on every path that leaves that loop iteration — a bail, a
     // cancel, a dispatch step, or a normal completion alike.
     coord: Option<&CoordHandle>,
+    // `EN.15.L` task 2: ADDITIVE, same contract as `coord` above. `None` is a true no-op —
+    // [`compose_and_append_ledger_entries`] returns immediately without invoking, creating,
+    // reading, or writing anything, so this loop's observable behaviour is byte-identical
+    // to before this parameter existed for every existing caller.
+    compose_ledger_entries: Option<&ComposeLedgerEntriesFn>,
 ) -> Result<Vec<ExecutionOutcome>, IntegrateError> {
     let total_steps = chain.len();
     let mut outcomes = Vec::with_capacity(chain.len());
@@ -2498,6 +2651,23 @@ async fn integrate_chain_impl_inner(
         // stamping it, not a path reachable today.
         require_profile_stamp(&entry, &step.repo, &step.block_id)?;
         append_lane_log_line(roadmap_dir, &entry)?;
+
+        // `EN.15.L` task 2: compose and append this step's D57 verification-ledger
+        // entries — AFTER the lane-log 'closed' line above is on disk, BEFORE
+        // `close_block` below, so a bail on the NEXT step still leaves THIS step's
+        // entries written. Best-effort and never fails the chain — see
+        // [`compose_and_append_ledger_entries`]'s own doc.
+        compose_and_append_ledger_entries(
+            compose_ledger_entries,
+            roadmap_dir,
+            step,
+            step_lane,
+            &outcome,
+            journal_sink,
+            campaign_id,
+            step_run_id,
+        )
+        .await;
 
         // `EN.ticket.orchestration-close-block-node-not-wired` task 1: flip
         // this step's block to `"closed"` in `planning/state.json` — the
