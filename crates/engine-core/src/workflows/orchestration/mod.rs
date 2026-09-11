@@ -84,6 +84,14 @@
 //!   later task threads a composer seam through [`integrate`] and
 //!   `engine-serve`'s `journal.rs`, beside the run-record sink `EN.15.G`
 //!   already wired there.
+//! - [`preflight`] (`EN.17.D` Task 2) — per-block claim extraction over a
+//!   [`crate::nodes::JudgmentNode`] (Task 1) and a compiled-in, per-program
+//!   `argv` validator (never a prefix allowlist — those admit `rg --pre`
+//!   and `git log --output`) with a no-shell, cleared-environment runner and
+//!   a per-command timeout. [`PreflightRunner::run_for_block`] reads one
+//!   block record and returns one [`preflight::BlockPreflight`]; the halt
+//!   decision on a false load-bearing claim, the unjudged default, and the
+//!   chain-loop wiring are [`integrate`]'s (Task 3).
 
 pub mod chain;
 pub mod checkpoint;
@@ -101,3 +109,4 @@ pub mod integrate;
 pub mod ledger;
 pub mod operator_edge;
 pub mod post_draft;
+pub mod preflight;

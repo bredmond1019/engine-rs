@@ -1172,6 +1172,90 @@ fn build_close_block_seam(
     })
 }
 
+/// `EN.17.D` task 4: build the production preflight seam from `registry`
+/// and the event's resolved `OrchestrationPolicy`'s eight preflight knobs
+/// — mirrors [`build_close_block_seam`]'s exact shape (a small standalone
+/// factory function, not inlined, so this closure's construction is easy
+/// to reason about independently of the registration closure's own many
+/// other captures).
+///
+/// `OrchestrationRunNode`'s `preflight` seam is a synchronous
+/// `Fn(&str, &str) -> PreflightOutcome` (`graph.rs`'s private `PreflightFn`)
+/// — [`PreflightRunner::run_for_block`] is `async` (it makes a real
+/// `claude` call), and this closure runs from INSIDE
+/// `integrate_chain_impl_inner`'s per-step loop, itself already driven via
+/// `rt.block_on(..)` on a dedicated `spawn_blocking` thread with its OWN
+/// fresh current-thread runtime (`OrchestrationRunNode::process`) —
+/// calling `tokio::runtime::Handle::current().block_on(..)` there would
+/// panic ("Cannot start a runtime from within a runtime"). The fix mirrors
+/// `channel_transport.rs`'s own bridge: spawn a brand-new OS thread
+/// carrying its own fresh current-thread runtime, block on it there, and
+/// `.join()` synchronously — a real thread boundary, not a nested runtime.
+type PreflightSeam = Arc<
+    dyn Fn(&str, &str) -> engine_core::workflows::orchestration::preflight::PreflightOutcome
+        + Send
+        + Sync,
+>;
+
+#[must_use]
+fn build_preflight_seam(
+    registry: Arc<RepoRegistry>,
+    policy: &engine_core::workflows::orchestration::graph::OrchestrationPolicy,
+) -> PreflightSeam {
+    use engine_core::workflows::orchestration::preflight::{
+        PreflightConfig, PreflightOutcome, PreflightRunner,
+    };
+
+    // `preflight_enabled: false` is the built-in default and the common
+    // case for a served run — never construct a `PreflightRunner` (or
+    // spawn a thread per step) when the switch is off.
+    if !policy.preflight_enabled {
+        return Arc::new(|_repo: &str, _block_id: &str| PreflightOutcome::Disabled);
+    }
+
+    let runner = Arc::new(PreflightRunner::new(PreflightConfig::from(policy)));
+    Arc::new(move |repo: &str, block_id: &str| {
+        let runner = runner.clone();
+        let registry = registry.clone();
+        let repo = repo.to_string();
+        let block_id = block_id.to_string();
+        std::thread::spawn(move || {
+            let rt = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(rt) => rt,
+                Err(err) => {
+                    return PreflightOutcome::Unjudged {
+                        error_kind: format!("preflight_runtime_build_failed: {err}"),
+                    };
+                }
+            };
+            // A fresh, minimal `TaskContext` — `JudgmentNode::judge` only
+            // ever reads it as a session/ctx.nodes baseline (it never
+            // writes to the caller's own `ctx.nodes`, per its own doc), so
+            // there is nothing meaningful from the real chain run to carry
+            // in here.
+            let ctx = TaskContext {
+                event: serde_json::json!({}),
+                nodes: HashMap::new(),
+                metadata: serde_json::json!({}),
+                node_runs: HashMap::new(),
+            };
+            rt.block_on(async {
+                runner
+                    .run_for_block(&ctx, &registry, &repo, &block_id)
+                    .await
+                    .outcome
+            })
+        })
+        .join()
+        .unwrap_or_else(|_| PreflightOutcome::Unjudged {
+            error_kind: "preflight_thread_panicked".to_string(),
+        })
+    })
+}
+
 /// The registry-nickname identity a Rust-driven chain registers,
 /// heartbeats, leases, and drains its inbox as
 /// (`EN.ticket.wire-coord-handle-into-orchestration-run-node`) —
@@ -1224,6 +1308,29 @@ pub fn register_orchestration_with_registry(
             // `planning/state.json` from this the same way
             // `CloseBlockNode::evaluate` resolves it via `find_brain_root`.
             let close_block_root = orch_event.brain_root.clone();
+            // `EN.17.D` task 4: a clone of the SAME repo registry the
+            // gates above resolve, taken before `gates_repo_registry` is
+            // moved into `CorpusGates::new` — mirrors
+            // `conductor_repo_registry`'s own comment immediately above.
+            // Preflight reads a block record's `planning/blocks/<id>.json`
+            // from this registry (`preflight::read_block_record`, task 2).
+            let preflight_repo_registry = gates_repo_registry.clone();
+            // `EN.17.D` task 4: this event's resolved `OrchestrationPolicy`
+            // — used only to build the eight preflight knobs below. This
+            // factory closure is re-invoked once per dispatched event (see
+            // this function's own module doc), so resolving it here reads
+            // the SAME `orch_event.brain_root`/`policy` override
+            // `OrchestrationRunNode::process` itself resolves independently
+            // once the node actually runs — `event_only_context` (already
+            // used by `register_sdlc_flow_with_registry` above) builds the
+            // minimal `TaskContext` `resolve_policy_for_run_from` needs
+            // from the raw event this closure was invoked with.
+            let preflight_policy =
+                engine_core::workflows::orchestration::graph::resolve_policy_for_run_from(
+                    &event_only_context(event),
+                    &PolicyConfigSource::Worktree(orch_event.brain_root.clone()),
+                )
+                .map_err(|err| err.to_string())?;
 
             let gates = Arc::new(
                 engine_core::workflows::orchestration::corpus_gates::CorpusGates::new(
@@ -1329,10 +1436,19 @@ pub fn register_orchestration_with_registry(
             // integrated/close path).
             let close_block_seam = build_close_block_seam(close_block_root);
 
+            // `EN.17.D` task 4: the production preflight seam — a no-op
+            // `PreflightOutcome::Disabled` when `preflight_policy.preflight_enabled`
+            // is `false` (the built-in default, and the common case), so a
+            // served run never pays for the `PreflightRunner` construction
+            // below unless HQ's `orchestration.policy.preflight_enabled`
+            // switch is actually on.
+            let preflight_seam = build_preflight_seam(preflight_repo_registry, &preflight_policy);
+
             let node = engine_core::workflows::orchestration::graph::OrchestrationRunNode::new()
                 .with_campaign_id(campaign_id)
                 .with_conductor(conductor_seam)
                 .with_close_block(close_block_seam)
+                .with_preflight(preflight_seam)
                 .with_coord_agent(coord_agent_identity())
                 .with_resolve_depends_on(Arc::new(move |repo: &str, block_id: &str| {
                     let edges = depends_on_gates.resolve_depends_on(repo, block_id);

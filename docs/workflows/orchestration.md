@@ -352,6 +352,152 @@ re-registration is safe because `Dispatcher::register` is a `HashMap` insert key
 here); acting on the operator's reply to a bail notification; scheduling SWEEP; and a real
 `session:<slug>` tmux name (`EN.15.I`).
 
+## Preflight: halting a block on a false premise before it dispatches (`EN.17.D`)
+
+In an unattended chain nobody catches a block whose record names a symbol that moved, a file that
+does not exist, or a flag that was never added — the engine burns a full `implement`/`test`/`fix`
+cycle proving the spec wrong, which is the most expensive way to find a stale premise. Preflight is
+a **light** check that runs immediately before `execute_step` for every `block`-kind step: it reads
+that step's block record, asks one bounded, schema-constrained claude call to extract its
+load-bearing claims, runs each claim's command through a per-program argv validator with no shell,
+and bails the step when a load-bearing claim's command exits contrary to its expectation. It is
+deliberately not the main premise check — that belongs in `GenerateTasksNode` at authoring time,
+where a wrong premise can be fixed before any task runs at all, not merely stopped from wasting one.
+
+**Disabled by default.** `OrchestrationPolicy::preflight_enabled` is `false`, matching this repo's
+standing rule 6 (a new knob must not change existing behavior) — every pre-existing chain, and every
+pre-existing orchestration test, is unaffected until a brain root's own `planning/harness.json`
+turns it on. The seam that runs the argv-validating judgment call itself is only wired in production
+(`engine-serve`'s `build_preflight_seam`, from the same `RepoRegistry` the other gate seams use); an
+`OrchestrationRunNode` built with no `.with_preflight(...)` call always reports `Disabled` and bills
+nothing, whatever the resolved knobs say.
+
+### `JudgmentNode`: the reusable bounded claude call
+
+`crates/engine-core/src/nodes/judgment.rs` — `JudgmentNode<T>`, built from a `JudgmentSpec` (a
+model tier, a byte-capped list of named input slices, a stable prompt, and an optional `max_turns`
+ceiling via claude-code-rs's `Config.max_turns`), makes one schema-constrained claude call and
+returns `Result<JudgmentResult<T>, JudgmentError>`. It follows `claim_reaffirm::judge::
+JudgeClaimNode`'s shape (composed `Config.json_schema`, tier via `policy::apply_model_tier`, the
+reply parsed by `workflows::parse_structured_or_fenced`) but adds slice truncation and the turn
+ceiling, and — unlike `JudgeClaimNode` — **returns its result instead of writing `ctx.nodes`
+itself**, because a repeat call from a caller like preflight (one call per block, in a loop) would
+otherwise overwrite the one node-result slot each call gets (`ctx-nodes-holds-one-slot-per-node`).
+Each oversize slice is truncated at a UTF-8 character boundary and marked with the bytes dropped;
+`JudgmentResult` names every truncated slice so a caller can tell an incomplete input from a
+complete one. `JudgeClaimNode` itself is unchanged — `JudgmentNode` is a new, separate node, not a
+migration.
+
+Every way the call can fail is a typed `JudgmentError` variant, and every variant that follows a
+billed call carries that call's sessions (so `NodeError::with_sessions` can surface them later — see
+the carryover on billed sessions being dropped on failure, referenced elsewhere in this doc):
+
+| Variant | When |
+|---|---|
+| `Timeout` | claude-code-rs `Error::Timeout` — no envelope was ever returned, so no session. |
+| `CliError { sessions, message }` | claude-code-rs returned an `is_error: true` envelope. |
+| `NoStructuredResult { sessions, max_turns }` | The call succeeded but its content is not JSON — the expected shape of a call that ran out of turns before producing a structured reply. claude-code-rs's `Outcome` classifies only by `is_error`, with no `subtype` field, so a turns-exhausted call cannot be told apart from any other unstructured reply by type alone. |
+| `SchemaViolation { sessions, error }` | JSON was present but does not deserialize into the target type, including an out-of-enum value. |
+
+An `Unjudged` outcome (any `JudgmentError`) is never silent — see "The unjudged default" below.
+
+### The argv validator: a per-program allowlist, never a prefix match
+
+Preflight's judged claims choose their own verification commands from model output derived from
+block text — so the runner cannot trust `argv[0]` alone. A **prefix allowlist is not safe here**: a
+red-team pass on 2026-09-10 confirmed `rg --pre=<program>` runs an arbitrary named program against
+every file `rg` searches, and `git log --output=<file>` writes a file — both would slip past a
+check that only asked "does this start with `rg`/`git`". The validator instead requires the full
+argv to match a compiled-in table, one entry per allowed program:
+
+- **`rg`** — only `-n -l -c -i -F -w -q -L -e -g`/`--glob -t`/`--type --files` (either
+  `--flag value` or `--flag=value`), with `--no-config` always prepended. Refused explicitly:
+  `--pre`, `--pre-glob`, `-z`/`--search-zip`, `--hostname-bin`, and anything else.
+- **`git`** — no global option before the subcommand (`-c -C --git-dir --work-tree --exec-path`
+  are refused outright); the subcommand must be one of `log show rev-parse ls-files`, each with
+  only `--oneline -n -<k> --format= --pretty= --name-only --name-status --since= --until= --author=
+  --grep= --`. Refused explicitly: `--output`, `-p`/`--patch`, `--ext-diff`, `--textconv`.
+- **`test`** — only `-e|-f|-d|-s <path>`. **`ls`** — only `-1`/`-a`.
+- `argv[0]` must be a bare program name in the table — a path such as `/tmp/rg` or `/usr/bin/rg` is
+  refused, even for an otherwise-allowed program.
+- Positional path arguments must be relative with no `..` component; the working directory is
+  always the step's own repo root.
+
+Execution is `std::process::Command` with an argv array — **never a shell string**, so `|`, `>` and
+`;` in a positional argument are inert text, not redirection or a pipe. The child process runs with
+a cleared environment (only a fixed `PATH`/`HOME`, plus `GIT_CONFIG_NOSYSTEM=1` and
+`GIT_CONFIG_GLOBAL=/dev/null`), so `RIPGREP_CONFIG_PATH` and `GIT_*` set in the parent's own
+environment are never inherited, stdout capped, and killed if it runs past
+`preflight_command_timeout_ms`. A refused, timed-out, or unspawnable command is recorded
+`unverifiable` with a reason and **never counts as `false`** — only a command that actually ran and
+produced a result contrary to its `expect` does.
+
+**The `preflight_programs` knob can only narrow this table, never extend it.** A config value
+naming a program or flag outside the compiled-in set is exactly the bypass this validator closes,
+so it intersects with the table rather than replacing it.
+
+### The halt, and the unjudged default
+
+Preflight runs after admission and before `execute_step`, in the same closure-injection style as
+the existing `resolve_depends_on`/`is_edge_met` seams. Its outcome per block step is one of:
+
+- **`Judged { claims }`** — a load-bearing claim whose command exited contrary to its `expect`
+  makes the step bail through `record_bail_escalation` with `check_id: "preflight-premise"`,
+  naming the failing claim and its argv — `execute_step` is never called for that step, and under
+  `on_bail: skip_dependents` (above) its dependents are skipped too. A **non-load-bearing** false
+  claim is recorded in the report only; the step still dispatches normally.
+- **`Unjudged { error_kind }`** — the judgment call itself failed (any `JudgmentError` variant).
+  This is never silent: the default, `preflight_on_unjudged: proceed`, dispatches the step anyway,
+  records a `preflight_unjudged` finding naming the `JudgmentError` kind, and appends a
+  `preflight: unjudged(<kind>)` note to that step's lane-log line. `preflight_on_unjudged: bail`
+  instead stops the step with `check_id: "preflight-unjudged"`, exactly like a false load-bearing
+  claim.
+- **`SkippedNoRecord`** — the step's `planning/blocks/<id>.json` does not exist for its repo; the
+  step dispatches normally with no claims processed.
+- **`Disabled`** — the built-in no-op; every wrapper function's default, and what an un-injected
+  `OrchestrationRunNode` always reports.
+
+A loop-local `Vec<BlockPreflight>` accumulates one entry per block step, in chain order, and is
+stamped into the node's own result **once**, as `preflight_report`, beside `chain_report` — before
+the node decides its final `Ok`/`Err` outcome, so the report survives on the error path too (the
+same "carried `node_result`" mechanism `chain_report` itself relies on, described above under
+"A chain's bail reaches the operator"). No per-block `ctx.nodes` slot is written; `preflight_report`
+also carries the resolved knob values (tier, max claims, max turns, slice byte cap, the effective
+program list, the command timeout, and the unjudged policy) so a run's actual behavior can be read
+straight off its own result.
+
+### The eight knobs, and where the effective switch lives
+
+| Knob | Built-in default | What it trades |
+|---|---|---|
+| `preflight_enabled` | `false` | Whether preflight runs at all. Behavior-stable — adding this knob changed nothing about an existing run. |
+| `preflight_model_tier` | `Haiku` | The model tier `JudgmentNode` uses for the claim-extraction call. |
+| `preflight_max_claims` | `5` | The most claims executed per block; the excess is recorded as `claims_dropped`, never silently ignored. |
+| `preflight_max_turns` | `None` (unbounded) | `Config.max_turns` on the judgment call. |
+| `preflight_slice_max_bytes` | `4_000` | The byte cap each input slice (`what`, `files`, `acceptance_criteria`) is truncated to before reaching the model. |
+| `preflight_programs` | `None` (the full compiled-in table) | Can only narrow the argv validator's program set, never add to it — see above. |
+| `preflight_command_timeout_ms` | `5_000` | Per-command kill timeout; an expired command is recorded `unverifiable` with reason `timeout`. |
+| `preflight_on_unjudged` | `proceed` | Whether a failed judgment call (`Unjudged`) lets the step dispatch anyway (`proceed`) or bails it (`bail`). |
+
+Same PROFILE RULE as every other knob in this table: `baseline` restates all eight at their
+built-in values (the explicit no-op); `cheap-fast` and `thorough` leave all eight unset, so an
+HQ-set `orchestration.policy.preflight_enabled` still governs a run naming either profile —
+`resolve_profile_from` returns a named bundle whole, with no merge onto the built-in bundle of the
+same name, so a profile that *did* set these knobs would silently drop every other built-in knob in
+it.
+
+**THE EFFECTIVE SWITCH LIVES IN HQ'S OWN `harness.json`, not this repo's** — the same reasoning as
+`on_bail`/`bail_channel` above: `OrchestrationRunNode` resolves policy from
+`PolicyConfigSource::Worktree(event.brain_root)`, and the engine-mounted `bastion serve` that drives
+a real chain runs with `ENGINE_BRAIN_ROOT` pointed at HQ. This repo's own `planning/harness.json`
+documents all eight knobs at their built-in values only, marked not effective for a real chain, for
+the same reason `child_sdlc_flow_policy` and `on_bail` are.
+
+**Scope.** Preflight covers only `block`-kind chain steps — a `dispatch` step never runs it. It is
+not a substitute for the authoring-time premise check (`GenerateTasksNode`, out of scope for this
+block) — it is the last, cheap check before a chain spends a full engine run on a premise that was
+already false when the block was written.
+
 ## A bail or a stuck operator hold now writes an escalation and a bails[] entry (`EN.15.G`)
 
 A step that fails on the BAIL path (`execute_step` returns an error) or the HOLD path

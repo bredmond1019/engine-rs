@@ -395,6 +395,87 @@ async fn hq_orchestration_policy_node_run_uses_brain_root_policy() {
     );
 }
 
+/// `EN.17.D` task 5: writes `<brain_root>/planning/harness.json` with an
+/// `orchestration.policy.preflight_enabled: true` switch and nothing else —
+/// no `orchestration.profiles` section, matching the real HQ file's shape
+/// and this file's other `write_*_harness` fixtures.
+fn write_preflight_enabled_harness(brain_root: &Path) {
+    let harness = json!({
+        "orchestration": {
+            "policy": { "preflight_enabled": true }
+        }
+    });
+    std::fs::create_dir_all(brain_root.join("planning")).unwrap();
+    std::fs::write(
+        brain_root.join("planning").join("harness.json"),
+        serde_json::to_string_pretty(&harness).unwrap(),
+    )
+    .unwrap();
+}
+
+/// `EN.17.D` task 5: a temp brain root whose `planning/harness.json` sets
+/// `orchestration.policy.preflight_enabled: true` — with NO inline event
+/// `policy` override — reaches a real `OrchestrationRunNode` chain run:
+/// the resolved knob is stamped into the node's own `preflight_report`
+/// (`enabled: true`), exactly as `EN.17.D` task 4's
+/// `process_stamps_resolved_preflight_knobs_and_one_entry_per_block_into_preflight_report`
+/// proves for an INLINE policy override. This is the harness-file half of
+/// that same mechanism, reusing this file's own `one_repo_brain_root`/
+/// `event_ctx` fixtures rather than new ones. The node's own `preflight`
+/// seam is left at its default (`with_run_flow` only, no `with_preflight`
+/// injected) — production wiring of the argv-validating seam itself is
+/// `engine-serve`'s `build_preflight_seam` (task 4), out of scope here;
+/// this proves only that the brain root's file is what the resolved
+/// `OrchestrationPolicy.preflight_enabled` reads, not the runtime
+/// validator.
+#[tokio::test]
+async fn hq_orchestration_policy_brain_root_enables_preflight() {
+    let dir = one_repo_brain_root();
+    write_preflight_enabled_harness(dir.path());
+
+    let (run_flow, calls) = recording_run_flow();
+    let node = OrchestrationRunNode::new().with_run_flow(run_flow);
+    let ctx = event_ctx(json!({
+        "brain_root": dir.path(),
+        "blocks": [{ "repo": "repo-a", "block_id": "A.1" }],
+        "roadmap_slug": "hq-orchestration-policy-fixture",
+    }));
+    let out = node
+        .process(ctx)
+        .await
+        .unwrap_or_else(|err| panic!("orchestration run should succeed: {err}"));
+    assert_eq!(calls.lock().unwrap().len(), 1);
+    assert_eq!(
+        out.nodes[NODE_NAME]["preflight_report"]["enabled"],
+        json!(true),
+        "the brain root's harness.json orchestration.policy.preflight_enabled must reach \
+         OrchestrationRunNode with no inline policy override: {:?}",
+        out.nodes[NODE_NAME]["preflight_report"]
+    );
+
+    // A sibling brain root with no `orchestration` key at all resolves to
+    // the built-in default, `false` — proving the switch is the brain
+    // root's file, not some other ambient default.
+    let dir_no_switch = one_repo_brain_root();
+    let (run_flow_no_switch, _calls_no_switch) = recording_run_flow();
+    let node_no_switch = OrchestrationRunNode::new().with_run_flow(run_flow_no_switch);
+    let ctx_no_switch = event_ctx(json!({
+        "brain_root": dir_no_switch.path(),
+        "blocks": [{ "repo": "repo-a", "block_id": "A.1" }],
+        "roadmap_slug": "hq-orchestration-policy-fixture",
+    }));
+    let out_no_switch = node_no_switch
+        .process(ctx_no_switch)
+        .await
+        .unwrap_or_else(|err| panic!("orchestration run should succeed: {err}"));
+    assert_eq!(
+        out_no_switch.nodes[NODE_NAME]["preflight_report"]["enabled"],
+        json!(false),
+        "with no orchestration.policy key at all, preflight_enabled must resolve to its \
+         built-in default, false"
+    );
+}
+
 /// This fleet's REAL HQ `planning/harness.json` — reached from this repo at
 /// `../../planning/harness.json` (engine-rs has no `brain.toml`; HQ is the
 /// brain root a real chain resolves against, per this file's module doc).
@@ -463,6 +544,18 @@ async fn hq_orchestration_policy_real_hq_file_sets_the_switches() {
         Some("notification"),
         "HQ's real orchestration.policy.bail_channel must be 'notification' (EN.17.C)"
     );
+    match policy.get("preflight_enabled") {
+        Some(preflight_enabled) => assert_eq!(
+            preflight_enabled.as_bool(),
+            Some(true),
+            "HQ's real orchestration.policy.preflight_enabled must be true (EN.17.D)"
+        ),
+        None => eprintln!(
+            "SKIP (partial): HQ harness.json's orchestration.policy has no preflight_enabled \
+             key yet -- EN.17.D's cross-tree write has not landed. The rest of this test still \
+             runs against on_bail/bail_channel."
+        ),
+    }
 
     // Proves task 4's stamping with the REAL resolved value (not a
     // fixture): resolve `OrchestrationPolicy` straight from THIS file, then
