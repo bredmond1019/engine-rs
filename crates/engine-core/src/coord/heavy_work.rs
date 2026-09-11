@@ -33,13 +33,20 @@
 
 use std::collections::HashMap;
 use std::fs;
+use std::future::Future;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::process::Command;
+use std::sync::Arc;
+use std::task::{Context, Poll};
+use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
+use tokio::sync::oneshot;
+use tokio::task::JoinHandle;
 use uuid::Uuid;
 
 /// `<lock_dir>/heavy-work` — the root of this module's on-disk layout.
@@ -428,6 +435,547 @@ fn parse_vm_stat_free_mb(output: &str) -> Option<u64> {
     Some((free_pages + inactive_pages) * page_size / (1024 * 1024))
 }
 
+// -------------------------------------------------------------------------------------------
+// Admission order and reclaim — the two pure decision rules the queue is built from.
+// -------------------------------------------------------------------------------------------
+
+/// The strict per-class admission order: `(enqueued_at, job_id)`, ascending. Sorting a class's
+/// `Queued` records by this key and admitting only the first one enforces "no skipping past a
+/// blocked head" — a later job never starts while an earlier same-class job is still waiting.
+/// The `job_id` tiebreak matters only when two jobs share the same `enqueued_at` instant; it is
+/// arbitrary but total, so the order is always fully determined.
+pub fn fifo_key(job: &HeavyWorkJob) -> (DateTime<Utc>, Uuid) {
+    (job.enqueued_at, job.job_id)
+}
+
+/// Whether a `Running` job is reclaimable RIGHT NOW: its holder pid is no longer running, OR its
+/// heartbeat has gone stale relative to `stale_after_secs`. Deliberately takes only `holder_pid`,
+/// `heartbeat_at`, `stale_after_secs` and `now` — never `admitted_at`/`enqueued_at` — because
+/// reclaim is a liveness question, not an elapsed-time-since-admission one. This is the exact
+/// defect this module's own doc comment describes in `scripts/fleet_build.py`'s `_sweep_stale`
+/// (which reclaims on `started_at` age even when the holder pid is alive); this function cannot
+/// repeat that mistake because the age it would need is not one of its parameters.
+///
+/// A `Running` record with a live pid but no `heartbeat_at` at all is treated as NOT reclaimable
+/// — every `Running` record this module itself writes always stamps `heartbeat_at` at admission
+/// (see [`HeavyWorkQueue`]), so a live pid with no heartbeat means this record was not produced
+/// by the normal admission path, and reclaim should not guess at staleness it has no evidence for.
+pub fn is_reclaimable(
+    holder_pid: Option<u32>,
+    heartbeat_at: Option<DateTime<Utc>>,
+    stale_after_secs: u64,
+    now: DateTime<Utc>,
+) -> bool {
+    let pid_alive = holder_pid.is_some_and(is_pid_running);
+    if !pid_alive {
+        return true;
+    }
+    match heartbeat_at {
+        Some(heartbeat) => {
+            let age_secs = (now - heartbeat).num_seconds();
+            age_secs < 0 || age_secs as u64 > stale_after_secs
+        }
+        None => false,
+    }
+}
+
+/// Whether OS pid `pid` is currently running, via `kill -0 <pid>` — mirrors
+/// `scripts/fleet_build.py`'s `_pid_running`, which calls `os.kill(pid, 0)` directly. This crate
+/// carries no `libc` dependency, so rather than adding one for a single syscall this shells out
+/// the same way [`VmStatFreeMemoryProbe`] already does for `vm_stat`. `kill -0` sends no signal;
+/// it only reports (via its exit status) whether the pid exists and is signalable by this user.
+/// Pid `0` is rejected without shelling out, since `kill -0 0` targets this process's own process
+/// group rather than a specific pid and would otherwise always read as "running".
+fn is_pid_running(pid: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    Command::new("kill")
+        .arg("-0")
+        .arg(pid.to_string())
+        .output()
+        .map(|output| output.status.success())
+        .unwrap_or(false)
+}
+
+// -------------------------------------------------------------------------------------------
+// `AdmissionLock` — a cross-process mutex around one admission decision.
+// -------------------------------------------------------------------------------------------
+
+/// `<lock_dir>/heavy-work/.admission.lock` — a directory used as a cross-process mutex. This
+/// crate has no `flock`-capable dependency (see the module doc comment's rationale for not
+/// pulling in a reader crate for `brain.toml` either), so this reuses the same atomicity
+/// `write_job` relies on: `mkdir` either creates the directory or fails with `AlreadyExists`,
+/// atomically, on every filesystem this fleet runs on.
+const ADMISSION_LOCK_NAME: &str = ".admission.lock";
+
+/// If the admission lock directory is older than this, its holder is assumed to have crashed
+/// while holding it (this process died between creating it and removing it) and it is forcibly
+/// cleared rather than wedging every future admission attempt forever. This is a safety net
+/// around the lock's OWN age, an implementation detail distinct from [`is_reclaimable`]'s
+/// liveness-only rule for a *job's* `Running` record: nothing should ever legitimately hold this
+/// lock for longer than a directory listing and a few small file writes.
+const ADMISSION_LOCK_STALE_AFTER: Duration = Duration::from_secs(30);
+
+/// Holds `<lock_dir>/heavy-work/.admission.lock` for as long as this value lives; the directory
+/// is removed on drop. Acquired only from inside a blocking context (see
+/// [`HeavyWorkQueue::wait_for_admission`]) since [`Self::acquire`] spin-waits with
+/// `std::thread::sleep`.
+struct AdmissionLock {
+    path: PathBuf,
+}
+
+impl AdmissionLock {
+    fn acquire(lock_dir: &Path) -> io::Result<Self> {
+        let path = lock_dir.join(HEAVY_WORK_SUBDIR).join(ADMISSION_LOCK_NAME);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        loop {
+            match fs::create_dir(&path) {
+                Ok(()) => return Ok(Self { path }),
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                    if let Ok(meta) = fs::metadata(&path) {
+                        if let Ok(modified) = meta.modified() {
+                            if modified.elapsed().unwrap_or(Duration::ZERO)
+                                > ADMISSION_LOCK_STALE_AFTER
+                            {
+                                let _ = fs::remove_dir(&path);
+                                continue;
+                            }
+                        }
+                    }
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+}
+
+impl Drop for AdmissionLock {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir(&self.path);
+    }
+}
+
+// -------------------------------------------------------------------------------------------
+// `HeavyWorkQueue` — submit/run, FIFO admission serialized through `AdmissionLock`, and
+// liveness-only reclaim on every dequeue attempt.
+// -------------------------------------------------------------------------------------------
+
+/// Whether this run went through the queue at all, and how. Stamped by task 5/6's callers into
+/// their node output at EVERY setting (never omitted), so the output shape never varies between
+/// an enabled and a disabled run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HeavyWorkMode {
+    /// No `[heavy_work]` table: every job runs inline, unqueued, exactly as before this block.
+    Disabled,
+    /// A `[heavy_work]` table is present — whether or not this particular job's own class is
+    /// configured in it. An unconfigured class still reports `Enabled`, with `degraded: true`.
+    Enabled,
+}
+
+/// The description of one unit of admitted work: the class it competes for a slot in, plus the
+/// bookkeeping fields recorded on the job (for observability via `GET
+/// /api/coordination/heavy-work` — task 7) even though this queue never executes `commands`
+/// itself; the caller's own `work` closure is what actually runs, matching `CommandRunner`'s
+/// synchronous shape.
+#[derive(Debug, Clone)]
+pub struct HeavyWorkSpec {
+    pub class: String,
+    pub repo: String,
+    pub cwd: PathBuf,
+    pub commands: Vec<String>,
+    pub run_id: Option<Uuid>,
+}
+
+/// The result of [`HeavyWorkQueue::submit`] / [`HeavyWorkQueue::run`]: admission facts alongside
+/// the caller's own work output.
+#[derive(Debug, Clone)]
+pub struct HeavyWorkOutcome<T> {
+    pub mode: HeavyWorkMode,
+    /// `None` when the job never went through the on-disk store: disabled mode, an unconfigured
+    /// class, or a lock dir the store could not write to (all three run inline instead).
+    pub job_id: Option<Uuid>,
+    pub class: String,
+    /// Milliseconds between this job's `enqueued_at` and `admitted_at` — `0` on every inline path.
+    pub waited_ms: u64,
+    /// `true` when this job bypassed real admission gating (disabled queue, an unconfigured
+    /// class, or an unwritable lock dir) rather than being genuinely bounded by
+    /// `limit`/`min_free_mb`.
+    pub degraded: bool,
+    pub output: T,
+}
+
+/// A future resolving to a [`HeavyWorkOutcome`]. Returned by [`HeavyWorkQueue::submit`], which
+/// does not itself block on completion — [`HeavyWorkQueue::run`] is `submit(..).await.await`.
+pub struct JobHandle<T> {
+    receiver: oneshot::Receiver<HeavyWorkOutcome<T>>,
+}
+
+impl<T> Future for JobHandle<T> {
+    type Output = HeavyWorkOutcome<T>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+        match Pin::new(&mut this.receiver).poll(cx) {
+            Poll::Ready(Ok(outcome)) => Poll::Ready(outcome),
+            Poll::Ready(Err(_)) => {
+                // The producing task (spawned in `HeavyWorkQueue::submit`) always sends on every
+                // path, including an admitted job's own panic (caught by `spawn_blocking`'s
+                // `JoinError` and turned into a panic here rather than a silent hang) — a dropped
+                // sender means a bug in this module, not a state a caller should have to handle.
+                panic!("heavy-work job's producing task dropped without sending an outcome")
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+/// The generic heavy-work queue: FIFO admission per class, bounded by `brain.toml`'s
+/// `[heavy_work]` table, with liveness-only reclaim. Cheap to construct per call site — `Clone`,
+/// holding only a path, a config snapshot, and two `Arc`-shared seams — because admission itself
+/// is serialized across every caller sharing the same `lock_dir` via [`AdmissionLock`], a
+/// cross-process directory mutex: multiple `HeavyWorkQueue` values pointed at the same
+/// `lock_dir` (in this process, or another) share one FIFO queue and one `limit` per class,
+/// regardless of how many `HeavyWorkQueue` values exist.
+#[derive(Clone)]
+pub struct HeavyWorkQueue {
+    lock_dir: PathBuf,
+    config: HeavyWorkConfig,
+    probe: Arc<dyn FreeMemoryProbe>,
+    clock: Arc<dyn Fn() -> DateTime<Utc> + Send + Sync>,
+}
+
+impl HeavyWorkQueue {
+    /// A queue over `lock_dir`, bounded by `config`. Uses the real [`VmStatFreeMemoryProbe`] and
+    /// [`Utc::now`] until overridden via [`Self::with_probe`] / [`Self::with_clock`] (the
+    /// injectable seams task 3's integration tests and this task's own unit tests use).
+    pub fn new(lock_dir: PathBuf, config: HeavyWorkConfig) -> Self {
+        Self {
+            lock_dir,
+            config,
+            probe: Arc::new(VmStatFreeMemoryProbe),
+            clock: Arc::new(Utc::now),
+        }
+    }
+
+    #[must_use]
+    pub fn with_probe(mut self, probe: Arc<dyn FreeMemoryProbe>) -> Self {
+        self.probe = probe;
+        self
+    }
+
+    #[must_use]
+    pub fn with_clock(mut self, clock: impl Fn() -> DateTime<Utc> + Send + Sync + 'static) -> Self {
+        self.clock = Arc::new(clock);
+        self
+    }
+
+    pub fn config(&self) -> &HeavyWorkConfig {
+        &self.config
+    }
+
+    /// Submit `spec` for admission and run `work` once admitted — or immediately, on every
+    /// degraded/disabled path (see [`HeavyWorkOutcome::degraded`]). Returns without waiting for
+    /// completion; await the returned [`JobHandle`] for the outcome. `work` runs on
+    /// [`tokio::task::spawn_blocking`] once admitted, matching every synchronous `CommandRunner`
+    /// this queue's SDLC callers (tasks 5/6) wrap.
+    pub async fn submit<F, T>(&self, spec: HeavyWorkSpec, work: F) -> JobHandle<T>
+    where
+        F: FnOnce() -> T + Send + 'static,
+        T: Send + 'static,
+    {
+        let (tx, rx) = oneshot::channel();
+        let this = self.clone();
+        tokio::spawn(async move {
+            let outcome = this.run_to_completion(spec, work).await;
+            let _ = tx.send(outcome);
+        });
+        JobHandle { receiver: rx }
+    }
+
+    /// `submit(..).await.await` — the shape task 5/6 actually call: submit, then wait for the
+    /// outcome.
+    pub async fn run<F, T>(&self, spec: HeavyWorkSpec, work: F) -> HeavyWorkOutcome<T>
+    where
+        F: FnOnce() -> T + Send + 'static,
+        T: Send + 'static,
+    {
+        self.submit(spec, work).await.await
+    }
+
+    async fn run_to_completion<F, T>(&self, spec: HeavyWorkSpec, work: F) -> HeavyWorkOutcome<T>
+    where
+        F: FnOnce() -> T + Send + 'static,
+        T: Send + 'static,
+    {
+        if !self.config.enabled {
+            return self.run_inline(HeavyWorkMode::Disabled, spec, work).await;
+        }
+
+        let Some(class_limit) = self.config.class(&spec.class).copied() else {
+            tracing::warn!(
+                class = %spec.class,
+                "heavy-work: class not present in brain.toml [heavy_work.classes]; running unqueued"
+            );
+            return self.run_inline(HeavyWorkMode::Enabled, spec, work).await;
+        };
+
+        match self.enqueue(&spec) {
+            Ok(job) => self.admit_and_run(job, class_limit, work).await,
+            Err(err) => {
+                tracing::warn!(
+                    class = %spec.class,
+                    error = %err,
+                    "heavy-work: could not persist a job record; running unqueued"
+                );
+                self.run_inline(HeavyWorkMode::Enabled, spec, work).await
+            }
+        }
+    }
+
+    async fn run_inline<F, T>(
+        &self,
+        mode: HeavyWorkMode,
+        spec: HeavyWorkSpec,
+        work: F,
+    ) -> HeavyWorkOutcome<T>
+    where
+        F: FnOnce() -> T + Send + 'static,
+        T: Send + 'static,
+    {
+        let output = tokio::task::spawn_blocking(work)
+            .await
+            .expect("heavy-work inline task panicked");
+        HeavyWorkOutcome {
+            mode,
+            job_id: None,
+            class: spec.class,
+            waited_ms: 0,
+            degraded: matches!(mode, HeavyWorkMode::Enabled),
+            output,
+        }
+    }
+
+    /// Persist the initial `Queued` record for `spec`, stamping `enqueued_at` from this queue's
+    /// (possibly injected) clock.
+    fn enqueue(&self, spec: &HeavyWorkSpec) -> Result<HeavyWorkJob, HeavyWorkStoreError> {
+        let job = HeavyWorkJob {
+            job_id: Uuid::new_v4(),
+            class: spec.class.clone(),
+            state: JobState::Queued,
+            repo: spec.repo.clone(),
+            cwd: spec.cwd.clone(),
+            commands: spec.commands.clone(),
+            run_id: spec.run_id,
+            holder_pid: None,
+            enqueued_at: (self.clock)(),
+            admitted_at: None,
+            heartbeat_at: None,
+            finished_at: None,
+            passed: None,
+        };
+        write_job(&self.lock_dir, &job)?;
+        Ok(job)
+    }
+
+    async fn admit_and_run<F, T>(
+        &self,
+        job: HeavyWorkJob,
+        class_limit: ClassLimit,
+        work: F,
+    ) -> HeavyWorkOutcome<T>
+    where
+        F: FnOnce() -> T + Send + 'static,
+        T: Send + 'static,
+    {
+        let job_id = job.job_id;
+        let class = job.class.clone();
+        let enqueued_at = job.enqueued_at;
+
+        let admitted_at = self.wait_for_admission(job_id, &class, class_limit).await;
+        let waited_ms = (admitted_at - enqueued_at).num_milliseconds().max(0) as u64;
+
+        let heartbeat = self.spawn_heartbeat(job_id);
+        let result = tokio::task::spawn_blocking(work).await;
+        heartbeat.abort();
+
+        self.finish_job(
+            job_id,
+            if result.is_ok() {
+                JobState::Done
+            } else {
+                JobState::Abandoned
+            },
+        )
+        .await;
+
+        HeavyWorkOutcome {
+            mode: HeavyWorkMode::Enabled,
+            job_id: Some(job_id),
+            class,
+            waited_ms,
+            degraded: false,
+            output: result.expect("heavy-work admitted work panicked"),
+        }
+    }
+
+    /// Block (via [`tokio::task::spawn_blocking`], polling at `poll_interval_ms`) until `job_id`
+    /// is admitted for `class`, returning the `admitted_at` timestamp. Every attempt re-reads the
+    /// free-memory probe and re-scans the store — never cached across attempts — and reclaims
+    /// any stale `Running` record of `class` it finds along the way.
+    async fn wait_for_admission(
+        &self,
+        job_id: Uuid,
+        class: &str,
+        limit: ClassLimit,
+    ) -> DateTime<Utc> {
+        let poll_interval = Duration::from_millis(self.config.poll_interval_ms.max(1));
+        loop {
+            let lock_dir = self.lock_dir.clone();
+            let class_owned = class.to_string();
+            let probe = Arc::clone(&self.probe);
+            let clock = Arc::clone(&self.clock);
+            let stale_after_secs = self.config.stale_after_secs;
+
+            let attempt = tokio::task::spawn_blocking(move || {
+                try_admit(
+                    &lock_dir,
+                    job_id,
+                    &class_owned,
+                    limit,
+                    probe.as_ref(),
+                    clock.as_ref(),
+                    stale_after_secs,
+                )
+            })
+            .await
+            .expect("heavy-work admission attempt task panicked");
+
+            match attempt {
+                Ok(Some(admitted_at)) => return admitted_at,
+                Ok(None) => {}
+                Err(err) => {
+                    tracing::warn!(
+                        class = %class,
+                        error = %err,
+                        "heavy-work: admission attempt failed reading the store; retrying"
+                    );
+                }
+            }
+            tokio::time::sleep(poll_interval).await;
+        }
+    }
+
+    fn spawn_heartbeat(&self, job_id: Uuid) -> JoinHandle<()> {
+        let lock_dir = self.lock_dir.clone();
+        let clock = Arc::clone(&self.clock);
+        let interval = Duration::from_secs(self.config.heartbeat_interval_secs.max(1));
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(interval).await;
+                let path = job_path(&lock_dir, job_id);
+                if let Ok(mut job) = read_job(&path) {
+                    if job.state == JobState::Running {
+                        job.heartbeat_at = Some(clock());
+                        let _ = write_job(&lock_dir, &job);
+                    }
+                }
+            }
+        })
+    }
+
+    async fn finish_job(&self, job_id: Uuid, state: JobState) {
+        let path = job_path(&self.lock_dir, job_id);
+        let now = (self.clock)();
+        if let Ok(mut job) = read_job(&path) {
+            job.state = state;
+            job.finished_at = Some(now);
+            let _ = write_job(&self.lock_dir, &job);
+        }
+    }
+}
+
+/// One admission attempt for `job_id`, run under [`AdmissionLock`] so two processes racing this
+/// same `lock_dir` never both admit past `limit`. Reclaims any stale `Running` record of `class`
+/// first (liveness only — see [`is_reclaimable`]), then admits `job_id` only when it is the
+/// earliest still-`Queued` record of `class` (no skipping past a blocked head) AND the live
+/// `Running` count is below `limit` AND the free-memory probe reads at or above `min_free_mb`
+/// (re-read on every call — never cached).
+fn try_admit(
+    lock_dir: &Path,
+    job_id: Uuid,
+    class: &str,
+    limit: ClassLimit,
+    probe: &dyn FreeMemoryProbe,
+    clock: &(dyn Fn() -> DateTime<Utc> + Send + Sync),
+    stale_after_secs: u64,
+) -> Result<Option<DateTime<Utc>>, HeavyWorkStoreError> {
+    let admission_lock_path = lock_dir.join(HEAVY_WORK_SUBDIR).join(ADMISSION_LOCK_NAME);
+    let _lock = AdmissionLock::acquire(lock_dir).map_err(|e| HeavyWorkStoreError::Io {
+        path: admission_lock_path,
+        source: e,
+    })?;
+
+    let now = clock();
+    let dir = jobs_dir(lock_dir);
+    let mut queued: Vec<HeavyWorkJob> = Vec::new();
+    let mut running_live = 0usize;
+
+    if dir.exists() {
+        let entries = fs::read_dir(&dir).map_err(|e| HeavyWorkStoreError::Io {
+            path: dir.clone(),
+            source: e,
+        })?;
+        for entry in entries {
+            let entry = entry.map_err(|e| HeavyWorkStoreError::Io {
+                path: dir.clone(),
+                source: e,
+            })?;
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                continue; // a `.tmp-<pid>-<uuid>` in-flight write, or something else entirely
+            }
+            let Ok(mut job) = read_job(&path) else {
+                continue; // corrupt/partial record; never fail the whole attempt over one file
+            };
+            if job.class != class {
+                continue;
+            }
+            match job.state {
+                JobState::Queued => queued.push(job),
+                JobState::Running => {
+                    if is_reclaimable(job.holder_pid, job.heartbeat_at, stale_after_secs, now) {
+                        job.state = JobState::Abandoned;
+                        job.finished_at = Some(now);
+                        write_job(lock_dir, &job)?;
+                    } else {
+                        running_live += 1;
+                    }
+                }
+                JobState::Done | JobState::Cancelled | JobState::Abandoned => {}
+            }
+        }
+    }
+
+    queued.sort_by_key(fifo_key);
+    let is_head = queued.first().map(|j| j.job_id) == Some(job_id);
+    if !is_head || running_live >= limit.limit || probe.free_mb() < limit.min_free_mb {
+        return Ok(None);
+    }
+
+    let mut job = read_job(&job_path(lock_dir, job_id))?;
+    job.state = JobState::Running;
+    job.admitted_at = Some(now);
+    job.heartbeat_at = Some(now);
+    job.holder_pid = Some(std::process::id());
+    write_job(lock_dir, &job)?;
+    Ok(Some(now))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -771,5 +1319,187 @@ Swapouts:                                      0.\n";
         // actual value is host-dependent and not fixture-controlled.
         let probe = VmStatFreeMemoryProbe;
         let _ = probe.free_mb();
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // `fifo_key` — the per-class admission order.
+    // ---------------------------------------------------------------------------------------
+
+    fn job_at(enqueued_at: &str, job_id: Uuid) -> HeavyWorkJob {
+        let mut job = sample_job(job_id);
+        job.enqueued_at = enqueued_at.parse().expect("valid timestamp");
+        job
+    }
+
+    #[test]
+    fn fifo_key_orders_by_enqueued_at_then_job_id() {
+        let early = "2026-09-10T09:00:00Z";
+        let late = "2026-09-10T09:00:01Z";
+
+        let mut jobs = vec![
+            job_at(late, Uuid::from_u128(2)),
+            job_at(early, Uuid::from_u128(3)),
+            job_at(early, Uuid::from_u128(1)),
+        ];
+        jobs.sort_by_key(fifo_key);
+
+        let ids: Vec<u128> = jobs.iter().map(|j| j.job_id.as_u128()).collect();
+        assert_eq!(
+            ids,
+            vec![1, 3, 2],
+            "earliest enqueued_at first; a tie is broken by job_id"
+        );
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // `is_reclaimable` — liveness only, never admission age.
+    // ---------------------------------------------------------------------------------------
+
+    #[test]
+    fn reclaim_ignores_admission_age() {
+        // `admitted_at` is not even a parameter of `is_reclaimable` — this test pins that a job
+        // whose holder pid is alive and whose heartbeat keeps advancing is never reclaimed, no
+        // matter how long ago it was admitted (a fact this function has no way to observe).
+        let stale_after_secs = 60;
+        let now = Utc::now();
+        let live_pid = std::process::id();
+        let advancing_heartbeat = Some(now); // heartbeat as fresh as `now` itself
+
+        assert!(
+            !is_reclaimable(Some(live_pid), advancing_heartbeat, stale_after_secs, now),
+            "a live pid with an advancing heartbeat must never be reclaimed"
+        );
+    }
+
+    #[test]
+    fn reclaim_dead_pid() {
+        // 999999 mirrors scripts/tests/test_fleet_build.py's own convention for "a pid that is
+        // not running" (test_stranded_permit_is_reclaimed_after_ttl).
+        let dead_pid = 999_999;
+        let now = Utc::now();
+        assert!(
+            is_reclaimable(Some(dead_pid), Some(now), 300, now),
+            "a dead holder pid is reclaimable regardless of heartbeat age"
+        );
+    }
+
+    #[test]
+    fn reclaim_stale_heartbeat() {
+        let live_pid = std::process::id();
+        let now = Utc::now();
+        let stale_heartbeat = now - chrono::Duration::seconds(301);
+        assert!(
+            is_reclaimable(Some(live_pid), Some(stale_heartbeat), 300, now),
+            "a live pid whose heartbeat is older than stale_after_secs is reclaimable"
+        );
+    }
+
+    #[test]
+    fn reclaim_live_pid_with_fresh_heartbeat_is_not_reclaimed() {
+        // Positive control for the two tests above: the same live pid, but a heartbeat well
+        // within the threshold, must NOT be reclaimed.
+        let live_pid = std::process::id();
+        let now = Utc::now();
+        let fresh_heartbeat = now - chrono::Duration::seconds(5);
+        assert!(!is_reclaimable(Some(live_pid), Some(fresh_heartbeat), 300, now));
+    }
+
+    #[test]
+    fn reclaim_classifier_signature_never_reads_admitted_or_enqueued_at() {
+        // Structural pin for the ticket's own gated invariant (AC): grepping this file for
+        // `admitted_at|enqueued_at` must match only record fields, ordering and serialization —
+        // never the reclaim classifier's own logic. This test doesn't run `rg` itself (the task's
+        // completeness check does that against the real file), it just documents the intent
+        // beside the function it's about.
+        let now = Utc::now();
+        let _ = is_reclaimable(Some(std::process::id()), Some(now), 300, now);
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // `HeavyWorkQueue` — smoke tests over the disabled/degraded/admitted paths.
+    // ---------------------------------------------------------------------------------------
+
+    fn heavy_work_spec(dir: &Path, class: &str) -> HeavyWorkSpec {
+        HeavyWorkSpec {
+            class: class.to_string(),
+            repo: "engine-rs".to_string(),
+            cwd: dir.to_path_buf(),
+            commands: vec!["cargo nextest run --workspace".to_string()],
+            run_id: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn disabled_config_runs_inline_immediately() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let queue = HeavyWorkQueue::new(dir.path().to_path_buf(), HeavyWorkConfig::disabled());
+
+        let outcome = queue.run(heavy_work_spec(dir.path(), "test"), || 42).await;
+
+        assert_eq!(outcome.mode, HeavyWorkMode::Disabled);
+        assert!(!outcome.degraded);
+        assert_eq!(outcome.job_id, None);
+        assert_eq!(outcome.waited_ms, 0);
+        assert_eq!(outcome.output, 42);
+    }
+
+    #[tokio::test]
+    async fn unconfigured_class_runs_degraded_inline() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut classes = HashMap::new();
+        classes.insert(
+            "build".to_string(),
+            ClassLimit {
+                limit: 1,
+                min_free_mb: 0,
+            },
+        );
+        let config = HeavyWorkConfig {
+            enabled: true,
+            heartbeat_interval_secs: 30,
+            stale_after_secs: 300,
+            poll_interval_ms: 5,
+            classes,
+        };
+        let queue = HeavyWorkQueue::new(dir.path().to_path_buf(), config);
+
+        // "test" is not configured — only "build" is.
+        let outcome = queue.run(heavy_work_spec(dir.path(), "test"), || "ok").await;
+
+        assert_eq!(outcome.mode, HeavyWorkMode::Enabled);
+        assert!(outcome.degraded);
+        assert_eq!(outcome.job_id, None);
+    }
+
+    #[tokio::test]
+    async fn single_job_is_admitted_and_completes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut classes = HashMap::new();
+        classes.insert(
+            "test".to_string(),
+            ClassLimit {
+                limit: 1,
+                min_free_mb: 0,
+            },
+        );
+        let config = HeavyWorkConfig {
+            enabled: true,
+            heartbeat_interval_secs: 30,
+            stale_after_secs: 300,
+            poll_interval_ms: 5,
+            classes,
+        };
+        let queue = HeavyWorkQueue::new(dir.path().to_path_buf(), config);
+
+        let outcome = queue.run(heavy_work_spec(dir.path(), "test"), || 7).await;
+
+        assert_eq!(outcome.mode, HeavyWorkMode::Enabled);
+        assert!(!outcome.degraded);
+        assert_eq!(outcome.output, 7);
+        let job_id = outcome.job_id.expect("job_id set on the admitted path");
+
+        let job = read_job(&job_path(dir.path(), job_id)).expect("job record persisted");
+        assert_eq!(job.state, JobState::Done);
+        assert!(job.finished_at.is_some());
     }
 }
