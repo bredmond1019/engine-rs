@@ -37,6 +37,7 @@ mod fan_out_aggregate;
 mod gate_baseline;
 mod gate_timeout_fixture;
 mod harvest_gate_e2e;
+mod heavy_work;
 mod held_session;
 mod hq_orchestration_policy;
 mod judgment;
