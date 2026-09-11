@@ -1014,6 +1014,31 @@ pub fn register_recall(dispatcher: &mut Dispatcher) {
     );
 }
 
+/// Register the `CONSOLIDATE` workflow (`engine_core::workflows::consolidate::graph`,
+/// `EN.15.K` task 6) with `dispatcher`, populating both the `workflow_registry` and the
+/// `schema_registry`.
+///
+/// A **seventh model-free workflow** registered in this module, alongside
+/// [`register_terminal_probe`] / [`register_recall`] / [`register_opportunity_set_stage`] /
+/// [`register_opportunity_add_action`] / [`register_harvest_approve`] / [`register_lead_ingest`]:
+/// `ConsolidateRunNode` calls no model — it drives the pure, already-tested discovery/selection/
+/// disposal-write/remediation-promote/watermark-advance functions over an event naming a brain
+/// root and a roadmap slug (see `consolidate::graph`'s own module doc) — so this factory resolves
+/// no policy and seeds no policy stamp: there is no `resolve_policy_for_run_from` call and no
+/// `seed_resolved_policy` call. Extraction and mechanism naming stay `ClaudeCodeStep`s, run
+/// entirely outside this declared graph, per this block's own `out_of_scope`.
+pub fn register_consolidate(dispatcher: &mut Dispatcher) {
+    dispatcher.register(
+        engine_core::workflows::consolidate::graph::schema(),
+        Box::new(|_event: &serde_json::Value| {
+            Ok(Workflow::new(
+                engine_core::workflows::consolidate::graph::registry(),
+                engine_core::workflows::consolidate::graph::schema(),
+            ))
+        }),
+    );
+}
+
 /// Register the `ORCHESTRATION` workflow (`engine_core::workflows::orchestration`,
 /// `EN.10.B`) with `dispatcher`. Like [`register_terminal_probe`], this
 /// factory resolves no policy and seeds no policy stamp at dispatch time:
@@ -1616,6 +1641,7 @@ pub fn register_builtin_workflows_with_registry(
     register_approve_and_run(dispatcher);
     register_terminal_probe(dispatcher);
     register_recall(dispatcher);
+    register_consolidate(dispatcher);
     register_orchestration(dispatcher);
     register_debrief(dispatcher);
     register_held_session(dispatcher);
@@ -3248,6 +3274,7 @@ mod tests {
             "APPROVE_AND_RUN",
             "TERMINAL_PROBE",
             "RECALL",
+            "CONSOLIDATE",
             "ORCHESTRATION",
             "HELD_SESSION",
             "DEBRIEF",
@@ -3299,6 +3326,29 @@ mod tests {
         register_recall(&mut dispatcher);
 
         assert!(dispatcher.is_registered("RECALL"));
+    }
+
+    #[test]
+    fn register_consolidate_populates_both_registries() {
+        let mut dispatcher = Dispatcher::new();
+
+        register_consolidate(&mut dispatcher);
+
+        assert!(dispatcher.is_registered("CONSOLIDATE"));
+
+        let schema = dispatcher
+            .resolve_schema("CONSOLIDATE")
+            .expect("CONSOLIDATE schema should resolve");
+        assert_eq!(schema.start_node, "ConsolidateRunNode");
+    }
+
+    #[test]
+    fn register_builtin_workflows_registers_consolidate() {
+        let mut dispatcher = Dispatcher::new();
+
+        register_builtin_workflows(&mut dispatcher);
+
+        assert!(dispatcher.is_registered("CONSOLIDATE"));
     }
 
     #[test]
