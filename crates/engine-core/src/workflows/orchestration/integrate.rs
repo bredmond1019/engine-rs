@@ -89,6 +89,7 @@ use super::escalate::{
 use super::execute::{execute_step, EngineKind, ExecuteError, ExecutionOutcome, FlowRunner};
 use super::gates::{check_dependencies, AdmissionGate, DependencyEdge, GateError};
 use super::graph::{BailChannel, OnBail};
+use super::preflight::{BlockPreflight, ClaimVerdict, PreflightOutcome};
 use crate::coord::write::RegisterOutcome;
 use crate::nodes::brain_client::RECALL_NODE_NAME;
 use crate::workflows::get_result;
@@ -1185,6 +1186,30 @@ pub enum IntegrateError {
         block_id: Option<String>,
         reason: String,
     },
+    /// `EN.17.D` task 3: a load-bearing preflight claim's `argv` exited
+    /// contrary to its `expect` — the block record's premise is false, so
+    /// the step stops BEFORE [`execute_step`] ever runs
+    /// (`check_id: "preflight-premise"`). Under [`OnBail::SkipDependents`]
+    /// this step's transitive dependents are skipped exactly like any
+    /// other bail.
+    PreflightPremiseFailed {
+        repo: String,
+        block_id: String,
+        claim: String,
+        argv: Vec<String>,
+    },
+    /// `EN.17.D` task 3: the preflight judgment call itself failed
+    /// ([`PreflightOutcome::Unjudged`]) and [`OnUnjudged::Bail`] is in
+    /// effect — the step stops rather than dispatching against an
+    /// unverified premise (`check_id: "preflight-unjudged"`). Under the
+    /// built-in [`OnUnjudged::Proceed`] this variant is never constructed;
+    /// the step dispatches and the `JudgmentError` kind is recorded on the
+    /// step's `preflight_report` entry instead.
+    PreflightUnjudged {
+        repo: String,
+        block_id: String,
+        error_kind: String,
+    },
 }
 
 /// Which of a [`CoordHandle`]'s three write calls produced an
@@ -1359,6 +1384,25 @@ impl fmt::Display for IntegrateError {
                     "chain registration (repo '{repo}') coordination {op} refused: {reason}"
                 ),
             },
+            IntegrateError::PreflightPremiseFailed {
+                repo,
+                block_id,
+                claim,
+                argv,
+            } => write!(
+                f,
+                "block '{block_id}' (repo '{repo}') refused: preflight's load-bearing claim \
+                 '{claim}' (argv {argv:?}) did not hold"
+            ),
+            IntegrateError::PreflightUnjudged {
+                repo,
+                block_id,
+                error_kind,
+            } => write!(
+                f,
+                "block '{block_id}' (repo '{repo}') refused: preflight was unjudged ({error_kind}) \
+                 and preflight_on_unjudged is 'bail'"
+            ),
         }
     }
 }
@@ -1382,7 +1426,9 @@ impl std::error::Error for IntegrateError {
             | IntegrateError::NoDispatcherConfigured { .. }
             | IntegrateError::StepMergeFailed { .. }
             | IntegrateError::MissingPermissionProfileStamp { .. }
-            | IntegrateError::CoordRefused { .. } => None,
+            | IntegrateError::CoordRefused { .. }
+            | IntegrateError::PreflightPremiseFailed { .. }
+            | IntegrateError::PreflightUnjudged { .. } => None,
             IntegrateError::CheckpointWriteFailed(source) => Some(source),
             IntegrateError::Dispatch(err) => Some(err),
         }
@@ -1943,6 +1989,36 @@ fn default_block_status(_repo: &str, _block_id: &str) -> BlockPresence {
     BlockPresence::Row("open".to_string())
 }
 
+/// `EN.17.D` task 3: `(repo, block_id) -> PreflightOutcome` — the preflight
+/// seam, consulted once per BLOCK step (a [`StepKind::Dispatch`] step never
+/// reaches it — see the block's own `out_of_scope`), after admission and
+/// immediately before [`execute_step`]. `default_preflight` (every wrapper
+/// below [`integrate_chain_with_coord_and_policy`], which is the only
+/// caller task 4 wires a real closure into) always reports
+/// [`PreflightOutcome::Disabled`], matching the built-in
+/// `OrchestrationPolicy::preflight_enabled: false` — so the seam is a no-op
+/// for them, exactly like [`default_block_status`] above.
+fn default_preflight(_repo: &str, _block_id: &str) -> PreflightOutcome {
+    PreflightOutcome::Disabled
+}
+
+/// `EN.17.D` task 3: what this loop does when the preflight judgment call
+/// itself failed ([`PreflightOutcome::Unjudged`]) — the call never even
+/// reached a claim, let alone verified one. `Proceed` (the built-in
+/// default, and what every wrapper below [`integrate_chain_with_coord_and_policy`]
+/// hardcodes) dispatches the step anyway and records the `JudgmentError`
+/// kind on this step's `preflight_report` entry; `Bail` stops the step
+/// exactly like a false load-bearing claim, with
+/// `check_id: "preflight-unjudged"`. `OrchestrationPolicy`'s own
+/// `preflight_on_unjudged` knob (task 4) resolves to one of these two
+/// variants.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum OnUnjudged {
+    #[default]
+    Proceed,
+    Bail,
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn integrate_chain(
     chain: &[ChainStep],
@@ -2002,6 +2078,9 @@ pub async fn integrate_chain(
         BailChannel::Session,
         &default_block_status,
         &mut ChainReport::default(),
+        &default_preflight,
+        OnUnjudged::Proceed,
+        &mut Vec::new(),
     )
     .await
 }
@@ -2068,6 +2147,9 @@ pub async fn integrate_chain_with_journal(
         BailChannel::Session,
         &default_block_status,
         &mut ChainReport::default(),
+        &default_preflight,
+        OnUnjudged::Proceed,
+        &mut Vec::new(),
     )
     .await
 }
@@ -2134,6 +2216,9 @@ pub async fn integrate_chain_with_coord(
         BailChannel::Session,
         &default_block_status,
         &mut ChainReport::default(),
+        &default_preflight,
+        OnUnjudged::Proceed,
+        &mut Vec::new(),
     )
     .await
 }
@@ -2222,6 +2307,89 @@ pub async fn integrate_chain_with_coord_and_policy(
         bail_channel,
         block_status,
         report,
+        &default_preflight,
+        OnUnjudged::Proceed,
+        &mut Vec::new(),
+    )
+    .await
+}
+
+/// `EN.17.D` task 3: identical to [`integrate_chain_with_coord_and_policy`],
+/// plus the preflight seam — `preflight`/`on_unjudged`/`preflight_report`.
+/// Task 4 threads `OrchestrationRunNode`'s resolved knobs through THIS
+/// function; [`integrate_chain_with_coord_and_policy`] itself keeps calling
+/// [`integrate_chain_impl`] with [`default_preflight`]/
+/// [`OnUnjudged::Proceed`]/a throwaway `Vec` internally, so its own
+/// existing caller (`OrchestrationRunNode::process` today, before task 4)
+/// is unaffected by this addition — the same "add a new entry point rather
+/// than widen an existing one" shape [`integrate_chain_with_run_record`]
+/// used for `run_record_sink`/`compose_ledger_entries`.
+#[allow(clippy::too_many_arguments)]
+pub async fn integrate_chain_with_preflight(
+    chain: &[ChainStep],
+    resolve_depends_on: &dyn Fn(&str, &str) -> Vec<DependencyEdge>,
+    is_edge_met: &dyn Fn(&str, &str) -> bool,
+    admission: &AdmissionGate,
+    hold_source: &dyn HoldSource,
+    poll_interval: Duration,
+    hold_deadline: Option<Duration>,
+    cancellation_token: Option<&crate::cancellation::CancellationToken>,
+    campaign_budget: Option<&Budget>,
+    resolve_engine: &dyn Fn(&str, &str) -> EngineKind,
+    registry: &RepoRegistry,
+    run_flow: &FlowRunner,
+    roadmap_dir: &Path,
+    lane: Option<&str>,
+    step_observer: &StepObserverFn,
+    default_use_worktree: bool,
+    default_auto_pr: bool,
+    campaign_id: uuid::Uuid,
+    close_block: &CloseBlockFn,
+    coord: Option<&CoordHandle>,
+    child_sdlc_flow_policy: Option<&serde_json::Value>,
+    child_sdlc_task_policy: Option<&serde_json::Value>,
+    on_bail: OnBail,
+    bail_channel: BailChannel,
+    block_status: &dyn Fn(&str, &str) -> BlockPresence,
+    report: &mut ChainReport,
+    preflight: &dyn Fn(&str, &str) -> PreflightOutcome,
+    on_unjudged: OnUnjudged,
+    preflight_report: &mut Vec<BlockPreflight>,
+) -> Result<Vec<ExecutionOutcome>, IntegrateError> {
+    integrate_chain_impl(
+        chain,
+        resolve_depends_on,
+        is_edge_met,
+        admission,
+        hold_source,
+        poll_interval,
+        hold_deadline,
+        cancellation_token,
+        campaign_budget,
+        resolve_engine,
+        registry,
+        run_flow,
+        roadmap_dir,
+        lane,
+        step_observer,
+        default_use_worktree,
+        default_auto_pr,
+        campaign_id,
+        close_block,
+        None,
+        None,
+        coord,
+        None,
+        None,
+        child_sdlc_flow_policy,
+        child_sdlc_task_policy,
+        on_bail,
+        bail_channel,
+        block_status,
+        report,
+        preflight,
+        on_unjudged,
+        preflight_report,
     )
     .await
 }
@@ -2291,6 +2459,9 @@ pub async fn integrate_chain_with_dispatch(
         BailChannel::Session,
         &default_block_status,
         &mut ChainReport::default(),
+        &default_preflight,
+        OnUnjudged::Proceed,
+        &mut Vec::new(),
     )
     .await
 }
@@ -2364,6 +2535,9 @@ pub async fn integrate_chain_with_run_record(
         BailChannel::Session,
         &default_block_status,
         &mut ChainReport::default(),
+        &default_preflight,
+        OnUnjudged::Proceed,
+        &mut Vec::new(),
     )
     .await
 }
@@ -2441,6 +2615,11 @@ async fn integrate_chain_impl(
     bail_channel: BailChannel,
     block_status: &dyn Fn(&str, &str) -> BlockPresence,
     report: &mut ChainReport,
+    // `EN.17.D` task 3: same contract as `integrate_chain_impl_inner`'s own
+    // fields of the same name.
+    preflight: &dyn Fn(&str, &str) -> PreflightOutcome,
+    on_unjudged: OnUnjudged,
+    preflight_report: &mut Vec<BlockPreflight>,
 ) -> Result<Vec<ExecutionOutcome>, IntegrateError> {
     if let Some(sink) = run_record_sink {
         sink(RunRecordLifecycle::Started);
@@ -2475,6 +2654,9 @@ async fn integrate_chain_impl(
         bail_channel,
         block_status,
         report,
+        preflight,
+        on_unjudged,
+        preflight_report,
     )
     .await;
     if let Some(sink) = run_record_sink {
@@ -2554,6 +2736,21 @@ async fn integrate_chain_impl_inner(
     // what lets a caller read the report on both the success and the error
     // path without changing this function's `Result` shape.
     report: &mut ChainReport,
+    // `EN.17.D` task 3: `(repo, block_id) -> PreflightOutcome` — see
+    // `default_preflight`'s own doc. `&default_preflight` (every wrapper
+    // below `integrate_chain_with_coord_and_policy`) keeps this loop's
+    // observable behaviour byte-identical to before this parameter existed.
+    preflight: &dyn Fn(&str, &str) -> PreflightOutcome,
+    // `EN.17.D` task 3: see `OnUnjudged`'s own doc. `OnUnjudged::Proceed`
+    // (every wrapper below `integrate_chain_with_coord_and_policy`) is a
+    // no-op alongside `default_preflight`, which never produces `Unjudged`.
+    on_unjudged: OnUnjudged,
+    // `EN.17.D` task 3: accumulates one `BlockPreflight` per BLOCK step, in
+    // chain order — a `&mut`, same contract as `report` above, so it is
+    // populated on both the success and the error return path. Task 4
+    // stamps this into `ctx.nodes` as `preflight_report`; this function
+    // only builds and threads it out.
+    preflight_report: &mut Vec<BlockPreflight>,
 ) -> Result<Vec<ExecutionOutcome>, IntegrateError> {
     let total_steps = chain.len();
     let mut outcomes = Vec::with_capacity(chain.len());
@@ -3166,6 +3363,121 @@ async fn integrate_chain_impl_inner(
             continue;
         }
 
+        // `EN.17.D` task 3 — PREFLIGHT SEAM. Consulted for BLOCK steps only
+        // (a `dispatch` step already `continue`d above; `command` steps
+        // never reach `execute_step` at all today — see the block's own
+        // `out_of_scope`), after admission and immediately before
+        // `execute_step`. `preflight` defaults to `&default_preflight`,
+        // which always reports `Disabled`, so this whole block is a no-op
+        // for every wrapper below `integrate_chain_with_coord_and_policy`.
+        let preflight_outcome = preflight(&step.repo, &step.block_id);
+        let mut preflight_lane_log_note: Option<String> = None;
+
+        if let PreflightOutcome::Judged { claims } = &preflight_outcome {
+            if let Some(bad_claim) = claims
+                .iter()
+                .find(|c| c.load_bearing && matches!(c.verdict, ClaimVerdict::False))
+            {
+                let reason = format!(
+                    "preflight: load-bearing claim '{}' (argv {:?}) did not hold its expectation",
+                    bad_claim.claim, bad_claim.argv
+                );
+                let entry = LaneLogEntry::bailed(step, step_lane, reason.clone())
+                    .with_identity(None)
+                    .with_permission_profile(Some(resolved_permission_profile_identifier(
+                        registry,
+                    )));
+                let _ = append_lane_log_line(roadmap_dir, &entry);
+                let _ = write_checkpoint(roadmap_dir, &checkpoint);
+                // See `record_bail_escalation`'s own doc for why every
+                // effect here is best-effort.
+                record_bail_escalation(
+                    roadmap_dir,
+                    registry,
+                    step,
+                    step_lane,
+                    "preflight-premise",
+                    resolve_engine(&step.repo, &step.block_id),
+                    &reason,
+                    bail_channel,
+                );
+                preflight_report.push(BlockPreflight {
+                    repo: step.repo.clone(),
+                    block_id: step.block_id.clone(),
+                    outcome: preflight_outcome.clone(),
+                    claims: claims.clone(),
+                    claims_dropped: 0,
+                });
+                bail_or_skip!(
+                    step,
+                    IntegrateError::PreflightPremiseFailed {
+                        repo: step.repo.clone(),
+                        block_id: step.block_id.clone(),
+                        claim: bad_claim.claim.clone(),
+                        argv: bad_claim.argv.clone(),
+                    }
+                );
+            }
+        }
+
+        if let PreflightOutcome::Unjudged { error_kind } = &preflight_outcome {
+            if matches!(on_unjudged, OnUnjudged::Bail) {
+                let reason = format!("preflight: unjudged({error_kind})");
+                let entry = LaneLogEntry::bailed(step, step_lane, reason.clone())
+                    .with_identity(None)
+                    .with_permission_profile(Some(resolved_permission_profile_identifier(
+                        registry,
+                    )));
+                let _ = append_lane_log_line(roadmap_dir, &entry);
+                let _ = write_checkpoint(roadmap_dir, &checkpoint);
+                record_bail_escalation(
+                    roadmap_dir,
+                    registry,
+                    step,
+                    step_lane,
+                    "preflight-unjudged",
+                    resolve_engine(&step.repo, &step.block_id),
+                    &reason,
+                    bail_channel,
+                );
+                preflight_report.push(BlockPreflight {
+                    repo: step.repo.clone(),
+                    block_id: step.block_id.clone(),
+                    outcome: preflight_outcome.clone(),
+                    claims: Vec::new(),
+                    claims_dropped: 0,
+                });
+                bail_or_skip!(
+                    step,
+                    IntegrateError::PreflightUnjudged {
+                        repo: step.repo.clone(),
+                        block_id: step.block_id.clone(),
+                        error_kind: error_kind.clone(),
+                    }
+                );
+            }
+            // `OnUnjudged::Proceed` (the built-in default): the step still
+            // dispatches below, but this step's eventual `closed` lane-log
+            // note names the unjudged kind so it is not silently invisible
+            // in the record a step that ran normally otherwise gets.
+            preflight_lane_log_note = Some(format!("preflight: unjudged({error_kind})"));
+        }
+
+        // Neither branch above bailed — record this step's preflight
+        // outcome once, whatever it was (`Judged` with only held/non-load-
+        // bearing-false claims, `Unjudged` under `Proceed`,
+        // `SkippedNoRecord`, or `Disabled`), and fall through to dispatch.
+        preflight_report.push(BlockPreflight {
+            repo: step.repo.clone(),
+            block_id: step.block_id.clone(),
+            claims: match &preflight_outcome {
+                PreflightOutcome::Judged { claims } => claims.clone(),
+                _ => Vec::new(),
+            },
+            outcome: preflight_outcome,
+            claims_dropped: 0,
+        });
+
         // `default_use_worktree` is the resolved `OrchestrationPolicy
         // ::default_use_worktree` fallback, threaded in from
         // `OrchestrationRunNode::process` — the row-3 case of
@@ -3314,13 +3626,18 @@ async fn integrate_chain_impl_inner(
             }
         }
 
-        let entry = LaneLogEntry::closed(
-            &outcome,
-            step_lane,
-            format!("block {} closed via SDLC_FLOW", step.block_id),
-        )
-        .with_identity(Some(step_run_id.to_string()))
-        .with_permission_profile(Some(resolved_permission_profile_identifier(registry)));
+        // `EN.17.D` task 3: append the preflight-unjudged note (set above
+        // only under `PreflightOutcome::Unjudged` + `OnUnjudged::Proceed`)
+        // to this step's `closed` note — every other path leaves the note
+        // byte-identical to before this parameter existed.
+        let mut closed_note = format!("block {} closed via SDLC_FLOW", step.block_id);
+        if let Some(note) = &preflight_lane_log_note {
+            closed_note.push_str("; ");
+            closed_note.push_str(note);
+        }
+        let entry = LaneLogEntry::closed(&outcome, step_lane, closed_note)
+            .with_identity(Some(step_run_id.to_string()))
+            .with_permission_profile(Some(resolved_permission_profile_identifier(registry)));
         // `EN.12.C` task 3: refuse to integrate a step whose about-to-be-
         // written record carries no resolved permission-profile stamp —
         // see [`IntegrateError::MissingPermissionProfileStamp`]. In

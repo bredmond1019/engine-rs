@@ -388,6 +388,18 @@ mod tests {
             // (D77 §2) field a draft was authored in — a config value, not a
             // runner-name escape hatch (`EN.12.M` task 1).
             ("post_draft.rs", &["build_post_draft_payload"]),
+            // Scan-list drift fix (`EN.17.D` task 3, same class of drift `escalate.rs`'s,
+            // `ledger.rs`'s and `operator_edge.rs`'s own notes above already name):
+            // `preflight.rs` landed in task 2 without this guard's allowlist being
+            // updated. `test_support::claim_exit_nonzero(text: &str, load_bearing: bool,
+            // argv: Vec<String>)` is a test-only claim-builder fixture (its module is
+            // `#[doc(hidden)] pub mod test_support`, gated to `tests/it/preflight.rs`
+            // reaching across the crate boundary) — a claim's free-text description and
+            // an `argv`, never a runner-name escape hatch. `PreflightRunner::run_for_block`
+            // and `test_support::{claim, run_execute_argv, run_one_claim}` all wrap their
+            // `&str` params onto their own lines (rustfmt), so this single-line scan never
+            // reaches them and there is nothing to allowlist for those.
+            ("preflight.rs", &["claim_exit_nonzero"]),
         ];
 
         let dir =

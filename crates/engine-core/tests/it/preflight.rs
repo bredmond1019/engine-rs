@@ -14,15 +14,25 @@
 //! (`rg`/`git`/`test`/`ls`) still run for real.
 
 use std::collections::{BTreeMap, HashMap};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use claude_code_rs::parse::Usage as SdkUsage;
 use claude_code_rs::{Config, Outcome};
 use engine_contract::TaskContext;
 use engine_core::repo_registry::RepoRegistry;
+use engine_core::workflows::orchestration::chain::ChainStep;
+use engine_core::workflows::orchestration::corpus_gates::BlockPresence;
+use engine_core::workflows::orchestration::execute::{EngineKind, FlowRunner};
+use engine_core::workflows::orchestration::gates::{AdmissionGate, DependencyEdge};
+use engine_core::workflows::orchestration::graph::{BailChannel, OnBail};
+use engine_core::workflows::orchestration::integrate::{
+    integrate_chain_with_preflight, ChainReport, IntegrateError, NeverHeld, OnUnjudged,
+    StepProgress,
+};
 use engine_core::workflows::orchestration::preflight::{
-    test_support, PreflightConfig, PreflightOutcome, PreflightRunner,
+    test_support, BlockPreflight, ClaimResult, ClaimVerdict, PreflightConfig, PreflightOutcome,
+    PreflightRunner,
 };
 use engine_core::workflows::ModelTransport;
 use futures::future::BoxFuture;
@@ -413,4 +423,463 @@ fn preflight_command_timeout_is_unverifiable_with_timeout_reason() {
     let result = test_support::run_one_claim(&claim, dir.path(), None, Duration::from_millis(0));
     assert!(test_support::verdict_is_unverifiable(&result));
     assert_eq!(result.reason.as_deref(), Some("timeout"));
+}
+
+// ---------------------------------------------------------------------------
+// `EN.17.D` task 3 — the preflight SEAM inside the chain loop, driven
+// through `integrate_chain_with_preflight` (the crate's public surface —
+// mirroring `orchestration_bail.rs`'s own discipline of duplicating fixture
+// helpers rather than exporting them, and never a mock: a real
+// `tempfile::tempdir()` `brain.toml` + real `planning/<id>/sdlc/` state
+// files). The seam is driven with a plain stub `preflight` closure here —
+// task 2's own `PreflightRunner` (its judged-claim extraction and argv
+// validator) is exercised separately above and needs no re-testing through
+// the chain loop.
+// ---------------------------------------------------------------------------
+
+fn seam_step(repo: &str, block_id: &str) -> ChainStep {
+    ChainStep {
+        repo: repo.to_string(),
+        block_id: block_id.to_string(),
+        directives: None,
+        ..Default::default()
+    }
+}
+
+fn seam_two_repo_registry() -> (tempfile::TempDir, RepoRegistry) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::create_dir_all(dir.path().join("repo-a")).unwrap();
+    std::fs::create_dir_all(dir.path().join("repo-b")).unwrap();
+    std::fs::write(
+        dir.path().join("brain.toml"),
+        "[[repos]]\nslug = \"repo-a\"\nrepo_path = \"repo-a\"\n\n\
+         [[repos]]\nslug = \"repo-b\"\nrepo_path = \"repo-b\"\n",
+    )
+    .unwrap();
+    let registry = RepoRegistry::from_brain_root(dir.path()).expect("registry");
+    (dir, registry)
+}
+
+fn seam_write_done_state(repo_path: &std::path::Path, block_id: &str) {
+    let dir = repo_path.join("planning").join(block_id).join("sdlc");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("sdlc-flow-state.json"),
+        json!({"status": "done"}).to_string(),
+    )
+    .unwrap();
+}
+
+/// A [`FlowRunner`] that records every dispatched block id and always
+/// succeeds — dispatch COUNT is what every seam test below asserts on, via
+/// `calls.lock().unwrap().len()` / `.contains(...)`.
+fn seam_recording_runner() -> (FlowRunner, Arc<Mutex<Vec<String>>>) {
+    let calls: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let recorded = calls.clone();
+    let runner: FlowRunner = Arc::new(move |invocation| {
+        recorded.lock().unwrap().push(invocation.block_id.clone());
+        Box::pin(async move {
+            Ok(engine_contract::TaskContext {
+                event: json!({}),
+                nodes: HashMap::new(),
+                metadata: json!({}),
+                node_runs: HashMap::new(),
+            })
+        })
+    });
+    (runner, calls)
+}
+
+fn seam_open_status(_repo: &str, _block_id: &str) -> BlockPresence {
+    BlockPresence::Row("open".to_string())
+}
+
+fn held_claim(text: &str, argv: &[&str]) -> ClaimResult {
+    ClaimResult {
+        claim: text.to_string(),
+        argv: argv.iter().map(|s| s.to_string()).collect(),
+        load_bearing: true,
+        exit_code: Some(0),
+        stdout_bytes: 0,
+        verdict: ClaimVerdict::Held,
+        reason: None,
+    }
+}
+
+fn false_claim(text: &str, argv: &[&str], load_bearing: bool) -> ClaimResult {
+    ClaimResult {
+        claim: text.to_string(),
+        argv: argv.iter().map(|s| s.to_string()).collect(),
+        load_bearing,
+        exit_code: Some(1),
+        stdout_bytes: 0,
+        verdict: ClaimVerdict::False,
+        reason: None,
+    }
+}
+
+/// The full, unabbreviated parameter list `integrate_chain_with_preflight`
+/// takes for everything a seam test below leaves at its permissive/no-op
+/// default: no campaign budget, no cancellation token, no coord handle, no
+/// forwarded child policy, dependency edges always met.
+#[allow(clippy::too_many_arguments)]
+async fn run_seam_chain(
+    chain: &[ChainStep],
+    registry: &RepoRegistry,
+    run_flow: &FlowRunner,
+    roadmap_dir: &std::path::Path,
+    on_bail: OnBail,
+    preflight: &dyn Fn(&str, &str) -> PreflightOutcome,
+    on_unjudged: OnUnjudged,
+    report: &mut ChainReport,
+    preflight_report: &mut Vec<BlockPreflight>,
+) -> Result<Vec<engine_core::workflows::orchestration::execute::ExecutionOutcome>, IntegrateError> {
+    let resolve_deps = |_repo: &str, _id: &str| Vec::<DependencyEdge>::new();
+    let resolve_engine = |_repo: &str, _id: &str| EngineKind::Flow;
+    let is_met = |_repo: &str, _id: &str| true;
+    let admission = AdmissionGate::with_default_policy();
+    integrate_chain_with_preflight(
+        chain,
+        &resolve_deps,
+        &is_met,
+        &admission,
+        &NeverHeld,
+        Duration::from_millis(1),
+        None,
+        None,
+        None,
+        &resolve_engine,
+        registry,
+        run_flow,
+        roadmap_dir,
+        None,
+        &|_: &StepProgress| {},
+        false,
+        true,
+        uuid::Uuid::new_v4(),
+        &|_repo: &str, _id: &str| {},
+        None,
+        None,
+        None,
+        on_bail,
+        BailChannel::Session,
+        &seam_open_status,
+        report,
+        preflight,
+        on_unjudged,
+        preflight_report,
+    )
+    .await
+}
+
+#[tokio::test]
+async fn preflight_seam_false_load_bearing_claim_bails_before_execute_step() {
+    let (dir, registry) = seam_two_repo_registry();
+    let (runner, calls) = seam_recording_runner();
+    let roadmap_dir = tempfile::tempdir().unwrap();
+    let chain = vec![seam_step("repo-a", "A.1")];
+    let mut report = ChainReport::default();
+    let mut preflight_report = Vec::new();
+
+    let preflight = |_repo: &str, _id: &str| PreflightOutcome::Judged {
+        claims: vec![false_claim(
+            "definitely-not-here.rs exists",
+            &["test", "-e", "definitely-not-here.rs"],
+            true,
+        )],
+    };
+
+    let err = run_seam_chain(
+        &chain,
+        &registry,
+        &runner,
+        roadmap_dir.path(),
+        OnBail::StopChain,
+        &preflight,
+        OnUnjudged::Proceed,
+        &mut report,
+        &mut preflight_report,
+    )
+    .await
+    .expect_err("a false load-bearing claim must bail the step");
+
+    assert!(matches!(err, IntegrateError::PreflightPremiseFailed { .. }));
+    assert_eq!(
+        calls.lock().unwrap().len(),
+        0,
+        "execute_step must never have dispatched A.1"
+    );
+    assert_eq!(report.bailed, vec!["repo-a:A.1".to_string()]);
+    assert_eq!(preflight_report.len(), 1);
+    assert!(matches!(
+        preflight_report[0].outcome,
+        PreflightOutcome::Judged { .. }
+    ));
+    let _ = dir; // keep the tempdir alive for the duration of the test
+}
+
+#[tokio::test]
+async fn preflight_seam_non_load_bearing_false_claim_is_recorded_and_dispatched() {
+    let (dir, registry) = seam_two_repo_registry();
+    seam_write_done_state(&dir.path().join("repo-a"), "A.1");
+    let (runner, calls) = seam_recording_runner();
+    let roadmap_dir = tempfile::tempdir().unwrap();
+    let chain = vec![seam_step("repo-a", "A.1")];
+    let mut report = ChainReport::default();
+    let mut preflight_report = Vec::new();
+
+    let preflight = |_repo: &str, _id: &str| PreflightOutcome::Judged {
+        claims: vec![false_claim(
+            "an incidental, non-load-bearing claim",
+            &["test", "-e", "still-not-here.rs"],
+            false,
+        )],
+    };
+
+    let outcomes = run_seam_chain(
+        &chain,
+        &registry,
+        &runner,
+        roadmap_dir.path(),
+        OnBail::StopChain,
+        &preflight,
+        OnUnjudged::Proceed,
+        &mut report,
+        &mut preflight_report,
+    )
+    .await
+    .expect("a non-load-bearing false claim must not bail the step");
+
+    assert_eq!(outcomes.len(), 1);
+    assert_eq!(calls.lock().unwrap().clone(), vec!["A.1".to_string()]);
+    assert_eq!(report.closed, vec!["repo-a:A.1".to_string()]);
+    assert_eq!(preflight_report.len(), 1);
+    match &preflight_report[0].outcome {
+        PreflightOutcome::Judged { claims } => {
+            assert_eq!(claims.len(), 1);
+            assert!(!claims[0].load_bearing);
+            assert!(test_support::verdict_is_false(&claims[0]));
+        }
+        other => panic!("expected Judged, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn preflight_seam_held_claim_is_dispatched() {
+    let (dir, registry) = seam_two_repo_registry();
+    seam_write_done_state(&dir.path().join("repo-a"), "A.1");
+    let (runner, calls) = seam_recording_runner();
+    let roadmap_dir = tempfile::tempdir().unwrap();
+    let chain = vec![seam_step("repo-a", "A.1")];
+    let mut report = ChainReport::default();
+    let mut preflight_report = Vec::new();
+
+    let preflight = |_repo: &str, _id: &str| PreflightOutcome::Judged {
+        claims: vec![held_claim("a true claim", &["ls", "-1"])],
+    };
+
+    let outcomes = run_seam_chain(
+        &chain,
+        &registry,
+        &runner,
+        roadmap_dir.path(),
+        OnBail::StopChain,
+        &preflight,
+        OnUnjudged::Proceed,
+        &mut report,
+        &mut preflight_report,
+    )
+    .await
+    .expect("a held claim must not bail the step");
+
+    assert_eq!(outcomes.len(), 1);
+    assert_eq!(calls.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn preflight_seam_unjudged_proceeds_by_default() {
+    let (dir, registry) = seam_two_repo_registry();
+    seam_write_done_state(&dir.path().join("repo-a"), "A.1");
+    let (runner, calls) = seam_recording_runner();
+    let roadmap_dir = tempfile::tempdir().unwrap();
+    let chain = vec![seam_step("repo-a", "A.1")];
+    let mut report = ChainReport::default();
+    let mut preflight_report = Vec::new();
+
+    let preflight = |_repo: &str, _id: &str| PreflightOutcome::Unjudged {
+        error_kind: "timeout".to_string(),
+    };
+
+    let outcomes = run_seam_chain(
+        &chain,
+        &registry,
+        &runner,
+        roadmap_dir.path(),
+        OnBail::StopChain,
+        &preflight,
+        OnUnjudged::Proceed,
+        &mut report,
+        &mut preflight_report,
+    )
+    .await
+    .expect("the built-in OnUnjudged::Proceed must not bail the step");
+
+    assert_eq!(outcomes.len(), 1);
+    assert_eq!(calls.lock().unwrap().len(), 1, "A.1 must have dispatched");
+    assert_eq!(preflight_report.len(), 1);
+    match &preflight_report[0].outcome {
+        PreflightOutcome::Unjudged { error_kind } => assert_eq!(error_kind, "timeout"),
+        other => panic!("expected Unjudged, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn preflight_seam_unjudged_bails_when_configured() {
+    let (dir, registry) = seam_two_repo_registry();
+    let (runner, calls) = seam_recording_runner();
+    let roadmap_dir = tempfile::tempdir().unwrap();
+    let chain = vec![seam_step("repo-a", "A.1")];
+    let mut report = ChainReport::default();
+    let mut preflight_report = Vec::new();
+
+    let preflight = |_repo: &str, _id: &str| PreflightOutcome::Unjudged {
+        error_kind: "schema_violation".to_string(),
+    };
+
+    let err = run_seam_chain(
+        &chain,
+        &registry,
+        &runner,
+        roadmap_dir.path(),
+        OnBail::StopChain,
+        &preflight,
+        OnUnjudged::Bail,
+        &mut report,
+        &mut preflight_report,
+    )
+    .await
+    .expect_err("OnUnjudged::Bail must bail the step");
+
+    assert!(matches!(err, IntegrateError::PreflightUnjudged { .. }));
+    assert_eq!(
+        calls.lock().unwrap().len(),
+        0,
+        "execute_step must never have dispatched A.1"
+    );
+    assert_eq!(report.bailed, vec!["repo-a:A.1".to_string()]);
+    let _ = dir;
+}
+
+#[tokio::test]
+async fn preflight_seam_missing_record_is_dispatched() {
+    let (dir, registry) = seam_two_repo_registry();
+    seam_write_done_state(&dir.path().join("repo-a"), "A.1");
+    let (runner, calls) = seam_recording_runner();
+    let roadmap_dir = tempfile::tempdir().unwrap();
+    let chain = vec![seam_step("repo-a", "A.1")];
+    let mut report = ChainReport::default();
+    let mut preflight_report = Vec::new();
+
+    let preflight = |_repo: &str, _id: &str| PreflightOutcome::SkippedNoRecord;
+
+    let outcomes = run_seam_chain(
+        &chain,
+        &registry,
+        &runner,
+        roadmap_dir.path(),
+        OnBail::StopChain,
+        &preflight,
+        OnUnjudged::Proceed,
+        &mut report,
+        &mut preflight_report,
+    )
+    .await
+    .expect("a missing block record must not bail the step");
+
+    assert_eq!(outcomes.len(), 1);
+    assert_eq!(calls.lock().unwrap().len(), 1);
+    assert_eq!(preflight_report.len(), 1);
+    assert!(matches!(
+        preflight_report[0].outcome,
+        PreflightOutcome::SkippedNoRecord
+    ));
+}
+
+#[tokio::test]
+async fn preflight_seam_disabled_dispatches_and_accumulates_nothing_interesting() {
+    let (dir, registry) = seam_two_repo_registry();
+    seam_write_done_state(&dir.path().join("repo-a"), "A.1");
+    let (runner, calls) = seam_recording_runner();
+    let roadmap_dir = tempfile::tempdir().unwrap();
+    let chain = vec![seam_step("repo-a", "A.1")];
+    let mut report = ChainReport::default();
+    let mut preflight_report = Vec::new();
+
+    let preflight = |_repo: &str, _id: &str| PreflightOutcome::Disabled;
+
+    let outcomes = run_seam_chain(
+        &chain,
+        &registry,
+        &runner,
+        roadmap_dir.path(),
+        OnBail::StopChain,
+        &preflight,
+        OnUnjudged::Proceed,
+        &mut report,
+        &mut preflight_report,
+    )
+    .await
+    .expect("Disabled must not bail the step");
+
+    assert_eq!(outcomes.len(), 1);
+    assert_eq!(calls.lock().unwrap().len(), 1);
+    assert_eq!(preflight_report.len(), 1);
+    assert!(matches!(
+        preflight_report[0].outcome,
+        PreflightOutcome::Disabled
+    ));
+}
+
+#[tokio::test]
+async fn preflight_seam_accumulates_one_entry_per_block_step_in_chain_order() {
+    let (dir, registry) = seam_two_repo_registry();
+    seam_write_done_state(&dir.path().join("repo-a"), "A.1");
+    seam_write_done_state(&dir.path().join("repo-a"), "B.1");
+    seam_write_done_state(&dir.path().join("repo-b"), "C.1");
+    let (runner, calls) = seam_recording_runner();
+    let roadmap_dir = tempfile::tempdir().unwrap();
+    let chain = vec![
+        seam_step("repo-a", "A.1"),
+        seam_step("repo-a", "B.1"),
+        seam_step("repo-b", "C.1"),
+    ];
+    let mut report = ChainReport::default();
+    let mut preflight_report = Vec::new();
+
+    let preflight = |_repo: &str, _id: &str| PreflightOutcome::Disabled;
+
+    let outcomes = run_seam_chain(
+        &chain,
+        &registry,
+        &runner,
+        roadmap_dir.path(),
+        OnBail::StopChain,
+        &preflight,
+        OnUnjudged::Proceed,
+        &mut report,
+        &mut preflight_report,
+    )
+    .await
+    .expect("all three steps should integrate");
+
+    assert_eq!(outcomes.len(), 3);
+    assert_eq!(calls.lock().unwrap().len(), 3);
+    assert_eq!(preflight_report.len(), 3);
+    assert_eq!(
+        preflight_report
+            .iter()
+            .map(|bp| bp.block_id.clone())
+            .collect::<Vec<_>>(),
+        vec!["A.1".to_string(), "B.1".to_string(), "C.1".to_string()]
+    );
 }
