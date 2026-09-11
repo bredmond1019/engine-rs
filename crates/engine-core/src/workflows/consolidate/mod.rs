@@ -26,6 +26,8 @@
 
 pub mod discover;
 pub mod select;
+pub mod watermark;
 
 pub use discover::{discover_participants, DiscoveryFinding, DiscoveryResult};
 pub use select::{select_ledger_rows, since_filter, SelectedRow};
+pub use watermark::{advance_watermark, read_watermark, AdvanceOutcome, WatermarkEntry, WatermarkError};
