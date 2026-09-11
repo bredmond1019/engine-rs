@@ -25,9 +25,15 @@
 //!   wrapping the above into one `ConsolidateRunNode`, registered in `engine-serve`.
 
 pub mod discover;
+pub mod disposal;
 pub mod select;
 pub mod watermark;
 
 pub use discover::{discover_participants, DiscoveryFinding, DiscoveryResult};
+pub use disposal::{
+    disposal_row_from_ledger_entry, selected_rows_to_disposal, write_disposal, DisposalError,
+};
 pub use select::{select_ledger_rows, since_filter, SelectedRow};
-pub use watermark::{advance_watermark, read_watermark, AdvanceOutcome, WatermarkEntry, WatermarkError};
+pub use watermark::{
+    advance_watermark, read_watermark, AdvanceOutcome, WatermarkEntry, WatermarkError,
+};
