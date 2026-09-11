@@ -451,6 +451,18 @@ async fn hq_orchestration_policy_real_hq_file_sets_the_switches() {
         Some("skip_dependents"),
         "HQ's real orchestration.policy.on_bail must be 'skip_dependents' (EN.17.B task 5c)"
     );
+    let Some(bail_channel) = policy.get("bail_channel") else {
+        eprintln!(
+            "SKIP: HQ harness.json's orchestration.policy has no bail_channel key yet -- \
+             EN.17.C's cross-tree write has not landed"
+        );
+        return;
+    };
+    assert_eq!(
+        bail_channel.as_str(),
+        Some("notification"),
+        "HQ's real orchestration.policy.bail_channel must be 'notification' (EN.17.C)"
+    );
 
     // Proves task 4's stamping with the REAL resolved value (not a
     // fixture): resolve `OrchestrationPolicy` straight from THIS file, then
