@@ -84,6 +84,12 @@ pub struct ModelTiers {
     /// model string that node was hardcoded to before it was onboarded to
     /// the policy path.
     pub docs: ModelTier,
+    /// The model tier `ImplementTaskNode` escalates to on a task's LAST fix
+    /// attempt (`attempt_count + 1 == max_attempts`), matching the JS engine's
+    /// `ESCALATION_MODEL` behavior (`sdlc-flow.js`). Built-in `None` —
+    /// behavior-stable: every attempt uses [`Self::implement`] as today. Every
+    /// earlier attempt is unaffected regardless of this setting.
+    pub implement_final_attempt: Option<ModelTier>,
 }
 
 impl Default for ModelTiers {
@@ -108,6 +114,7 @@ impl Default for ModelTiers {
             triage: ModelTier::Sonnet,
             generate: ModelTier::Opus,
             docs: ModelTier::Sonnet,
+            implement_final_attempt: None,
         }
     }
 }
@@ -400,6 +407,11 @@ pub struct PartialModelTiers {
     pub triage: Option<ModelTier>,
     pub generate: Option<ModelTier>,
     pub docs: Option<ModelTier>,
+    /// Nested `Option` — [`ModelTiers::implement_final_attempt`] is itself
+    /// `Option<ModelTier>`, so an override layer needs "unset" (fall through)
+    /// distinct from "explicitly clear". Merged via [`merge_opt`], not the
+    /// hand-written field-by-field arms the other tiers use.
+    pub implement_final_attempt: Option<Option<ModelTier>>,
 }
 
 /// All-optional mirror of [`CallTimeouts`] for per-stage partial overrides.
@@ -433,6 +445,8 @@ fn merge_model_tiers(mut base: ModelTiers, over: &PartialModelTiers) -> ModelTie
     if let Some(v) = over.docs {
         base.docs = v;
     }
+    base.implement_final_attempt =
+        merge_opt(base.implement_final_attempt, over.implement_final_attempt);
     base
 }
 
@@ -709,6 +723,32 @@ mod tests {
         let merged = merge_model_tiers(base, &over);
         assert_eq!(merged.generate, ModelTier::Sonnet);
         assert_eq!(merged.docs, ModelTier::Sonnet);
+    }
+
+    /// `implement_final_attempt`'s built-in default is `None`; an absent
+    /// override layer leaves it there, and a `Some(Some(..))` override layer
+    /// sets it — mirroring `merge_model_tiers_overrides_generate_and_docs_
+    /// independently`'s coverage for this knob.
+    #[test]
+    fn merge_model_tiers_sets_implement_final_attempt_when_overridden() {
+        let base = ModelTiers::default();
+        assert_eq!(base.implement_final_attempt, None);
+
+        // No override layer: falls through, untouched.
+        let over = PartialModelTiers::default();
+        let merged = merge_model_tiers(base, &over);
+        assert_eq!(merged.implement_final_attempt, None);
+
+        // Override layer sets it.
+        let over = PartialModelTiers {
+            implement_final_attempt: Some(Some(ModelTier::Opus)),
+            ..Default::default()
+        };
+        let merged = merge_model_tiers(base, &over);
+        assert_eq!(merged.implement_final_attempt, Some(ModelTier::Opus));
+        // Every other tier stays untouched.
+        assert_eq!(merged.implement, ModelTier::Sonnet);
+        assert_eq!(merged.generate, ModelTier::Opus);
     }
 
     #[test]

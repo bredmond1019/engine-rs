@@ -31,6 +31,9 @@ pub fn baseline() -> PartialPolicy {
             // exactly, or selecting it would silently downgrade the stage.
             generate: Some(ModelTier::Opus),
             docs: Some(ModelTier::Sonnet),
+            // Restates the built-in default verbatim — baseline's no-op
+            // contract. No escalation.
+            implement_final_attempt: Some(None),
         }),
         review_mode: Some(ReviewMode::PerTask),
         llm_triage: Some(false),
@@ -202,6 +205,11 @@ pub fn thorough() -> PartialPolicy {
             triage: Some(ModelTier::Opus),
             generate: Some(ModelTier::Opus),
             docs: Some(ModelTier::Opus),
+            // The quality ceiling: already Opus on every attempt via
+            // `implement` above, so this never changes the tier used — set
+            // explicitly anyway, matching this bundle's own doc comment
+            // ("every field on `PartialPolicy` is set explicitly").
+            implement_final_attempt: Some(Some(ModelTier::Opus)),
         }),
         timeouts: Some(PartialCallTimeouts {
             // Generous per-stage ceiling rather than the built-in

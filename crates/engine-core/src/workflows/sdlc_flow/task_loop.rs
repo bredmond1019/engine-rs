@@ -1209,8 +1209,32 @@ impl Node for ImplementTaskNode {
             prompt.push_str(&feedback);
         }
 
-        let (mut config, prompt) =
-            apply_policy(self.config.clone(), prompt, &policy, Stage::Implement);
+        // Escalate to `model_tiers.implement_final_attempt` (default `None`,
+        // behavior-stable) on the task's LAST attempt only — matching the JS
+        // engine's `ESCALATION_MODEL` behavior. `current_task_state` reads
+        // the *live* durable state, the same authority `TriageTaskNode` uses
+        // for this same attempt/max_attempts pair. The attempt about to run
+        // is `attempt_count + 1` (`attempt_count` counts RETRIES, not
+        // attempts — see [`bump_task_attempt`]'s doc comment), so this is
+        // final when that equals `max_attempts`.
+        let task_state = current_task_state(&ctx, "ImplementTaskNode")?;
+        let is_final_attempt =
+            u64::from(task_state.attempt_count) + 1 >= u64::from(task_state.max_attempts);
+        let mut effective_policy = policy.clone();
+        let mut model_tier_used = policy.model_tiers.implement;
+        if is_final_attempt {
+            if let Some(escalated) = policy.model_tiers.implement_final_attempt {
+                effective_policy.model_tiers.implement = escalated;
+                model_tier_used = escalated;
+            }
+        }
+
+        let (mut config, prompt) = apply_policy(
+            self.config.clone(),
+            prompt,
+            &effective_policy,
+            Stage::Implement,
+        );
         // Scope the model's session to the actual worktree so it edits the
         // right checkout rather than inheriting the host process's ambient
         // cwd. Best-effort: a ctx driven directly (no `SetupWorktreeNode`
@@ -1259,6 +1283,10 @@ impl Node for ImplementTaskNode {
             "summary": parsed.summary,
             "modified_files": parsed.modified_files,
             "tests_added": parsed.tests_added,
+            // Stamp the resolved tier so `RunTelemetry`/`PolicyAggregate` can
+            // attribute this call's cost to the setting that caused it
+            // (standing rule 6) — mirrors `docs.rs`'s `"model_tier"` stamp.
+            "model_tier": model_tier_used,
         });
         // Nested under `"state"`, not instead of the payload above: this
         // result is also what the write-verification guard reads
@@ -7460,6 +7488,88 @@ pub(crate) mod tests {
             .clone()
             .expect("transport should have been called");
         assert_eq!(config.model.as_deref(), Some("claude-haiku-4-5"));
+    }
+
+    // --- implement_final_attempt (EN.17.F task 3) --------------------------
+
+    /// Drive `ImplementTaskNode` for one attempt with `implement_final_attempt`
+    /// set, asserting on the `Config` the stub transport actually saw and on
+    /// the tier stamped into the node's transport result.
+    async fn implement_attempt_config(
+        attempt_count: u32,
+        max_attempts: u32,
+        implement_final_attempt: Option<ModelTier>,
+    ) -> (Config, serde_json::Value) {
+        let mut task = SDLCTask::new(1, "One", "d1");
+        task.attempt_count = attempt_count;
+        task.max_attempts = max_attempts;
+        let state = state_with_tasks(vec![task.clone()]);
+        let ctx = ctx_with_current_task(&state, &task);
+
+        let policy = SdlcPolicy {
+            model_tiers: ModelTiers {
+                implement: ModelTier::Sonnet,
+                implement_final_attempt,
+                ..ModelTiers::default()
+            },
+            ..SdlcPolicy::default()
+        };
+        let ctx = ctx_with_policy(ctx, &policy);
+
+        let seen_config: Arc<Mutex<Option<Config>>> = Arc::new(Mutex::new(None));
+        let seen_config_clone = seen_config.clone();
+        let transport: ModelTransport = Arc::new(move |config, _prompt| {
+            *seen_config_clone.lock().unwrap() = Some(config);
+            let outcome = canned_outcome(json!({ "summary": "done" }).to_string());
+            Box::pin(async move { Ok(outcome) })
+        });
+
+        let node = ImplementTaskNode::new().with_transport(transport);
+        let ctx = node.process(ctx).await.expect("process should succeed");
+
+        let config = seen_config
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("transport should have been called");
+        let result = ctx
+            .nodes
+            .get("ImplementTaskNode")
+            .cloned()
+            .expect("ImplementTaskNode stamped a result");
+        (config, result)
+    }
+
+    /// With `implement_final_attempt: Some(Opus)` and `max_attempts: 3`, an
+    /// attempt that is NOT the task's last (`attempt_count: 0`, about to run
+    /// attempt 1 of 3) dispatches on the ordinary `implement` tier, and
+    /// stamps that tier — not the escalated one — into the transport result.
+    #[tokio::test]
+    async fn implement_final_attempt_tier_unused_before_the_last_attempt() {
+        let (config, result) = implement_attempt_config(0, 3, Some(ModelTier::Opus)).await;
+        assert_eq!(config.model.as_deref(), Some("claude-sonnet-4-5"));
+        assert_eq!(result["model_tier"], json!("sonnet"));
+    }
+
+    /// With `implement_final_attempt: Some(Opus)` and `max_attempts: 3`, the
+    /// task's LAST attempt (`attempt_count: 2`, about to run attempt 3 of 3)
+    /// dispatches on the escalated Opus tier, stamped into the transport
+    /// result.
+    #[tokio::test]
+    async fn implement_final_attempt_escalates_on_the_last_attempt() {
+        let (config, result) = implement_attempt_config(2, 3, Some(ModelTier::Opus)).await;
+        assert_eq!(config.model.as_deref(), Some("claude-opus-4-8"));
+        assert_eq!(result["model_tier"], json!("opus"));
+    }
+
+    /// With `implement_final_attempt: None` (the built-in default), every
+    /// attempt — including the task's last — uses the `implement` tier
+    /// exactly as today.
+    #[tokio::test]
+    async fn implement_final_attempt_none_leaves_every_attempt_on_implement_tier() {
+        let (config, result) = implement_attempt_config(2, 3, None).await;
+        assert_eq!(config.model.as_deref(), Some("claude-sonnet-4-5"));
+        assert_eq!(result["model_tier"], json!("sonnet"));
     }
 
     // --- transport_retry (EN.ticket.sdlc-flow-dead-policy-knobs task 3) ----

@@ -241,6 +241,11 @@ impl SdlcTaskPolicy {
                 triage: self.model_tiers.triage,
                 generate: self.model_tiers.generate,
                 docs: fallback.model_tiers.docs,
+                // Not yet a SDLC_TASK-applicable knob until task 6 decides
+                // (per its own scoping note) — left at the fallback (`None`,
+                // behavior-stable) here rather than omitted, so this struct
+                // literal compiles against task 3's new `ModelTiers` field.
+                implement_final_attempt: fallback.model_tiers.implement_final_attempt,
             },
             timeouts: crate::workflows::sdlc_flow::policy::CallTimeouts {
                 implement: self.timeouts.implement,
