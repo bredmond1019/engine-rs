@@ -12,8 +12,8 @@
 //!   dedup, reusing [`crate::roadmap_status`]'s existing `discover_run_records` /
 //!   `realpath_dedup` / `read_lane_log` / `repos_from_lane_log` rather than re-implementing any
 //!   of them.
-//! - `select` (Task 2) — the D57 two-axis `origin_roadmap` selection rule, plus `--since` scoping
-//!   mirrored from `lane_log_watermark.py`'s `since_filter`.
+//! - [`select`] (Task 2) — the D57 two-axis `origin_roadmap` selection rule, plus `--since`
+//!   scoping mirrored from `lane_log_watermark.py`'s `since_filter`.
 //! - `watermark` (Task 3) — reads the Python watermark writer's last line before advancing, so a
 //!   mixed-writer log stays monotonic; refuses on hash drift rather than re-basing.
 //! - `disposal` (Task 4) — writes `disposal.json` through the existing `okf_core::coord::disposal`
@@ -25,5 +25,7 @@
 //!   wrapping the above into one `ConsolidateRunNode`, registered in `engine-serve`.
 
 pub mod discover;
+pub mod select;
 
 pub use discover::{discover_participants, DiscoveryFinding, DiscoveryResult};
+pub use select::{select_ledger_rows, since_filter, SelectedRow};
