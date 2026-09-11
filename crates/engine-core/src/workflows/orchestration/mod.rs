@@ -74,6 +74,16 @@
 //!   four-`option` `notification` record made structurally unrepresentable
 //!   rather than rejected at runtime. [`integrate`] (Task 2) calls it on
 //!   the bail and hold paths.
+//! - [`ledger`] (`EN.15.L` Task 1) — the D57 verification ledger: a typed
+//!   [`ledger::LedgerEntry`] with the six `status_values`, a
+//!   [`ledger::Remediation`] usable only on a `failed`/`blocked` entry (no
+//!   `finding` field — that number is `/consolidate-run`'s to mint),
+//!   create-if-absent for `verification-ledger.json`/`.md`, and a
+//!   read-modify-write merge/append writer that never drops or overwrites
+//!   an existing entry. Pure logic + I/O helpers only; no caller yet — a
+//!   later task threads a composer seam through [`integrate`] and
+//!   `engine-serve`'s `journal.rs`, beside the run-record sink `EN.15.G`
+//!   already wired there.
 
 pub mod chain;
 pub mod checkpoint;
@@ -88,5 +98,6 @@ pub mod execute;
 pub mod gates;
 pub mod graph;
 pub mod integrate;
+pub mod ledger;
 pub mod operator_edge;
 pub mod post_draft;

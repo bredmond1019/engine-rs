@@ -5,7 +5,7 @@ description: Chronological log of work completed for engine-rs.
 doc_id: log
 layer: [factory]
 status: active
-timestamp: "2026-09-10T22:26:09Z"
+timestamp: "2026-09-11T00:13:39Z"
 keywords: [work log, session history, development log]
 related: [status, context]
 ---
@@ -13,6 +13,42 @@ related: [status, context]
 # Log — engine-rs
 
 *Append-only working log. One dated entry per session. Newest entries at the top.*
+
+## [run: 2026-09-10]
+
+`/sdlc-flow` on branch `EN.15.L-flow` closed `EN.15.L` — the D57 verification-ledger seam for ORCHESTRATION — across 5 tasks, PASS review. Task 1 added `crates/engine-core/src/workflows/orchestration/ledger.rs`: a typed `LedgerEntry` (compile-time-unrepresentable `finding` field, remediation only valid on failed/blocked), `create_ledger_if_absent` (json + OKF-frontmatter md wrapper), and a read-modify-write `merge_append_entries` that is id-collision-safe. Task 2 wired the append into `integrate_chain_with_run_record` between the lane-log "closed" line and `close_block`, behind an injected `ComposeLedgerEntriesFn` seam, so a bail on the next step still leaves the just-closed block's entries on disk; a composer error is caught and recorded as a non-fatal `GateRefused` journal row rather than failing the chain. Task 3 gave `engine-serve`'s `journal.rs` a real production `AgentCodeStep`-based composer, resolving its model tier through a new `orchestration.policy.composer_model_tier` harness knob (sonnet/haiku/opus across baseline/cheap-fast/thorough) — and confirmed via `escalate.rs`'s `BailEntry` that no production path files a remediation ticket today, so the composer answers `call_site: NONE` and the gap is recorded as an open finding in `coordination-layer-port/notes.md` rather than inventing a caller. Task 4 documented the new knob in `planning/harness.json`. Task 5 added `crates/engine-core/tests/it/ledger.rs` (6 chain-level tests: bail-proves-per-close, happy path, create-if-absent, merge/dedupe, validation refusals, composer-error-is-non-fatal) and fixed a pre-existing `engine_kind.rs` scan-list drift (`ledger.rs` missing from the sanctioned-string-fn allowlist) that was failing the workspace-wide `cargo nextest run --workspace` gate independent of this spec's own changes. `docs/workflows/orchestration.md` updated. Next: EN.17.A — a refused or foreign-held lease stops the block, and the coordination reader sees real inboxes.
+
+```
+36db511 docs: update docs for "EN.15.L
+7d414b7 fix: review pass 1 for "EN.15.L
+c6427fc feat: implement EN.15.L-task5
+799e3f6 feat: implement EN.15.L-task3
+90f9155 feat: implement EN.15.L-task2
+a4acef6 feat: implement EN.15.L-task1
+3ea58b4 docs: log coordination-layer-port lane session (EN.15.I/J closed via /begin-orchestration)
+814c582 Merge remote-tracking branch 'origin/main'
+```
+
+## [run: 2026-09-10]
+
+### `/begin-orchestration` — coordination-layer-port engine lane, `EN.15.I`/`EN.15.J` closed
+
+- **What:** Resumed the `engine` lane on `coordination-layer-port` (`/begin-orchestration
+  --roadmap coordination-layer-port --lane engine --execute`) — the lane record had grown three
+  new blocks (`EN.15.I`/`J`/`K`/`L`) since its last close on 2026-09-08. Specced and ran
+  `EN.15.I` (bailed once on a task-3 scoping gap, respec'd, resumed clean) and `EN.15.J` (clean
+  first pass). Both PRs (#80, #81) merged despite hosted CI red on an unrelated, pre-existing
+  test (`engine-serve::http::tests::adding_the_roadmap_status_route_leaves_coordination_and_health_unaffected`
+  — CI's bare checkout can't resolve `.fleet-locks`/`brain.toml`) — filed as carryover
+  `hosted-ci-cannot-resolve-fleet-locks-brain-toml`. Reconciled local `main` against origin twice
+  (this repo's local `main` runs ahead of `origin/main` by design — pushes route through the HQ
+  script). Fixed two unrelated pre-existing dangling links in `docs/decisions/D84-...md` that
+  were blocking the corpus `--links` gate. `EN.15.L`'s spec is written and ready; stopped here
+  per operator instruction to hand off rather than launch it this session.
+- **Why:** Operator asked to continue driving the roadmap's critical-path lane; handed off before
+  starting the largest remaining block (`EN.15.L`, 5 tasks) so a fresh session can run it with
+  full context budget.
+- **Refs:** `planning/orchestration-run/coordination-layer-port/notes.md`, `planning/handoff.md`.
 
 ## [run: 2026-09-10]
 
