@@ -1091,8 +1091,8 @@ pub fn register_orchestration(dispatcher: &mut Dispatcher) {
 /// over that registry and wires
 /// [`OrchestrationRunNode::new`](engine_core::workflows::orchestration::graph::OrchestrationRunNode::new)'s
 /// `with_resolve_depends_on` / `with_is_edge_met` / `with_is_block_open` /
-/// `with_hold_source` seams to it, registers the wired node into a fresh
-/// `NodeRegistry`, and validates.
+/// `with_block_status` / `with_hold_source` seams to it, registers the wired
+/// node into a fresh `NodeRegistry`, and validates.
 ///
 /// Every wired closure checks
 /// [`CorpusGates::take_error`](engine_core::workflows::orchestration::corpus_gates::CorpusGates::take_error)
@@ -1232,6 +1232,7 @@ pub fn register_orchestration_with_registry(
             let depends_on_gates = gates.clone();
             let edge_met_gates = gates.clone();
             let block_open_gates = gates.clone();
+            let block_status_gates = gates.clone();
 
             // `EN.11.F` task 2 follow-up: resolve this run's campaign id
             // HERE, up front — the SAME resolver `OrchestrationRunNode::process`
@@ -1351,6 +1352,13 @@ pub fn register_orchestration_with_registry(
                         panic!("{err}");
                     }
                     open
+                }))
+                .with_block_status(Arc::new(move |repo: &str, block_id: &str| {
+                    let status = block_status_gates.block_status(repo, block_id);
+                    if let Some(err) = block_status_gates.take_error() {
+                        panic!("{err}");
+                    }
+                    status
                 }))
                 .with_hold_source(hold_source.clone())
                 .with_cancellation_token(run_token)
