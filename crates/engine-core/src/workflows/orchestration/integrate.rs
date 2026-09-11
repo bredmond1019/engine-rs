@@ -1814,6 +1814,12 @@ pub async fn integrate_chain(
     default_auto_pr: bool,
     campaign_id: uuid::Uuid,
     close_block: &CloseBlockFn,
+    // `EN.17.F` task 2: the resolved `OrchestrationPolicy::child_sdlc_flow_policy` /
+    // `child_sdlc_task_policy` knobs, forwarded to every `execute_step` call this
+    // chain makes. `None, None` leaves every emitted child event byte-identical to
+    // before these parameters existed.
+    child_sdlc_flow_policy: Option<&serde_json::Value>,
+    child_sdlc_task_policy: Option<&serde_json::Value>,
 ) -> Result<Vec<ExecutionOutcome>, IntegrateError> {
     integrate_chain_impl(
         chain,
@@ -1840,6 +1846,8 @@ pub async fn integrate_chain(
         None,
         None,
         None,
+        child_sdlc_flow_policy,
+        child_sdlc_task_policy,
     )
     .await
 }
@@ -1900,6 +1908,8 @@ pub async fn integrate_chain_with_journal(
         None,
         None,
         None,
+        None,
+        None,
     )
     .await
 }
@@ -1931,6 +1941,9 @@ pub async fn integrate_chain_with_coord(
     campaign_id: uuid::Uuid,
     close_block: &CloseBlockFn,
     coord: Option<&CoordHandle>,
+    // `EN.17.F` task 2: same contract as `integrate_chain`'s own new parameters.
+    child_sdlc_flow_policy: Option<&serde_json::Value>,
+    child_sdlc_task_policy: Option<&serde_json::Value>,
 ) -> Result<Vec<ExecutionOutcome>, IntegrateError> {
     integrate_chain_impl(
         chain,
@@ -1957,6 +1970,8 @@ pub async fn integrate_chain_with_coord(
         coord,
         None,
         None,
+        child_sdlc_flow_policy,
+        child_sdlc_task_policy,
     )
     .await
 }
@@ -2017,6 +2032,8 @@ pub async fn integrate_chain_with_dispatch(
         close_block,
         journal_sink,
         Some(dispatcher),
+        None,
+        None,
         None,
         None,
         None,
@@ -2087,6 +2104,8 @@ pub async fn integrate_chain_with_run_record(
         coord,
         run_record_sink,
         compose_ledger_entries,
+        None,
+        None,
     )
     .await
 }
@@ -2151,6 +2170,10 @@ async fn integrate_chain_impl(
     coord: Option<&CoordHandle>,
     run_record_sink: Option<&RunRecordSinkFn>,
     compose_ledger_entries: Option<&ComposeLedgerEntriesFn>,
+    // `EN.17.F` task 2: same contract as `integrate_chain_impl_inner`'s own
+    // fields of the same name.
+    child_sdlc_flow_policy: Option<&serde_json::Value>,
+    child_sdlc_task_policy: Option<&serde_json::Value>,
 ) -> Result<Vec<ExecutionOutcome>, IntegrateError> {
     if let Some(sink) = run_record_sink {
         sink(RunRecordLifecycle::Started);
@@ -2179,6 +2202,8 @@ async fn integrate_chain_impl(
         dispatcher,
         coord,
         compose_ledger_entries,
+        child_sdlc_flow_policy,
+        child_sdlc_task_policy,
     )
     .await;
     if let Some(sink) = run_record_sink {
@@ -2223,6 +2248,12 @@ async fn integrate_chain_impl_inner(
     // reading, or writing anything, so this loop's observable behaviour is byte-identical
     // to before this parameter existed for every existing caller.
     compose_ledger_entries: Option<&ComposeLedgerEntriesFn>,
+    // `EN.17.F` task 2: the resolved `OrchestrationPolicy::child_sdlc_flow_policy` /
+    // `child_sdlc_task_policy` knobs, forwarded straight through to every
+    // [`execute_step`] call this loop makes. `None, None` is byte-identical to
+    // before these parameters existed (no `"policy"` key on either child event).
+    child_sdlc_flow_policy: Option<&serde_json::Value>,
+    child_sdlc_task_policy: Option<&serde_json::Value>,
 ) -> Result<Vec<ExecutionOutcome>, IntegrateError> {
     let total_steps = chain.len();
     let mut outcomes = Vec::with_capacity(chain.len());
@@ -2719,6 +2750,8 @@ async fn integrate_chain_impl_inner(
             None,
             parent_permission_profile,
             None,
+            child_sdlc_flow_policy,
+            child_sdlc_task_policy,
         )
         .await
         {
@@ -3648,6 +3681,8 @@ mod tests {
             true,
             uuid::Uuid::new_v4(),
             &|_repo: &str, _id: &str| {},
+            None,
+            None,
         )
         .await
         .expect("chain should complete once the hold clears");
@@ -3730,6 +3765,8 @@ mod tests {
             true,
             uuid::Uuid::new_v4(),
             &|_repo: &str, _id: &str| {},
+            None,
+            None,
         );
 
         let checker_fut = async {
@@ -3766,6 +3803,8 @@ mod tests {
                     true,
                     uuid::Uuid::new_v4(),
                     &|_repo: &str, _id: &str| {},
+                    None,
+                    None,
                 ),
             )
             .await
@@ -3881,6 +3920,8 @@ mod tests {
             true,
             uuid::Uuid::new_v4(),
             &|_repo: &str, _id: &str| {},
+            None,
+            None,
         )
         .await
         .expect("chain should complete");
@@ -3933,6 +3974,8 @@ mod tests {
             false,
             uuid::Uuid::new_v4(),
             &|_repo: &str, _id: &str| {},
+            None,
+            None,
         )
         .await
         .expect("chain should complete");
@@ -3983,6 +4026,8 @@ mod tests {
             true,
             uuid::Uuid::new_v4(),
             &|_repo: &str, _id: &str| {},
+            None,
+            None,
         )
         .await
         .expect("chain should complete");
@@ -4047,6 +4092,8 @@ mod tests {
             true,
             uuid::Uuid::new_v4(),
             &close_block,
+            None,
+            None,
         )
         .await
         .expect("chain should complete");
@@ -4110,6 +4157,8 @@ mod tests {
             true,
             uuid::Uuid::new_v4(),
             &close_block,
+            None,
+            None,
         )
         .await
         .expect_err("a failing step must propagate its error");
@@ -4157,6 +4206,8 @@ mod tests {
             true,
             uuid::Uuid::new_v4(),
             &|_repo: &str, _id: &str| {},
+            None,
+            None,
         )
         .await
         .expect("chain should complete");
@@ -4209,6 +4260,8 @@ mod tests {
             true,
             uuid::Uuid::new_v4(),
             &|_repo: &str, _id: &str| {},
+            None,
+            None,
         )
         .await
         .expect("chain should complete");
@@ -4292,6 +4345,8 @@ mod tests {
             true,
             uuid::Uuid::new_v4(),
             &|_repo: &str, _id: &str| {},
+            None,
+            None,
         )
         .await
         .expect_err("a failing step must propagate its error");
@@ -4354,6 +4409,8 @@ mod tests {
             true,
             uuid::Uuid::new_v4(),
             &|_repo: &str, _id: &str| {},
+            None,
+            None,
         )
         .await
         .expect_err("the original step failure must still surface");
@@ -4433,6 +4490,8 @@ mod tests {
             true,
             uuid::Uuid::new_v4(),
             &|_repo: &str, _id: &str| {},
+            None,
+            None,
         )
         .await
         .expect_err("the chain must stop on the first failing step");
@@ -4541,6 +4600,8 @@ mod tests {
             true,
             uuid::Uuid::new_v4(),
             &|_repo: &str, _id: &str| {},
+            None,
+            None,
         )
         .await
         .expect("a budget halt is not an error — it returns Ok with what already integrated");
@@ -4628,6 +4689,8 @@ mod tests {
             true,
             uuid::Uuid::new_v4(),
             &|_repo: &str, _id: &str| {},
+            None,
+            None,
         )
         .await
         .expect("an unreached ceiling must never halt the chain");
@@ -4776,6 +4839,8 @@ mod tests {
             true,
             campaign_id,
             &|_repo: &str, _id: &str| {},
+            None,
+            None,
         )
         .await
         .expect("all three steps should integrate");
@@ -4856,6 +4921,8 @@ mod tests {
             true,
             campaign_id,
             &|_repo: &str, _id: &str| {},
+            None,
+            None,
         )
         .await
         .expect_err("the checkpoint write failure must surface");
@@ -5725,6 +5792,8 @@ mod tests {
             true,
             uuid::Uuid::new_v4(),
             &|_repo: &str, _id: &str| {},
+            None,
+            None,
         )
         .await
         .expect_err("a dispatch step with no Dispatcher configured must fail");
@@ -5876,6 +5945,8 @@ mod tests {
             true,
             uuid::Uuid::new_v4(),
             &|_repo: &str, _id: &str| {},
+            None,
+            None,
         )
         .await
         .expect("chain should complete");
@@ -5933,6 +6004,8 @@ mod tests {
             uuid::Uuid::new_v4(),
             &|_repo: &str, _id: &str| {},
             Some(&coord),
+            None,
+            None,
         )
         .await
         .expect("chain should complete");
@@ -5999,6 +6072,8 @@ mod tests {
             true,
             uuid::Uuid::new_v4(),
             &|_repo: &str, _id: &str| {},
+            None,
+            None,
             None,
         )
         .await
@@ -6124,6 +6199,8 @@ mod tests {
             uuid::Uuid::new_v4(),
             &|_repo: &str, _id: &str| {},
             Some(&coord),
+            None,
+            None,
         )
         .await
         .expect("chain should complete");
@@ -6205,6 +6282,8 @@ mod tests {
             uuid::Uuid::new_v4(),
             &|_repo: &str, _id: &str| {},
             Some(&coord),
+            None,
+            None,
         )
         .await
         .expect("chain should complete");

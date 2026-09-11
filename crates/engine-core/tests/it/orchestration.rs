@@ -280,6 +280,8 @@ async fn two_repo_chain_runs_end_to_end_with_per_step_cwd_and_one_lane_log_line_
         true,
         Uuid::new_v4(),
         &|_repo: &str, _id: &str| {},
+        None,
+        None,
     )
     .await
     .expect("two-repo chain should integrate cleanly");
@@ -340,6 +342,8 @@ async fn unmet_dependency_stops_the_chain_before_it_starts_and_names_the_edge() 
         true,
         Uuid::new_v4(),
         &|_repo: &str, _id: &str| {},
+        None,
+        None,
     )
     .await
     .expect_err("an unmet dependency must refuse the block");
@@ -422,6 +426,8 @@ async fn admission_at_capacity_waits_rather_than_proceeding_or_failing_inner() {
             true,
             Uuid::new_v4(),
             &|_repo: &str, _id: &str| {},
+            None,
+            None,
         )
         .await;
         admitted_writer.store(true, Ordering::SeqCst);
@@ -544,6 +550,8 @@ async fn an_operator_hold_pauses_and_resumes_without_rerunning_completed_blocks_
             true,
             Uuid::new_v4(),
             &|_repo: &str, _id: &str| {},
+            None,
+            None,
         )
         .await
     });
@@ -618,6 +626,8 @@ async fn a_corrupted_state_write_fails_the_run_loudly() {
         true,
         Uuid::new_v4(),
         &|_repo: &str, _id: &str| {},
+        None,
+        None,
     )
     .await
     .expect_err("a corrupted state write must fail the run");
@@ -804,6 +814,8 @@ async fn engine_written_lane_log_line_is_readable_by_the_real_discovery_script_w
         true,
         Uuid::new_v4(),
         &|_repo: &str, _id: &str| {},
+        None,
+        None,
     )
     .await
     .expect("single-block chain should integrate cleanly");
@@ -952,6 +964,8 @@ async fn cancellation_after_the_first_step_stops_the_chain_before_the_second_run
             true,
             Uuid::new_v4(),
             &|_repo: &str, _id: &str| {},
+            None,
+            None,
         )
         .await
     });
@@ -1056,6 +1070,8 @@ async fn a_chain_parked_on_a_never_clearing_hold_aborts_promptly_on_cancel_inner
             true,
             Uuid::new_v4(),
             &|_repo: &str, _id: &str| {},
+            None,
+            None,
         )
         .await
     });
@@ -1126,6 +1142,8 @@ async fn n_step_chain_calls_the_observer_exactly_n_times_with_correct_indices() 
         true,
         Uuid::new_v4(),
         &|_repo: &str, _id: &str| {},
+        None,
+        None,
     )
     .await
     .expect("three-step chain should integrate cleanly");
@@ -1201,6 +1219,8 @@ async fn the_observer_fires_after_the_lane_log_line_is_appended() {
         true,
         Uuid::new_v4(),
         &|_repo: &str, _id: &str| {},
+        None,
+        None,
     )
     .await
     .expect("two-step chain should integrate cleanly");
@@ -1242,6 +1262,8 @@ async fn no_observer_injected_changes_nothing() {
         true,
         Uuid::new_v4(),
         &|_repo: &str, _id: &str| {},
+        None,
+        None,
     )
     .await
     .expect("two-repo chain should integrate cleanly");
@@ -1616,6 +1638,8 @@ async fn two_step_chain_attributes_cost_and_tokens_to_the_step_that_spent_them_w
         true,
         Uuid::new_v4(),
         &|_repo: &str, _id: &str| {},
+        None,
+        None,
     )
     .await
     .expect("two-step chain with distinct per-step usage should integrate cleanly");
@@ -2534,6 +2558,8 @@ async fn path_b_the_same_action_under_unrestricted_permits_and_the_chain_complet
         true,
         Uuid::new_v4(),
         &|_repo: &str, _id: &str| {},
+        None,
+        None,
     )
     .await
     .expect("the same action under unrestricted must complete the chain");
@@ -2591,6 +2617,8 @@ async fn path_c_the_run_record_written_under_each_profile_carries_that_profiles_
             true,
             Uuid::new_v4(),
             &|_repo: &str, _id: &str| {},
+            None,
+            None,
         )
         .await
         .unwrap_or_else(|err| panic!("chain under profile '{default}' should integrate: {err}"));
@@ -2639,6 +2667,8 @@ async fn path_d_a_locked_parent_cannot_produce_an_unrestricted_child() {
         None,
         PermissionProfile::Locked,
         Some(PermissionProfile::Unrestricted),
+        None,
+        None,
     )
     .await
     .expect_err("a Locked parent must refuse to produce an Unrestricted child");

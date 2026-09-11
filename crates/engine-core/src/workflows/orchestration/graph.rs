@@ -1094,6 +1094,13 @@ impl Node for OrchestrationRunNode {
         // `bool` is `Copy`, so this crosses the `spawn_blocking` closure
         // by value, no `Arc`/clone needed.
         let default_auto_pr = policy.default_auto_pr;
+        // `EN.17.F` task 2: the resolved child policy overrides, cloned out
+        // of `policy` (not `Copy`, unlike the two `bool` knobs above) so the
+        // clones can move into the `spawn_blocking` closure below by value —
+        // `None` for either leaves the forwarded child event byte-identical
+        // to before this knob existed.
+        let child_sdlc_flow_policy = policy.child_sdlc_flow_policy.clone();
+        let child_sdlc_task_policy = policy.child_sdlc_task_policy.clone();
         // `EN.12.F` Task 5: a conductor-proposed ("autonomous") run gets a
         // real campaign budget ceiling — `integrate::integrate_chain`'s
         // `campaign_budget` parameter has checked this at every block
@@ -1243,6 +1250,11 @@ impl Node for OrchestrationRunNode {
                     // `integrate_chain` call this replaces — see the
                     // `coord` binding's own doc above.
                     coord.as_ref(),
+                    // `EN.17.F` task 2: the EFFECTIVE switch — resolved
+                    // from `policy` above, forwarded to every child event
+                    // this chain composes.
+                    child_sdlc_flow_policy.as_ref(),
+                    child_sdlc_task_policy.as_ref(),
                 ))
                 .map_err(|err| NodeError::new(err.to_string()))
             })
