@@ -5,7 +5,7 @@ description: Chronological log of work completed for engine-rs.
 doc_id: log
 layer: [factory]
 status: active
-timestamp: "2026-09-11T00:13:39Z"
+timestamp: "2026-09-11T21:18:30Z"
 keywords: [work log, session history, development log]
 related: [status, context]
 ---
@@ -15,6 +15,23 @@ related: [status, context]
 *Append-only working log. One dated entry per session. Newest entries at the top.*
 
 ## [run: 2026-09-11]
+
+### EN.17.D merged, main reconciled, session closed out
+
+- **What:** Diagnosed and fixed PR #86's CI red (claude-code-rs's `max_turns` field unpushed;
+  `rg` absent on the hosted runner), merged the PR past an already-tracked unrelated pre-existing
+  CI carryover (`hosted-ci-cannot-resolve-fleet-locks-brain-toml`, following the PR #80/#81
+  precedent), then reconciled local `main` with `origin/main` after they diverged in both
+  directions (local held 62 unpushed `EN.17.A/B/C` commits; origin independently gained
+  `EN.15.K`/`EN.15.L`/`EN.17.D` via squash-merges) — merge commit `d7a7a61`, full workspace suite
+  green before committing. Ran a complete `/close-out`: all harness gates green, one flaky test
+  found and filed as carryover (`preflight-command-timeout-is-flaky-under-heavy-parallel-load`),
+  coverage adequate, docs already current.
+- **Why:** `/begin-orchestration --roadmap coordination-layer-port --lane engine-unattended
+  --execute` continuing the lane past EN.17.D; the operator then asked for a clean `/close-out`
+  before ending the session.
+- **Refs:** `planning/orchestration-run/coordination-layer-port/{notes.md,review.md}`,
+  `planning/handoff.md`, PR #86.
 
 `/sdlc-flow` ran `EN.17.D` on branch `EN.17.D-flow` across all 5 tasks (all passed), PASS review.
 Task 1 added `JudgmentNode<T>`: a bounded, schema-constrained claude call over byte-capped
