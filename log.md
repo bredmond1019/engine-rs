@@ -16,6 +16,44 @@ related: [status, context]
 
 ## [run: 2026-09-11]
 
+`/sdlc-flow` ran `EN.17.D` on branch `EN.17.D-flow` across all 5 tasks (all passed), PASS review.
+Task 1 added `JudgmentNode<T>`: a bounded, schema-constrained claude call over byte-capped
+`InputSlice`s (UTF-8-safe truncation with a marker), `Config.max_turns` wired in, no retries (one
+billed attempt), returning `JudgmentResult<T>` or a typed `JudgmentError`
+(`Timeout`/`CliError`/`NoStructuredResult`/`SchemaViolation`) without ever writing to the caller's
+`ctx.nodes`. Task 2 added `PreflightRunner`: per-block claim extraction over `JudgmentNode` plus a
+compiled-in, per-program argv validator (`rg`/`git`/`test`/`ls`) with a no-shell, cleared-environment,
+timeout-bounded runner — rejecting `rg --pre`, `git log --output`, path-based programs, and unlisted
+flags, never counting a refusal/timeout as a false claim. Task 3 wired a per-step preflight seam into
+the chain loop in `integrate.rs`, before `execute_step`: a false load-bearing claim bails with
+`check_id preflight-premise`, an unjudged judgment call proceeds by default (or bails per
+`OnUnjudged::Bail`), and every block step's outcome accumulates into a threaded `preflight_report`,
+exposed through a new `integrate_chain_with_preflight` entry point that leaves every pre-existing
+caller untouched. Task 4 gave `OrchestrationPolicy` all eight preflight knobs (built-in defaults,
+restated in `baseline`, unset in `cheap-fast`/`thorough` per the PROFILE RULE), wired
+`OrchestrationRunNode` to a real preflight seam and to stamp resolved knobs plus one `BlockPreflight`
+per block into `ctx.nodes[..]["preflight_report"]` on both success and error paths, and gave
+`engine-serve` a production seam bridging the async `PreflightRunner::run_for_block` onto the seam's
+synchronous signature via a dedicated OS thread with its own fresh tokio runtime. Task 5 added a
+fixture test proving a brain-root `harness.json`'s `preflight_enabled` reaches
+`OrchestrationRunNode` with no inline policy, extended the real-HQ-file test with a soft-skip
+`preflight_enabled` assertion, and documented the full mechanism in `docs/workflows/orchestration.md`.
+The cross-tree HQ `harness.json` write flipping `orchestration.policy.preflight_enabled: true` was
+deliberately left out of scope for this run — it belongs to a separate cross-tree commit per the
+block's own notes. Closes `EN.17.D`. Next: `EN.17.E` — EDGE_RELEASED, FINDING and QUERY are acted on
+at the block boundary.
+
+```
+2051f19 feat: implement EN.17.D-task5
+91e59f0 feat: implement EN.17.D-task4
+5baf2bd feat: implement EN.17.D-task3
+8d6bee6 feat: implement EN.17.D-task2
+8ed2db9 feat: implement EN.17.D-task1
+1ae08fb Merge EN.17.C-flow: bail-to-operator via one shared sweep router (bail_channel notification)
+```
+
+## [run: 2026-09-11]
+
 `/sdlc-flow` ran `EN.17.C` on branch `EN.17.C-flow` across all 7 tasks (all passed). Task 1 added the `BailChannel` (`Session`/`Notification`) knob to `OrchestrationPolicy`; task 2 threaded a `BailChannel` parameter through `record_bail_escalation`, defaulted to `Session` at every wrapper call site; task 3 gave `OrchestrationRunNode` an injectable `OperatorTransport` and called `sweep::run_sweep_pass` exactly once per bailing chain, after `chain_report` is stamped into `ctx`; task 4 resolved `bail_channel` from the run's `OrchestrationPolicy` and threaded it into `integrate_chain_with_coord_and_policy`, closing the real end-to-end switch; task 5 gave `engine-serve` a `register_builtin_workflows_with_operator` entry point wiring a real transport into SWEEP and ORCHESTRATION; task 6 documented the `bail_channel` knob in `docs/workflows/orchestration.md` and both engine-rs's and HQ's `planning/harness.json` (HQ's copy switched `orchestration.policy.bail_channel: notification`); task 7 added `crates/engine-core/tests/it/operator_reach.rs` (5 tests) and extended `hq_orchestration_policy.rs` to assert the real HQ file's switch. Review returned **PARTIAL**: two acceptance criteria are not literally satisfied, though both are documented, reasoned deviations rather than oversights. (1) The AC that a chain with two bailed blocks produces a number of stub `send` calls equal to `chain_report.bailed.len()` is contradicted by the pre-existing, intentional `sweep::route::Budget` cap of one operator-notify per `run_sweep_pass` call — the second bail is recorded as `action:skip-operator-budget, routed:false` rather than sent, which task 7's own commit treats as tension inside the spec's own wording (its "why" text says the per-pass budget stays in `route_escalation`, "never re-implemented here") rather than an implementation bug. (2) The AC that a skipped dependent's id appears in its bailed parent's escalation payload was never implemented — `record_bail_escalation`'s summary is composed from `err_display` alone, and the skip loop never calls it. The run bailed on this PARTIAL verdict rather than looping further fixes, since both gaps are scope/wording questions for a human. Next: a human decides whether to relax the two ACs to match the documented budget/skip-payload behavior or open a follow-up task to close them, then `EN.17.C` can be resumed to close.
 
 ```
