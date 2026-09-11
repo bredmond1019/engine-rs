@@ -619,6 +619,53 @@ pub fn unlease(lock_dir: &Path, repo: &str) -> Result<bool, CoordWriteError> {
     Ok(existed)
 }
 
+/// What happened when [`unlease_own`] was asked to release `repo`'s lease on `agent`'s behalf.
+///
+/// `EN.17.A` task 2. Named exactly per the task's acceptance criteria — note this differs from
+/// the block record's own prose, which sketches a `{Removed, Absent, ForeignKept}` shape; the
+/// task's acceptance criteria are more specific than the record's prose and this follows them,
+/// rather than silently reconciling the two into a third shape of its own.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UnleaseOutcome {
+    /// No lease file existed at the path — nothing to release, and nothing was touched.
+    NotHeld,
+    /// A lease existed, was held by `agent`, and was removed.
+    Removed,
+    /// A lease existed, parsed, but is held by a DIFFERENT agent — left completely in place.
+    HeldByOther { agent: String },
+    /// A file existed at the lease path but failed to parse as a typed [`LeaseRecord`] — left
+    /// completely in place, since it is not this caller's own lease to release with confidence.
+    Unreadable { path: PathBuf },
+}
+
+/// `unlease_own` — release the lease on `repo` ONLY if it is held by `agent`. Unlike
+/// [`unlease`] (the operator's unconditional force-release, unchanged by this function), this is
+/// the self-serve release a lane uses on its own lease: a foreign or unreadable lease is left
+/// byte-identical rather than deleted.
+pub fn unlease_own(
+    lock_dir: &Path,
+    repo: &str,
+    agent: &str,
+) -> Result<UnleaseOutcome, CoordWriteError> {
+    let path = lease_path(lock_dir, repo);
+    if !path.exists() {
+        return Ok(UnleaseOutcome::NotHeld);
+    }
+    let Some(record) = read_typed::<LeaseRecord>(&path) else {
+        return Ok(UnleaseOutcome::Unreadable { path });
+    };
+    if record.agent != agent {
+        return Ok(UnleaseOutcome::HeldByOther {
+            agent: record.agent,
+        });
+    }
+    fs::remove_file(&path).map_err(|e| CoordWriteError::Io {
+        path: path.clone(),
+        source: e,
+    })?;
+    Ok(UnleaseOutcome::Removed)
+}
+
 // ---------------------------------------------------------------------------------------------
 // Message verbs — send / drain / complete, with the receipts the fleet gate now requires.
 // `EN.15.C` task 4.
@@ -1891,6 +1938,93 @@ mod tests {
         assert!(
             !removed_again,
             "unleasing an already-absent lease is a no-op, not an error"
+        );
+    }
+
+    #[test]
+    fn unlease_own_keeps_a_foreign_lease() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let no_blocks: Vec<String> = Vec::new();
+        let req = lease_req(
+            "engine-rs",
+            "engine-rs",
+            "A",
+            "2026-09-08T10:00:00Z",
+            None,
+            &no_blocks,
+        );
+        lease(dir.path(), &req).expect("lease by A must succeed");
+        let path = lease_path(dir.path(), "engine-rs");
+        let original_bytes = fs::read(&path).expect("lease file must exist");
+
+        let outcome =
+            unlease_own(dir.path(), "engine-rs", "B").expect("unlease_own must not error");
+        assert_eq!(
+            outcome,
+            UnleaseOutcome::HeldByOther {
+                agent: "A".to_string()
+            }
+        );
+        assert!(path.exists(), "a foreign lease must be left in place");
+        let bytes_after = fs::read(&path).expect("lease file must still be readable");
+        assert_eq!(
+            original_bytes, bytes_after,
+            "a foreign lease must be left byte-identical"
+        );
+    }
+
+    #[test]
+    fn unlease_own_removes_its_own_lease() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let no_blocks: Vec<String> = Vec::new();
+        let req = lease_req(
+            "engine-rs",
+            "engine-rs",
+            "A",
+            "2026-09-08T10:00:00Z",
+            None,
+            &no_blocks,
+        );
+        lease(dir.path(), &req).expect("lease by A must succeed");
+        let path = lease_path(dir.path(), "engine-rs");
+        assert!(path.exists());
+
+        let outcome =
+            unlease_own(dir.path(), "engine-rs", "A").expect("unlease_own must not error");
+        assert_eq!(outcome, UnleaseOutcome::Removed);
+        assert!(!path.exists(), "the caller's own lease must be removed");
+    }
+
+    #[test]
+    fn unlease_own_reports_not_held_when_absent() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        assert!(!lease_path(dir.path(), "engine-rs").exists());
+
+        let outcome = unlease_own(dir.path(), "engine-rs", "A")
+            .expect("unlease_own over an absent lease must not error");
+        assert_eq!(outcome, UnleaseOutcome::NotHeld);
+    }
+
+    #[test]
+    fn unlease_own_reports_unreadable_and_leaves_the_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = lease_path(dir.path(), "engine-rs");
+        fs::create_dir_all(path.parent().expect("lease path has a parent"))
+            .expect("create leases dir");
+        fs::write(&path, b"not valid json{{{").expect("write invalid lease file");
+        let original_bytes = fs::read(&path).expect("lease file must exist");
+
+        let outcome = unlease_own(dir.path(), "engine-rs", "A")
+            .expect("unlease_own over an unreadable lease must not error");
+        assert_eq!(
+            outcome,
+            UnleaseOutcome::Unreadable { path: path.clone() }
+        );
+        assert!(path.exists(), "an unreadable lease must be left in place");
+        let bytes_after = fs::read(&path).expect("lease file must still be readable");
+        assert_eq!(
+            original_bytes, bytes_after,
+            "an unreadable lease must be left byte-identical"
         );
     }
 
