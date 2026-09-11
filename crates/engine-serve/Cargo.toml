@@ -17,6 +17,11 @@ term-core = { path = "../term-core", features = ["tokio"] }
 # `okf_core::LeaseKind`/`LeaseScope` directly (both already `Deserialize`) rather than
 # reinventing a parallel wire enum in this crate — see `http.rs`'s `CoordLeaseBody`.
 okf-core = { workspace = true }
+# `EN.15.L` task 3: `journal.rs`'s production verification-ledger composer runs one
+# `AgentCodeStep` call per just-integrated block — the first non-test caller in this crate,
+# so this moves from [dev-dependencies] (added for `EN.15.G`'s test fixtures) to a real
+# dependency.
+claude-code-rs = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -40,7 +45,6 @@ test-fixtures = []
 [dev-dependencies]
 engine-serve = { path = ".", features = ["test-fixtures"] }
 tempfile = { workspace = true }
-claude-code-rs = { workspace = true }
 
 # ONE integration-test binary, not one per file. cargo builds a separate binary for every
 # `tests/*.rs`, and each statically links this crate plus its dependency graph. These modules were
