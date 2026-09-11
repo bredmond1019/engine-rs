@@ -95,7 +95,7 @@ path, per `EN.3.K`). See tasks 7 and 9 of `planning/EN.3.J-sdlc-flow-smoke/tasks
 - **`use_worktree: true` is not optional.** The field defaults to `false`
   (`crates/engine-core/src/workflows/sdlc_flow/schema.rs:133`), and on that path
   `SetupWorktreeNode` runs `git checkout -B sdlc/smoke-sdlc-flow origin/main` in the **live
-  checkout** (`crates/engine-core/src/workflows/sdlc_flow/setup.rs:220-228`) — moving HEAD out from
+  checkout** (`crates/engine-core/src/workflows/sdlc_flow/setup.rs:673-682`) — moving HEAD out from
   under you while an agentic node with real write permission edits the real tree. Omitting this
   flag is the most damaging mistake available when running this smoke.
   `SetupWorktreeNode` does now refuse to start a `use_worktree: false` run against a **dirty**
@@ -147,7 +147,7 @@ rm -rf planning/smoke-sdlc-flow/sdlc
 ```
 
 The third command is not optional. `SpecExistsRouterNode::route`
-(`crates/engine-core/src/workflows/sdlc_flow/setup.rs:318-327`) checks
+(`crates/engine-core/src/workflows/sdlc_flow/setup.rs:940`) checks
 `dir.join("sdlc").join("sdlc-flow-state.json").exists() || dir.join("tasks.json").exists()` and
 routes to `LoadTaskStateNode` when either holds. A leftover state file from a previous smoke
 therefore makes the next trigger **resume a run that is already `done`** — it appears to succeed
