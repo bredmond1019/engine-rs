@@ -1,4 +1,5 @@
 {
+  "generate_context_max_bytes": null,
   "llm_triage": false,
   "local": {
     "constrained_json": false,
@@ -7,10 +8,18 @@
   },
   "max_attempts": 3,
   "max_review_attempts": 3,
+  "max_turns": {
+    "docs": null,
+    "generate": null,
+    "implement": null,
+    "review": null,
+    "triage": null
+  },
   "model_tiers": {
     "docs": "sonnet",
     "generate": "opus",
     "implement": "sonnet",
+    "implement_final_attempt": null,
     "implement_simple": "sonnet",
     "review": "sonnet",
     "triage": "sonnet"

@@ -547,6 +547,8 @@ Resolved through the standard four layers (per-run event override > named profil
 | `campaign_max_cost_usd_cents` | `Some(5_000)` | `CONDUCTOR`-only — the campaign cost ceiling in USD cents, wired into `integrate_chain`'s `campaign_budget` and enforced via the `budget_halted` terminal state (`EN.11.F`). |
 | `campaign_max_total_tokens` | `None` | `CONDUCTOR`-only — the same ceiling by token count. Unset on every named profile. |
 | `composer_model_tier` | `sonnet` | The model tier the injected D57 verification-ledger composer seam (see above) runs its `AgentCodeStep` judgment call at. Resolved from a standalone `Partial` type (not `OrchestrationPolicy` itself), read from this same `orchestration.policy`/`orchestration.profiles` section of `planning/harness.json`. |
+| `child_sdlc_flow_policy` | `None` | **`EN.17.F`.** A partial `SdlcPolicy` override object, forwarded verbatim as the `"policy"` key on every `flow` step's composed child event — layer 1 of that child's own four-layer resolution. `None` (the built-in default on every named profile, `baseline` included) leaves the composed child event byte-identical to before this knob existed: no `"policy"` key at all. See "Child policy forwarding" below. |
+| `child_sdlc_task_policy` | `None` | **`EN.17.F`.** The same mechanism as `child_sdlc_flow_policy`, but forwarded only into a `task` step's child event — a `flow` step never sees it and vice versa. |
 
 Named profiles (`crates/engine-core/src/workflows/orchestration/graph.rs`):
 
@@ -587,6 +589,65 @@ hit `PullRequestNode` and, against a repo with no PR-capable remote, still baile
 GitHub host`. `policy.default_auto_pr` is now threaded from `OrchestrationRunNode::process` through
 `integrate_chain`/`integrate_chain_impl` into that `execute_step` call, mirroring how
 `default_use_worktree` was already threaded.
+
+### Child policy forwarding (`EN.17.F`) — JS-engine parity by default
+
+**Why this exists.** A cost analysis found that a lane launched through a Rust `ORCHESTRATION`
+chain spends MORE than the same lane run through the JS `/sdlc-flow` engine directly, for reasons
+unrelated to the work itself: the Rust `SDLC_FLOW` child reviews every task (`review_mode:
+per_task`) where the JS engine reviews once at the end; it never escalates a failing final attempt
+to a stronger model, so it spends more cheap attempts failing; and — until `CC.ticket.config-max-
+turns-passthrough` and this block — it had no in-turn tool-call ceiling at all (one bella run made
+156 tool calls in a single turn). `execute_step` used to forward only a `PermissionProfile` to a
+child event, never a policy, so a chain's child `SDLC_FLOW`/`SDLC_TASK` in another repo resolved
+purely from THAT repo's own `planning/harness.json` — which most repos never tuned for
+chain-driven parity.
+
+**The mechanism.** `OrchestrationPolicy::{child_sdlc_flow_policy, child_sdlc_task_policy}` (the
+table above) are each a partial policy object — `Option<serde_json::Value>`, `None` by default.
+`OrchestrationRunNode::process` resolves them the same way as every other knob in this table
+(event override > profile > `planning/harness.json` > built-in default) and threads the resolved
+values all the way down through `integrate_chain`/`integrate_chain_impl` into `execute_step`,
+which forwards the matching one — `child_sdlc_flow_policy` for a `flow` step,
+`child_sdlc_task_policy` for a `task` step, never both — onto that step's composed child event's
+`"policy"` key. That key is layer 1 of the CHILD'S OWN four-layer resolution
+(`sdlc_flow::setup::resolve_policy_for_run_from` / `sdlc_task::profiles::resolve_policy_for_run_from`),
+the same layer a hand-authored per-run event override would occupy — the child cannot tell the
+difference between a policy an operator typed and one a parent chain forwarded. With `None` (the
+built-in default, restated explicitly by `baseline`), the composed child event carries no
+`"policy"` key at all — byte-identical to before either field existed.
+
+**THE EFFECTIVE SWITCH LIVES IN THE BRAIN ROOT'S OWN `harness.json`, not this repo's.**
+`OrchestrationRunNode` resolves `OrchestrationPolicy` from `PolicyConfigSource::Worktree(event.
+brain_root)` — and the engine-mounted `bastion serve` that drives a real chain runs with
+`ENGINE_BRAIN_ROOT` pointed at HQ (`agentic-portfolio`, per `docs/infrastructure.md`). engine-rs
+carries no `brain.toml` of its own, so a real chain's policy NEVER resolves against this repo's
+`planning/harness.json` — only HQ's does. HQ sets:
+
+```json
+{
+  "orchestration": {
+    "policy": {
+      "child_sdlc_flow_policy": { "review_mode": "end_only", "model_tiers": { "implement_final_attempt": "opus" } },
+      "child_sdlc_task_policy": { "model_tiers": { "implement_final_attempt": "opus" } }
+    }
+  }
+}
+```
+
+which is the JS-parity default this block ships: one consolidated end-of-run review per `SDLC_FLOW`
+child instead of one per task, and Opus only on each task's final attempt. This repo's own
+`planning/harness.json` documents the same two keys under `orchestration.policy._comment`, both at
+their built-in `None` — correct for engine-rs's OWN standalone runs, but a reminder that they are
+**not effective** for a chain, because a chain never reads this file's `orchestration` section.
+
+**Measured in sessions and tokens, never dollars.** `EndReviewNode`'s spend is absent from
+`RunTelemetry.total_cost_usd` (carryover `end-review-node-is-billed-but-absent-from-cost-bearing-
+stages`), so switching to `end_only` makes a run LOOK cheaper in dollars than it is until that gap
+is closed. Every parity measurement here — review-stage session COUNT and per-session token totals
+— is read from the run's session ledger (`crates/engine-core/src/sessions.rs`,
+`ctx.metadata["claude_sessions"]`), which carries `EndReviewNode`'s session entries, never from the
+cost total.
 
 ### `ORCHESTRATION` isolates by default
 
