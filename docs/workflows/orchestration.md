@@ -630,7 +630,13 @@ graded action runs. On denial it calls an injected `author_operator_edge` closur
 denied the same action shares one operator gate to clear) and refuses the step —
 `PermissionGateError::Denied` or `::EdgeAuthorFailed`. It never writes `state.json` in-process;
 authoring the edge is delegated the same way `gates.rs`'s existing `depends_on` machinery treats
-mev as the single writer.
+mev as the single writer. The production closure is
+[`operator_edge::make_author_operator_edge`](../../crates/engine-core/src/workflows/orchestration/operator_edge.rs)
+(`EN.15.J`), re-exported from `gates.rs` as `author_operator_edge` — it calls
+`mev::add_operator_edge_as` (the quiesce-guarded verb, never the plain `mev::add_operator_edge`),
+maps a diagnostic-carrying `Ok(Report)` refusal (e.g. a duplicate slug) to `Err` the same as a hard
+`Err`, and best-effort composes and enqueues an operator-gate notification escalation
+(`escalate.rs`) when the caller's `OperatorEdgeAuthorConfig.roadmap_dir` is set.
 
 **Threading it through a chain.** `execute_step` resolves each child step's effective profile from
 `resolve_child_permission_profile(parent_profile, requested_profile)` — a per-step request may

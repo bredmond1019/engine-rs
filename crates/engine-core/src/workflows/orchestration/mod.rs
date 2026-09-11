@@ -88,4 +88,5 @@ pub mod execute;
 pub mod gates;
 pub mod graph;
 pub mod integrate;
+pub mod operator_edge;
 pub mod post_draft;
