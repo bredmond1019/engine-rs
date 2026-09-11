@@ -145,6 +145,29 @@ fn coord_now_iso() -> String {
 
 // ── Policy ───────────────────────────────────────────────────────────────
 
+/// `EN.17.B` Task 2: how the per-step loop
+/// (`integrate::integrate_chain_impl_inner`) reacts when a step bails —
+/// `execute_step` failure, `verify_state_write` failure, merge failure,
+/// `wait_for_clearance` failure, or a refused lease/permission gate.
+///
+/// The built-in default is [`Self::StopChain`] — today's behavior, per
+/// CLAUDE.md standing rule 6 (a new knob must not change what an existing
+/// run does). [`Self::SkipDependents`] is the knob EN.17.B–F add: a bail
+/// records that step `bailed` and skips only the steps that (transitively)
+/// depend on it, via a `block` edge naming it; every independent step still
+/// runs, and the run ends with a terminal `chain_report`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum OnBail {
+    /// The first bailed step ends the whole chain immediately — no later
+    /// step, dependent or independent, is dispatched. Pre-EN.17.B behavior.
+    #[default]
+    StopChain,
+    /// A bailed step skips only the steps that (transitively) depend on it;
+    /// every independent step still runs to completion.
+    SkipDependents,
+}
+
 /// The fully-resolved, per-run ORCHESTRATION policy: the merge of built-in
 /// defaults, `harness.json`'s `orchestration.policy` defaults, a named
 /// `profile`, and any per-run event override, high->low precedence in that
@@ -253,6 +276,13 @@ pub struct OrchestrationPolicy {
     /// forwarded opaquely as JSON for the same layering reason. `None` (the
     /// built-in default) leaves a child event's `policy` field untouched.
     pub child_sdlc_task_policy: Option<serde_json::Value>,
+    /// `EN.17.B` Task 2: how the per-step loop reacts to a bail — see
+    /// [`OnBail`]. `OnBail::StopChain` (the built-in default) is today's
+    /// behavior, per CLAUDE.md standing rule 6. The effective switch for a
+    /// real chain lives in HQ's `planning/harness.json`
+    /// (`orchestration.policy.on_bail`), not in this repo's own harness
+    /// file — see the block record's `notes` field for why.
+    pub on_bail: OnBail,
 }
 
 impl Default for OrchestrationPolicy {
@@ -275,6 +305,7 @@ impl Default for OrchestrationPolicy {
             conductor_single_repo_only: true,
             child_sdlc_flow_policy: None,
             child_sdlc_task_policy: None,
+            on_bail: OnBail::StopChain,
         }
     }
 }
@@ -301,6 +332,7 @@ pub struct PartialOrchestrationPolicy {
     pub conductor_single_repo_only: Option<bool>,
     pub child_sdlc_flow_policy: Option<Option<serde_json::Value>>,
     pub child_sdlc_task_policy: Option<Option<serde_json::Value>>,
+    pub on_bail: Option<OnBail>,
 }
 
 impl crate::policy::Policy for OrchestrationPolicy {
@@ -345,6 +377,7 @@ impl crate::policy::Policy for OrchestrationPolicy {
                 self.child_sdlc_task_policy,
                 over.child_sdlc_task_policy.clone(),
             ),
+            on_bail: crate::policy::merge_opt(self.on_bail, over.on_bail),
         }
     }
 }
@@ -378,6 +411,9 @@ pub fn baseline() -> PartialOrchestrationPolicy {
         // forwarded override) — baseline's no-op contract.
         child_sdlc_flow_policy: Some(None),
         child_sdlc_task_policy: Some(None),
+        // EN.17.B Task 2: restate the built-in default verbatim —
+        // baseline's no-op contract.
+        on_bail: Some(OnBail::StopChain),
     }
 }
 
@@ -655,6 +691,11 @@ type DependsOnFn = Arc<dyn Fn(&str, &str) -> Vec<DependencyEdge> + Send + Sync>;
 type EdgeMetFn = Arc<dyn Fn(&str, &str) -> bool + Send + Sync>;
 type EngineFn = Arc<dyn Fn(&str, &str) -> EngineKind + Send + Sync>;
 type BlockOpenFn = Arc<dyn Fn(&str) -> bool + Send + Sync>;
+/// `EN.17.B` Task 2: `(repo, block_id) -> BlockPresence`, the seam
+/// [`OrchestrationRunNode::with_block_status`] installs —
+/// `corpus_gates::CorpusGates::block_status` in production. Not yet
+/// consulted by `process` (that lands in Task 4).
+type BlockStatusFn = Arc<dyn Fn(&str, &str) -> super::corpus_gates::BlockPresence + Send + Sync>;
 /// A per-step observer, called once per completed step — see
 /// [`OrchestrationRunNode::with_step_observer`] and
 /// [`integrate::StepProgress`].
@@ -684,6 +725,16 @@ pub struct OrchestrationRunNode {
     is_edge_met: EdgeMetFn,
     resolve_engine: EngineFn,
     is_block_open: BlockOpenFn,
+    /// `EN.17.B` Task 2: the status-aware boundary seam — see
+    /// [`Self::with_block_status`]. Defaults to a permissive
+    /// `BlockPresence::NotInTracks` stand-in
+    /// ([`super::corpus_gates::BlockPresence::NotInTracks`] would itself be
+    /// treated as "not in tracks", not "open", so [`Self::new`] instead
+    /// defaults this to a closure that always reports the block present and
+    /// `"open"` — behavior-stable per CLAUDE.md standing rule 6, matching
+    /// `is_block_open`'s own always-false default). Not yet consulted by
+    /// `process` (Task 4 wires the boundary check itself).
+    block_status: BlockStatusFn,
     hold_source: Arc<dyn HoldSource>,
     admission: AdmissionGate,
     /// `None` (the default) builds a fresh [`default_flow_runner`] per run
@@ -772,6 +823,9 @@ impl OrchestrationRunNode {
             is_edge_met: Arc::new(|_repo, _block_id| true),
             resolve_engine: Arc::new(|_repo, _block_id| EngineKind::Flow),
             is_block_open: Arc::new(|_held_until| false),
+            block_status: Arc::new(|_repo, _block_id| {
+                super::corpus_gates::BlockPresence::Row("open".to_string())
+            }),
             hold_source: Arc::new(NeverHeld),
             admission: AdmissionGate::with_default_policy(),
             run_flow: None,
@@ -806,6 +860,16 @@ impl OrchestrationRunNode {
     #[must_use]
     pub fn with_is_block_open(mut self, f: BlockOpenFn) -> Self {
         self.is_block_open = f;
+        self
+    }
+
+    /// `EN.17.B` Task 2: install the status-aware boundary seam — production
+    /// registration wires `corpus_gates::CorpusGates::block_status` from the
+    /// same `CorpusGates` instance `with_is_block_open` already draws from.
+    /// Not yet consulted by `process`; Task 4 wires the boundary check.
+    #[must_use]
+    pub fn with_block_status(mut self, f: BlockStatusFn) -> Self {
+        self.block_status = f;
         self
     }
 
