@@ -22,14 +22,25 @@
 
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use serde_json::json;
 
 use engine_contract::TaskContext;
 use engine_core::node::Node;
-use engine_core::workflows::orchestration::execute::FlowInvocation;
-use engine_core::workflows::orchestration::graph::{OrchestrationRunNode, NODE_NAME};
+use engine_core::policy::PolicyConfigSource;
+use engine_core::repo_registry::RepoRegistry;
+use engine_core::workflows::orchestration::chain::ChainStep;
+use engine_core::workflows::orchestration::execute::{EngineKind, FlowInvocation, FlowRunner};
+use engine_core::workflows::orchestration::gates::{AdmissionGate, DependencyEdge};
+use engine_core::workflows::orchestration::graph::{
+    resolve_policy_for_run_from, OnBail, OrchestrationRunNode, NODE_NAME,
+};
+use engine_core::workflows::orchestration::integrate::{
+    integrate_chain_with_coord_and_policy, ChainReport, NeverHeld, StepProgress,
+};
+use engine_core::WorkflowError;
 
 /// A tempdir `brain.toml` + one real repo directory, mirroring
 /// `orchestration.rs`'s own `isolation_matrix_brain_root` (private to that
@@ -71,6 +82,36 @@ fn write_child_flow_policy_harness(brain_root: &Path, review_mode: &str) {
         serde_json::to_string_pretty(&harness).unwrap(),
     )
     .unwrap();
+}
+
+/// `EN.17.B` task 6: writes `<brain_root>/planning/harness.json` with an
+/// `orchestration.policy.on_bail` switch and, deliberately, no
+/// `orchestration.profiles` section at all — the PROFILE RULE this block's
+/// own notes describe (`graph.rs`'s `cheap_fast`/`thorough` doc comments):
+/// an HQ profile section would replace the built-in bundle wholesale rather
+/// than merge onto it, so this fixture never adds one, matching the real
+/// HQ file's own shape.
+fn write_on_bail_harness(brain_root: &Path, on_bail: &str) {
+    let harness = json!({
+        "orchestration": {
+            "policy": { "on_bail": on_bail }
+        }
+    });
+    std::fs::create_dir_all(brain_root.join("planning")).unwrap();
+    std::fs::write(
+        brain_root.join("planning").join("harness.json"),
+        serde_json::to_string_pretty(&harness).unwrap(),
+    )
+    .unwrap();
+}
+
+fn event_ctx(event: serde_json::Value) -> TaskContext {
+    TaskContext {
+        event,
+        nodes: HashMap::new(),
+        metadata: json!({}),
+        node_runs: HashMap::new(),
+    }
 }
 
 /// A `FlowRunner` that records every [`FlowInvocation`] it receives, writes
@@ -196,16 +237,158 @@ async fn hq_orchestration_policy_brain_root_child_policy_reaches_the_child() {
     );
 }
 
+// ── `EN.17.B` task 6 — `orchestration.policy.on_bail` resolution ────────
+
+/// A temp brain root's `planning/harness.json` carrying
+/// `orchestration.policy.on_bail: skip_dependents` (and no
+/// `orchestration.profiles` at all) resolves `OnBail::SkipDependents`; a
+/// fixture root with no `orchestration` key at all resolves the built-in
+/// default, `OnBail::StopChain`.
+#[test]
+fn hq_orchestration_policy_fixture_root_resolves_on_bail() {
+    let dir = one_repo_brain_root();
+    write_on_bail_harness(dir.path(), "skip_dependents");
+    let source = PolicyConfigSource::Worktree(dir.path().to_path_buf());
+    let ctx = event_ctx(json!({ "brain_root": dir.path() }));
+    let resolved = resolve_policy_for_run_from(&ctx, &source).expect("resolves");
+    assert_eq!(resolved.on_bail, OnBail::SkipDependents);
+
+    let dir_no_switch = one_repo_brain_root();
+    let source_no_switch = PolicyConfigSource::Worktree(dir_no_switch.path().to_path_buf());
+    let ctx_no_switch = event_ctx(json!({ "brain_root": dir_no_switch.path() }));
+    let resolved_no_switch = resolve_policy_for_run_from(&ctx_no_switch, &source_no_switch)
+        .expect("resolves with no orchestration key at all");
+    assert_eq!(resolved_no_switch.on_bail, OnBail::StopChain);
+}
+
+/// `cheap-fast` and `thorough` both leave `on_bail` unset (`graph.rs`'s own
+/// PROFILE RULE comment on each), so the HQ brain-root switch flows through
+/// unchanged. `baseline` explicitly restates `OnBail::StopChain` — an event
+/// `profile` outranks the harness-file default in
+/// `crate::policy::resolve`'s precedence, so `baseline` wins over the HQ
+/// switch even though `baseline` merely restates the built-in value.
+#[test]
+fn hq_orchestration_policy_profiles_do_not_override_the_brain_root_switch() {
+    let dir = one_repo_brain_root();
+    write_on_bail_harness(dir.path(), "skip_dependents");
+    let source = PolicyConfigSource::Worktree(dir.path().to_path_buf());
+
+    for profile in ["cheap-fast", "thorough"] {
+        let ctx = event_ctx(json!({ "brain_root": dir.path(), "profile": profile }));
+        let resolved = resolve_policy_for_run_from(&ctx, &source).expect("resolves");
+        assert_eq!(
+            resolved.on_bail,
+            OnBail::SkipDependents,
+            "profile '{profile}' must not override the HQ on_bail switch"
+        );
+    }
+
+    let ctx_baseline = event_ctx(json!({ "brain_root": dir.path(), "profile": "baseline" }));
+    let resolved_baseline = resolve_policy_for_run_from(&ctx_baseline, &source).expect("resolves");
+    assert_eq!(
+        resolved_baseline.on_bail,
+        OnBail::StopChain,
+        "baseline explicitly restates StopChain, which outranks the harness default"
+    );
+}
+
+/// A chain run through `OrchestrationRunNode` from a fixture brain root,
+/// with no inline event `policy` override, applies skip-dependents purely
+/// because that brain root's own `planning/harness.json` sets
+/// `orchestration.policy.on_bail: skip_dependents` — the independent step
+/// after a bail is still dispatched, and the dependent never is.
+#[tokio::test]
+async fn hq_orchestration_policy_node_run_uses_brain_root_policy() {
+    let dir = one_repo_brain_root();
+    write_on_bail_harness(dir.path(), "skip_dependents");
+
+    let calls: Arc<Mutex<Vec<FlowInvocation>>> = Arc::new(Mutex::new(Vec::new()));
+    let recorded = calls.clone();
+    let run_flow: FlowRunner = Arc::new(move |invocation: FlowInvocation| {
+        recorded.lock().unwrap().push(invocation.clone());
+        Box::pin(async move {
+            if invocation.block_id == "A.1" {
+                return Err(WorkflowError::new("simulated failure for A.1".to_string()));
+            }
+            let dir = invocation
+                .repo_path
+                .join("planning")
+                .join(&invocation.block_id)
+                .join("sdlc");
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(
+                dir.join("sdlc-flow-state.json"),
+                json!({ "status": "done" }).to_string(),
+            )
+            .unwrap();
+            Ok(TaskContext {
+                event: json!({}),
+                nodes: HashMap::new(),
+                metadata: json!({}),
+                node_runs: HashMap::new(),
+            })
+        })
+    });
+
+    let node = OrchestrationRunNode::new()
+        .with_run_flow(run_flow)
+        .with_resolve_depends_on(Arc::new(|repo: &str, id: &str| -> Vec<DependencyEdge> {
+            if repo == "repo-a" && id == "B.1" {
+                vec![DependencyEdge::Block {
+                    repo: "repo-a".to_string(),
+                    block_id: "A.1".to_string(),
+                }]
+            } else {
+                Vec::new()
+            }
+        }));
+
+    let ctx = event_ctx(json!({
+        "brain_root": dir.path(),
+        "blocks": [
+            { "repo": "repo-a", "block_id": "A.1" },
+            { "repo": "repo-a", "block_id": "B.1" },
+            { "repo": "repo-a", "block_id": "C.1" },
+        ],
+        "roadmap_slug": "hq-orchestration-policy-fixture",
+    }));
+
+    let err = node
+        .process(ctx)
+        .await
+        .expect_err("A.1 bails, so the node itself reports the run as failed");
+    assert!(err.message.contains("A.1"));
+
+    let dispatched: Vec<String> = calls
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|inv| inv.block_id.clone())
+        .collect();
+    assert!(
+        dispatched.contains(&"C.1".to_string()),
+        "under skip_dependents (resolved from the brain root's own harness.json), \
+         the independent step C.1 must still have been dispatched: {dispatched:?}"
+    );
+    assert!(
+        !dispatched.contains(&"B.1".to_string()),
+        "B.1 depends on the bailed A.1 and must never be dispatched: {dispatched:?}"
+    );
+}
+
 /// This fleet's REAL HQ `planning/harness.json` — reached from this repo at
 /// `../../planning/harness.json` (engine-rs has no `brain.toml`; HQ is the
 /// brain root a real chain resolves against, per this file's module doc).
-/// Looks for both `child_sdlc_flow_policy` and `child_sdlc_task_policy`
-/// under `orchestration.policy`, and SKIPS CLEANLY (never fails) when
-/// either the file or the `orchestration` key is absent — that write is
-/// made afterward, by hand, by the orchestrating lane (this block's own
-/// notes), not by this task.
-#[test]
-fn hq_orchestration_policy_real_hq_file_sets_the_switches() {
+/// Looks for `child_sdlc_flow_policy`, `child_sdlc_task_policy` AND (EN.17.B
+/// task 6) `on_bail` under `orchestration.policy`, and SKIPS CLEANLY (never
+/// fails) when either the file or the `orchestration` key is absent — those
+/// writes are made afterward, by hand, by the orchestrating lane (each
+/// block's own notes), not by this task. `#[tokio::test]` (not `#[test]`)
+/// because the second half drives a real chain, async, through the public
+/// `integrate_chain_with_coord_and_policy` entry point — the early-return
+/// skip paths above are unaffected by running inside a tokio runtime.
+#[tokio::test]
+async fn hq_orchestration_policy_real_hq_file_sets_the_switches() {
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
     // crates/engine-core -> engine-rs repo root -> core -> agentic-portfolio (HQ root).
     let hq_harness_path = manifest_dir.join("../../../../planning/harness.json");
@@ -237,4 +420,144 @@ fn hq_orchestration_policy_real_hq_file_sets_the_switches() {
         policy.get("child_sdlc_task_policy").is_some(),
         "HQ's real orchestration.policy is missing child_sdlc_task_policy"
     );
+    let Some(on_bail) = policy.get("on_bail") else {
+        eprintln!(
+            "SKIP: HQ harness.json's orchestration.policy has no on_bail key yet — EN.17.B \
+             task 5c's cross-tree write has not landed"
+        );
+        return;
+    };
+    assert_eq!(
+        on_bail.as_str(),
+        Some("skip_dependents"),
+        "HQ's real orchestration.policy.on_bail must be 'skip_dependents' (EN.17.B task 5c)"
+    );
+
+    // Proves task 4's stamping with the REAL resolved value (not a
+    // fixture): resolve `OrchestrationPolicy` straight from THIS file, then
+    // feed its `on_bail` into a real chain and confirm the terminal
+    // `ChainReport` shows the independent step closing while the dependent
+    // is skipped — the effect `on_bail: skip_dependents` is contracted to
+    // produce.
+    let ctx = event_ctx(json!({}));
+    let resolved = resolve_policy_for_run_from(
+        &ctx,
+        &PolicyConfigSource::HarnessFile(hq_harness_path.clone()),
+    )
+    .expect("resolves against the real HQ harness.json");
+    assert_eq!(resolved.on_bail, OnBail::SkipDependents);
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::create_dir_all(dir.path().join("repo-a")).unwrap();
+    std::fs::write(
+        dir.path().join("brain.toml"),
+        "[[repos]]\nslug = \"repo-a\"\nrepo_path = \"repo-a\"\n",
+    )
+    .unwrap();
+    let registry = RepoRegistry::from_brain_root(dir.path()).expect("registry");
+    let chain = vec![
+        ChainStep {
+            repo: "repo-a".to_string(),
+            block_id: "A.1".to_string(),
+            directives: None,
+            ..Default::default()
+        },
+        ChainStep {
+            repo: "repo-a".to_string(),
+            block_id: "B.1".to_string(),
+            directives: None,
+            ..Default::default()
+        },
+        ChainStep {
+            repo: "repo-a".to_string(),
+            block_id: "C.1".to_string(),
+            directives: None,
+            ..Default::default()
+        },
+    ];
+    let resolve_deps = |repo: &str, id: &str| -> Vec<DependencyEdge> {
+        if repo == "repo-a" && id == "B.1" {
+            vec![DependencyEdge::Block {
+                repo: "repo-a".to_string(),
+                block_id: "A.1".to_string(),
+            }]
+        } else {
+            Vec::new()
+        }
+    };
+    let is_met = |_repo: &str, _id: &str| true;
+    let admission = AdmissionGate::with_default_policy();
+    let roadmap_dir = tempfile::tempdir().unwrap();
+    let repo_a = dir.path().join("repo-a");
+    std::fs::create_dir_all(repo_a.join("planning").join("C.1").join("sdlc")).unwrap();
+    std::fs::write(
+        repo_a
+            .join("planning")
+            .join("C.1")
+            .join("sdlc")
+            .join("sdlc-flow-state.json"),
+        json!({ "status": "done" }).to_string(),
+    )
+    .unwrap();
+    let run_flow: FlowRunner = Arc::new(move |invocation| {
+        Box::pin(async move {
+            if invocation.block_id == "A.1" {
+                Err(WorkflowError::new("simulated failure for A.1".to_string()))
+            } else {
+                Ok(TaskContext {
+                    event: json!({}),
+                    nodes: HashMap::new(),
+                    metadata: json!({}),
+                    node_runs: HashMap::new(),
+                })
+            }
+        })
+    });
+    let resolve_engine = |_repo: &str, _id: &str| EngineKind::Flow;
+    let mut report = ChainReport::default();
+    let block_status = |_repo: &str, _id: &str| {
+        engine_core::workflows::orchestration::corpus_gates::BlockPresence::Row("open".to_string())
+    };
+
+    #[allow(clippy::too_many_arguments)]
+    let outcomes = integrate_chain_with_coord_and_policy(
+        &chain,
+        &resolve_deps,
+        &is_met,
+        &admission,
+        &NeverHeld,
+        Duration::from_millis(1),
+        None,
+        None,
+        None,
+        &resolve_engine,
+        &registry,
+        &run_flow,
+        roadmap_dir.path(),
+        None,
+        &|_: &StepProgress| {},
+        false,
+        true,
+        uuid::Uuid::new_v4(),
+        &|_repo: &str, _id: &str| {},
+        None,
+        None,
+        None,
+        resolved.on_bail,
+        &block_status,
+        &mut report,
+    )
+    .await
+    .expect("skip_dependents keeps the chain going past A.1's bail");
+
+    assert_eq!(outcomes.len(), 1);
+    assert_eq!(outcomes[0].block_id, "C.1");
+    assert_eq!(report.bailed, vec!["repo-a:A.1".to_string()]);
+    assert_eq!(report.closed, vec!["repo-a:C.1".to_string()]);
+    assert_eq!(
+        report.skipped.len(),
+        1,
+        "B.1 must be recorded as skipped in the terminal ChainReport"
+    );
+    assert_eq!(report.skipped[0].block, "repo-a:B.1");
 }

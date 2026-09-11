@@ -46,6 +46,7 @@ mod node_invocations;
 mod operator_queue;
 mod opportunity_loop_e2e;
 mod orchestration;
+mod orchestration_bail;
 mod orchestration_chain;
 mod parallel;
 mod policy_baseline;
