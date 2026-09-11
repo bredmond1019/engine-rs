@@ -29,6 +29,7 @@ use crate::sessions::{self, ClaudeSession};
 pub mod approve_and_run;
 pub mod claim_reaffirm;
 pub mod commander;
+pub mod consolidate;
 pub mod content_pipeline;
 pub mod deliverable_render;
 pub mod diagnostic_intake;
