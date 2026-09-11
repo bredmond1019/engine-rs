@@ -597,11 +597,11 @@ mod tests {
     #[test]
     fn promotion_writes_both_files_and_check_remediation_exits_0() {
         let Some(brain_root) = find_brain_root(Path::new(env!("CARGO_MANIFEST_DIR"))) else {
-            eprintln!("SKIPPING: no sibling brain.toml found to copy the real scripts from");
+            tracing::warn!("SKIPPING: no sibling brain.toml found to copy the real scripts from");
             return;
         };
         if !python3_available() {
-            eprintln!("SKIPPING: python3 not on PATH");
+            tracing::warn!("SKIPPING: python3 not on PATH");
             return;
         }
 
@@ -656,11 +656,11 @@ mod tests {
     #[test]
     fn promotion_of_an_already_closed_block_is_status_fixed() {
         let Some(brain_root) = find_brain_root(Path::new(env!("CARGO_MANIFEST_DIR"))) else {
-            eprintln!("SKIPPING: no sibling brain.toml found to copy the real scripts from");
+            tracing::warn!("SKIPPING: no sibling brain.toml found to copy the real scripts from");
             return;
         };
         if !python3_available() {
-            eprintln!("SKIPPING: python3 not on PATH");
+            tracing::warn!("SKIPPING: python3 not on PATH");
             return;
         }
 
@@ -680,11 +680,11 @@ mod tests {
     #[test]
     fn second_promotion_of_the_same_ledger_entry_is_a_no_op() {
         let Some(brain_root) = find_brain_root(Path::new(env!("CARGO_MANIFEST_DIR"))) else {
-            eprintln!("SKIPPING: no sibling brain.toml found to copy the real scripts from");
+            tracing::warn!("SKIPPING: no sibling brain.toml found to copy the real scripts from");
             return;
         };
         if !python3_available() {
-            eprintln!("SKIPPING: python3 not on PATH");
+            tracing::warn!("SKIPPING: python3 not on PATH");
             return;
         }
 

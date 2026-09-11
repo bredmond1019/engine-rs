@@ -396,7 +396,10 @@ mod tests {
 
         // The stored entry is untouched — no silent re-base.
         let still_stored = read_watermark(root, "demo").expect("entry present");
-        assert_eq!(still_stored.last_line_sha256.as_deref(), Some("not-the-real-hash"));
+        assert_eq!(
+            still_stored.last_line_sha256.as_deref(),
+            Some("not-the-real-hash")
+        );
     }
 
     #[test]
