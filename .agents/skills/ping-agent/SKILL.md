@@ -48,6 +48,20 @@ or the string **`UNVERIFIED: <who claimed it>`** naming the claimant when you ar
 than independently checking. Neither an empty string nor a bare adjective such as `measured`
 satisfies it — that is the exact defect this field exists to catch.
 
+**Field-length caps (BT.ticket.message-envelope-field-caps).** Every free-text field carries a hard
+`maxLength` in `.claude/workflows/message.schema.json`, measured 2026-09-10 from the live queue and
+enforced by `scripts/check_messages.py`. These are the ceilings to write within — an envelope over
+cap fails the check (or is tagged, not gating, if `sent_at` predates the ticket's effective date):
+
+| Field | Cap (chars) |
+|---|---|
+| `subject.repo` | 100 |
+| `subject.block` | 200 |
+| `body` | 5800 |
+| `durable_home.channel` | 100 |
+| `durable_home.ref` | 400 |
+| `verified_by` | 1900 |
+
 #### Bastion coord (preferred)
 
 If `bastion` is on PATH, write the envelope to a local JSON file (still shaped exactly like the

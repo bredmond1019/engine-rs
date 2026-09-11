@@ -11,6 +11,19 @@ delegated, or who else is running right now. This command supplies that, then ha
 
 **One `/begin-orchestration` session drives one repo.** Run several at once — that is the lane model.
 
+**Decide as you go — do not stop to ask the operator for ordinary calls.** Write every decision,
+with its reasoning, into this lane's `notes.md` as you make it (Rule 6 below has the full contract,
+including the handful of things that still must escalate rather than being decided alone).
+
+**Keep all four run artifacts under `planning/orchestration-run/<roadmap-slug>/` for the entire
+session, not just at close:**
+- `notes.md`
+- `review.md`
+- `verification-ledger.json`
+- `verification-ledger.md`
+
+`docs/sandbox/run-verification-ledger-prompt.md` is the authority for the ledger's entry schema —
+see Rule 5 below for the full artifact contract; cite that doc rather than restating it here.
 
 **Before writing down anything that is wrong, follow
 [`.claude/workflows/finding-discipline.md`](../workflows/finding-discipline.md).** Evidence travels

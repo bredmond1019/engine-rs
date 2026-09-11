@@ -231,6 +231,35 @@ directory's** `index.md`, and every index row must point at a file that exists.
 | `E_STRUCT_DANGLING_ROW` | An index row points at a file that is not on disk. Located at the `index.md`. |
 | `W_STRUCT_DANGLING_ROW_EPHEMERAL` | A row points at a known-ephemeral name (`handoff.md`, `tasks.md`). Expected, not drift — the standard "delete after consuming" handoff row. |
 
+### The row itself — link text is the filename, not the title
+
+The checker only cares that a link to the file exists somewhere in the index (Step 3 above); it has
+no opinion on row *shape*. But a fleet-wide survey (2026-09-11, ~15 `index.md` files sampled across
+`learn-ai`, `engine-rs`, `mev`, `synapse`, `business`, brain-root and more) found the corpus has
+already converged on a convention the checker doesn't enforce, and a generated or hand-written row
+that ignores it stands out immediately next to its siblings:
+
+- **Link text is the sibling's filename, not its human title** — `[analytics.md](analytics.md)`,
+  `[capabilities.md](capabilities.md)`, never `[Analytics Guide](analytics.md)`. This holds in both
+  of the two shapes below. The human-readable text goes in the description instead.
+- **Two listing shapes cover nearly everything in the corpus**, and both are correct — match
+  whichever the directory already uses rather than picking one:
+  - **A markdown table**, first column always the file link, remaining columns free-form
+    (`| Doc | What it covers |`, `| File | Type | Read it when… |`, etc.). This is the more common
+    shape for directories with more than a handful of files, especially when grouped under several
+    `##` subheadings by topic (e.g. `core/mev/docs/index.md`'s "I want to run something" / "I want
+    to configure something" sections).
+  - **A flat bullet list**, `- [file.md](file.md) — one-line description` (or `*   [...]`). More
+    common for short, single-purpose directories (e.g. `business/planning/index.md`,
+    `side/index.md`).
+- **A directory with several grouped tables is genuinely ambiguous** for anything automated — mev's
+  own docs index has six, one per "what are you trying to do" section, and nothing in the file
+  format says which one a new doc belongs under. Don't guess; ask, or place it by hand and say so.
+- This is *prose convention*, not schema — `docs/okf-frontmatter.md` and `state-schema.md` govern
+  the YAML frontmatter fields, but nothing currently writes this row-shape rule down for the
+  *body* of an `index.md`. If you're hand-authoring or scripting index maintenance and want the
+  result to look native, match the survey above rather than inventing a third shape.
+
 ---
 
 ### Linking out of `planning/` — the symlink trap
