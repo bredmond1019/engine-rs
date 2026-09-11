@@ -116,11 +116,11 @@ use term_core::driver::TerminalDriver;
 use super::chain::{resolve_explicit_chain, resolve_lane_chain, ChainStep};
 use super::conductor::{ConductorProposalError, DroppedCandidate, ProposalOutcome};
 use super::coord_lane::CoordHandle;
-use super::execute::{default_flow_runner, EngineKind, FlowRunner};
+use super::execute::{default_flow_runner, EngineKind, ExecutionOutcome, FlowRunner};
 use super::gates::{AdmissionGate, DependencyEdge};
 use super::integrate::{
-    integrate_chain_with_coord, resolve_roadmap_dir, CloseBlockFn, HoldSource, JournalSinkFn,
-    NeverHeld, StepProgress,
+    integrate_chain_with_coord_and_policy, resolve_roadmap_dir, ChainReport, CloseBlockFn,
+    HoldSource, JournalSinkFn, NeverHeld, StepProgress,
 };
 
 /// The registered workflow type string, used both to register the workflow
@@ -1264,16 +1264,37 @@ impl Node for OrchestrationRunNode {
         // a global default alone would not reach.
         let current_span = tracing::Span::current();
         let current_dispatch = tracing::dispatcher::get_default(|d| d.clone());
-        let outcomes = tokio::task::spawn_blocking(move || {
+        // `EN.17.B` task 4: the resolved policy switch and the status-aware
+        // boundary seam, captured before the `spawn_blocking` closure below
+        // exactly like every other owned seam here — `OnBail` is `Copy`
+        // (crosses by value, no clone needed); `block_status` is an `Arc`
+        // clone, `Send + Sync + 'static`.
+        let on_bail = policy.on_bail;
+        let block_status = self.block_status.clone();
+        let outcomes_result: Result<
+            (Vec<ExecutionOutcome>, ChainReport),
+            (NodeError, ChainReport),
+        > = tokio::task::spawn_blocking(move || {
             tracing::dispatcher::with_default(&current_dispatch, || {
                 let _span_guard = current_span.enter();
-                let rt = tokio::runtime::Builder::new_current_thread()
+                let rt = match tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build()
-                    .map_err(|err| {
-                        NodeError::new(format!("failed to start orchestration runtime: {err}"))
-                    })?;
-                rt.block_on(integrate_chain_with_coord(
+                {
+                    Ok(rt) => rt,
+                    Err(err) => {
+                        return Err((
+                            NodeError::new(format!("failed to start orchestration runtime: {err}")),
+                            ChainReport::default(),
+                        ));
+                    }
+                };
+                // `EN.17.B` task 4, part 5: accumulates `closed`/`bailed`/`skipped`
+                // as `integrate_chain_with_coord_and_policy` runs — populated on
+                // BOTH the `Ok` and the `Err` arm below, since it is threaded in
+                // as `&mut` rather than returned, per `ChainReport`'s own doc.
+                let mut chain_report = ChainReport::default();
+                let result = rt.block_on(integrate_chain_with_coord_and_policy(
                     &chain,
                     &move |repo, block_id| resolve_depends_on(repo, block_id),
                     &move |repo, block_id| is_edge_met(repo, block_id),
@@ -1319,12 +1340,45 @@ impl Node for OrchestrationRunNode {
                     // this chain composes.
                     child_sdlc_flow_policy.as_ref(),
                     child_sdlc_task_policy.as_ref(),
-                ))
-                .map_err(|err| NodeError::new(err.to_string()))
+                    // `EN.17.B` task 4: the two new seams, resolved above —
+                    // `default_block_status`-equivalent permissive behaviour
+                    // whenever `block_status` was never wired (matches
+                    // `Self::new`'s own default), `OnBail::StopChain` whenever
+                    // no HQ/profile override resolved anything else.
+                    on_bail,
+                    &move |repo, block_id| block_status(repo, block_id),
+                    &mut chain_report,
+                ));
+                match result {
+                    Ok(outcomes) => Ok((outcomes, chain_report)),
+                    Err(err) => Err((NodeError::new(err.to_string()), chain_report)),
+                }
             })
         })
         .await
-        .map_err(|err| NodeError::new(format!("orchestration task panicked: {err}")))??;
+        .map_err(|err| NodeError::new(format!("orchestration task panicked: {err}")))?;
+
+        // `EN.17.B` task 4, part 5: on the error path, `ctx` itself is still
+        // discarded by the framework once this function returns `Err`
+        // (`NodeError`'s own doc: `node_context` reverts to its pre-call
+        // snapshot) — there is no seam on `NodeError` today to carry a
+        // structured payload past that revert the way `sessions` does, so
+        // the accumulated report is folded into the error MESSAGE instead,
+        // naming every bailed block, rather than silently lost.
+        let (outcomes, chain_report) = match outcomes_result {
+            Ok(pair) => pair,
+            Err((err, report)) => {
+                return Err(if report.bailed.is_empty() {
+                    err
+                } else {
+                    NodeError::new(format!(
+                        "{} (bailed blocks: {})",
+                        err.message,
+                        report.bailed.join(", ")
+                    ))
+                });
+            }
+        };
 
         // A cancel win is only real if it actually cut the chain short —
         // `integrate_chain` can return `outcomes.len() == total_steps` even
@@ -1372,10 +1426,27 @@ impl Node for OrchestrationRunNode {
             None => json!({ "cancelled": false }),
         };
 
+        // `EN.17.B` task 4, part 5: decided BEFORE the report is moved into
+        // the `json!` stamp below — under `OnBail::SkipDependents`, the
+        // chain can finish with `Ok` outcomes yet still have bailed steps
+        // (their dependents were merely skipped, not the whole chain
+        // stopped), so the "bailed non-empty" check applies regardless of
+        // which arm `outcomes_result` returned.
+        let bailed_error_message = if chain_report.bailed.is_empty() {
+            None
+        } else {
+            Some(format!(
+                "chain integrated with {} bailed block(s): {}",
+                chain_report.bailed.len(),
+                chain_report.bailed.join(", ")
+            ))
+        };
+
         ctx.nodes.insert(
             NODE_NAME.to_string(),
             json!({
                 "steps_integrated": outcomes.len(),
+                "chain_report": chain_report,
                 "blocks": outcomes
                     .iter()
                     .map(|o| json!({
@@ -1424,6 +1495,13 @@ impl Node for OrchestrationRunNode {
                     .collect::<Vec<_>>(),
             }),
         );
+        // `EN.17.B` task 4, part 5: the report is now on `ctx` (stamped
+        // above) regardless of which branch this takes; this is what makes
+        // the `bailed`-non-empty check independent of the `Ok`/`Err` arm
+        // `outcomes_result` returned.
+        if let Some(message) = bailed_error_message {
+            return Err(NodeError::new(message));
+        }
         Ok(ctx)
     }
 
