@@ -5,7 +5,7 @@ description: Chronological log of work completed for engine-rs.
 doc_id: log
 layer: [factory]
 status: active
-timestamp: "2026-09-10T22:26:09Z"
+timestamp: "2026-09-11T00:13:39Z"
 keywords: [work log, session history, development log]
 related: [status, context]
 ---
@@ -13,6 +13,27 @@ related: [status, context]
 # Log — engine-rs
 
 *Append-only working log. One dated entry per session. Newest entries at the top.*
+
+## [run: 2026-09-10]
+
+### `/begin-orchestration` — coordination-layer-port engine lane, `EN.15.I`/`EN.15.J` closed
+
+- **What:** Resumed the `engine` lane on `coordination-layer-port` (`/begin-orchestration
+  --roadmap coordination-layer-port --lane engine --execute`) — the lane record had grown three
+  new blocks (`EN.15.I`/`J`/`K`/`L`) since its last close on 2026-09-08. Specced and ran
+  `EN.15.I` (bailed once on a task-3 scoping gap, respec'd, resumed clean) and `EN.15.J` (clean
+  first pass). Both PRs (#80, #81) merged despite hosted CI red on an unrelated, pre-existing
+  test (`engine-serve::http::tests::adding_the_roadmap_status_route_leaves_coordination_and_health_unaffected`
+  — CI's bare checkout can't resolve `.fleet-locks`/`brain.toml`) — filed as carryover
+  `hosted-ci-cannot-resolve-fleet-locks-brain-toml`. Reconciled local `main` against origin twice
+  (this repo's local `main` runs ahead of `origin/main` by design — pushes route through the HQ
+  script). Fixed two unrelated pre-existing dangling links in `docs/decisions/D84-...md` that
+  were blocking the corpus `--links` gate. `EN.15.L`'s spec is written and ready; stopped here
+  per operator instruction to hand off rather than launch it this session.
+- **Why:** Operator asked to continue driving the roadmap's critical-path lane; handed off before
+  starting the largest remaining block (`EN.15.L`, 5 tasks) so a fresh session can run it with
+  full context budget.
+- **Refs:** `planning/orchestration-run/coordination-layer-port/notes.md`, `planning/handoff.md`.
 
 ## [run: 2026-09-10]
 
