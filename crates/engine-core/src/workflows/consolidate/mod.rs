@@ -26,6 +26,7 @@
 
 pub mod discover;
 pub mod disposal;
+pub mod graph;
 pub mod remediation;
 pub mod select;
 pub mod watermark;
