@@ -32,8 +32,8 @@ use std::time::Duration;
 
 use chrono::{DateTime, TimeZone, Utc};
 use engine_core::coord::heavy_work::{
-    ClassLimit, FreeMemoryProbe, HeavyWorkConfig, HeavyWorkQueue, HeavyWorkSpec, is_reclaimable,
-    job_path, read_job, JobState,
+    is_reclaimable, job_path, read_job, ClassLimit, FreeMemoryProbe, HeavyWorkConfig,
+    HeavyWorkQueue, HeavyWorkSpec, JobState,
 };
 
 fn spec(dir: &Path, class: &str) -> HeavyWorkSpec {
@@ -48,10 +48,7 @@ fn spec(dir: &Path, class: &str) -> HeavyWorkSpec {
 
 fn config_with_class(class: &str, limit: usize, min_free_mb: u64) -> HeavyWorkConfig {
     let mut classes = HashMap::new();
-    classes.insert(
-        class.to_string(),
-        ClassLimit { limit, min_free_mb },
-    );
+    classes.insert(class.to_string(), ClassLimit { limit, min_free_mb });
     HeavyWorkConfig {
         enabled: true,
         heartbeat_interval_secs: 3600, // long enough that no heartbeat task fires mid-test
@@ -108,7 +105,9 @@ impl FreeMemoryProbe for ScriptedProbe {
 
 /// A fixed clock the test can advance by replacing the `Arc<Mutex<...>>` cell's value, so
 /// `HeavyWorkQueue::with_clock` reads whatever the test currently wants "now" to be.
-fn fixed_clock(at: Arc<Mutex<DateTime<Utc>>>) -> impl Fn() -> DateTime<Utc> + Send + Sync + 'static {
+fn fixed_clock(
+    at: Arc<Mutex<DateTime<Utc>>>,
+) -> impl Fn() -> DateTime<Utc> + Send + Sync + 'static {
     move || *at.lock().expect("lock poisoned")
 }
 
@@ -124,7 +123,8 @@ fn base_time() -> DateTime<Utc> {
 async fn heavy_work_fifo_order_limit_one() {
     let dir = tempfile::tempdir().expect("tempdir");
     let config = config_with_class("test", 1, 0);
-    let queue = HeavyWorkQueue::new(dir.path().to_path_buf(), config).with_probe(Arc::new(AlwaysFreeProbe));
+    let queue =
+        HeavyWorkQueue::new(dir.path().to_path_buf(), config).with_probe(Arc::new(AlwaysFreeProbe));
 
     let started: Arc<Mutex<Vec<&'static str>>> = Arc::new(Mutex::new(Vec::new()));
     let running_now: Arc<Mutex<Vec<&'static str>>> = Arc::new(Mutex::new(Vec::new()));
@@ -186,7 +186,8 @@ async fn heavy_work_fifo_order_limit_one() {
 async fn max_concurrency_at_limit(limit: usize) -> usize {
     let dir = tempfile::tempdir().expect("tempdir");
     let config = config_with_class("test", limit, 0);
-    let queue = HeavyWorkQueue::new(dir.path().to_path_buf(), config).with_probe(Arc::new(AlwaysFreeProbe));
+    let queue =
+        HeavyWorkQueue::new(dir.path().to_path_buf(), config).with_probe(Arc::new(AlwaysFreeProbe));
 
     let in_flight = Arc::new(AtomicUsize::new(0));
     let max_seen = Arc::new(AtomicUsize::new(0));
@@ -275,7 +276,9 @@ async fn heavy_work_memory_floor_blocked_head_is_not_overtaken() {
     let dir_path_head = dir.path().to_path_buf();
     let queue_head = queue.clone();
     let head_handle = tokio::spawn(async move {
-        queue_head.run(spec(&dir_path_head, "test"), || "head").await
+        queue_head
+            .run(spec(&dir_path_head, "test"), || "head")
+            .await
     });
 
     // Give the head job time to enqueue and attempt (and fail) admission at least once.
@@ -369,7 +372,10 @@ async fn heavy_work_dead_holder_is_reclaimed() {
     // Find the Running job and rewrite its holder_pid to one that is not running.
     let jobs_dir = dir.path().join("heavy-work").join("jobs");
     let mut job_path_found = None;
-    for entry in std::fs::read_dir(&jobs_dir).expect("read jobs dir").flatten() {
+    for entry in std::fs::read_dir(&jobs_dir)
+        .expect("read jobs dir")
+        .flatten()
+    {
         let path = entry.path();
         if path.extension().and_then(|e| e.to_str()) == Some("json") {
             if let Ok(job) = read_job(&path) {
@@ -462,7 +468,9 @@ async fn heavy_work_unwritable_lock_dir_degrades_open() {
     let lock_dir = dir.path().join("locked");
     std::fs::create_dir_all(&lock_dir).expect("create lock dir");
 
-    let mut perms = std::fs::metadata(&lock_dir).expect("metadata").permissions();
+    let mut perms = std::fs::metadata(&lock_dir)
+        .expect("metadata")
+        .permissions();
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -475,11 +483,19 @@ async fn heavy_work_unwritable_lock_dir_degrades_open() {
 
     let outcome = queue.run(spec(&lock_dir, "test"), || "ran anyway").await;
 
-    assert_eq!(outcome.output, "ran anyway", "work must still run under an unwritable lock dir");
-    assert!(outcome.degraded, "an unwritable lock dir must degrade open, not refuse the job");
+    assert_eq!(
+        outcome.output, "ran anyway",
+        "work must still run under an unwritable lock dir"
+    );
+    assert!(
+        outcome.degraded,
+        "an unwritable lock dir must degrade open, not refuse the job"
+    );
 
     // Restore write permission so tempdir cleanup doesn't fail on drop.
-    let mut restore = std::fs::metadata(&lock_dir).expect("metadata").permissions();
+    let mut restore = std::fs::metadata(&lock_dir)
+        .expect("metadata")
+        .permissions();
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;

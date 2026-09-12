@@ -31,9 +31,9 @@ use crate::nodes::{AgentCodeStep, MetaTransport};
 use crate::routing::Router;
 use crate::workflows::{admitted_command_runner, CommandSpec, SpecCommandRunner};
 
+use super::close_block::DEFAULT_REPO_SLUG;
 #[cfg(test)]
 use super::policy::OutputVerbosity;
-use super::close_block::DEFAULT_REPO_SLUG;
 use super::policy::{ModelTier, RetryFeedback, ReviewMode, SdlcPolicy, TestDepth};
 use super::schema::{RunMeta, SDLCState, SDLCTask, SDLCTaskStatus};
 use super::setup::baseline_snapshot_path;
@@ -2306,96 +2306,96 @@ impl Node for TestTaskNode {
         // it never touches the heavy-work queue — `heavy_work` is stamped
         // `disabled` here on its own terms, not by consulting `self.heavy_work`'s
         // configured state, since no admission was ever attempted.
-        let (mut check_results, mut failed_names, selection, heavy_work_json) =
-            if !harness_exists && task_validation_commands.is_empty() {
-                let result = CheckResult {
-                    name: "harness-missing".to_string(),
-                    kind: "harness-missing".to_string(),
-                    passed: false,
-                    output: String::new(),
-                    message: format!(
-                        "no planning/harness.json found at {} and task {current_task_id} \
+        let (mut check_results, mut failed_names, selection, heavy_work_json) = if !harness_exists
+            && task_validation_commands.is_empty()
+        {
+            let result = CheckResult {
+                name: "harness-missing".to_string(),
+                kind: "harness-missing".to_string(),
+                passed: false,
+                output: String::new(),
+                message: format!(
+                    "no planning/harness.json found at {} and task {current_task_id} \
                          declares no validation_commands: nothing to validate against, so this \
                          is a gating failure rather than a silent pass",
-                        harness_path.display()
-                    ),
-                    failure_class: FailureClass::Fixable,
-                };
-                (
-                    vec![result.clone()],
-                    vec![result.name.clone()],
-                    CheckSelection {
-                        source: "harness",
-                        depth,
-                        excluded: Vec::new(),
-                    },
-                    json!({
-                        "mode": "disabled",
-                        "job_id": null,
-                        "class": "test",
-                        "waited_ms": 0,
-                        "degraded": false,
-                    }),
-                )
-            } else {
-                let (selected_checks, selection) =
-                    select_task_checks(&harness_checks, &task_validation_commands, depth, true);
-
-                let heavy_work_spec = HeavyWorkSpec {
-                    class: "test".to_string(),
-                    repo,
-                    cwd: worktree.to_path_buf(),
-                    commands: selected_checks
-                        .iter()
-                        .filter_map(|check| {
-                            check
-                                .get("command")
-                                .and_then(|v| v.as_str())
-                                .map(str::to_string)
-                        })
-                        .collect(),
-                    run_id: None,
-                };
-
-                // The admitted job's own subprocess calls go through
-                // `admitted_command_runner` (task 4) so `fleet_build.py`'s
-                // separate permit sees `FLEET_BUILD_PREADMITTED=1` and skips
-                // its own (redundant) acquisition. `CommandRunner` carries no
-                // per-call env, so the wrapping `SpecCommandRunner` ignores
-                // `spec.env`/`spec.timeout` and forwards only the triple this
-                // node's own runner understands.
-                let admitted_runner: CommandRunner = {
-                    let base = self.runner.clone();
-                    let spec_runner: SpecCommandRunner = Arc::new(move |spec: &CommandSpec| {
-                        (base)(spec.program, spec.args, spec.cwd)
-                    });
-                    admitted_command_runner(spec_runner)
-                };
-                let job_node = TestTaskNode {
-                    runner: admitted_runner,
-                    heavy_work: self.heavy_work.clone(),
-                };
-                let checks_for_job = selected_checks;
-                let worktree_for_job = worktree.to_path_buf();
-                let spec_dir_for_job = spec_dir.clone();
-
-                let outcome = self
-                    .heavy_work
-                    .run(heavy_work_spec, move || {
-                        job_node.run_checks(&checks_for_job, &worktree_for_job, &spec_dir_for_job)
-                    })
-                    .await;
-
-                let heavy_work_json = json!({
-                    "mode": serde_json::to_value(outcome.mode).unwrap_or(serde_json::Value::Null),
-                    "job_id": outcome.job_id.map(|id| id.to_string()),
-                    "class": outcome.class,
-                    "waited_ms": outcome.waited_ms,
-                    "degraded": outcome.degraded,
-                });
-                let (results, failed) = outcome.output;
-                (results, failed, selection, heavy_work_json)
+                    harness_path.display()
+                ),
+                failure_class: FailureClass::Fixable,
             };
+            (
+                vec![result.clone()],
+                vec![result.name.clone()],
+                CheckSelection {
+                    source: "harness",
+                    depth,
+                    excluded: Vec::new(),
+                },
+                json!({
+                    "mode": "disabled",
+                    "job_id": null,
+                    "class": "test",
+                    "waited_ms": 0,
+                    "degraded": false,
+                }),
+            )
+        } else {
+            let (selected_checks, selection) =
+                select_task_checks(&harness_checks, &task_validation_commands, depth, true);
+
+            let heavy_work_spec = HeavyWorkSpec {
+                class: "test".to_string(),
+                repo,
+                cwd: worktree.to_path_buf(),
+                commands: selected_checks
+                    .iter()
+                    .filter_map(|check| {
+                        check
+                            .get("command")
+                            .and_then(|v| v.as_str())
+                            .map(str::to_string)
+                    })
+                    .collect(),
+                run_id: None,
+            };
+
+            // The admitted job's own subprocess calls go through
+            // `admitted_command_runner` (task 4) so `fleet_build.py`'s
+            // separate permit sees `FLEET_BUILD_PREADMITTED=1` and skips
+            // its own (redundant) acquisition. `CommandRunner` carries no
+            // per-call env, so the wrapping `SpecCommandRunner` ignores
+            // `spec.env`/`spec.timeout` and forwards only the triple this
+            // node's own runner understands.
+            let admitted_runner: CommandRunner = {
+                let base = self.runner.clone();
+                let spec_runner: SpecCommandRunner =
+                    Arc::new(move |spec: &CommandSpec| (base)(spec.program, spec.args, spec.cwd));
+                admitted_command_runner(spec_runner)
+            };
+            let job_node = TestTaskNode {
+                runner: admitted_runner,
+                heavy_work: self.heavy_work.clone(),
+            };
+            let checks_for_job = selected_checks;
+            let worktree_for_job = worktree.to_path_buf();
+            let spec_dir_for_job = spec_dir.clone();
+
+            let outcome = self
+                .heavy_work
+                .run(heavy_work_spec, move || {
+                    job_node.run_checks(&checks_for_job, &worktree_for_job, &spec_dir_for_job)
+                })
+                .await;
+
+            let heavy_work_json = json!({
+                "mode": serde_json::to_value(outcome.mode).unwrap_or(serde_json::Value::Null),
+                "job_id": outcome.job_id.map(|id| id.to_string()),
+                "class": outcome.class,
+                "waited_ms": outcome.waited_ms,
+                "degraded": outcome.degraded,
+            });
+            let (results, failed) = outcome.output;
+            (results, failed, selection, heavy_work_json)
+        };
 
         if let Some(guard_result) = write_verification {
             failed_names.insert(0, guard_result.name.clone());

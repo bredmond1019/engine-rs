@@ -1401,7 +1401,12 @@ Swapouts:                                      0.\n";
         let live_pid = std::process::id();
         let now = Utc::now();
         let fresh_heartbeat = now - chrono::Duration::seconds(5);
-        assert!(!is_reclaimable(Some(live_pid), Some(fresh_heartbeat), 300, now));
+        assert!(!is_reclaimable(
+            Some(live_pid),
+            Some(fresh_heartbeat),
+            300,
+            now
+        ));
     }
 
     #[test]
@@ -1464,7 +1469,9 @@ Swapouts:                                      0.\n";
         let queue = HeavyWorkQueue::new(dir.path().to_path_buf(), config);
 
         // "test" is not configured — only "build" is.
-        let outcome = queue.run(heavy_work_spec(dir.path(), "test"), || "ok").await;
+        let outcome = queue
+            .run(heavy_work_spec(dir.path(), "test"), || "ok")
+            .await;
 
         assert_eq!(outcome.mode, HeavyWorkMode::Enabled);
         assert!(outcome.degraded);

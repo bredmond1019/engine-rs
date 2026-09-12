@@ -361,7 +361,10 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         // dynamic extractor anywhere in this file (and a different HTTP method than the eight
         // write verbs below, which share the same `/api/coordination/` prefix) — registration
         // order relative to them does not matter.
-        .route("/api/coordination/heavy-work", web::get().to(get_heavy_work))
+        .route(
+            "/api/coordination/heavy-work",
+            web::get().to(get_heavy_work),
+        )
         // `EN.15.C` task 6. Eight literal path segments under `/api/coordination/`, colliding
         // with no dynamic extractor anywhere in this file — registration order among them (and
         // relative to `GET /api/coordination` above, a different HTTP method) does not matter.
@@ -1125,12 +1128,12 @@ async fn get_heavy_work() -> impl Responder {
         .partition(|j| matches!(j.state, JobState::Queued | JobState::Running));
     let newest_key =
         |j: &engine_core::coord::heavy_work::HeavyWorkJob| j.finished_at.unwrap_or(j.enqueued_at);
-    terminal.sort_by(|a, b| newest_key(b).cmp(&newest_key(a)));
+    terminal.sort_by_key(|j| std::cmp::Reverse(newest_key(j)));
     terminal.truncate(50);
 
     let mut jobs = active;
     jobs.extend(terminal);
-    jobs.sort_by(|a, b| newest_key(b).cmp(&newest_key(a)));
+    jobs.sort_by_key(|j| std::cmp::Reverse(newest_key(j)));
 
     HttpResponse::Ok().json(serde_json::json!({
         "enabled": config.enabled,

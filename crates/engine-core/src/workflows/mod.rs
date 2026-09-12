@@ -647,8 +647,8 @@ fn log_noop_commit(label: &str, output: &CommandOutput) {
 #[cfg(test)]
 mod tests {
     use super::{
-        commit_all, default_command_runner, default_spec_runner, is_noop_commit,
-        strip_json_fence, CommandOutput, CommandRunner, CommandSpec, CommitOutcome,
+        commit_all, default_command_runner, default_spec_runner, is_noop_commit, strip_json_fence,
+        CommandOutput, CommandRunner, CommandSpec, CommitOutcome,
     };
     use std::sync::Arc;
 
