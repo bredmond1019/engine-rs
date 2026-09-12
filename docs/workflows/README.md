@@ -213,6 +213,14 @@ directory, `~/.cargo`, the HQ vault behind the worktree's `planning/` symlink), 
 description or a cloud-hosted model without revisiting this boundary. See `pi_transport.rs`'s module
 doc for the same statement kept next to the code.
 
+**A known flaky test, not a functional gap.** `pi_transport`'s own subprocess-lifecycle tests spawn a
+fake child and wait on a marker file it writes; under the full `--workspace --all-features` run's CPU
+contention that wait can occasionally lose the race, which is why `.config/nextest.toml` overrides
+`retries = 2` for both the unit test (`nodes::pi_transport::tests::timeout_kills_the_child_process`)
+and its integration-suite counterpart (`agent_backend_pi_transport_kills_child_on_timeout`). A single
+retry clearing it is expected; the transport's own kill-on-timeout/kill-on-cancel behaviour is
+unaffected either way.
+
 ## See also
 
 - [index.md](index.md) — navigation table for this directory.
