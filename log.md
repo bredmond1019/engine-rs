@@ -16,6 +16,56 @@ related: [status, context]
 
 ## [run: 2026-09-12]
 
+### `/sdlc-flow EN.16.B` — BAILED after task 10 (docs-only), 9 of 10 tasks passed
+
+- **What:** Ran `/sdlc-flow EN.16.B` on branch `EN.16.B-flow` in a worktree. Tasks 1-9 all passed
+  with confirmed work assertions: the `AgentBackend { ClaudeCli, Pi }` knob plumbed through
+  `SdlcTaskPolicy`'s four-layer resolution and `SdlcPolicy`'s projection (task 1); `TransportInfo`
+  gained additive `backend`/`cost_known` fields across every existing transport literal (task 2);
+  `AgentOutcome`/`CostEstimate` plus the single `translate()` to `(Outcome, TransportInfo)` (task
+  3); `AgentCodeStep` omits `cost_usd` (rather than writing `0.0`) when cost is unknown, and
+  `BudgetLedger` gained `has_unknown_cost_node` (task 4); `ClaudeSession.cost_known` plus
+  `ledger_totals`/`RunTelemetry` surfacing an unknown-cost-invocation count (task 5); `PiTransport`
+  — a real `MetaTransport` shelling to `pi_agent_rust` against local Ollama, with timeout +
+  cancellation kill-on-drop, a `--mode json` parser built from a real capture fixture, and
+  exit-3-vs-ordinary-failure handling (task 6); `ImplementTaskNode` gained `with_meta_transport`
+  and derives `modified_files` from git-status for any non-`claude_cli` backend (task 7); Pi
+  dispatch wired on both `registry_for_policy_with_cancellation` registration paths, including the
+  previously-silent `token: None` path (task 8); the 11-test `agent_backend.rs` integration suite
+  proving Pi dispatch, subprocess lifecycle, the real-capture parse, and the cost-honesty chain
+  end to end (task 9). Task 10 (docs: `data-contract.md`, `docs/workflows/README.md`) ran but the
+  run **BAILED** rather than reaching review — see below.
+- **Why it bailed:** Two test failures surfaced at task 10's validation gate, neither a code
+  defect. `hq_orchestration_policy_real_hq_file_sets_the_switches` only fails inside this task's
+  worktree because its `harness.json` resolves to engine-rs's own copy instead of HQ's root file
+  (verified 2026-09-12: the identical test PASSES, exit 0, against the main engine-rs tree at
+  `e3bab71`). `agent_backend_pi_transport_kills_child_on_timeout` is a known CPU-contention timing
+  flake, already documented as such by task 9's own decisions. Task 10 is docs-only and cannot fix
+  either failure; retrying the same docs task would not change the outcome. The spec status stays
+  "In progress" — `planning/state.json` was left untouched this run (no flip to closed).
+- **Notable decisions:** see each task's own `decisions[]` in
+  `planning/EN.16.B/sdlc/sdlc-flow-state.json` — most notably the `PiTransport` timing-margin
+  widening in task 9's integration tests (host CPU-contention headroom, not a logic fix) and the
+  `agent_backend` field being carried on `SdlcPolicy` ahead of `SDLC_FLOW`'s own dispatch wiring
+  (EN.16.D).
+
+Next: resolve the two task-10 gate failures out of band (HQ harness.json resolution in a worktree;
+the timing-flake threshold), then resume `/sdlc-flow EN.16.B --resume` to finish task 10 and reach
+review/PR. EN.16.D (Pi backend in SDLC_FLOW) remains the next block after EN.16.B closes.
+
+```
+514d27d feat: implement EN.16.B-task10
+bc78604 feat: implement EN.16.B-task9
+6255502 feat: implement EN.16.B-task8
+e17c4b1 feat: implement EN.16.B-task7
+93fe176 feat: implement EN.16.B-task6
+0e191c3 feat: implement EN.16.B-task5
+365c462 feat: implement EN.16.B-task4
+aea0740 feat: implement EN.16.B-task3
+```
+
+### `/close-out` — EN.17.G/I/J closed this session, EN.17.E gap caught before handoff
+
 ### `/close-out` — EN.17.G/I/J closed this session, EN.17.E gap caught before handoff
 
 - **What:** Ran the full `/close-out` gate suite (fmt, clippy, full-workspace test 4317/4317,
