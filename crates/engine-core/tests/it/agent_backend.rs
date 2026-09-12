@@ -25,9 +25,15 @@ use claude_code_rs::{Config, Outcome};
 use engine_contract::TaskContext;
 use engine_core::nodes::{pi_meta_transport, translate_agent_outcome, AgentOutcome, CostEstimate};
 use engine_core::policy::telemetry::{harvest as harvest_telemetry, RunTelemetryInputs};
-use engine_core::policy::{AgentBackend, LocalConfig, RESOLVED_POLICY_IDENTITY};
+use engine_core::policy::{AgentBackend, LocalConfig, Policy, RESOLVED_POLICY_IDENTITY};
 use engine_core::sessions;
-use engine_core::workflows::sdlc_flow::policy::SdlcPolicy;
+use engine_core::workflows::sdlc_flow::graph::{
+    registry_for_policy as sdlc_flow_registry_for_policy,
+    registry_for_policy_with_cancellation as sdlc_flow_registry_for_policy_with_cancellation,
+};
+use engine_core::workflows::sdlc_flow::policy::{
+    PartialPolicy as SdlcFlowPartialPolicy, SdlcPolicy,
+};
 use engine_core::workflows::sdlc_flow::schema::{SDLCState, SDLCTask};
 use engine_core::workflows::sdlc_flow::task_loop::{ImplementTaskNode, TestTaskNode};
 use engine_core::workflows::sdlc_task::graph::{
@@ -288,6 +294,137 @@ async fn agent_backend_task_token_none_does_not_fall_back_to_claude() {
         out.nodes["ImplementTaskNode"]["transport"]["backend"],
         serde_json::json!("pi"),
         "token: None must not fall back to the billed claude_cli node — got {out:#?}"
+    );
+}
+
+// -- dispatch: both SDLC_FLOW registration paths (EN.16.D task 3) -------
+
+/// `agent_backend: pi` via SDLC_FLOW's
+/// [`sdlc_flow_registry_for_policy_with_cancellation`] (`token: Some(..)`)
+/// must dispatch `PiTransport` on `ImplementTaskNode` — mirrors
+/// [`agent_backend_task_dispatch_wires_pi_transport`] for the flow
+/// workflow. Would fail if `graph.rs`'s `pi_backend` gate (EN.16.D task 2)
+/// were removed.
+#[cfg(unix)]
+#[tokio::test]
+async fn agent_backend_flow_dispatch_wires_pi_transport() {
+    let _guard = PI_BINARY_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (_dir, script) = write_fake_pi_binary(SUCCESS_STREAM);
+    // SAFETY: single-threaded within this test's own process (`cargo
+    // nextest run` forks one process per test), scoped to this test and
+    // serialized via `PI_BINARY_ENV_LOCK`.
+    unsafe {
+        std::env::set_var("PI_BINARY", &script);
+    }
+
+    let policy = SdlcPolicy {
+        agent_backend: AgentBackend::Pi,
+        ..SdlcPolicy::default()
+    };
+    let token = CancellationToken::new();
+    let registry = sdlc_flow_registry_for_policy_with_cancellation(&policy, Some(token), None);
+    let node = registry
+        .get("ImplementTaskNode")
+        .expect("ImplementTaskNode registered");
+    let ctx = sdlc_task_ctx(AgentBackend::Pi);
+    let result = node.process(ctx).await;
+
+    unsafe {
+        std::env::remove_var("PI_BINARY");
+    }
+
+    let out = result.expect("process should succeed against the fake pi script");
+    assert_eq!(
+        out.nodes["ImplementTaskNode"]["transport"]["backend"],
+        serde_json::json!("pi"),
+        "agent_backend: pi must dispatch PiTransport on SDLC_FLOW's \
+         ImplementTaskNode — got {out:#?}"
+    );
+}
+
+/// The SAME `agent_backend: pi` policy through
+/// [`sdlc_flow_registry_for_policy`] — the real production call site
+/// (`token: None`) — must STILL dispatch `PiTransport`. Before task 2's
+/// fix, SDLC_FLOW's re-registration was gated on `token.is_some()` alone,
+/// so this exact shape silently kept the base registry's billed
+/// `claude_cli` node. Would fail if that gate regressed back to
+/// `token.is_some()` alone.
+#[cfg(unix)]
+#[tokio::test]
+async fn agent_backend_flow_token_none_does_not_fall_back_to_claude() {
+    let _guard = PI_BINARY_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (_dir, script) = write_fake_pi_binary(SUCCESS_STREAM);
+    unsafe {
+        std::env::set_var("PI_BINARY", &script);
+    }
+
+    let policy = SdlcPolicy {
+        agent_backend: AgentBackend::Pi,
+        ..SdlcPolicy::default()
+    };
+    let registry = sdlc_flow_registry_for_policy(&policy);
+    let node = registry
+        .get("ImplementTaskNode")
+        .expect("ImplementTaskNode registered");
+    let ctx = sdlc_task_ctx(AgentBackend::Pi);
+    let result = node.process(ctx).await;
+
+    unsafe {
+        std::env::remove_var("PI_BINARY");
+    }
+
+    let out = result.expect("process should succeed against the fake pi script");
+    assert_eq!(
+        out.nodes["ImplementTaskNode"]["transport"]["backend"],
+        serde_json::json!("pi"),
+        "token: None must not fall back to the billed claude_cli node on \
+         SDLC_FLOW — got {out:#?}"
+    );
+}
+
+/// End-to-end four-layer resolution into dispatch: a `PartialPolicy`
+/// override carrying `agent_backend: Some(Pi)` (task 1's new merge arm),
+/// applied over `SdlcPolicy::default()` via `Policy::apply`, must resolve
+/// to a policy that `sdlc_flow_registry_for_policy` dispatches Pi for —
+/// proving the merge arm actually reaches dispatch, not just that the
+/// field round-trips in isolation (task 1's own unit test already covers
+/// that in isolation).
+#[cfg(unix)]
+#[tokio::test]
+async fn agent_backend_flow_profile_resolves_pi() {
+    let _guard = PI_BINARY_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (_dir, script) = write_fake_pi_binary(SUCCESS_STREAM);
+    unsafe {
+        std::env::set_var("PI_BINARY", &script);
+    }
+
+    let resolved = SdlcPolicy::default().apply(&SdlcFlowPartialPolicy {
+        agent_backend: Some(AgentBackend::Pi),
+        ..SdlcFlowPartialPolicy::default()
+    });
+    assert_eq!(
+        resolved.agent_backend,
+        AgentBackend::Pi,
+        "sanity: the merge arm must have actually resolved to Pi before \
+         dispatch is even exercised"
+    );
+
+    let registry = sdlc_flow_registry_for_policy(&resolved);
+    let node = registry
+        .get("ImplementTaskNode")
+        .expect("ImplementTaskNode registered");
+    let ctx = sdlc_task_ctx(AgentBackend::Pi);
+    let result = node.process(ctx).await;
+
+    unsafe {
+        std::env::remove_var("PI_BINARY");
+    }
+
+    let out = result.expect("process should succeed against the fake pi script");
+    assert_eq!(
+        out.nodes["ImplementTaskNode"]["transport"]["backend"],
+        serde_json::json!("pi"),
+        "a PartialPolicy-resolved agent_backend must reach dispatch — got {out:#?}"
     );
 }
 

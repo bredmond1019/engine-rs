@@ -214,6 +214,7 @@ mod tests {
             total_cache_creation_tokens: 0,
             unknown_cost_invocations: 0,
             model_tier_used: BTreeMap::new(),
+            backend_used: BTreeMap::new(),
         }
     }
 
@@ -243,6 +244,44 @@ mod tests {
         let row2 = rows.iter().find(|r| r.policy == p2).unwrap();
         assert_eq!(row2.run_count, 1);
         assert_eq!(row2.pass_rate, 0.0);
+    }
+
+    // EN.16.D task 5: proves `policy_key`'s full-JSON-serialization grouping
+    // already keeps a `pi` run and a `claude_cli` run apart, with no
+    // production code change needed here — `agent_backend` is a plain field
+    // on `SdlcPolicy` (since EN.16.B) and is therefore already part of the
+    // serialized key `policy_key` groups by. Would fail (collapsing to 1
+    // row) if `agent_backend` were ever excluded from the key, e.g. by a
+    // stray `#[serde(skip)]`.
+    #[test]
+    fn agent_backend_aggregate_separates_backends() {
+        use crate::policy::AgentBackend;
+        use crate::workflows::sdlc_flow::policy::SdlcPolicy;
+
+        let claude_policy = SdlcPolicy::default();
+        assert_eq!(claude_policy.agent_backend, AgentBackend::ClaudeCli);
+        let pi_policy = SdlcPolicy {
+            agent_backend: AgentBackend::Pi,
+            ..SdlcPolicy::default()
+        };
+
+        let runs = vec![
+            (claude_policy, telemetry(1.0, 10.0, 1, 0, &["A:PASS"])),
+            (pi_policy, telemetry(1.0, 10.0, 1, 0, &["A:PASS"])),
+        ];
+
+        let rows = aggregate(&runs);
+        assert_eq!(
+            rows.len(),
+            2,
+            "a claude_cli run and a pi run must never merge into one PolicyAggregate row"
+        );
+        assert!(rows
+            .iter()
+            .any(|r| r.policy.agent_backend == AgentBackend::ClaudeCli));
+        assert!(rows
+            .iter()
+            .any(|r| r.policy.agent_backend == AgentBackend::Pi));
     }
 
     #[test]

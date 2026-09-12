@@ -4,14 +4,26 @@
 //! already accept (`with_meta_transport`), mirroring
 //! [`super::openai_compat_transport`]'s shape for the `local` model tier.
 //!
-//! It shells to `pi -p <prompt> --mode json --approval-mode yolo --provider
-//! ollama --model <local.model>`, with the resolved policy's `local.model`
-//! (never a literal) as the only model/provider string beyond the
-//! `--provider ollama` flag itself. `local.endpoint` has no direct `pi` CLI
-//! flag on the `ollama` provider, so it is honored best-effort via the
-//! `OLLAMA_HOST` environment variable the child inherits — the widely-used
-//! convention for redirecting an Ollama-backed client away from the default
-//! `http://localhost:11434` — rather than being silently dropped.
+//! It shells to `pi --mode json --approval-mode yolo --provider ollama
+//! --model <local.model> -p <prompt>`, with the resolved policy's
+//! `local.model` (never a literal) as the only model/provider string beyond
+//! the `--provider ollama` flag itself. **`-p <prompt>` MUST come last.**
+//! The operator's first real engine run (`first-real-pi-engine-run`,
+//! 2026-09-12) hit this for real: with `-p` positioned first, `pi` silently
+//! fell through to Amazon Bedrock authentication instead of `ollama` on
+//! every dispatch — the exact stray-positional-argument failure mode
+//! `evidence/pi-real-cli-run.md`'s "Other runs captured" section had
+//! already documented for the raw CLI, which this transport had not yet
+//! applied. Fixed by moving `-p`/`prompt` to the end of the arg list; no
+//! fake-binary unit test catches an arg-order regression like this because
+//! a fake script doesn't care what order its arguments arrive in — only a
+//! real `pi` binary does.
+//!
+//! `local.endpoint` has no direct `pi` CLI flag on the `ollama` provider, so
+//! it is honored best-effort via the `OLLAMA_HOST` environment variable the
+//! child inherits — the widely-used convention for redirecting an
+//! Ollama-backed client away from the default `http://localhost:11434` —
+//! rather than being silently dropped.
 //!
 //! `Config.cwd` (the scoped git worktree) becomes the child's
 //! `current_dir`; `Config.timeout` (default [`DEFAULT_PI_TIMEOUT`], sized
@@ -138,8 +150,6 @@ async fn run_pi(
 
     let mut command = Command::new(&binary);
     command
-        .arg("-p")
-        .arg(&prompt)
         .arg("--mode")
         .arg("json")
         .arg("--approval-mode")
@@ -148,6 +158,8 @@ async fn run_pi(
         .arg("ollama")
         .arg("--model")
         .arg(&local.model)
+        .arg("-p")
+        .arg(&prompt)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

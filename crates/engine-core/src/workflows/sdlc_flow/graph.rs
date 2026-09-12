@@ -63,6 +63,8 @@ use claude_code_rs::Config;
 use crate::cancellation::CancellationToken;
 use crate::node::NodeRegistry;
 use crate::nodes::openai_compat_transport::openai_compat_meta_transport_live;
+use crate::nodes::pi_meta_transport_live;
+use crate::policy::AgentBackend;
 use crate::schema::{NodeConfig, WorkflowSchema};
 use crate::workflow::Workflow;
 
@@ -413,6 +415,17 @@ fn registry_with_agent(agent: Option<&str>) -> NodeRegistry {
 /// a node can carry a local-tier transport override AND a cancellation
 /// token at once. This function threads the token onto whichever variant of
 /// each node this call ends up registering (local-tier-wired or plain).
+///
+/// **`ImplementTaskNode` re-registration is gated on `policy.agent_backend`
+/// being [`AgentBackend::Pi`], OR on `token` being given — not on `token`
+/// alone (`EN.16.D` task 2, mirroring `sdlc_task`'s `EN.16.B` task 8 fix).**
+/// The base [`registry`] this function starts from always registers the
+/// `claude_cli` `ImplementTaskNode` (no meta transport); the real
+/// production call site goes through [`registry_for_policy`], i.e.
+/// `token: None`. Gating the re-registration on `token.is_some()` alone
+/// would mean `agent_backend: pi` with no cancellation token silently kept
+/// the base registry's billed `claude_cli` node: the knob would have no
+/// effect on the one path that actually runs in production.
 #[must_use]
 pub fn registry_for_policy_with_cancellation(
     policy: &SdlcPolicy,
@@ -451,12 +464,17 @@ pub fn registry_for_policy_with_cancellation(
         registry.register(Box::new(node));
     }
 
-    if let Some(t) = token {
-        registry.register(Box::new(
-            ImplementTaskNode::new()
-                .with_config(agentic_write_config("claude-sonnet-4-5"))
-                .with_cancellation_token(t),
-        ));
+    let pi_backend = policy.agent_backend == AgentBackend::Pi;
+    if pi_backend || token.is_some() {
+        let mut node =
+            ImplementTaskNode::new().with_config(agentic_write_config("claude-sonnet-4-5"));
+        if pi_backend {
+            node = node.with_meta_transport(pi_meta_transport_live(policy.local.clone()));
+        }
+        if let Some(t) = token {
+            node = node.with_cancellation_token(t);
+        }
+        registry.register(Box::new(node));
     }
 
     registry
