@@ -90,6 +90,10 @@ fn billed_failure(
             cache_creation_input_tokens: usage.cache_creation_input_tokens,
             model: model.to_string(),
             started_at: Some(started_at.to_string()),
+            // A billed API failure only ever comes from the `claude` CLI transport (the match arm
+            // above is `claude_code_rs::Error::Api`, which no other transport can raise), so this
+            // is a real, known cost exactly like every other pre-`EN.16.B` entry.
+            cost_known: true,
         }),
         _ => None,
     }
@@ -596,6 +600,11 @@ impl Node for AgentCodeStep {
                 // the node entry can never disagree.
                 model: model.clone(),
                 started_at: Some(last_attempt_started_at.clone()),
+                // `EN.16.B` task 5: the transport's own `cost_known` (task 2's `TransportInfo`
+                // field) travels onto the ledger entry, not a hardcoded `true` — this is what lets
+                // `sessions::ledger_totals` count a Pi/local-model invocation as unknown-cost
+                // rather than as a confirmed, silent zero.
+                cost_known: transport_info.cost_known,
             },
         );
 

@@ -87,6 +87,21 @@ pub struct ClaudeSession {
     /// before this field existed.
     #[serde(default)]
     pub started_at: Option<String>,
+    /// Whether `cost_usd` (and the token counts alongside it) is a real, billed figure rather
+    /// than a placeholder. Mirrors `nodes::agent_code_step::TransportInfo::cost_known` (`EN.16.B`
+    /// task 2) at the point the invocation is appended to this ledger.
+    ///
+    /// `#[serde(default = "default_cost_known")]` returns `true`: every entry written before this
+    /// field existed came from the `claude` CLI transport, which always billed a real cost, so an
+    /// old record must deserialize as known rather than silently reading as unknown.
+    #[serde(default = "default_cost_known")]
+    pub cost_known: bool,
+}
+
+/// `true` — the serde default for [`ClaudeSession::cost_known`] on an entry written before the
+/// field existed.
+fn default_cost_known() -> bool {
+    true
 }
 
 /// Append one invocation to `metadata`'s ledger, creating it if absent. Order-preserving.
@@ -171,6 +186,12 @@ pub struct LedgerTotals {
     pub output_tokens: u64,
     pub cache_read_input_tokens: u64,
     pub cache_creation_input_tokens: u64,
+    /// Count of invocations whose `cost_known` was `false` — a transport that ran but could not
+    /// report a real dollar cost (e.g. a Pi/local-model run, `EN.16.B` task 2). These invocations'
+    /// `cost_usd` (always `0.0` for them, per `TransportInfo::cost_known`'s contract) is still
+    /// summed into [`Self::cost_usd`] above, so this count is what tells a reader `cost_usd` is
+    /// an UNDERCOUNT rather than a complete, confirmed total.
+    pub unknown_cost_invocations: usize,
 }
 
 /// Roll the ledger up into a run total.
@@ -190,6 +211,9 @@ pub fn ledger_totals(metadata: &Value) -> LedgerTotals {
             acc.output_tokens += s.output_tokens;
             acc.cache_read_input_tokens += s.cache_read_input_tokens;
             acc.cache_creation_input_tokens += s.cache_creation_input_tokens;
+            if !s.cost_known {
+                acc.unknown_cost_invocations += 1;
+            }
             acc
         })
 }
@@ -199,6 +223,16 @@ mod tests {
     use super::*;
 
     fn session(node: &str, id: Option<&str>, ok: bool, cost: f64) -> ClaudeSession {
+        session_with_cost_known(node, id, ok, cost, true)
+    }
+
+    fn session_with_cost_known(
+        node: &str,
+        id: Option<&str>,
+        ok: bool,
+        cost: f64,
+        cost_known: bool,
+    ) -> ClaudeSession {
         ClaudeSession {
             node: node.to_string(),
             session_id: id.map(str::to_string),
@@ -210,6 +244,7 @@ mod tests {
             cache_creation_input_tokens: 1,
             model: String::new(),
             started_at: None,
+            cost_known,
         }
     }
 
@@ -353,5 +388,57 @@ mod tests {
 
         assert_eq!(ledger_totals(&meta).invocations, 1);
         assert_eq!(ledger_totals(&meta).cost_usd, 0.0);
+    }
+
+    /// `EN.16.B` task 5: `ledger_totals` counts unknown-cost invocations (e.g. a Pi transport run,
+    /// `cost_known: false`) separately from the known-cost ones, over a ledger mixing both.
+    #[test]
+    fn ledger_totals_counts_unknown_cost_invocations_over_a_mixed_ledger() {
+        let mut meta = serde_json::json!({});
+        append_session(
+            &mut meta,
+            session_with_cost_known("Implement", Some("s1"), true, 1.0, true),
+        );
+        append_session(
+            &mut meta,
+            session_with_cost_known("Implement", Some("s2"), true, 0.0, false),
+        );
+        append_session(
+            &mut meta,
+            session_with_cost_known("Test", Some("s3"), true, 2.0, true),
+        );
+        append_session(
+            &mut meta,
+            session_with_cost_known("Test", Some("s4"), false, 0.0, false),
+        );
+
+        let totals = ledger_totals(&meta);
+        assert_eq!(totals.invocations, 4);
+        assert_eq!(
+            totals.unknown_cost_invocations, 2,
+            "exactly the two cost_known: false entries must be counted"
+        );
+        assert!(
+            (totals.cost_usd - 3.0).abs() < 1e-9,
+            "the unknown-cost entries' 0.0 must still be summed, not skipped"
+        );
+    }
+
+    /// `ClaudeSession.cost_known`'s serde default: a pre-`EN.16.B` JSON entry lacking the key
+    /// (every entry written before this field existed came from the `claude` CLI, which always
+    /// billed a real cost) must deserialize as `true`, never as `false`.
+    #[test]
+    fn cost_known_serde_default_is_true_for_a_pre_change_entry() {
+        let meta = serde_json::json!({
+            SESSIONS_METADATA_KEY: [{ "node": "Implement", "session_id": "s1", "ok": true, "cost_usd": 1.0 }]
+        });
+
+        let sessions = read_sessions(&meta);
+        assert_eq!(sessions.len(), 1);
+        assert!(
+            sessions[0].cost_known,
+            "an entry with no cost_known key must deserialize as known, not unknown"
+        );
+        assert_eq!(ledger_totals(&meta).unknown_cost_invocations, 0);
     }
 }

@@ -124,6 +124,7 @@ mod session_delta_tests {
             cache_creation_input_tokens: 0,
             model: String::new(),
             started_at: None,
+            cost_known: true,
         }
     }
 
