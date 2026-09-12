@@ -14,6 +14,36 @@ related: [status, context]
 
 *Append-only working log. One dated entry per session. Newest entries at the top.*
 
+## [run: 2026-09-12]
+
+Implemented `EN.16.C` — the Aider coding-agent backend — via `/sdlc-flow` on branch `EN.16.C-flow`,
+all 6 tasks passed, PASS review. Added the `Aider` variant to the shared `AgentBackend` enum (task
+1); `AiderTransport`, a `MetaTransport` shelling to `aider --message ... --yes-always` against local
+Ollama, mirroring `PiTransport`'s cwd/timeout/cancellation-kill/missing-binary/stderr-capture
+contract and reporting an outer-`None` cost as unknown on every channel (task 2); Aider dispatch
+arms wired onto both registration paths in both `sdlc_task::graph` and `sdlc_flow::graph` (task 3);
+`ImplementTaskNode` now derives `modified_files` for the Aider backend from a pre-call HEAD diff
+rather than `git status`, since Aider auto-commits mid-call and a worktree-status read comes back
+clean (task 4); seven `agent_backend_aider_*` integration tests plus an auto-commit `modified_files`
+case, with a `.config/nextest.toml` retry override for a reproduced ~1/3 cancellation-test flake
+(task 5); `docs/workflows/README.md` documents the new backend, and all seven `gates:true` harness
+checks pass at the full authoritative command (task 6). The block's one non-gateable AC — a real
+`agent_backend: aider` SDLC_TASK run making an observable code change — is an operator gate, not
+closed by this run; it stays PENDING at
+`planning/open-work/pre-plan/pluggable-code-agent-transport/evidence/aider-real-engine-run.md`.
+Closes `EN.16.C`. Next: `EN.17.E` — EDGE_RELEASED, FINDING and QUERY are acted on at the block
+boundary.
+
+```
+023e0f9 docs: update docs for EN.16.C
+f016a78 feat: implement EN.16.C-task6
+e66f4ea feat: implement EN.16.C-task5
+56a280b feat: implement EN.16.C-task4
+009253f feat: implement EN.16.C-task3
+8e0be33 feat: implement EN.16.C-task2
+d204486 feat: implement EN.16.C-task1
+```
+
 ## [2026-09-12]
 
 ### Closed both operator gates on pluggable-code-agent-transport; filed EN.16.E; captured eval-harness idea
