@@ -4,6 +4,12 @@
 //! `agent_code_step` (`EN.2.A`) wires the `core/claude-code-rs` SDK's async
 //! `execute()` into a `Node`, mapping its `Outcome` into `NodeRun`/`TaskContext`.
 //!
+//! `agent_outcome` (`EN.16.B` task 3) is `AgentOutcome`/`CostEstimate` — the
+//! backend-agnostic shape a non-`claude_cli` transport reports its result in
+//! — plus `translate`, the single function mapping that shape onto
+//! `(claude_code_rs::Outcome, TransportInfo)` so such a transport slots into
+//! `MetaTransport` unchanged.
+//!
 //! `openai_compat_transport` (`EN.3.C` task 5) builds a `ModelTransport` for
 //! the `local` model tier: an OpenAI-compatible HTTP transport with the same
 //! signature as `claude_code_rs::execute`, so it slots into
@@ -132,6 +138,7 @@
 //! (`EN.17.D` task 2) is its first consumer.
 
 pub mod agent_code_step;
+pub mod agent_outcome;
 pub mod aggregate;
 pub mod brain_client;
 pub mod channel_transport;
@@ -151,6 +158,7 @@ pub mod suspend;
 pub mod terminal;
 
 pub use agent_code_step::{AgentCodeStep, MetaTransport, TransportInfo};
+pub use agent_outcome::{translate as translate_agent_outcome, AgentOutcome, CostEstimate};
 pub use aggregate::AggregateNode;
 pub use brain_client::{
     http_get_live, BrainConfig, BrainConfigError, HttpGet, RecallNode, RecallResult,
