@@ -143,6 +143,21 @@ When the queue is enabled:
 - `FinalValidationNode::process` (`crates/engine-core/src/workflows/sdlc_flow/final_validation.rs`)
   wraps its checks with class `build`.
 
+### How a node gets a queue (the wiring seam)
+
+Both nodes own a `HeavyWorkQueue` field whose **constructor default is
+`HeavyWorkQueue::new(PathBuf::new(), HeavyWorkConfig::disabled())`** — an explicitly disabled
+queue — and both expose a builder override, `TestTaskNode::with_heavy_work(queue)` and
+`FinalValidationNode::with_heavy_work(queue)`. A caller enables the queue by constructing
+`HeavyWorkQueue::new(coord::resolve_lock_dir(..), <config parsed from brain.toml>)` and passing it
+through that builder.
+
+As of this block, `sdlc_flow::graph`'s registry registers `TestTaskNode::new()` and
+`FinalValidationNode::new()` — **no `with_heavy_work` call**, so a real `SDLC_TASK` / `SDLC_FLOW`
+run executes its checks inline and unqueued, exactly as before this block, and the only callers
+passing a live queue today are this repo's own tests. That is the behaviour-stable default standing
+rule 6 requires: landing the queue changes no existing run until a caller opts in at the seam.
+
 Both nodes stamp `heavy_work: { mode, job_id, class, waited_ms, degraded }` into their `ctx.nodes`
 output **at every setting** — `mode: "disabled"` with null fields when the queue is off, so the
 output shape never varies between an enabled and a disabled run. When the queue is enabled but the
@@ -221,3 +236,5 @@ the `email_adapter` precedent for non-knob configuration.
 - **Per-host limits** — `brain.toml` is shared by every host through git, so the same numbers
   apply everywhere.
 - **Bounding how long a job may wait in the queue.**
+- **Today's real `SDLC_TASK` / `SDLC_FLOW` runs** — `sdlc_flow::graph` registers both nodes with
+  `::new()`, whose default queue is disabled; see "How a node gets a queue" above.
