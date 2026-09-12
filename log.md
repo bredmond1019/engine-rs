@@ -16,6 +16,41 @@ related: [status, context]
 
 ## [run: 2026-09-12]
 
+### `/sdlc-flow EN.16.B` wrap-up — PASS
+
+Full spec is done. `/sdlc-flow` on branch `EN.16.B-flow` (worktree), all 10 tasks passed with
+confirmed work assertions, PASS review. Implemented across tasks: `AgentBackend { ClaudeCli, Pi }`
+plumbed through `SdlcTaskPolicy`'s four-layer resolution and `SdlcPolicy`'s pass-through projection
+(task 1); additive `TransportInfo.backend`/`cost_known` fields on the existing `MetaTransport` seam
+(task 2); `AgentOutcome`/`CostEstimate` and a single `translate()` to `(Outcome, TransportInfo)`
+(task 3); cost-honesty on both channels — `AgentCodeStep` omits `cost_usd` (never a silent $0.0) and
+`BudgetLedger::has_unknown_cost_node` when unknown (task 4); `ClaudeSession.cost_known` plus
+ledger/`RunTelemetry` unknown-cost surfacing (task 5); `PiTransport` — a real `MetaTransport` shelling
+to `pi_agent_rust` against local Ollama, with timeout/cancellation kill-on-drop and a parser built
+from a real capture fixture (task 6); `ImplementTaskNode.with_meta_transport` plus git-status-derived
+`modified_files` for non-`claude_cli` backends (task 7); Pi dispatch wired on both SDLC_TASK
+registration paths, closing the token:None gap (task 8); an 11-test `agent_backend.rs` integration
+suite (task 9); docs (task 10). Notable decision: a prior AC10 regex (`"qwen|llama|ollama_chat/"`)
+was unsatisfiable as written — it substring-matched the required `ollama`/`OLLAMA_HOST` literals the
+block's own other ACs require present — and was corrected to a backslash-free character class that
+no longer self-triggers; re-review then returned PASS (this spec had bailed MAJOR twice on the
+identical defect across the prior two wrap-up attempts, visible in the branch's own commit history).
+Full gate green. Closes `EN.16.B`. Next: `EN.16.D` — Pi backend in SDLC_FLOW, with the backend
+attributed in run telemetry.
+
+```
+c347009 docs: update docs for EN.16.B
+2b5c87c fix: replace fragile \b AC10 escape with a backslash-free character class
+0a32ab1 chore: wrap up EN.16.B
+a1dedc1 fix: rephrase pi_transport.rs's AC10 comment to not self-trigger the check
+b888b8d chore: wrap up EN.16.B
+587489e fix: fix pass 1 for EN.16.B-task10
+a52e74c fix: unblock EN.16.B task 10's gate — worktree path resolution, timing flakes, baseline drift
+09f52a2 chore: wrap up EN.16.B
+```
+
+## [run: 2026-09-12 — earlier attempt, superseded]
+
 ### `/sdlc-flow EN.16.B` wrap-up (2nd attempt) — PARTIAL (review-verdict bail persists after AC-comment fix)
 
 All 10 tasks (1-10) confirmed passed with confirmed work assertions, unchanged from the prior
