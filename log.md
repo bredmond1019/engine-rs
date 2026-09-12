@@ -16,6 +16,45 @@ related: [status, context]
 
 ## [run: 2026-09-12]
 
+### `/sdlc-flow EN.16.B` wrap-up — PARTIAL (review-verdict bail, AC regex self-contradictory)
+
+All 10 tasks passed with confirmed work assertions: the `AgentBackend { ClaudeCli, Pi }` knob
+plumbed through `SdlcTaskPolicy`'s four-layer resolution and `SdlcPolicy`'s projection (task 1);
+`TransportInfo` gained additive `backend`/`cost_known` fields across every existing transport
+literal (task 2); `AgentOutcome`/`CostEstimate` plus the single `translate()` to `(Outcome,
+TransportInfo)` (task 3); `AgentCodeStep` omits `cost_usd` (rather than writing `0.0`) when cost
+is unknown, and `BudgetLedger` gained `has_unknown_cost_node` (task 4); `ClaudeSession.cost_known`
+plus `ledger_totals`/`RunTelemetry` surfacing an unknown-cost-invocation count (task 5);
+`PiTransport` — a real `MetaTransport` shelling to `pi_agent_rust` against local Ollama, with
+timeout + cancellation kill-on-drop, a `--mode json` parser built from a real capture fixture, and
+exit-3-vs-ordinary-failure handling (task 6); `ImplementTaskNode` gained `with_meta_transport` and
+derives `modified_files` from git-status for any non-`claude_cli` backend (task 7); Pi dispatch
+wired on both `registry_for_policy_with_cancellation` registration paths, including the
+previously-silent `token: None` path (task 8); the 11-test `agent_backend.rs` integration suite
+proving Pi dispatch, subprocess lifecycle, the real-capture parse, and the cost-honesty chain end
+to end (task 9); docs (`data-contract.md`, `docs/workflows/README.md`) plus a note on the
+pi_transport timeout test's known CPU-contention flake (task 10). The run's end review returned
+**PARTIAL and bailed**: the block's own acceptance-criterion regex (`rg -n '"qwen|llama|ollama_chat/'
+pi_transport.rs` must exit 1) is self-contradictory — it forbids any match of `llama`, but the
+block's own required literal `--provider ollama` / `OLLAMA_HOST` necessarily contains `llama` as a
+substring, so the check can never pass regardless of implementation. The underlying intent (no
+hardcoded model name; the model is always read from the resolved policy's `local.model`) is
+independently verified satisfied at `pi_transport.rs:150`. This is a defect in the AC's own regex,
+not in the implementation, and was flagged by the implementing agent itself in task 6's decisions
+log. Next: correct the AC regex (e.g. a word-boundary match or an explicit exclusion for the
+`ollama` provider name) so the block can close; no code change is expected to be needed.
+
+```
+587489e fix: fix pass 1 for EN.16.B-task10
+a52e74c fix: unblock EN.16.B task 10's gate — worktree path resolution, timing flakes, baseline drift
+09f52a2 chore: wrap up EN.16.B
+514d27d feat: implement EN.16.B-task10
+bc78604 feat: implement EN.16.B-task9
+6255502 feat: implement EN.16.B-task8
+e17c4b1 feat: implement EN.16.B-task7
+93fe176 feat: implement EN.16.B-task6
+```
+
 ### `/sdlc-flow EN.16.B` — BAILED after task 10 (docs-only), 9 of 10 tasks passed
 
 - **What:** Ran `/sdlc-flow EN.16.B` on branch `EN.16.B-flow` in a worktree. Tasks 1-9 all passed
