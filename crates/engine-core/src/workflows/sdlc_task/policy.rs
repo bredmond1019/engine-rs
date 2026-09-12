@@ -69,7 +69,7 @@ use crate::policy::{merge_opt, Overlay};
 use crate::workflows::sdlc_flow::policy::SdlcPolicy;
 pub use crate::workflows::sdlc_flow::policy::{
     OutputVerbosity, PartialRetryFeedback, PartialTransportRetry, RetryFeedback, TestDepth,
-    TransportRetry,
+    TestDispatch, TransportRetry,
 };
 
 /// Per-stage model tier assignment for SDLC_TASK's three model-driven
@@ -236,6 +236,11 @@ pub struct SdlcTaskPolicy {
     /// `profiles.rs`'s `cheap_fast`/`thorough` doc comments for the same
     /// caveat restated at the two profiles it affects.
     pub test_depth: TestDepth,
+    /// How `TestTaskNode` dispatches its selected checks — same knob and
+    /// same shared-node consumer as `sdlc_flow::policy::SdlcPolicy::
+    /// test_dispatch` (EN.17.J).
+    #[serde(default)]
+    pub test_dispatch: TestDispatch,
     pub model_tiers: SdlcTaskModelTiers,
     pub timeouts: SdlcTaskCallTimeouts,
     /// Per-stage in-turn tool-call ceiling for `implement`/`triage`/
@@ -285,6 +290,7 @@ impl Default for SdlcTaskPolicy {
             output_verbosity: OutputVerbosity::Normal,
             prompt_cache: false,
             test_depth: TestDepth::Full,
+            test_dispatch: TestDispatch::Inline,
             model_tiers: SdlcTaskModelTiers::default(),
             timeouts: SdlcTaskCallTimeouts::default(),
             max_turns: SdlcTaskTurnCeilings::default(),
@@ -318,6 +324,7 @@ impl SdlcTaskPolicy {
             review_skip_max_files: fallback.review_skip_max_files,
             review_skip_max_diff_lines: fallback.review_skip_max_diff_lines,
             test_depth: self.test_depth,
+            test_dispatch: self.test_dispatch,
             model_tiers: crate::workflows::sdlc_flow::policy::ModelTiers {
                 implement: self.model_tiers.implement,
                 implement_simple: fallback.model_tiers.implement_simple,
@@ -376,6 +383,7 @@ pub struct PartialSdlcTaskPolicy {
     pub output_verbosity: Option<OutputVerbosity>,
     pub prompt_cache: Option<bool>,
     pub test_depth: Option<TestDepth>,
+    pub test_dispatch: Option<TestDispatch>,
     pub model_tiers: Option<PartialSdlcTaskModelTiers>,
     pub timeouts: Option<PartialSdlcTaskCallTimeouts>,
     pub max_turns: Option<PartialSdlcTaskTurnCeilings>,
@@ -426,6 +434,7 @@ impl crate::policy::Policy for SdlcTaskPolicy {
             output_verbosity: merge_opt(base.output_verbosity, over.output_verbosity),
             prompt_cache: merge_opt(base.prompt_cache, over.prompt_cache),
             test_depth: merge_opt(base.test_depth, over.test_depth),
+            test_dispatch: merge_opt(base.test_dispatch, over.test_dispatch),
             model_tiers: match &over.model_tiers {
                 Some(mt) => merge_sdlc_task_model_tiers(base.model_tiers, mt),
                 None => base.model_tiers,
@@ -700,6 +709,7 @@ mod tests {
             output_verbosity: Some(OutputVerbosity::Normal),
             prompt_cache: Some(false),
             test_depth: Some(TestDepth::Full),
+            test_dispatch: Some(TestDispatch::Inline),
             model_tiers: Some(PartialSdlcTaskModelTiers {
                 implement: Some(ModelTier::Sonnet),
                 triage: Some(ModelTier::Sonnet),
