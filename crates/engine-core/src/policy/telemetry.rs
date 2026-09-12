@@ -79,6 +79,14 @@ pub struct RunTelemetry {
     /// names).
     #[serde(default)]
     pub model_tier_used: BTreeMap<String, String>,
+    /// Per-stage code-agent backend actually used this run
+    /// (`ctx.nodes[stage]["transport"]["backend"]`, the field
+    /// `AgentCodeStep::process` stamps — `EN.16.B`/`EN.16.D`), keyed by
+    /// stage identity. `#[serde(default)]` so telemetry recorded before this
+    /// field existed still deserializes, reporting an empty map rather than
+    /// failing.
+    #[serde(default)]
+    pub backend_used: BTreeMap<String, String>,
 }
 
 /// The parts of a [`RunTelemetry`] snapshot a caller must supply because
@@ -257,6 +265,28 @@ pub fn observed_model_tiers(ctx: &TaskContext, stages: &[&str]) -> BTreeMap<Stri
         .collect()
 }
 
+/// Read the code-agent backend actually called for each `stages` entry out
+/// of `ctx.nodes[stage]["transport"]["backend"]` — the shape
+/// `AgentCodeStep::process` stamps for every call (`EN.16.B`/`EN.16.D`).
+/// Mirrors [`observed_model_tiers`] exactly, one field over. A stage that
+/// never ran this run (no `"transport"` key at all) is simply absent from
+/// the returned map.
+#[must_use]
+pub fn observed_backends(ctx: &TaskContext, stages: &[&str]) -> BTreeMap<String, String> {
+    stages
+        .iter()
+        .filter_map(|stage| {
+            let backend = ctx
+                .nodes
+                .get(*stage)?
+                .get("transport")?
+                .get("backend")?
+                .as_str()?;
+            Some(((*stage).to_string(), backend.to_string()))
+        })
+        .collect()
+}
+
 /// Harvest a full [`RunTelemetry`] snapshot: deterministic — reads only
 /// `ctx`'s already-accumulated state plus the caller-supplied
 /// [`RunTelemetryInputs`], spends no model tokens, and stays a pure
@@ -318,6 +348,8 @@ pub fn harvest(
     let mut model_tier_used = inputs.model_tier_used;
     model_tier_used.extend(observed_model_tiers(ctx, inputs.model_stages));
 
+    let backend_used = observed_backends(ctx, inputs.model_stages);
+
     RunTelemetry {
         wall_clock_secs: wall_clock_secs(ctx, inputs.start_node_identity, now),
         total_attempts: inputs.total_attempts,
@@ -332,6 +364,7 @@ pub fn harvest(
         total_cache_creation_tokens,
         unknown_cost_invocations,
         model_tier_used,
+        backend_used,
     }
 }
 
@@ -784,6 +817,75 @@ mod tests {
         );
     }
 
+    #[test]
+    fn observed_backends_reads_the_stamped_transport_backend() {
+        let mut nodes = HashMap::new();
+        nodes.insert(
+            "ImplementTaskNode".to_string(),
+            serde_json::json!({ "transport": { "backend": "pi", "tier": "sonnet" } }),
+        );
+        let ctx = ctx_with(nodes, HashMap::new());
+        let observed = observed_backends(&ctx, &["ImplementTaskNode"]);
+        assert_eq!(observed.get("ImplementTaskNode"), Some(&"pi".to_string()));
+    }
+
+    #[test]
+    fn observed_backends_omits_stages_with_no_transport_stamp() {
+        let ctx = ctx_with(HashMap::new(), HashMap::new());
+        assert!(observed_backends(&ctx, &["ImplementTaskNode"]).is_empty());
+    }
+
+    /// `EN.16.D` task 4: a `claude_cli` run and a `pi` run must report
+    /// different `backend_used` values for the same stage, so `RunTelemetry`
+    /// can be read back to tell the two backends apart — this is what makes
+    /// `PolicyAggregate` (task 5) able to keep the two from merging into one
+    /// row. Reverting the `observed_backends` wiring in `harvest` collapses
+    /// both cases to an empty map and fails this assertion.
+    #[test]
+    fn agent_backend_telemetry_attributes_backend() {
+        let mut claude_nodes = HashMap::new();
+        claude_nodes.insert(
+            "ImplementTaskNode".to_string(),
+            serde_json::json!({ "transport": { "backend": "claude_cli", "tier": "sonnet" } }),
+        );
+        let claude_ctx = ctx_with(claude_nodes, HashMap::new());
+
+        let mut pi_nodes = HashMap::new();
+        pi_nodes.insert(
+            "ImplementTaskNode".to_string(),
+            serde_json::json!({ "transport": { "backend": "pi", "tier": "sonnet" } }),
+        );
+        let pi_ctx = ctx_with(pi_nodes, HashMap::new());
+
+        let inputs = || RunTelemetryInputs {
+            start_node_identity: "SetupWorktreeNode",
+            verdict_stages: &[],
+            cost_bearing_stages: &[],
+            total_attempts: 0,
+            total_retries: 0,
+            tasks_passed: 0,
+            tasks_failed: 0,
+            model_tier_used: BTreeMap::new(),
+            model_stages: &["ImplementTaskNode"],
+        };
+
+        let claude_telemetry = harvest(&claude_ctx, Utc::now(), inputs());
+        let pi_telemetry = harvest(&pi_ctx, Utc::now(), inputs());
+
+        assert_eq!(
+            claude_telemetry.backend_used.get("ImplementTaskNode"),
+            Some(&"claude_cli".to_string())
+        );
+        assert_eq!(
+            pi_telemetry.backend_used.get("ImplementTaskNode"),
+            Some(&"pi".to_string())
+        );
+        assert_ne!(
+            claude_telemetry.backend_used.get("ImplementTaskNode"),
+            pi_telemetry.backend_used.get("ImplementTaskNode")
+        );
+    }
+
     /// EN.4.0 task 5 step 5.2's guard, re-run here to prove task 10's
     /// `model_stages` addition didn't move `RunTelemetry`'s serde surface —
     /// see the byte-identical assertion in
@@ -804,6 +906,7 @@ mod tests {
             total_cache_creation_tokens: 8,
             unknown_cost_invocations: 0,
             model_tier_used: BTreeMap::from([("implement".to_string(), "sonnet".to_string())]),
+            backend_used: BTreeMap::from([("ImplementTaskNode".to_string(), "pi".to_string())]),
         };
         let value = serde_json::to_value(&telemetry).unwrap();
         assert_eq!(
@@ -822,10 +925,36 @@ mod tests {
                 "total_cache_creation_tokens": 8,
                 "unknown_cost_invocations": 0,
                 "model_tier_used": { "implement": "sonnet" },
+                "backend_used": { "ImplementTaskNode": "pi" },
             })
         );
         let round_tripped: RunTelemetry = serde_json::from_value(value).unwrap();
         assert_eq!(round_tripped, telemetry);
+    }
+
+    /// A `RunTelemetry` recorded before `backend_used` existed (no such key
+    /// in the JSON at all) still deserializes, reporting an empty map rather
+    /// than failing — the same `#[serde(default)]` contract every other
+    /// field added after `EN.4.0` relies on.
+    #[test]
+    fn run_telemetry_without_backend_used_key_deserializes_with_empty_map() {
+        let value = serde_json::json!({
+            "wall_clock_secs": 1.0,
+            "total_attempts": 0,
+            "total_retries": 0,
+            "tasks_passed": 0,
+            "tasks_failed": 0,
+            "review_verdicts": [],
+            "total_input_tokens": 0,
+            "total_output_tokens": 0,
+            "total_cost_usd": 0.0,
+            "total_cache_read_tokens": 0,
+            "total_cache_creation_tokens": 0,
+            "unknown_cost_invocations": 0,
+            "model_tier_used": {},
+        });
+        let telemetry: RunTelemetry = serde_json::from_value(value).unwrap();
+        assert!(telemetry.backend_used.is_empty());
     }
 
     /// `EN.16.B` task 5: a run whose ledger holds an unknown-cost invocation (e.g. a Pi transport
