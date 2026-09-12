@@ -634,14 +634,16 @@ mod tests {
 
     // This block's acceptance criterion "no hardcoded local model names" is
     // checked from OUTSIDE Rust, against this file's own source text, using a
-    // grep for a quoted Qwen-family literal, a word-bounded Llama-family
-    // literal (word-bounded so it does not false-positive on the required
-    // `--provider ollama` literal above, which legitimately contains that
-    // family name as a substring), or a hardcoded LiteLLM-style
-    // "ollama_chat" routing prefix (with its trailing path separator). See
-    // the block record's own acceptance criteria for the exact
-    // command; it is not spelled out literally here on purpose — an inline
-    // `include_str!("pi_transport.rs")` unit test cannot check this either
+    // grep for a quoted Qwen-family literal, a Llama-family literal excluded
+    // from matching inside the required `--provider ollama` literal above
+    // (which legitimately contains that family name as a substring — the
+    // exclusion is a character class, deliberately not a `\b` word-boundary
+    // escape, since that shape survived worse across a JSON round-trip and a
+    // review re-transcription than a plain character class does), or a
+    // hardcoded LiteLLM-style "ollama_chat" routing prefix (with its trailing
+    // path separator). See the block record's own acceptance criteria for
+    // the exact command; it is not spelled out literally here on purpose —
+    // an inline `include_str!("pi_transport.rs")` unit test cannot check this either
     // way, since the check string itself would have to spell the forbidden
     // substrings, which would then make THIS file contain them.
 
