@@ -1,13 +1,13 @@
 ---
 type: Reference
 title: Crash Recovery (Orphan Sweep + Stale-Run Alarm)
-description: The metadata.completion marker, the boot sweep that fails crash-stranded runs loudly, the stale-run alarm on aged running/suspended runs, the OrphanLister seam, the OrphanPolicy knobs, and where boot wiring lives (bastion's `serve/mod.rs`, now wired).
+description: The metadata.completion marker, the boot sweep that fails crash-stranded runs loudly, the stale-run alarm on aged running/suspended runs (and its not-yet-wired queue-park exemption), the OrphanLister seam, the OrphanPolicy knobs, and where boot wiring lives (bastion's `serve/mod.rs`, now wired).
 doc_id: orphan-recovery
 layer: [engine]
 project: engine-rs
 status: active
-keywords: [orphan, crash recovery, completion marker, boot sweep, stale-run alarm, OrphanLister, OrphanPolicy, launchd, KeepAlive]
-related: [architecture, data-contract, suspend-resume, operator-payload-contract, D6-cancellation-and-budget-semantics]
+keywords: [orphan, crash recovery, completion marker, boot sweep, stale-run alarm, OrphanLister, OrphanPolicy, launchd, KeepAlive, queue-park, heavy-work-queue]
+related: [architecture, data-contract, suspend-resume, operator-payload-contract, D6-cancellation-and-budget-semantics, heavy-work-queue]
 ---
 
 # Crash Recovery (Orphan Sweep + Stale-Run Alarm)
@@ -127,6 +127,26 @@ terminal notifications (`operator-payload-contract.md`): `LiveStateStore::mark_a
 candidate is skipped rather than propagated; the sweep still processes every other candidate and
 never panics or blocks the caller's path.
 
+### A queue-parked run's exemption exists, but `alarm_stale_runs` does not use it yet
+
+`crate::orphan::stale_run_ids_excluding_live_queue_parks` (`EN.17.J` task 6) is a second decision
+function, alongside `stale_run_ids` rather than a new parameter on it, that exempts a run whose
+`metadata.heavy_work` marker shows it still queue-parked (see
+[heavy-work-queue.md](heavy-work-queue.md)) on a job that is still `Queued` or `Running` — a
+legitimate park must not trip the stale-run alarm merely because its own progress marker goes quiet
+while waiting behind another job at the class limit. It re-checks the parked job's *current* state
+on disk (via `coord::heavy_work::read_job`, keyed off the lock dir passed in) rather than trusting
+the marker's `"queued"` snapshot, so once the parked job is reclaimed to `Abandoned` (`EN.17.I`'s own
+liveness sweep — a dead holder pid or a stale heartbeat, never elapsed time) the exemption stops
+applying and the run alarms exactly like any other stale run.
+
+**This function is not yet wired into `alarm_stale_runs`** — that function still calls plain
+`stale_run_ids` (no lock-dir argument to source), so today a genuinely still-queued run *will* alarm
+once it crosses `stale_run_alarm_secs`, exemption notwithstanding. `stale_run_ids_excluding_live_queue_parks`
+is exercised only by its own unit tests (`crates/engine-serve/src/orphan.rs`) at this point. Wiring
+`alarm_stale_runs` to call it — which requires threading a heavy-work lock dir into this function's
+signature — is a follow-on, not part of `EN.17.J`.
+
 ## Policy: `OrphanPolicy`
 
 `crates/engine-core/src/operator/orphan.rs` mirrors `operator/failure.rs`'s shape — `OrphanPolicy` +
@@ -172,7 +192,10 @@ configuration: `BASTION_ENGINE_HARNESS_PATH` is unset and `schedule.entries` is 
   `alarm_stale_runs`: reconciles N candidates, idempotent on a second sweep, no-ops when the policy
   disables it, surfaces a lister error rather than swallowing it, a fresh run does not alarm, a run
   past the threshold alarms exactly once, a second pass adds nothing, and a terminal run never
-  alarms.
+  alarms. `stale_run_ids_excluding_live_queue_parks` (`EN.17.J` task 6) adds: a queue-parked run
+  whose job is still queued is excluded, one whose job is still running is excluded, one whose job
+  has been reclaimed to `Abandoned` alarms same as any other stale run, and one whose job record is
+  missing entirely alarms rather than being silently exempted.
 
 No new integration-test binary was added to any crate — all new tests are unit tests in-module or
 cases appended to the existing `#[ignore]`d binary (CLAUDE.md standing rule 9).

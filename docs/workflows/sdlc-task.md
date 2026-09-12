@@ -178,6 +178,7 @@ stage and no docs stage, so neither node is registered in its graph.
 | `output_verbosity` | `Normal` | Every `AgentCodeStep`-driven node's output shaping |
 | `prompt_cache` | `false` | Every `AgentCodeStep`-driven node's prompt-cache header |
 | `test_depth` | `Full` | `TestTaskNode` (per-task check depth) and `FinalValidationNode` (reconcile skip — see the caveat below) |
+| `test_dispatch` | `Inline` | `TestTaskNode` — `Inline` runs its selected checks synchronously; `QueuePark` (`EN.17.J`) submits them to the heavy-work queue and suspends the walk instead — see [Test stage under `test_dispatch: queue_park`](#test-stage-under-test_dispatch-queue_park-en17j) below |
 | `model_tiers.implement` | `Sonnet` | `ImplementTaskNode` |
 | `model_tiers.triage` | `Sonnet` | `TriageTaskNode` |
 | `model_tiers.generate` | `Opus` | `GenerateTasksNode` |
@@ -244,6 +245,26 @@ higher retry ceiling and the strongest model tier instead, while **`cheap-fast` 
 is the profile that actually RUNS the reconcile** — the one place `Fast` per-task checks get
 backstopped by an authoritative pass. `baseline` matches today's (pre-`EN.11.O`) behaviour: `Full`,
 reconcile skipped.
+
+### Test stage under `test_dispatch: queue_park` (`EN.17.J`)
+
+`SDLC_TASK` reuses `TestTaskNode` from `sdlc_flow` unmodified, so the `queue_park` behavior
+documented in [sdlc-flow.md](sdlc-flow.md#test-stage-under-test_dispatch-queue_park-en17j) applies
+here identically: under `test_dispatch: queue_park`, `TestTaskNode` submits its selected checks to
+the `EN.17.I` heavy-work queue without awaiting them, stamps `ctx.metadata.heavy_work = {job_id,
+class: "test", state: "queued"}`, and requests a suspension with `reason: heavy_work_queue` and
+`resume_at: TriageTaskNode`. `engine_core::workflows::queue_park::drive` — not this workflow's own
+graph — is what awaits the parked job and resumes the walk at `TriageTaskNode` once it completes;
+see [suspend-resume.md](../suspend-resume.md#the-queue_parkdrive-loop) for that loop.
+
+This repo's own `planning/harness.json` sets `sdlc_task.policy.test_dispatch: queue_park` (task 7),
+scoped to this repo only — its `_comment_test_dispatch` explains why: both of this repo's own
+`SDLC_TASK` callers (`engine-serve`'s `spawn_run`, and an `ORCHESTRATION` child's
+`default_flow_runner`) already drive a queue-parked run through `queue_park::drive`, so nothing
+here is left holding a suspended ctx it doesn't know to un-park. As with `SDLC_FLOW`, the knob alone
+does not make a real run park — `TestTaskNode`'s own `HeavyWorkQueue` must also be enabled at
+graph-registration time, which `sdlc_task::graph` does not yet do; see
+[heavy-work-queue.md](../heavy-work-queue.md)'s "What this queue does not gate" section.
 
 ## Dispatchable since `EN.11.P`
 

@@ -1,13 +1,13 @@
 ---
 type: Reference
 title: Heavy-Work Queue (EN.17.I)
-description: The FIFO heavy-work queue that admits Rust SDLC check runs by per-class limit and free memory, reclaims by liveness never by age, and what it does not gate
+description: The FIFO heavy-work queue that admits Rust SDLC check runs by per-class limit and free memory, reclaims by liveness never by age, parks a walk at the node boundary until the job completes, and what it does not gate
 doc_id: heavy-work-queue
 layer: [engine]
 project: engine-rs
 status: active
-keywords: [heavy work queue, admission, fifo, reclaim, heartbeat, fleet build]
-related: [architecture, engine-rs-testing]
+keywords: [heavy work queue, admission, fifo, reclaim, heartbeat, fleet build, queue-park, suspend-resume]
+related: [architecture, engine-rs-testing, suspend-resume]
 created: 2026-09-11
 updated: 2026-09-11
 ---
@@ -164,6 +164,48 @@ output shape never varies between an enabled and a disabled run. When the queue 
 lock dir is unwritable, the node still runs every selected check and stamps
 `heavy_work.degraded == true` rather than failing the task.
 
+## The parking consumer (`EN.17.J`) and the `metadata.heavy_work` marker
+
+The section above describes `run_checks` awaited synchronously — the shape every consumer used
+before `EN.17.J`. Under policy `test_dispatch: queue_park` (`crates/engine-core/src/workflows/
+sdlc_flow/policy.rs`, mirrored in `sdlc_task/policy.rs`), `TestTaskNode` instead **submits without
+awaiting**: `queue_park_active` (`task_loop.rs`) gates this on three conditions all holding —
+`policy.test_dispatch == TestDispatch::QueuePark`, `self.heavy_work.config().enabled`, and the
+job's class being configured in that queue — and only then mints a fresh `job_id`, calls
+`HeavyWorkQueue::submit` (not `run`), and requests a walk suspension instead of blocking on the
+result. Any one of the three conditions being false falls through to the inline `run` path
+unchanged — `TestDispatch::Inline` behavior, exactly.
+
+The suspension marker this stamps is a **separate** key from the per-check `ctx.nodes["TestTaskNode"].heavy_work`
+telemetry shape documented above — this one lives at `ctx.metadata.heavy_work` (a workflow-level
+correlation record for whatever resumes the walk to key off of, not a per-node output):
+
+```json
+{
+  "heavy_work": { "job_id": "<uuid>", "class": "test", "state": "queued" }
+}
+```
+
+`state` flips to `"done"` when `workflows::queue_park::drive` (see
+[suspend-resume.md](suspend-resume.md#the-queue_parkdrive-loop)) injects the job's outcome and
+resumes the walk. `TestTaskNode`'s own `ctx.nodes["TestTaskNode"]` output for this attempt is the
+lighter-weight `{"queued": true, "job_id", "guard_result", "test_dispatch": "queue_park"}` — the
+job's actual check results land in `ctx.nodes["TestTaskNode"]` only once `drive` injects them on
+completion, overwriting this queued placeholder.
+
+`Workflow::walk` finalizes the requested suspension exactly like an operator pause or a
+`SuspendNode`: `resume_at` is `TriageTaskNode` (the node `TestTaskNode` already routes to on a
+normal inline run), `reason` is `SuspendReason::HeavyWorkQueue`, and the `BudgetLedger` is
+snapshotted at the same point. The full origin, marker shape, and the `queue_park::drive` loop that
+un-parks it are documented in [suspend-resume.md](suspend-resume.md) — this doc covers only what
+`TestTaskNode` and the queue itself contribute to that story; `suspend-resume.md` owns the general
+suspend/resume mechanism.
+
+**This repo's own `planning/harness.json` sets `sdlc.policy.test_dispatch` /
+`sdlc_task.policy.test_dispatch` to `queue_park`** (`EN.17.J` task 7) — but that alone does not make
+a real `SDLC_TASK`/`SDLC_FLOW` run here actually park: see "What this queue does not gate" below for
+the graph-wiring gap that still applies.
+
 An admitted job's own subprocess calls run through
 `workflows::admitted_command_runner(SpecCommandRunner) -> CommandRunner`
 (`crates/engine-core/src/workflows/mod.rs`), which adds `FLEET_BUILD_PREADMITTED=1` to the
@@ -227,8 +269,6 @@ the `email_adapter` precedent for non-knob configuration.
 
 - **JS engines** (`sdlc-flow.js` / `sdlc-task.js`) — unchanged. They keep today's lane caps and,
   in this repo, the `fleet_build.py` wrapper as before.
-- **Parking a workflow while its job waits, and resuming it on completion** — `EN.17.J`. Here the
-  wait is an awaiting future inside the node; there is no node-boundary pause/resume yet.
 - **`fleet_build.py`'s TTL sweep of a live permit** — after this block it affects only JS-driven
   engine-rs runs and humans invoking the script directly.
 - **`fleet_concurrency_check.py`'s native-build lane cap of 4** — remains stacked on this queue,
@@ -236,5 +276,19 @@ the `email_adapter` precedent for non-knob configuration.
 - **Per-host limits** — `brain.toml` is shared by every host through git, so the same numbers
   apply everywhere.
 - **Bounding how long a job may wait in the queue.**
-- **Today's real `SDLC_TASK` / `SDLC_FLOW` runs** — `sdlc_flow::graph` registers both nodes with
-  `::new()`, whose default queue is disabled; see "How a node gets a queue" above.
+- **`FinalValidationNode`'s `build`-class checks never park.** Only `TestTaskNode`'s `test`-class
+  checks read `policy.test_dispatch`; `FinalValidationNode` still always awaits its own
+  `HeavyWorkQueue::run` call synchronously (queued admission, never a suspended walk) regardless of
+  `test_dispatch` — parking is `EN.17.J`'s test-stage feature only, not a queue-wide behavior.
+- **Today's real `SDLC_TASK` / `SDLC_FLOW` runs still do not actually queue-park, even with this
+  repo's own `planning/harness.json` now setting `test_dispatch: queue_park`.** `queue_park_active`
+  (`task_loop.rs`) additionally requires `self.heavy_work.config().enabled` — i.e. the node's own
+  `HeavyWorkQueue` must be a real, enabled one, not the `::new(PathBuf::new(),
+  HeavyWorkConfig::disabled())` every node still gets by default. `sdlc_flow::graph` and
+  `sdlc_task::graph` register both nodes with plain `::new()` — **no `with_heavy_work` call** — so a
+  real production run here executes its checks inline and unqueued today regardless of the policy
+  knob; `test_dispatch: queue_park` is exercised end-to-end only by this repo's own tests, which
+  construct a `TestTaskNode` with a real queue via `with_heavy_work` directly. Wiring `graph.rs` to
+  pass a queue built from `brain.toml`'s `[heavy_work]` table (present at the fleet's brain root,
+  see "Configuration" above) so this repo's real runs actually park is a follow-on, not part of this
+  block.

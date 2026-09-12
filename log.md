@@ -16,6 +16,45 @@ related: [status, context]
 
 ## [run: 2026-09-11]
 
+### EN.17.J done — SDLC test stage parks on the heavy-work queue and resumes to fix/next
+
+Ran `/sdlc-flow` on branch `EN.17.J-flow` across all 7 tasks (all passed), PASS review. Task 1
+added `SuspendReason::HeavyWorkQueue` plus `request_suspension_with_reason`/`requested_reason`, so
+`Workflow::walk` reads back the requested suspend reason instead of always hardcoding
+`SuspendNode`. Task 2 added a `test_dispatch: TestDispatch { Inline, QueuePark }` policy knob on
+`SdlcPolicy`/`SdlcTaskPolicy`, set across every named profile in both `sdlc_flow`/`sdlc_task`
+`profiles.rs`. Task 3 made `TestTaskNode` submit (not run) its checks and request
+`HeavyWorkQueue` suspension under `QueuePark` when the queue is enabled for class `test`, falling
+back to EN.17.I's inline path otherwise. Task 4 added `workflows::queue_park::drive` — a
+run/park/await/inject/resume loop over `Workflow::run_with`/`run_from` via an injectable
+`HeavyJobLookup` seam, passing any other suspension or terminal state through unchanged and
+handling cancellation of a still-queued job. Task 5 wired `default_flow_runner`'s Flow/Task arms
+to drive queue-parked children through `queue_park::drive` so `execute_step` never observes a
+still-suspended child ctx, with a D68 observed-red test plus a 9-test `queue_park` integration
+suite. Task 6 made engine-serve's `spawn_run` drive both Fresh/Resume runs through
+`queue_park::drive`, added a 409 refusal on `POST /events/{id}/resume` for a `heavy_work_queue`-
+suspended snapshot, and exempted a live-queued/running job from the stale-run alarm. Task 7 set
+this repo's own `sdlc-flow`/`sdlc-task` to default to `test_dispatch: queue_park` in
+`harness.json`, updated `suspend-resume.md`/`sdlc-flow.md`/`sdlc-task.md`/`heavy-work-queue.md`,
+and got the full validation suite green. Two known gaps carried forward (see the spec's D18
+amendment note in `planning/status.md`): `TestTaskNode`'s own correlation `job_id` does not match
+the id `HeavyWorkQueue::submit` persists internally, so production job lookup by id cannot resolve
+a real queued job; and `sdlc_flow::graph`/`sdlc_task::graph` still register `TestTaskNode` with
+plain `::new()` (queue disabled), so `test_dispatch: queue_park` alone does not make a real run
+here actually park. Full gate green. Closes `EN.17.J`. Next: `EN.17.H` — a real unattended chain on
+the installed binary.
+
+```
+919f67b docs: update docs for EN.17.J
+1d592b6 feat: implement EN.17.J-task7
+729370d feat: implement EN.17.J-task6
+bfc81d0 feat: ORCHESTRATION children resume through queue_park::drive (EN.17.J task 5)
+12e944a feat: implement EN.17.J-task4
+15a12f6 feat: implement EN.17.J-task3
+9177a7f feat: implement EN.17.J-task2
+94cfcd7 feat: implement EN.17.J-task1
+```
+
 ### EN.17.I done — heavy-work queue for Rust check jobs
 
 Ran `/sdlc-flow` on branch `EN.17.I-flow` across all 8 tasks (all passed), PASS review. Tasks 1-2

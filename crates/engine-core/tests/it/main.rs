@@ -59,6 +59,7 @@ mod policy_profile_matrix;
 mod post_draft;
 mod preflight;
 mod prompt_externalization;
+mod queue_park;
 mod research_agent_contacts_e2e;
 mod research_agent_grounding_e2e;
 mod research_ingress_dispatch_e2e;

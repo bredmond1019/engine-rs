@@ -36,6 +36,7 @@
   "review_skip_max_diff_lines": 40,
   "review_skip_max_files": 2,
   "test_depth": "full",
+  "test_dispatch": "inline",
   "timeouts": {
     "docs": null,
     "generate": null,
