@@ -783,7 +783,14 @@ touch "$DONE"
 
     #[cfg(unix)]
     fn wait_for_marker(marker: &std::path::Path, panic_message: &str) {
-        for _ in 0..50 {
+        // 750 * 20ms = 15s, matching the sibling helper in
+        // `tests/it/agent_backend.rs` — widened from 1s (50 iterations) for
+        // the same reason: under a full `--workspace --all-features` run
+        // competing for CPU against thousands of other tests, spawning the
+        // fake child and having it touch its marker file can take far
+        // longer than in isolation. See also this test's nextest `retries`
+        // override in `.config/nextest.toml`.
+        for _ in 0..750 {
             if marker.exists() {
                 return;
             }

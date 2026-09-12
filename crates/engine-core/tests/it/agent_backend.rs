@@ -178,7 +178,13 @@ fn porcelain_runner(status_lines: &'static str) -> CommandRunner {
 /// concern.
 #[cfg(unix)]
 fn wait_for_marker(marker: &Path, panic_message: &str) {
-    for _ in 0..250 {
+    // 750 * 20ms = 15s. Widened from 5s (250 iterations) after a full
+    // workspace `cargo nextest run --workspace --all-features` run under CPU
+    // contention timed out here waiting for a subprocess to write its marker
+    // file — the transport-level behavior under test was never in doubt (it
+    // passes in isolation every time), only the scheduler's ability to run
+    // the fake child promptly under full-parallel load.
+    for _ in 0..750 {
         if marker.exists() {
             return;
         }
