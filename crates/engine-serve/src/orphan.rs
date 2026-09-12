@@ -330,6 +330,72 @@ pub fn stale_run_ids(
         .collect()
 }
 
+/// `true` iff `snapshot` carries a queue-park marker
+/// (`metadata.heavy_work.state == "queued"`, `EN.17.J` task 3) whose job is
+/// still `Queued` or `Running` in the on-disk `coord::heavy_work` store
+/// rooted at `lock_dir` — a legitimate, still-live park, never one whose
+/// holder has already been reclaimed. `false` on any absent/malformed
+/// marker, or an unreadable/missing job record: an unreadable record must
+/// never be treated as live, or a genuinely orphaned run would be masked by
+/// a bad read.
+fn is_live_queue_park(snapshot: &TaskContext, lock_dir: &std::path::Path) -> bool {
+    let Some(heavy_work) = snapshot.metadata.get("heavy_work") else {
+        return false;
+    };
+    if heavy_work.get("state").and_then(|v| v.as_str()) != Some("queued") {
+        return false;
+    }
+    let Some(job_id) = heavy_work
+        .get("job_id")
+        .and_then(|v| v.as_str())
+        .and_then(|s| Uuid::parse_str(s).ok())
+    else {
+        return false;
+    };
+    let path = engine_core::coord::heavy_work::job_path(lock_dir, job_id);
+    match engine_core::coord::heavy_work::read_job(&path) {
+        Ok(job) => matches!(
+            job.state,
+            engine_core::coord::heavy_work::JobState::Queued
+                | engine_core::coord::heavy_work::JobState::Running
+        ),
+        Err(_) => false,
+    }
+}
+
+/// Like [`stale_run_ids`], but exempts a run whose `metadata.heavy_work`
+/// marker shows it still queue-parked on a LIVE job (`EN.17.J` task 6): a
+/// legitimate park must never trip the stale-run alarm merely because its
+/// own progress marker goes quiet while queued behind another job at the
+/// class limit. Once the parked job is reclaimed to `Abandoned` (`EN.17.I`'s
+/// own liveness sweep — a dead holder pid or a stale heartbeat, never
+/// elapsed time), the exemption no longer applies and the run alarms exactly
+/// like any other stale run.
+///
+/// A separate function, not a new parameter on [`stale_run_ids`] itself —
+/// mirroring `orchestration::execute`'s `default_flow_runner` /
+/// `default_flow_runner_with_heavy_work` split for the identical reason:
+/// this task's own acceptance criteria require every pre-existing
+/// `stale_run_ids` call site (this file's own tests included) to keep
+/// compiling and passing with its existing three-argument signature.
+#[must_use]
+pub fn stale_run_ids_excluding_live_queue_parks(
+    records: &[(RunId, TaskContext, DateTime<Utc>)],
+    now: DateTime<Utc>,
+    stale_run_alarm_secs: u64,
+    heavy_work_lock_dir: &std::path::Path,
+) -> Vec<RunId> {
+    stale_run_ids(records, now, stale_run_alarm_secs)
+        .into_iter()
+        .filter(|run_id| {
+            let Some((_, snapshot, _)) = records.iter().find(|(id, _, _)| id == run_id) else {
+                return true;
+            };
+            !is_live_queue_park(snapshot, heavy_work_lock_dir)
+        })
+        .collect()
+}
+
 /// Render a stale-run alarm into a validated [`OperatorPayload`] — same
 /// rendering discipline as `failure::render_failure_payload`: a fixed
 /// header naming the run and how long it has sat past its last recorded
@@ -815,6 +881,131 @@ mod tests {
         assert!(stale_run_ids(&records, now, 3600).is_empty());
         // But stale against a tighter, policy-resolved 60s threshold.
         assert_eq!(stale_run_ids(&records, now, 60), vec![run_id]);
+    }
+
+    // -- `stale_run_ids_excluding_live_queue_parks` (`EN.17.J` task 6) ------
+
+    fn queue_parked_context(job_id: Uuid) -> TaskContext {
+        let mut ctx = task_context_with_running_node("TestTaskNode");
+        ctx.metadata = serde_json::json!({
+            "heavy_work": { "job_id": job_id.to_string(), "class": "test", "state": "queued" },
+        });
+        ctx
+    }
+
+    fn write_test_job(
+        lock_dir: &std::path::Path,
+        job_id: Uuid,
+        state: engine_core::coord::heavy_work::JobState,
+    ) {
+        use engine_core::coord::heavy_work::{write_job, HeavyWorkJob};
+        write_job(
+            lock_dir,
+            &HeavyWorkJob {
+                job_id,
+                class: "test".to_string(),
+                state,
+                repo: "repo-a".to_string(),
+                cwd: std::path::PathBuf::from("."),
+                commands: vec!["true".to_string()],
+                run_id: None,
+                holder_pid: None,
+                enqueued_at: Utc::now(),
+                admitted_at: None,
+                heartbeat_at: None,
+                finished_at: None,
+                passed: None,
+            },
+        )
+        .expect("write_job should succeed under a tempdir");
+    }
+
+    #[test]
+    fn excludes_a_queue_parked_run_whose_job_is_still_queued() {
+        let dir = tempfile::tempdir().unwrap();
+        let job_id = Uuid::new_v4();
+        write_test_job(
+            dir.path(),
+            job_id,
+            engine_core::coord::heavy_work::JobState::Queued,
+        );
+
+        let run_id = Uuid::new_v4();
+        let now = Utc::now();
+        let updated_at = now - chrono::Duration::seconds(7200);
+        let records = vec![(run_id, queue_parked_context(job_id), updated_at)];
+
+        // The plain function still calls it stale (it knows nothing about
+        // the heavy-work queue) -- the exemption is additive, not a change
+        // to `stale_run_ids` itself.
+        assert_eq!(stale_run_ids(&records, now, 3600), vec![run_id]);
+
+        let stale = stale_run_ids_excluding_live_queue_parks(&records, now, 3600, dir.path());
+        assert!(
+            stale.is_empty(),
+            "a run parked on a still-Queued job must not alarm"
+        );
+    }
+
+    #[test]
+    fn excludes_a_queue_parked_run_whose_job_is_still_running() {
+        let dir = tempfile::tempdir().unwrap();
+        let job_id = Uuid::new_v4();
+        write_test_job(
+            dir.path(),
+            job_id,
+            engine_core::coord::heavy_work::JobState::Running,
+        );
+
+        let run_id = Uuid::new_v4();
+        let now = Utc::now();
+        let updated_at = now - chrono::Duration::seconds(7200);
+        let records = vec![(run_id, queue_parked_context(job_id), updated_at)];
+
+        let stale = stale_run_ids_excluding_live_queue_parks(&records, now, 3600, dir.path());
+        assert!(
+            stale.is_empty(),
+            "a run parked on a still-Running job must not alarm"
+        );
+    }
+
+    #[test]
+    fn includes_a_queue_parked_run_once_its_job_is_abandoned() {
+        let dir = tempfile::tempdir().unwrap();
+        let job_id = Uuid::new_v4();
+        write_test_job(
+            dir.path(),
+            job_id,
+            engine_core::coord::heavy_work::JobState::Abandoned,
+        );
+
+        let run_id = Uuid::new_v4();
+        let now = Utc::now();
+        let updated_at = now - chrono::Duration::seconds(7200);
+        let records = vec![(run_id, queue_parked_context(job_id), updated_at)];
+
+        let stale = stale_run_ids_excluding_live_queue_parks(&records, now, 3600, dir.path());
+        assert_eq!(
+            stale,
+            vec![run_id],
+            "a run parked on an Abandoned job must alarm, same as any other stale run"
+        );
+    }
+
+    #[test]
+    fn includes_a_queue_parked_run_whose_job_record_is_missing() {
+        // Fails closed: an unreadable/missing job record is never treated as
+        // live, so a genuinely orphaned run is never masked by a bad read.
+        let dir = tempfile::tempdir().unwrap();
+        let job_id = Uuid::new_v4();
+
+        let run_id = Uuid::new_v4();
+        let now = Utc::now();
+        let updated_at = now - chrono::Duration::seconds(7200);
+        let records = vec![(run_id, queue_parked_context(job_id), updated_at)];
+
+        let stale = stale_run_ids_excluding_live_queue_parks(&records, now, 3600, dir.path());
+        assert_eq!(stale, vec![run_id]);
     }
 
     #[test]

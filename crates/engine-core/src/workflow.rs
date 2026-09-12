@@ -515,13 +515,8 @@ impl Workflow {
             // that case `current` is already `None` and the loop exits
             // normally below).
             if suspend::suspension_requested(&ctx.metadata) && current.is_some() {
-                self.finish_suspended(
-                    &mut ctx,
-                    current.clone(),
-                    SuspendReason::SuspendNode,
-                    Some(&identity),
-                    &ledger,
-                );
+                let reason = suspend::requested_reason(&ctx.metadata);
+                self.finish_suspended(&mut ctx, current.clone(), reason, Some(&identity), &ledger);
                 stamp_run_telemetry(&mut ctx, &self.schema.start_node);
                 on_progress(&ctx);
                 return Ok(ctx);
@@ -1623,6 +1618,25 @@ mod tests {
         }
     }
 
+    struct RequestHeavyWorkQueueSuspendNode;
+
+    #[async_trait::async_trait]
+    impl Node for RequestHeavyWorkQueueSuspendNode {
+        async fn process(&self, mut ctx: TaskContext) -> Result<TaskContext, NodeError> {
+            ctx.nodes
+                .insert(self.name().to_string(), serde_json::json!({ "ran": true }));
+            crate::suspend::request_suspension_with_reason(
+                &mut ctx.metadata,
+                crate::suspend::SuspendReason::HeavyWorkQueue,
+            );
+            Ok(ctx)
+        }
+
+        fn name(&self) -> &str {
+            "RequestHeavyWorkQueueSuspendNode"
+        }
+    }
+
     #[test]
     fn run_options_default_has_no_pause_signal() {
         let options = RunOptions::default();
@@ -1720,6 +1734,43 @@ mod tests {
         assert_eq!(
             suspension.origin_identity.as_deref(),
             Some("RequestSuspendNode")
+        );
+    }
+
+    #[tokio::test]
+    async fn walk_reads_back_the_requested_reason_for_a_heavy_work_queue_suspension() {
+        let mut registry = NodeRegistry::new();
+        registry.register(Box::new(RequestHeavyWorkQueueSuspendNode));
+        registry.register(Box::new(SuccessNode));
+
+        let mut nodes = HashMap::new();
+        nodes.insert(
+            "RequestHeavyWorkQueueSuspendNode".to_string(),
+            crate::schema::NodeConfig::new(
+                "RequestHeavyWorkQueueSuspendNode",
+                vec!["SuccessNode".to_string()],
+            ),
+        );
+        nodes.insert(
+            "SuccessNode".to_string(),
+            crate::schema::NodeConfig::new("SuccessNode", vec![]),
+        );
+        let schema = WorkflowSchema::new("linear", "RequestHeavyWorkQueueSuspendNode", nodes);
+        let workflow = Workflow::new(registry, schema);
+        let on_progress: OnProgress<'_> = Box::new(|_c: &TaskContext| {});
+
+        let ctx = workflow
+            .run(serde_json::json!({}), on_progress)
+            .await
+            .expect("run should return Ok when it suspends");
+
+        let suspension =
+            crate::suspend::read_suspension(&ctx.metadata).expect("suspension marker present");
+        assert!(suspension.suspended);
+        assert_eq!(suspension.resume_at.as_deref(), Some("SuccessNode"));
+        assert_eq!(
+            suspension.reason,
+            Some(crate::suspend::SuspendReason::HeavyWorkQueue)
         );
     }
 

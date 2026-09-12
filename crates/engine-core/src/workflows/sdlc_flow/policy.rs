@@ -69,6 +69,21 @@ pub enum TestDepth {
     Fast,
 }
 
+/// How `TestTaskNode` dispatches its selected checks (EN.17.J).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TestDispatch {
+    /// Today's behavior (the behavior-stable built-in default): checks run
+    /// synchronously in-process, inline in the node's own call.
+    #[default]
+    Inline,
+    /// Submit the selected checks to the EN.17.I heavy-work queue and
+    /// suspend the walk at the node boundary (reason `heavy_work_queue`);
+    /// the job's completion event injects the results and resumes at
+    /// `TriageTaskNode`.
+    QueuePark,
+}
+
 /// Per-stage model tier assignment. Field names match the stage identities
 /// used across `task_loop.rs`/`graph.rs`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -277,6 +292,10 @@ pub struct SdlcPolicy {
     pub review_skip_max_diff_lines: u32,
     /// How much of a task's own check suite `TestTaskNode` runs (EN.3.D).
     pub test_depth: TestDepth,
+    /// How `TestTaskNode` dispatches its selected checks — inline or
+    /// queue-and-park (EN.17.J).
+    #[serde(default)]
+    pub test_dispatch: TestDispatch,
     pub model_tiers: ModelTiers,
     /// Per-stage whole-call timeout in seconds; all-`None` (no override) by
     /// default, i.e. `claude-code-rs`'s own 300s default applies.
@@ -382,6 +401,7 @@ impl Default for SdlcPolicy {
             review_skip_max_files: 2,
             review_skip_max_diff_lines: 40,
             test_depth: TestDepth::Full,
+            test_dispatch: TestDispatch::Inline,
             model_tiers: ModelTiers::default(),
             timeouts: CallTimeouts::default(),
             max_turns: StageTurnCeilings::default(),
@@ -422,6 +442,7 @@ pub struct PartialPolicy {
     pub review_skip_max_files: Option<u32>,
     pub review_skip_max_diff_lines: Option<u32>,
     pub test_depth: Option<TestDepth>,
+    pub test_dispatch: Option<TestDispatch>,
     pub model_tiers: Option<PartialModelTiers>,
     pub timeouts: Option<PartialCallTimeouts>,
     pub max_turns: Option<PartialStageTurnCeilings>,
@@ -599,6 +620,7 @@ impl crate::policy::Policy for SdlcPolicy {
                 over.review_skip_max_diff_lines,
             ),
             test_depth: merge_opt(base.test_depth, over.test_depth),
+            test_dispatch: merge_opt(base.test_dispatch, over.test_dispatch),
             model_tiers: match &over.model_tiers {
                 Some(mt) => merge_model_tiers(base.model_tiers, mt),
                 None => base.model_tiers,
@@ -1739,6 +1761,10 @@ mod tests {
         ),
         ("test_depth", "task_loop.rs (TestTaskNode's check-suite depth)"),
         (
+            "test_dispatch",
+            "task_loop.rs::TestTaskNode (inline vs. queue-and-park check dispatch; this task adds the knob only — the consumer wiring is a follow-on EN.17.J task)",
+        ),
+        (
             "model_tiers",
             "task_loop.rs::model_tier_for_stage (all five stages), docs.rs, setup.rs (GenerateTasksNode), graph.rs (local-transport gate)",
         ),
@@ -1800,6 +1826,7 @@ mod tests {
             review_skip_max_files,
             review_skip_max_diff_lines,
             test_depth,
+            test_dispatch,
             model_tiers,
             timeouts,
             max_turns,

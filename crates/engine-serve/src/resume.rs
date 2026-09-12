@@ -379,6 +379,25 @@ pub async fn resume_run(
         },
     };
 
+    // `EN.17.J` task 6: a run whose suspension reason is `heavy_work_queue`
+    // is being driven to completion by its OWN `spawn_run`'s
+    // `queue_park::drive` call — nothing but that parked job's own
+    // completion may resume it. Checked uniformly for BOTH sources above
+    // (`take_for_resume`'s in-memory index and `rehydrate_from_store`'s
+    // Postgres fallback both produce this same `SuspendedEntry` shape), so
+    // this single check covers either path a snapshot could have arrived
+    // through. `clear_resuming` mirrors every other refusal below: a
+    // refused resume must never permanently strand an entry in the
+    // in-flight `resuming` state.
+    let suspension_reason =
+        engine_core::suspend::read_suspension(&entry.snapshot.metadata).and_then(|s| s.reason);
+    if suspension_reason == Some(engine_core::suspend::SuspendReason::HeavyWorkQueue) {
+        suspend::clear_resuming(run_id);
+        return HttpResponse::Conflict().json(serde_json::json!({
+            "error": "run is parked on the heavy-work queue",
+        }));
+    }
+
     // Step 4: rebuild the budget ledger from the marker's snapshot,
     // falling back to the lossy `from_context` reconstruction when the
     // marker carries no ledger (an older/foreign snapshot).
@@ -986,6 +1005,80 @@ mod tests {
         match suspend::take_for_resume(run_id) {
             TakeForResume::Ready(_) => {}
             _ => panic!("expected the failed resume to have cleared `resuming`, got a state that is not Ready"),
+        }
+
+        suspend::remove_suspended(run_id);
+    }
+
+    // -- heavy-work-queue-parked resume refusal (`EN.17.J` task 6) --------
+
+    /// `entry.snapshot`'s suspension reason is checked BEFORE any
+    /// rebuild/dispatch work — a heavy-work-queue-suspended run is being
+    /// driven by its own `spawn_run`'s `queue_park::drive` call, so this
+    /// route must refuse it with 409 rather than starting a second walk.
+    /// Exercises the in-memory `take_for_resume` source directly (the
+    /// `rehydrate_from_store` source shares the exact same check,
+    /// immediately after producing the same `SuspendedEntry` shape — see
+    /// `resume_run`'s own code comment at this check).
+    #[actix_web::test]
+    async fn resume_on_a_heavy_work_queue_suspended_run_is_409_and_clears_resuming() {
+        let _guard = crate::suspend::registry_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let state = test_app_state_with_suspend_fixture();
+        let app = test::init_service(
+            App::new()
+                .app_data(web::Data::new(state))
+                .configure(crate::http::configure),
+        )
+        .await;
+
+        let run_id = Uuid::new_v4();
+        let mut metadata = serde_json::json!({});
+        engine_core::suspend::stamp_suspended(
+            &mut metadata,
+            engine_core::suspend::Suspension {
+                resume_at: "TriageTaskNode",
+                reason: engine_core::suspend::SuspendReason::HeavyWorkQueue,
+                origin_identity: Some("TestTaskNode"),
+                ledger: &BudgetLedger::new(),
+            },
+        );
+        let snapshot = TaskContext {
+            event: serde_json::Value::Null,
+            nodes: StdHashMap::new(),
+            metadata,
+            node_runs: StdHashMap::new(),
+        };
+        suspend::insert_suspended(
+            run_id,
+            SuspendedEntry {
+                workflow_type: "suspend-fixture".to_string(),
+                data: serde_json::json!({}),
+                snapshot,
+                created_at: Utc::now(),
+                suspended_at: Utc::now(),
+                resume_at: "TriageTaskNode".to_string(),
+                reason: "heavy_work_queue".to_string(),
+                resuming: false,
+            },
+        );
+
+        let req = test::TestRequest::post()
+            .uri(&format!("/events/{run_id}/resume"))
+            .insert_header(("X-API-Key", "test-key"))
+            .to_request();
+        let resp = test::call_service(&app, req).await;
+        assert_eq!(resp.status(), 409);
+        let body: serde_json::Value = test::read_body_json(resp).await;
+        assert_eq!(body["error"], "run is parked on the heavy-work queue");
+
+        // Refusing the resume must not permanently strand the entry as
+        // in-flight — `resuming` is cleared, same as every other refusal
+        // path this handler has.
+        match suspend::take_for_resume(run_id) {
+            TakeForResume::Ready(_) => {}
+            _ => panic!("expected clear_resuming to have restored Ready"),
         }
 
         suspend::remove_suspended(run_id);

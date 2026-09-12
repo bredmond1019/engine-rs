@@ -11,6 +11,7 @@
 use super::policy::{
     ModelTier, OutputVerbosity, PartialCallTimeouts, PartialModelTiers, PartialPolicy,
     PartialRetryFeedback, PartialStageTurnCeilings, PartialTransportRetry, ReviewMode, TestDepth,
+    TestDispatch,
 };
 use crate::policy::PartialLocalConfig;
 
@@ -38,6 +39,9 @@ pub fn baseline() -> PartialPolicy {
         review_mode: Some(ReviewMode::PerTask),
         llm_triage: Some(false),
         test_depth: Some(TestDepth::Full),
+        // Restates the built-in default verbatim — baseline's no-op
+        // contract (EN.17.J).
+        test_dispatch: Some(TestDispatch::Inline),
         // Restates the built-in default verbatim — baseline's no-op contract.
         review_diff_max_chars: Some(120_000),
         // Restates the built-in default verbatim — baseline's no-op contract.
@@ -81,6 +85,10 @@ pub fn cheap_fast() -> PartialPolicy {
         output_verbosity: Some(OutputVerbosity::Terse),
         review_mode: Some(ReviewMode::TrivialSkip),
         test_depth: Some(TestDepth::Fast),
+        // The cost/latency floor's dispatch mode (EN.17.J): offload checks
+        // to the heavy-work queue and park rather than tying up this node's
+        // own process for the duration of the check suite.
+        test_dispatch: Some(TestDispatch::QueuePark),
         // The cost/latency floor for the reviewer prompt — a spend choice,
         // not a capacity limit. This number was originally sized for a
         // LOCAL reviewer's context window; now that `review` is `haiku`,
@@ -122,6 +130,9 @@ pub fn pragmatist() -> PartialPolicy {
         review_mode: Some(ReviewMode::TrivialSkip),
         llm_triage: Some(true),
         test_depth: Some(TestDepth::Fast),
+        // Same queue-and-park dispatch as `cheap-fast`/`thorough` (EN.17.J)
+        // — only `baseline` restates the inline built-in default.
+        test_dispatch: Some(TestDispatch::QueuePark),
         // Above `cheap-fast`, below `batch-reviewer`'s ceiling — a middle
         // spend/latency setting, not a capacity limit. Like `cheap-fast`'s
         // 20_000, this number was sized when `review` ran on the `local`
@@ -149,6 +160,10 @@ pub fn batch_reviewer() -> PartialPolicy {
         }),
         review_mode: Some(ReviewMode::EndOnly),
         test_depth: Some(TestDepth::Fast),
+        // Same queue-and-park dispatch as `cheap-fast`/`pragmatist`/
+        // `thorough` (EN.17.J) — only `baseline` restates the inline
+        // built-in default.
+        test_dispatch: Some(TestDispatch::QueuePark),
         // The quality ceiling. `end_only` makes `EndReviewNode` (the drain
         // branch's single review node, `end_review.rs`) issue exactly ONE
         // review call that sees the WHOLE run's accumulated diff rather
@@ -193,6 +208,10 @@ pub fn thorough() -> PartialPolicy {
         review_skip_max_files: Some(2),
         review_skip_max_diff_lines: Some(40),
         test_depth: Some(TestDepth::Full),
+        // The quality ceiling's dispatch mode (EN.17.J): queue-and-park,
+        // matching `cheap-fast`/`pragmatist`/`batch-reviewer` — only
+        // `baseline` restates the inline built-in default.
+        test_dispatch: Some(TestDispatch::QueuePark),
         model_tiers: Some(PartialModelTiers {
             // The strongest tier this workflow supports, on every stage —
             // including `implement_simple`, which no production node reads
@@ -342,6 +361,7 @@ mod tests {
         assert!(p.review_skip_max_files.is_some());
         assert!(p.review_skip_max_diff_lines.is_some());
         assert!(p.test_depth.is_some());
+        assert!(p.test_dispatch.is_some());
         let tiers = p.model_tiers.as_ref().expect("model_tiers set");
         assert!(tiers.implement.is_some());
         assert!(tiers.implement_simple.is_some());
@@ -505,6 +525,25 @@ mod tests {
             assert!(
                 p.test_depth.is_some(),
                 "profile `{name}` must set test_depth explicitly"
+            );
+        }
+    }
+
+    /// Standing rule 6 for `test_dispatch` (EN.17.J): every named profile
+    /// must pin the knob explicitly rather than leaving it to fall through.
+    #[test]
+    fn every_named_profile_sets_test_dispatch() {
+        for name in [
+            "baseline",
+            "cheap-fast",
+            "thorough",
+            "pragmatist",
+            "batch-reviewer",
+        ] {
+            let p = profile_by_name(name).expect("known profile name");
+            assert!(
+                p.test_dispatch.is_some(),
+                "profile `{name}` must set test_dispatch explicitly"
             );
         }
     }

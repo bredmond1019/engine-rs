@@ -16,7 +16,7 @@ use engine_contract::TaskContext;
 use crate::node::NodeError;
 use crate::policy::PolicyConfigSource;
 
-use super::policy::{PartialSdlcTaskPolicy, SdlcTaskPolicy, TestDepth};
+use super::policy::{PartialSdlcTaskPolicy, SdlcTaskPolicy, TestDepth, TestDispatch};
 use super::schema::SdlcTaskEventSchema;
 
 /// The `harness.json` section key this workflow's policy/profiles live
@@ -41,6 +41,9 @@ pub fn baseline() -> PartialSdlcTaskPolicy {
         // this behaviour unchanged (it IS the control), so its reconcile
         // is skipped exactly as it is today.
         test_depth: Some(d.test_depth),
+        // Restates the built-in default verbatim — baseline's no-op
+        // contract (EN.17.J).
+        test_dispatch: Some(d.test_dispatch),
         model_tiers: Some(super::policy::PartialSdlcTaskModelTiers {
             implement: Some(d.model_tiers.implement),
             triage: Some(d.model_tiers.triage),
@@ -95,6 +98,9 @@ pub fn cheap_fast() -> PartialSdlcTaskPolicy {
         // reconcile (`sdlc_flow/final_validation.rs:265` only skips on
         // `Full`), unlike `thorough`, which keeps `Full` and skips it.
         test_depth: Some(TestDepth::Fast),
+        // The cost/latency floor's dispatch mode (EN.17.J): queue-and-park
+        // rather than tying up this node's own process for the check suite.
+        test_dispatch: Some(TestDispatch::QueuePark),
         model_tiers: Some(super::policy::PartialSdlcTaskModelTiers {
             implement: Some(super::policy::ModelTier::Haiku),
             triage: Some(super::policy::ModelTier::Haiku),
@@ -153,6 +159,9 @@ pub fn thorough() -> PartialSdlcTaskPolicy {
         // `FinalValidationNode`'s reconcile is SKIPPED for this profile,
         // the same way it is skipped today with no profile selected.
         test_depth: Some(TestDepth::Full),
+        // Same queue-and-park dispatch as `cheap-fast` (EN.17.J) — only
+        // `baseline` restates the inline built-in default.
+        test_dispatch: Some(TestDispatch::QueuePark),
         model_tiers: Some(super::policy::PartialSdlcTaskModelTiers {
             implement: Some(super::policy::ModelTier::Opus),
             triage: Some(super::policy::ModelTier::Sonnet),
@@ -381,6 +390,25 @@ mod tests {
     fn thorough_keeps_full_test_depth_and_cheap_fast_switches_to_fast() {
         assert_eq!(thorough().test_depth, Some(TestDepth::Full));
         assert_eq!(cheap_fast().test_depth, Some(TestDepth::Fast));
+    }
+
+    /// Standing rule 6 for `test_dispatch` (EN.17.J): every named profile
+    /// must pin the knob explicitly rather than leaving it to fall through.
+    #[test]
+    fn every_named_profile_sets_test_dispatch() {
+        for (name, p) in [
+            ("baseline", baseline()),
+            ("cheap-fast", cheap_fast()),
+            ("thorough", thorough()),
+        ] {
+            assert!(
+                p.test_dispatch.is_some(),
+                "profile `{name}` must set test_dispatch explicitly"
+            );
+        }
+        assert_eq!(baseline().test_dispatch, Some(TestDispatch::Inline));
+        assert_eq!(cheap_fast().test_dispatch, Some(TestDispatch::QueuePark));
+        assert_eq!(thorough().test_dispatch, Some(TestDispatch::QueuePark));
     }
 
     /// EN.14.G / standing rule 6: `baseline` restates the built-in payload

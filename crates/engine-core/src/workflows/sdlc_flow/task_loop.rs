@@ -29,12 +29,13 @@ use crate::coord::heavy_work::{HeavyWorkConfig, HeavyWorkQueue, HeavyWorkSpec};
 use crate::node::{Node, NodeError};
 use crate::nodes::{AgentCodeStep, MetaTransport};
 use crate::routing::Router;
+use crate::suspend::{self, SuspendReason};
 use crate::workflows::{admitted_command_runner, CommandSpec, SpecCommandRunner};
 
 use super::close_block::DEFAULT_REPO_SLUG;
 #[cfg(test)]
 use super::policy::OutputVerbosity;
-use super::policy::{ModelTier, RetryFeedback, ReviewMode, SdlcPolicy, TestDepth};
+use super::policy::{ModelTier, RetryFeedback, ReviewMode, SdlcPolicy, TestDepth, TestDispatch};
 use super::schema::{RunMeta, SDLCState, SDLCTask, SDLCTaskStatus};
 use super::setup::baseline_snapshot_path;
 use super::{
@@ -2378,6 +2379,66 @@ impl Node for TestTaskNode {
             let checks_for_job = selected_checks;
             let worktree_for_job = worktree.to_path_buf();
             let spec_dir_for_job = spec_dir.clone();
+
+            // EN.17.J task 3: under `TestDispatch::QueuePark`, with the
+            // heavy-work queue enabled and this job's class configured in
+            // it, submit the check run without awaiting it and suspend the
+            // walk at this node boundary instead — the job's completion
+            // (via `workflows::queue_park::drive`, EN.17.J task 4) injects
+            // the result and resumes at `TriageTaskNode`. An unconfigured
+            // class or a disabled queue falls through to the inline `run`
+            // below unchanged (EN.17.I's existing degraded-open behavior),
+            // and never requests suspension — matching `TestDispatch::Inline`
+            // exactly.
+            let queue_park_active = matches!(policy.test_dispatch, TestDispatch::QueuePark)
+                && self.heavy_work.config().enabled
+                && self
+                    .heavy_work
+                    .config()
+                    .class(&heavy_work_spec.class)
+                    .is_some();
+
+            if queue_park_active {
+                // This id is minted here, not read back from the queue's own
+                // on-disk job record (`HeavyWorkQueue::submit` has no
+                // synchronous way to hand that back before admission) — it is
+                // this walk's own correlation id for the suspended job,
+                // carried in `ctx.metadata.heavy_work`/this node's output for
+                // whatever resumes the walk to key off of.
+                let job_id = uuid::Uuid::new_v4();
+
+                // Submitted, not awaited: `submit` returns a `JobHandle`
+                // immediately without blocking on admission or the check run
+                // itself, so the stub check runner in a "still queued" test
+                // is invoked zero times before this function returns.
+                let _job_handle = self
+                    .heavy_work
+                    .submit(heavy_work_spec, move || {
+                        job_node.run_checks(&checks_for_job, &worktree_for_job, &spec_dir_for_job)
+                    })
+                    .await;
+
+                put_result(
+                    &mut ctx,
+                    "TestTaskNode",
+                    json!({
+                        "queued": true,
+                        "job_id": job_id.to_string(),
+                        "guard_result": write_verification,
+                        "test_dispatch": "queue_park",
+                    }),
+                );
+                ctx.metadata["heavy_work"] = json!({
+                    "job_id": job_id.to_string(),
+                    "class": "test",
+                    "state": "queued",
+                });
+                suspend::request_suspension_with_reason(
+                    &mut ctx.metadata,
+                    SuspendReason::HeavyWorkQueue,
+                );
+                return Ok(ctx);
+            }
 
             let outcome = self
                 .heavy_work
@@ -10249,6 +10310,174 @@ pub(crate) mod tests {
         assert_eq!(out.nodes["TestTaskNode"]["all_passed"], true);
         let heavy_work = &out.nodes["TestTaskNode"]["heavy_work"];
         assert_eq!(heavy_work["degraded"], json!(true));
+    }
+
+    // --- `TestDispatch::QueuePark` (EN.17.J task 3) -------------------------
+
+    /// A `HeavyWorkQueue` with `class` admitted at `limit`, over a fresh
+    /// tempdir lock dir.
+    fn enabled_heavy_work_queue(lock_dir: &Path, class: &str, limit: usize) -> HeavyWorkQueue {
+        let mut classes = HashMap::new();
+        classes.insert(
+            class.to_string(),
+            crate::coord::heavy_work::ClassLimit {
+                limit,
+                min_free_mb: 0,
+            },
+        );
+        let config = crate::coord::heavy_work::HeavyWorkConfig {
+            enabled: true,
+            heartbeat_interval_secs: 60,
+            stale_after_secs: 300,
+            poll_interval_ms: 5,
+            classes,
+        };
+        HeavyWorkQueue::new(lock_dir.to_path_buf(), config)
+    }
+
+    #[tokio::test]
+    async fn test_task_queue_park_suspends_without_running_checks() {
+        let worktree = temp_worktree();
+        write_harness(&worktree, json!([cmd_check("fmt", "cargo fmt --check")]));
+        let task = SDLCTask::new(1, "One", "d1");
+        let state = state_with_tasks(vec![task.clone()]);
+        let ctx = ctx_with_current_task_and_worktree(&state, &task, &worktree);
+        let policy = SdlcPolicy {
+            test_dispatch: TestDispatch::QueuePark,
+            ..SdlcPolicy::default()
+        };
+        let ctx = ctx_with_policy(ctx, &policy);
+
+        let lock_dir = tempfile::tempdir().expect("tempdir");
+        let queue = enabled_heavy_work_queue(lock_dir.path(), "test", 1);
+
+        let (runner, recorded) = recording_command_runner();
+        let node = TestTaskNode::new()
+            .with_runner(runner)
+            .with_heavy_work(queue);
+        let out = node.process(ctx).await.expect("process should succeed");
+
+        // Nothing ran: `submit` never awaits admission, let alone the work
+        // closure, before `process` returns.
+        assert!(recorded.lock().unwrap().is_empty());
+
+        let result = &out.nodes["TestTaskNode"];
+        assert_eq!(result["queued"], json!(true));
+        assert_eq!(result["test_dispatch"], json!("queue_park"));
+        assert!(!result["job_id"].as_str().unwrap().is_empty());
+        // The write-verification guard still ran inline and is carried
+        // alongside the queued marker — `temp_worktree`'s fixture already
+        // shows a change, so the guard passes and reports no result, exactly
+        // as it would inline.
+        assert!(result["guard_result"].is_null());
+
+        assert_eq!(out.metadata["heavy_work"]["state"], json!("queued"));
+        assert_eq!(out.metadata["heavy_work"]["class"], json!("test"));
+        assert_eq!(
+            out.metadata["heavy_work"]["job_id"],
+            result["job_id"].clone()
+        );
+
+        // `TestTaskNode` only REQUESTS suspension (`requested: true` plus the
+        // intended `pending_reason`) -- finalizing it (`suspended: true`,
+        // `reason: ...`) is `Workflow::walk`'s job at the node boundary, not
+        // this node's.
+        assert!(suspend::suspension_requested(&out.metadata));
+        assert_eq!(
+            suspend::requested_reason(&out.metadata),
+            SuspendReason::HeavyWorkQueue
+        );
+    }
+
+    #[tokio::test]
+    async fn test_task_queue_park_inline_when_dispatch_unset() {
+        let worktree = temp_worktree();
+        write_harness(&worktree, json!([cmd_check("fmt", "cargo fmt --check")]));
+        let task = SDLCTask::new(1, "One", "d1");
+        let state = state_with_tasks(vec![task.clone()]);
+        // Default policy: `test_dispatch` unset -> `Inline`.
+        let ctx = ctx_with_current_task_and_worktree(&state, &task, &worktree);
+
+        let lock_dir = tempfile::tempdir().expect("tempdir");
+        let queue = enabled_heavy_work_queue(lock_dir.path(), "test", 1);
+
+        let (runner, recorded) = recording_command_runner();
+        let node = TestTaskNode::new()
+            .with_runner(runner)
+            .with_heavy_work(queue);
+        let out = node.process(ctx).await.expect("process should succeed");
+
+        assert_eq!(*recorded.lock().unwrap(), vec!["cargo fmt --check"]);
+        assert_eq!(out.nodes["TestTaskNode"]["all_passed"], json!(true));
+        assert!(out.nodes["TestTaskNode"].get("queued").is_none());
+        assert!(!suspend::suspension_requested(&out.metadata));
+    }
+
+    #[tokio::test]
+    async fn test_task_queue_park_falls_back_inline_when_class_unconfigured() {
+        let worktree = temp_worktree();
+        write_harness(&worktree, json!([cmd_check("fmt", "cargo fmt --check")]));
+        let task = SDLCTask::new(1, "One", "d1");
+        let state = state_with_tasks(vec![task.clone()]);
+        let ctx = ctx_with_current_task_and_worktree(&state, &task, &worktree);
+        let policy = SdlcPolicy {
+            test_dispatch: TestDispatch::QueuePark,
+            ..SdlcPolicy::default()
+        };
+        let ctx = ctx_with_policy(ctx, &policy);
+
+        // `[heavy_work]` is enabled but declares no `test` class -> degraded,
+        // never suspends, even under `QueuePark`.
+        let lock_dir = tempfile::tempdir().expect("tempdir");
+        let config = crate::coord::heavy_work::HeavyWorkConfig {
+            enabled: true,
+            heartbeat_interval_secs: 60,
+            stale_after_secs: 300,
+            poll_interval_ms: 5,
+            classes: HashMap::new(),
+        };
+        let queue = HeavyWorkQueue::new(lock_dir.path().to_path_buf(), config);
+
+        let (runner, recorded) = recording_command_runner();
+        let node = TestTaskNode::new()
+            .with_runner(runner)
+            .with_heavy_work(queue);
+        let out = node.process(ctx).await.expect("process should succeed");
+
+        assert_eq!(*recorded.lock().unwrap(), vec!["cargo fmt --check"]);
+        assert_eq!(out.nodes["TestTaskNode"]["all_passed"], json!(true));
+        assert_eq!(
+            out.nodes["TestTaskNode"]["heavy_work"]["degraded"],
+            json!(true)
+        );
+        assert!(!suspend::suspension_requested(&out.metadata));
+    }
+
+    #[tokio::test]
+    async fn test_task_queue_park_falls_back_inline_when_queue_disabled() {
+        let worktree = temp_worktree();
+        write_harness(&worktree, json!([cmd_check("fmt", "cargo fmt --check")]));
+        let task = SDLCTask::new(1, "One", "d1");
+        let state = state_with_tasks(vec![task.clone()]);
+        let ctx = ctx_with_current_task_and_worktree(&state, &task, &worktree);
+        let policy = SdlcPolicy {
+            test_dispatch: TestDispatch::QueuePark,
+            ..SdlcPolicy::default()
+        };
+        let ctx = ctx_with_policy(ctx, &policy);
+
+        // No `with_heavy_work` call -> the queue defaults to disabled.
+        let (runner, recorded) = recording_command_runner();
+        let node = TestTaskNode::new().with_runner(runner);
+        let out = node.process(ctx).await.expect("process should succeed");
+
+        assert_eq!(*recorded.lock().unwrap(), vec!["cargo fmt --check"]);
+        assert_eq!(out.nodes["TestTaskNode"]["all_passed"], json!(true));
+        assert_eq!(
+            out.nodes["TestTaskNode"]["heavy_work"]["mode"],
+            json!("disabled")
+        );
+        assert!(!suspend::suspension_requested(&out.metadata));
     }
 
     // --- with_cancellation_token (EN.ticket.abort-must-interrupt-an-in-flight-agent-node) ---

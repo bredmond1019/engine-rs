@@ -1,21 +1,22 @@
 ---
 type: Reference
 title: Suspend / Resume (Operator Pause + Human-in-the-Loop Approval)
-description: The metadata.suspension marker, the two suspension origins (operator pause, SuspendNode), the run_from rehydration path, the three HTTP routes, and the granularity/atomicity limits of pausing a graph walk.
+description: The metadata.suspension marker, the three suspension origins (operator pause, SuspendNode, heavy_work_queue), the run_from rehydration path, the three HTTP routes, and the granularity/atomicity limits of pausing a graph walk.
 doc_id: suspend-resume
 layer: [engine]
 project: engine-rs
 status: active
-keywords: [suspend, resume, pause, walk-pointer, rehydration, approval-gate, checkpoint, crash-recovery, campaign]
-related: [architecture, data-contract, D6-cancellation-and-budget-semantics]
+keywords: [suspend, resume, pause, walk-pointer, rehydration, approval-gate, checkpoint, crash-recovery, campaign, heavy-work-queue, queue-park]
+related: [architecture, data-contract, D6-cancellation-and-budget-semantics, heavy-work-queue]
 ---
 
 # Suspend / Resume
 
-`EN.6.F` makes a run stoppable at a node boundary and continuable later, from either an
-**operator** signal (`POST /events/{run_id}/pause`) or a **workflow-authored** `SuspendNode`. Both
-origins converge on one durable marker (`metadata.suspension`) and one entry point
-(`Workflow::run_from`) that starts the walk somewhere other than `schema.start_node`.
+`EN.6.F` makes a run stoppable at a node boundary and continuable later, from an **operator**
+signal (`POST /events/{run_id}/pause`), a **workflow-authored** `SuspendNode`, or (`EN.17.J`) a
+`TestTaskNode` that has enqueued its checks onto the heavy-work queue and must park until they
+finish. All three origins converge on one durable marker (`metadata.suspension`) and one entry
+point (`Workflow::run_from`) that starts the walk somewhere other than `schema.start_node`.
 
 ## The `metadata.suspension` marker
 
@@ -43,13 +44,13 @@ as `metadata` keys, never as a new `NodeRunStatus` variant).
 | `suspended` | `bool` | `true` while the run is stopped; flipped back to `false` by `stamp_resumed` on resume. The key itself is **never deleted** — a stable shape across suspended/resumed/never-suspended states is what makes a resumed run's final `EventsRow` round-trip identical in shape to an uninterrupted run's. |
 | `at` | ISO-8601 string | When this suspension was stamped. |
 | `resume_at` | `string \| null` | The node identity `Workflow::run_from` starts the walk at on resume — the durable walk pointer. |
-| `reason` | `"operator_pause" \| "suspend_node" \| null` | Which of the two origins produced this marker (`SuspendReason`). |
+| `reason` | `"operator_pause" \| "suspend_node" \| "heavy_work_queue" \| null` | Which of the three origins produced this marker (`SuspendReason`). |
 | `origin_identity` | `string \| null` | The identity of the node whose successor became `resume_at` (the node that just finished when the walk stopped). |
 | `ledger` | `{total_tokens, total_cost_usd} \| null` | A `LedgerSnapshot` of the running `BudgetLedger` totals at the moment of suspension — what lets a resume continue spending from the pre-suspend totals instead of a fresh allowance. |
 | `resume_count` | `u32` | Carried forward across suspend/resume cycles; only incremented by `stamp_resumed`. |
 | `requested` | `bool` | Set by `SuspendNode`/`request_suspension` to ask the walk to stop after the current node; reset to `false` by both a fresh `stamp_suspended` and by `stamp_resumed`. |
 
-## The two origins, one marker
+## The three origins, one marker
 
 1. **Operator pause** — `POST /events/{run_id}/pause` sets the run's `PauseSignal` (a clearable,
    `tokio::sync::watch`-backed two-way flag; see below for why it is deliberately not
@@ -64,10 +65,71 @@ as `metadata` keys, never as a new `NodeRunStatus` variant).
    in-place no-op, patterned on `MaterializeDocNode::with_enabled` — the node stays in the declared
    graph at every setting, so the node set never varies by policy) and always stamps its resolved
    `enabled` value into `ctx.nodes[identity]` for telemetry attribution.
+3. **`heavy_work_queue`** (`EN.17.J`) — under policy `test_dispatch: queue_park`, `TestTaskNode`
+   (`workflows::sdlc_flow::task_loop`) submits its selected checks to the `EN.17.I` heavy-work
+   queue *without awaiting them*, stamps `ctx.metadata.heavy_work = {job_id, class, state:
+   "queued"}`, and calls `request_suspension_with_reason(&mut ctx.metadata,
+   SuspendReason::HeavyWorkQueue)`. `Workflow::walk` finalizes this exactly like the other two
+   requested-suspension path (`resume_at` = `TriageTaskNode`, the node `TestTaskNode` already
+   routes to), the one difference being *what* is expected to end the park: not an operator, not a
+   graph author's own judgement, but the enqueued job's own completion. See "The `queue_park::drive`
+   loop" below for how that completion actually reaches the walk.
 
-Both paths land on the same `stamp_suspended` call, so a resume never needs to know which origin
-produced the marker it is rehydrating from — `resume_at`, `reason`, and the ledger snapshot are all
-it reads.
+All three paths land on the same `stamp_suspended` call, so a resume never needs to know which
+origin produced the marker it is rehydrating from — `resume_at`, `reason`, and the ledger snapshot
+are all it reads.
+
+## The `queue_park::drive` loop
+
+`engine_core::workflows::queue_park::drive(workflow, start, cancel)` is what makes a
+`heavy_work_queue` suspension transparent to a caller that just wants a workflow to run to
+completion, instead of a terminal state it must itself know how to un-park. It wraps
+`Workflow::run_with`/`run_from` and, on every `HeavyWorkQueue`-reasoned suspension it observes,
+loops: it looks the parked job up by the `job_id` stamped in `ctx.metadata.heavy_work.job_id`
+(via an injectable `HeavyJobLookup` seam — never the concrete `coord::heavy_work::HeavyWorkQueue`
+directly, so the loop's own unit tests drive it against an in-file stub with no real admission or
+filesystem), awaits the job's outcome (racing that against its own `CancellationToken`), injects
+the result into `ctx.nodes["TestTaskNode"]`, calls `stamp_resumed`, and re-enters `run_from` at the
+suspension's own `resume_at` (`TriageTaskNode`) — repeating until the walk reaches a genuinely
+terminal state (success, failure, budget halt) or a *different* suspension reason (operator pause,
+`SuspendNode`), which `drive` passes straight through untouched, never interacting with
+`heavy_work` for it. A structural `WorkflowError` propagates immediately, same as calling
+`run_with`/`run_from` directly — `drive` is a strict superset of that contract, not a replacement.
+
+Two callers drive a workflow through this loop instead of calling `run_with`/`run_from` directly:
+
+- **`engine-serve`'s `spawn_run`** — a served run whose graph requests a `heavy_work_queue`
+  suspension is carried to completion by `drive` inside the same spawned task that would otherwise
+  have called `run_with` once and returned.
+- **An `ORCHESTRATION` child** — `default_flow_runner` (`workflows::orchestration::execute`) calls
+  `drive` for its `Flow`/`Task` arms instead of awaiting the child `Workflow::run_with` inline, so a
+  queue-parked child is fully resolved before `execute_step` ever reads the returned ctx.
+  `derive_terminal_status` (`completion.rs`) still has no `suspended` arm — the fix is that a child
+  no longer *reaches* `execute_step` in a `heavy_work_queue`-suspended state at all, not that the
+  terminal-status reader learned to recognize one.
+
+A caller that has **not** been taught to drive `queue_park::drive` (still calls `run_with`/
+`run_from` directly) must not enable `test_dispatch: queue_park` — see `planning/harness.json`'s
+`_comment_test_dispatch` for the scoping rule this repo applies to itself.
+
+## Why the HTTP resume route refuses a `heavy_work_queue` park with `409`, not a resume
+
+`POST /events/{event_id}/resume` (`engine-serve/src/resume.rs`) checks the entry's stamped
+`suspension.reason` before doing any of its usual rebuild work: if it reads
+`SuspendReason::HeavyWorkQueue`, it clears the entry's `resuming` flag and returns
+`409 {"error": "run is parked on the heavy-work queue"}` immediately, touching neither the ledger
+nor the `WorkflowFactory` rebuild path the other two reasons go through. This is deliberate, not a
+gap to close later: a `heavy_work_queue` park is **already** being driven to completion by that same
+run's own `spawn_run` call, inside its own `queue_park::drive` loop, on its own schedule (the job's
+completion, not an operator's). A second, independent resume through the ordinary HTTP path would
+race that in-process loop for the same `resume_at` node — the exact double-resume the route's own
+`take_for_resume`/`clear_resuming` guard exists to forbid for the operator-pause/`SuspendNode` cases,
+except here the "someone else already resuming" caller is the run's own background task rather than
+a second HTTP request. Refusing outright, rather than resuming and letting the two races settle on
+their own, keeps the guarantee absolute: **only** the parked job's own completion may ever resume a
+`heavy_work_queue` suspension. `clear_resuming` on the refusal path mirrors every other refusal in
+the route — a refused resume must never permanently strand the entry in the in-flight `resuming`
+state.
 
 ## `PauseSignal` vs. `CancellationToken`
 
@@ -132,7 +194,7 @@ failure modes (pause vs. crash) are not conflated.
 | Method | Path | Behavior |
 |---|---|---|
 | `POST` | `/events/{run_id}/pause` | `401` without a valid `X-API-Key`; `404` for a `run_id` that is neither live nor suspended; `409` if already suspended; otherwise sets the run's `PauseSignal` and returns `202 {run_id, status: "pausing"}`. Idempotent against a repeat call while still pausing. |
-| `POST` | `/events/{event_id}/resume` | `401` without a valid key; `404` for an unknown or non-suspended run; `409` for a concurrent resume already in flight; `422` for a policy-resolution failure or an unresolvable `resume_at` (the resume point no longer exists in the rebuilt graph); otherwise `202 {run_id, event_id, status: "resuming", resume_at}`. No request body — an operator `{"at": ...}` override to pick a different resume point is a deliberate non-goal. |
+| `POST` | `/events/{event_id}/resume` | `401` without a valid key; `404` for an unknown or non-suspended run; `409` for a concurrent resume already in flight, **or** for a run whose suspension `reason` is `heavy_work_queue` (see below — refused unconditionally, never resumed via this route); `422` for a policy-resolution failure or an unresolvable `resume_at` (the resume point no longer exists in the rebuilt graph); otherwise `202 {run_id, event_id, status: "resuming", resume_at}`. No request body — an operator `{"at": ...}` override to pick a different resume point is a deliberate non-goal. |
 | `GET` | `/events/suspended` | `401` without a valid key; `200 [{run_id, workflow_type, created_at, suspended_at, resume_at, reason}]`, newest first. Registered ahead of `{event_id}` in `configure` — actix-web resolves routes first-registration-wins, so the literal path must not be shadowed by the uuid extractor. |
 
 Resume's double-resume guard (`take_for_resume`/`clear_resuming` in `engine-serve`'s `suspend.rs`)
@@ -244,3 +306,8 @@ stopped on purpose.
   its atomic writer, and its reader (`EN.11.H` task 1).
 - `engine-serve/src/resume.rs`'s campaign section — `plan_campaign_resume` and
   `reconcile_stale_branch` (`EN.11.H` task 4).
+- [heavy-work-queue.md](heavy-work-queue.md) — the queue `TestTaskNode` enqueues onto, admission,
+  reclaim, and the current wiring gap that keeps a real `SDLC_TASK`/`SDLC_FLOW` run's queue disabled
+  by default even with `test_dispatch: queue_park` set.
+- `engine-core/src/workflows/queue_park.rs` — `drive`, `HeavyJobLookup`, and the
+  `metadata.heavy_work` read/write helpers (`EN.17.J` task 4).

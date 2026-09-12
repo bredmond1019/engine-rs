@@ -83,6 +83,10 @@ pub enum SuspendReason {
     /// A workflow-authored `SuspendNode` requested it via
     /// [`request_suspension`].
     SuspendNode,
+    /// A `TestTaskNode` under `test_dispatch: queue_park` policy submitted
+    /// its checks to the EN.17.I queue and is parked awaiting the job's
+    /// completion event, requested via [`request_suspension_with_reason`].
+    HeavyWorkQueue,
 }
 
 /// Everything the walk knows at the moment it stops — the write side passed
@@ -179,6 +183,12 @@ pub fn stamp_resumed(metadata: &mut serde_json::Value) {
 /// `SuspendNode`'s write: records that suspension has been requested,
 /// without itself stopping the walk (a `Node` cannot do that — only
 /// `Workflow::walk` can). Tolerant of non-object `metadata`.
+///
+/// This is the no-reason form: it does not itself write a `pending_reason`,
+/// so [`requested_reason`] falls through to its behavior-stable default of
+/// `SuspendReason::SuspendNode`. Any `pending_reason` left by a prior
+/// [`request_suspension_with_reason`] call is cleared, so a later plain
+/// `request_suspension` call cannot leak a stale reason forward.
 pub fn request_suspension(metadata: &mut serde_json::Value) {
     if !metadata.is_object() {
         *metadata = serde_json::json!({});
@@ -186,6 +196,7 @@ pub fn request_suspension(metadata: &mut serde_json::Value) {
     if let Some(existing) = metadata.get(SUSPENSION_METADATA_KEY).cloned() {
         let mut updated = existing;
         updated["requested"] = serde_json::json!(true);
+        updated["pending_reason"] = serde_json::Value::Null;
         metadata[SUSPENSION_METADATA_KEY] = updated;
     } else {
         metadata[SUSPENSION_METADATA_KEY] = serde_json::json!({
@@ -197,6 +208,35 @@ pub fn request_suspension(metadata: &mut serde_json::Value) {
             "ledger": serde_json::Value::Null,
             "resume_count": 0,
             "requested": true,
+            "pending_reason": serde_json::Value::Null,
+        });
+    }
+}
+
+/// Mirrors [`request_suspension`] exactly, but additionally records the
+/// intended [`SuspendReason`] under the marker's `pending_reason` key so it
+/// survives until `Workflow::walk` reads it back via [`requested_reason`]
+/// and passes it to `finish_suspended`. Tolerant of non-object `metadata`.
+pub fn request_suspension_with_reason(metadata: &mut serde_json::Value, reason: SuspendReason) {
+    if !metadata.is_object() {
+        *metadata = serde_json::json!({});
+    }
+    if let Some(existing) = metadata.get(SUSPENSION_METADATA_KEY).cloned() {
+        let mut updated = existing;
+        updated["requested"] = serde_json::json!(true);
+        updated["pending_reason"] = serde_json::json!(reason);
+        metadata[SUSPENSION_METADATA_KEY] = updated;
+    } else {
+        metadata[SUSPENSION_METADATA_KEY] = serde_json::json!({
+            "suspended": false,
+            "at": serde_json::Value::Null,
+            "resume_at": serde_json::Value::Null,
+            "reason": serde_json::Value::Null,
+            "origin_identity": serde_json::Value::Null,
+            "ledger": serde_json::Value::Null,
+            "resume_count": 0,
+            "requested": true,
+            "pending_reason": serde_json::json!(reason),
         });
     }
 }
@@ -209,6 +249,21 @@ pub fn suspension_requested(metadata: &serde_json::Value) -> bool {
         .and_then(|v| v.get("requested"))
         .and_then(|v| v.as_bool())
         .unwrap_or(false)
+}
+
+/// Reads back the [`SuspendReason`] a request intended, via the marker's
+/// `pending_reason` key written by [`request_suspension_with_reason`].
+/// Falls back to the behavior-stable default `SuspendReason::SuspendNode`
+/// when `pending_reason` is absent, null, or malformed — matching what a
+/// plain [`request_suspension`] call implies. `Workflow::walk` calls this
+/// at the suspend boundary to pick the reason it passes to
+/// `finish_suspended`.
+pub fn requested_reason(metadata: &serde_json::Value) -> SuspendReason {
+    metadata
+        .get(SUSPENSION_METADATA_KEY)
+        .and_then(|v| v.get("pending_reason"))
+        .and_then(|v| serde_json::from_value(v.clone()).ok())
+        .unwrap_or(SuspendReason::SuspendNode)
 }
 
 /// Reads `metadata`'s suspension marker as a typed [`SuspensionState`], or
@@ -454,5 +509,93 @@ mod tests {
         let metadata = serde_json::json!({ "suspension": serde_json::Value::Null });
         assert!(!is_suspended(&metadata));
         assert!(read_suspension(&metadata).is_none());
+    }
+
+    // -- HeavyWorkQueue / request_suspension_with_reason / requested_reason --
+
+    #[test]
+    fn heavy_work_queue_round_trips_through_serde_as_snake_case() {
+        let value = serde_json::to_value(SuspendReason::HeavyWorkQueue).unwrap();
+        assert_eq!(value, serde_json::json!("heavy_work_queue"));
+        let back: SuspendReason = serde_json::from_value(value).unwrap();
+        assert_eq!(back, SuspendReason::HeavyWorkQueue);
+    }
+
+    #[test]
+    fn requested_reason_defaults_to_suspend_node_on_absent_metadata() {
+        let metadata = serde_json::json!({});
+        assert_eq!(requested_reason(&metadata), SuspendReason::SuspendNode);
+    }
+
+    #[test]
+    fn plain_request_suspension_still_implies_suspend_node_via_requested_reason() {
+        let mut metadata = serde_json::json!({});
+        request_suspension(&mut metadata);
+        assert!(suspension_requested(&metadata));
+        assert_eq!(requested_reason(&metadata), SuspendReason::SuspendNode);
+    }
+
+    #[test]
+    fn request_suspension_with_reason_heavy_work_queue_round_trips_via_requested_reason() {
+        let mut metadata = serde_json::json!({});
+        request_suspension_with_reason(&mut metadata, SuspendReason::HeavyWorkQueue);
+        assert!(suspension_requested(&metadata));
+        assert_eq!(requested_reason(&metadata), SuspendReason::HeavyWorkQueue);
+    }
+
+    #[test]
+    fn request_suspension_with_reason_tolerates_non_object_metadata() {
+        let mut metadata = serde_json::Value::Null;
+        request_suspension_with_reason(&mut metadata, SuspendReason::HeavyWorkQueue);
+        assert!(metadata.is_object());
+        assert!(suspension_requested(&metadata));
+        assert_eq!(requested_reason(&metadata), SuspendReason::HeavyWorkQueue);
+    }
+
+    #[test]
+    fn a_later_plain_request_suspension_clears_a_prior_pending_reason() {
+        let mut metadata = serde_json::json!({});
+        request_suspension_with_reason(&mut metadata, SuspendReason::HeavyWorkQueue);
+        assert_eq!(requested_reason(&metadata), SuspendReason::HeavyWorkQueue);
+
+        request_suspension(&mut metadata);
+        assert_eq!(
+            requested_reason(&metadata),
+            SuspendReason::SuspendNode,
+            "a plain request_suspension must not leave a stale pending_reason behind"
+        );
+    }
+
+    #[test]
+    fn stamp_suspended_snapshot_still_reads_back_operator_pause_and_suspend_node() {
+        // Pre-existing snapshots stamped before this change carry no
+        // `pending_reason` key at all; `read_suspension`'s own typed `reason`
+        // field (not `requested_reason`) must still read back unaffected.
+        let mut metadata = serde_json::json!({});
+        let ledger = ledger_with(1, 0.0);
+
+        stamp_suspended(
+            &mut metadata,
+            Suspension {
+                resume_at: "Next",
+                reason: SuspendReason::OperatorPause,
+                origin_identity: None,
+                ledger: &ledger,
+            },
+        );
+        let state = read_suspension(&metadata).unwrap();
+        assert_eq!(state.reason, Some(SuspendReason::OperatorPause));
+
+        stamp_suspended(
+            &mut metadata,
+            Suspension {
+                resume_at: "Next",
+                reason: SuspendReason::SuspendNode,
+                origin_identity: None,
+                ledger: &ledger,
+            },
+        );
+        let state = read_suspension(&metadata).unwrap();
+        assert_eq!(state.reason, Some(SuspendReason::SuspendNode));
     }
 }

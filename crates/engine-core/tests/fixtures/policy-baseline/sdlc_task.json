@@ -26,6 +26,7 @@
     "max_chars": 4000
   },
   "test_depth": "full",
+  "test_dispatch": "inline",
   "timeouts": {
     "generate": null,
     "implement": null,

@@ -24,11 +24,14 @@
 //! the only backstop.
 
 use std::collections::{HashMap as StdHashMap, VecDeque};
-use std::sync::{OnceLock, RwLock};
+use std::path::PathBuf;
+use std::sync::{Arc, OnceLock, RwLock};
 
 use chrono::{DateTime, Utc};
 use engine_contract::{NodeRunStatus, TaskContext};
+use engine_core::coord::heavy_work::{self, JobState};
 use engine_core::workflow::ResumeState;
+use engine_core::workflows::queue_park::{self, HeavyJobLookup, RunStart as QueueParkRunStart};
 use engine_core::{Budget, CancellationToken, PauseSignal, Workflow};
 use futures::FutureExt;
 use uuid::Uuid;
@@ -38,6 +41,87 @@ use engine_core::workflows::orchestration::integrate::StepProgress;
 use crate::abort::{CampaignRegistry, RunRegistry};
 use crate::durable::{durable_on_progress, DurableHandle};
 use crate::live_state::LiveStateStore;
+
+/// A best-effort, disk-backed [`HeavyJobLookup`] over `coord::heavy_work`'s
+/// on-disk job store — [`spawn_run`]'s production bridge for a queue-parked
+/// `TestTaskNode` suspension (`EN.17.J` task 6). Mirrors
+/// `orchestration::execute::DiskHeavyJobLookup` exactly (that struct is
+/// private to its own module, so this crate cannot reuse it directly — this
+/// is engine-serve's own equivalent over the same on-disk store).
+struct DiskHeavyJobLookup {
+    lock_dir: PathBuf,
+    poll_interval: std::time::Duration,
+}
+
+impl DiskHeavyJobLookup {
+    fn new(lock_dir: PathBuf) -> Self {
+        Self {
+            lock_dir,
+            poll_interval: std::time::Duration::from_millis(200),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl HeavyJobLookup for DiskHeavyJobLookup {
+    async fn await_outcome(&self, job_id: Uuid) -> serde_json::Value {
+        let path = heavy_work::job_path(&self.lock_dir, job_id);
+        loop {
+            if let Ok(job) = heavy_work::read_job(&path) {
+                if matches!(
+                    job.state,
+                    JobState::Done | JobState::Cancelled | JobState::Abandoned
+                ) {
+                    let all_passed = job.passed.unwrap_or(false);
+                    return serde_json::json!({
+                        "all_passed": all_passed,
+                        "check_results": [],
+                        "failure_summary": if all_passed {
+                            String::new()
+                        } else {
+                            "heavy-work job did not report success".to_string()
+                        },
+                        "test_depth": serde_json::Value::Null,
+                        "check_source": serde_json::Value::Null,
+                        "excluded_checks": serde_json::Value::Array(Vec::new()),
+                        "heavy_work": {
+                            "mode": "enabled",
+                            "job_id": job_id.to_string(),
+                            "state": format!("{:?}", job.state).to_lowercase(),
+                        },
+                    });
+                }
+            }
+            tokio::time::sleep(self.poll_interval).await;
+        }
+    }
+
+    async fn cancel_if_queued(&self, job_id: Uuid) {
+        let path = heavy_work::job_path(&self.lock_dir, job_id);
+        if let Ok(mut job) = heavy_work::read_job(&path) {
+            if job.state == JobState::Queued {
+                job.state = JobState::Cancelled;
+                job.finished_at = Some(chrono::Utc::now());
+                let _ = heavy_work::write_job(&self.lock_dir, &job);
+            }
+        }
+    }
+}
+
+/// Resolves this process's heavy-work lock directory the same way
+/// `crate::http::get_heavy_work` does (`brain_root::resolve_brain_root` then
+/// `coord::resolve_lock_dir`), falling back to `.` on a resolution failure —
+/// harmless when it happens, since [`queue_park::drive`] only ever touches
+/// the returned lookup for a REAL `HeavyWorkQueue` suspension, which cannot
+/// occur unless `brain.toml`'s `[heavy_work]` table (and therefore a
+/// resolvable brain root) is already configured.
+fn heavy_work_lookup_for_this_process() -> Arc<dyn HeavyJobLookup> {
+    let lock_dir = match engine_core::brain_root::resolve_brain_root() {
+        Ok(brain_root) => engine_core::coord::resolve_lock_dir(&brain_root),
+        Err(_) => PathBuf::from("."),
+    };
+    Arc::new(DiskHeavyJobLookup::new(lock_dir))
+}
 
 /// A suspended run's rehydration payload — everything a resume needs to
 /// rebuild the `Workflow` and continue the walk from `snapshot`'s recorded
@@ -539,6 +623,15 @@ pub(crate) fn spawn_run(spawned: SpawnedRun) {
         let on_progress: engine_core::OnProgress<'static> =
             Box::new(move |snapshot| fanout(snapshot));
 
+        // Cloned before `token` is moved into `options` below (`EN.17.J`
+        // task 6): `queue_park::drive`'s own `cancel` parameter is a
+        // separate `&CancellationToken` argument, not read out of
+        // `RunOptions` -- both must observe the SAME token so `POST
+        // /events/{run_id}/abort` can end a queue-parked run via `drive`'s
+        // own cancellation branch, exactly as it already ends a normal
+        // in-flight node via `RunOptions.cancellation_token`.
+        let cancel_for_drive = token.clone();
+
         let options = engine_core::RunOptions {
             cancellation_token: Some(token),
             budget: Some(budget),
@@ -567,16 +660,48 @@ pub(crate) fn spawn_run(spawned: SpawnedRun) {
         // task before reaching the cleanup below, leaking the run in
         // `live_run_metadata()`/`RunRegistry` forever and leaving any SSE
         // subscriber hanging with no terminal frame.
+        //
+        // `EN.17.J` task 6: both `RunStart::Fresh`/`Resume` variants are
+        // driven through `queue_park::drive` rather than
+        // `workflow.run_with`/`run_from` directly. `drive` is a strict
+        // superset of calling either directly (its own module docs) — a run
+        // whose test stage never queue-parks (the `Inline` default, or a
+        // degraded/disabled queue) behaves EXACTLY as before this task. A
+        // run whose test stage DOES queue-park is driven through the whole
+        // park -> await job -> inject result -> resume loop INSIDE this one
+        // `drive` call, so this function's own suspended-index branch below
+        // never sees an intermediate `HeavyWorkQueue` suspension at all --
+        // the run is never inserted into `SuspendedIndex` for that reason,
+        // only its own awaited future is what is parked.
+        let heavy_work = heavy_work_lookup_for_this_process();
         let run_result = match start {
             RunStart::Fresh(event) => {
-                std::panic::AssertUnwindSafe(workflow.run_with(event, on_progress, options))
-                    .catch_unwind()
-                    .await
+                std::panic::AssertUnwindSafe(queue_park::drive(
+                    &workflow,
+                    QueueParkRunStart::Fresh {
+                        event,
+                        on_progress,
+                        options,
+                        heavy_work,
+                    },
+                    &cancel_for_drive,
+                ))
+                .catch_unwind()
+                .await
             }
             RunStart::Resume(state) => {
-                std::panic::AssertUnwindSafe(workflow.run_from(state, on_progress, options))
-                    .catch_unwind()
-                    .await
+                std::panic::AssertUnwindSafe(queue_park::drive(
+                    &workflow,
+                    QueueParkRunStart::Resume {
+                        state,
+                        on_progress,
+                        options,
+                        heavy_work,
+                    },
+                    &cancel_for_drive,
+                ))
+                .catch_unwind()
+                .await
             }
         };
 
@@ -613,7 +738,23 @@ pub(crate) fn spawn_run(spawned: SpawnedRun) {
         };
 
         let updated_at = Utc::now();
-        let suspended = engine_core::suspend::is_suspended(&final_ctx.metadata);
+        // `EN.17.J` task 6: `queue_park::drive`'s own cancellation branch
+        // stamps the crate's ordinary `cancellation` marker but deliberately
+        // never clears the (still-parked) `suspension` marker it inherited
+        // -- "drive never pretends the walk un-parked itself" (see
+        // `queue_park::drive`'s own module tests). A cancelled-while-queued
+        // run is therefore terminal (`derive_terminal_status` reads
+        // `cancellation` first, before `suspension`), never a genuine
+        // suspended exit -- checked here explicitly so this branch and
+        // `derive_terminal_status` never disagree about which one it is.
+        let cancelled_terminal = final_ctx
+            .metadata
+            .get("cancellation")
+            .and_then(|v| v.get("cancelled"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let suspended =
+            engine_core::suspend::is_suspended(&final_ctx.metadata) && !cancelled_terminal;
 
         // EN.6.J task 5: a failed walk (not a suspended exit -- that run is
         // not over) leaves a terminal `"blocked"` status in the flow's
@@ -1238,6 +1379,175 @@ mod tests {
             .unwrap_or_else(|e| e.into_inner());
         let run_id = Uuid::new_v4();
         assert!(remove_suspended(run_id).is_none());
+    }
+
+    // -- queue-park wiring (`EN.17.J` task 6) -------------------------------
+
+    mod queue_park_wiring {
+        use engine_core::coord::heavy_work::{write_job, HeavyWorkJob, JobState};
+        use engine_core::schema::{NodeConfig, WorkflowSchema};
+        use engine_core::{Budget, Node, NodeError, NodeRegistry, PauseSignal};
+
+        use super::*;
+
+        /// Mirrors `queue_park`'s own `RequestHeavyWorkQueueNode` test node:
+        /// stamps `metadata.heavy_work` and requests a `HeavyWorkQueue`
+        /// suspension against a FIXED job id, so this test can pre-write
+        /// that exact job's record to a tempdir before spawning the run.
+        struct RequestHeavyWorkQueueNode {
+            job_id: Uuid,
+        }
+
+        #[async_trait::async_trait]
+        impl Node for RequestHeavyWorkQueueNode {
+            async fn process(&self, mut ctx: TaskContext) -> Result<TaskContext, NodeError> {
+                ctx.metadata["heavy_work"] = serde_json::json!({
+                    "job_id": self.job_id.to_string(),
+                    "class": "test",
+                    "state": "queued",
+                });
+                engine_core::suspend::request_suspension_with_reason(
+                    &mut ctx.metadata,
+                    engine_core::suspend::SuspendReason::HeavyWorkQueue,
+                );
+                Ok(ctx)
+            }
+
+            fn name(&self) -> &str {
+                "RequestHeavyWorkQueueNode"
+            }
+        }
+
+        struct SuccessNode;
+
+        #[async_trait::async_trait]
+        impl Node for SuccessNode {
+            async fn process(&self, mut ctx: TaskContext) -> Result<TaskContext, NodeError> {
+                ctx.nodes
+                    .insert(self.name().to_string(), serde_json::json!({ "ran": true }));
+                Ok(ctx)
+            }
+
+            fn name(&self) -> &str {
+                "SuccessNode"
+            }
+        }
+
+        fn heavy_work_workflow(job_id: Uuid) -> Workflow {
+            let mut registry = NodeRegistry::new();
+            registry.register(Box::new(RequestHeavyWorkQueueNode { job_id }));
+            registry.register(Box::new(SuccessNode));
+
+            let mut nodes = StdHashMap::new();
+            nodes.insert(
+                "RequestHeavyWorkQueueNode".to_string(),
+                NodeConfig::new("RequestHeavyWorkQueueNode", vec!["SuccessNode".to_string()]),
+            );
+            nodes.insert(
+                "SuccessNode".to_string(),
+                NodeConfig::new("SuccessNode", vec![]),
+            );
+            let schema =
+                WorkflowSchema::new("queue-park-fixture", "RequestHeavyWorkQueueNode", nodes);
+            Workflow::new(registry, schema)
+        }
+
+        /// `spawn_run` drives a queue-parked test job all the way to
+        /// completion via `queue_park::drive` (task 6's own wiring): the run
+        /// never appears in `list_suspended()` at any point — it is never
+        /// inserted into `SuspendedIndex` for a `HeavyWorkQueue` reason,
+        /// only its own awaited future is what is parked — and its
+        /// readback goes cleanly terminal once the pre-written `Done` job
+        /// resolves.
+        #[actix_web::test]
+        async fn spawn_run_drives_a_queue_parked_run_to_completion_never_appearing_suspended() {
+            let _guard = registry_test_lock()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+
+            let dir = tempfile::tempdir().unwrap();
+            // `coord::resolve_lock_dir` prefers `FLEET_LOCK_DIR` over any
+            // brain-root walk -- pointing it straight at this tempdir is
+            // what makes `heavy_work_lookup_for_this_process` find the job
+            // below without needing a real `brain.toml`/cwd dance.
+            std::env::set_var("FLEET_LOCK_DIR", dir.path());
+
+            let job_id = Uuid::new_v4();
+            write_job(
+                dir.path(),
+                &HeavyWorkJob {
+                    job_id,
+                    class: "test".to_string(),
+                    state: JobState::Done,
+                    repo: "repo-a".to_string(),
+                    cwd: std::path::PathBuf::from("."),
+                    commands: vec!["true".to_string()],
+                    run_id: None,
+                    holder_pid: None,
+                    enqueued_at: Utc::now(),
+                    admitted_at: None,
+                    heartbeat_at: None,
+                    finished_at: Some(Utc::now()),
+                    passed: Some(true),
+                },
+            )
+            .expect("write_job should succeed under a tempdir");
+
+            let run_id = Uuid::new_v4();
+            let live = LiveStateStore::new();
+            let workflow = heavy_work_workflow(job_id);
+            let spawned = SpawnedRun {
+                run_id,
+                workflow,
+                workflow_type: "queue-park-fixture".to_string(),
+                data: serde_json::json!({}),
+                created_at: Utc::now(),
+                start: RunStart::Fresh(serde_json::json!({})),
+                live: live.clone(),
+                durable: crate::durable::spawn_durable_writer(None),
+                runs: RunRegistry::new(),
+                campaigns: CampaignRegistry::new(),
+                token: engine_core::CancellationToken::new(),
+                pause: PauseSignal::new(),
+                budget: Budget::default(),
+            };
+
+            spawn_run(spawned);
+
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                if let Some(record) = live.get_record(run_id) {
+                    if record.terminal {
+                        break;
+                    }
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "run never went terminal"
+                );
+                // While waiting, this run must never appear in the
+                // suspended index -- it is never inserted for a
+                // `HeavyWorkQueue` reason.
+                assert!(
+                    !list_suspended().into_iter().any(|(id, _)| id == run_id),
+                    "a queue-parked run must never be inserted into the suspended index"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+
+            let record = live.get_record(run_id).expect("run should be terminal");
+            assert_eq!(
+                record.snapshot.metadata["completion"]["status"],
+                serde_json::json!("succeeded")
+            );
+            assert!(record.snapshot.nodes.contains_key("SuccessNode"));
+            assert!(
+                !list_suspended().into_iter().any(|(id, _)| id == run_id),
+                "must never have appeared in the suspended index at any point"
+            );
+
+            std::env::remove_var("FLEET_LOCK_DIR");
+        }
     }
 
     // -- ORCHESTRATION abort/progress wiring (EN.ticket.orchestration-abort-and-progress task 4) --
