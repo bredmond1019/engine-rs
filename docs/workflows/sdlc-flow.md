@@ -454,6 +454,42 @@ vault. If you were relying on a bare re-POST silently continuing a run, add `"re
 > Not to be confused with **`POST /events/{id}/resume`**, the suspend/resume index — a different
 > mechanism entirely (resuming a *suspended* engine run by its event id), unrelated to this field.
 
+## Test stage under `test_dispatch: queue_park` (`EN.17.J`)
+
+`sdlc.policy.test_dispatch` (built-in default `inline`) selects how `TestTaskNode` dispatches its
+selected per-task checks. Everything documented elsewhere in this file — the write-verification
+guard, `test_depth`'s check-suite depth, the baseline-diff snapshot — is unchanged by this knob;
+only *how the check run itself is awaited* differs:
+
+- **`inline`** (default) — `TestTaskNode` runs the selected checks synchronously in-process, exactly
+  as documented above, and the walk never suspends for this reason.
+- **`queue_park`** — `TestTaskNode` instead submits the checks to the `EN.17.I` heavy-work queue
+  without awaiting them, stamps `ctx.metadata.heavy_work = {job_id, class: "test", state:
+  "queued"}`, and requests a walk suspension with `reason: heavy_work_queue`. `Workflow::walk`
+  finalizes it with `resume_at: TriageTaskNode` — the same node the inline path already routes to
+  on completion — and the walk stops at that boundary. The queued job's eventual completion is
+  injected back in and the walk resumed at `TriageTaskNode` by
+  `engine_core::workflows::queue_park::drive`, not by this file's node graph — see
+  [suspend-resume.md](../suspend-resume.md#the-queue_parkdrive-loop) for that loop and
+  [heavy-work-queue.md](../heavy-work-queue.md#the-parking-consumer-en17j-and-the-metadataheavy_work-marker)
+  for the marker shape. `TriageTaskNode` itself reads the injected result exactly as it would an
+  inline one — it has no branch on `test_dispatch` — so the retry-N-vs-implement-N+1 routing
+  described elsewhere in this doc is identical either way.
+
+Two things this repo's own `planning/harness.json` gets right about scope, both worth restating
+here rather than only in the JSON's own `_comment`:
+
+- **`queue_park` only actually parks a walk when the enclosing caller drives it through
+  `queue_park::drive`.** `engine-serve`'s `spawn_run` and an `ORCHESTRATION` child's
+  `default_flow_runner` both do; a caller that still calls `Workflow::run_with`/`run_from` directly
+  would be handed a suspended ctx it does not know to un-park. This repo's `harness.json` sets
+  `test_dispatch: queue_park` on the strength of both its own callers already doing so.
+- **The knob alone is not sufficient to make a real run park** — `TestTaskNode`'s
+  `queue_park_active` gate also requires the node's own `HeavyWorkQueue` to be enabled (a
+  `with_heavy_work` call at graph-registration time, which `sdlc_flow::graph` does not yet make).
+  See [heavy-work-queue.md](../heavy-work-queue.md)'s "What this queue does not gate" section for
+  the current wiring gap.
+
 ## Inspecting a stalled or crashed run, and resuming
 
 Since `SaveStateNode` writes `sdlc-flow-state.json` once per **completed** task-loop iteration (not

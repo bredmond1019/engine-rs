@@ -516,13 +516,7 @@ impl Workflow {
             // normally below).
             if suspend::suspension_requested(&ctx.metadata) && current.is_some() {
                 let reason = suspend::requested_reason(&ctx.metadata);
-                self.finish_suspended(
-                    &mut ctx,
-                    current.clone(),
-                    reason,
-                    Some(&identity),
-                    &ledger,
-                );
+                self.finish_suspended(&mut ctx, current.clone(), reason, Some(&identity), &ledger);
                 stamp_run_telemetry(&mut ctx, &self.schema.start_node);
                 on_progress(&ctx);
                 return Ok(ctx);

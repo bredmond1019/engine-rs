@@ -2392,7 +2392,11 @@ impl Node for TestTaskNode {
             // exactly.
             let queue_park_active = matches!(policy.test_dispatch, TestDispatch::QueuePark)
                 && self.heavy_work.config().enabled
-                && self.heavy_work.config().class(&heavy_work_spec.class).is_some();
+                && self
+                    .heavy_work
+                    .config()
+                    .class(&heavy_work_spec.class)
+                    .is_some();
 
             if queue_park_active {
                 // This id is minted here, not read back from the queue's own
@@ -10442,7 +10446,10 @@ pub(crate) mod tests {
 
         assert_eq!(*recorded.lock().unwrap(), vec!["cargo fmt --check"]);
         assert_eq!(out.nodes["TestTaskNode"]["all_passed"], json!(true));
-        assert_eq!(out.nodes["TestTaskNode"]["heavy_work"]["degraded"], json!(true));
+        assert_eq!(
+            out.nodes["TestTaskNode"]["heavy_work"]["degraded"],
+            json!(true)
+        );
         assert!(!suspend::suspension_requested(&out.metadata));
     }
 

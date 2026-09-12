@@ -859,10 +859,7 @@ pub fn default_flow_runner_with_heavy_work(
         let registry = registry.clone();
         let heavy_work = heavy_work.clone();
         Box::pin(async move {
-            let cancel = invocation
-                .cancellation_token
-                .clone()
-                .unwrap_or_default();
+            let cancel = invocation.cancellation_token.clone().unwrap_or_default();
             match invocation.engine {
                 EngineKind::Flow => {
                     let event = sdlc_flow_event(&invocation);

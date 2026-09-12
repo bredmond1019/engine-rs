@@ -307,7 +307,10 @@ mod tests {
                 "class": "test",
                 "state": "queued",
             });
-            suspend::request_suspension_with_reason(&mut ctx.metadata, SuspendReason::HeavyWorkQueue);
+            suspend::request_suspension_with_reason(
+                &mut ctx.metadata,
+                SuspendReason::HeavyWorkQueue,
+            );
             Ok(ctx)
         }
 
@@ -344,7 +347,10 @@ mod tests {
             "RequestOperatorPauseNode".to_string(),
             NodeConfig::new("RequestOperatorPauseNode", vec!["SuccessNode".to_string()]),
         );
-        nodes.insert("SuccessNode".to_string(), NodeConfig::new("SuccessNode", vec![]));
+        nodes.insert(
+            "SuccessNode".to_string(),
+            NodeConfig::new("SuccessNode", vec![]),
+        );
         let schema = WorkflowSchema::new("linear", "RequestOperatorPauseNode", nodes);
         Workflow::new(registry, schema)
     }
@@ -359,7 +365,10 @@ mod tests {
             "RequestHeavyWorkQueueNode".to_string(),
             NodeConfig::new("RequestHeavyWorkQueueNode", vec!["SuccessNode".to_string()]),
         );
-        nodes.insert("SuccessNode".to_string(), NodeConfig::new("SuccessNode", vec![]));
+        nodes.insert(
+            "SuccessNode".to_string(),
+            NodeConfig::new("SuccessNode", vec![]),
+        );
         let schema = WorkflowSchema::new("linear", "RequestHeavyWorkQueueNode", nodes);
         Workflow::new(registry, schema)
     }
@@ -415,7 +424,10 @@ mod tests {
     impl HeavyJobLookup for StubQueue {
         async fn await_outcome(&self, job_id: Uuid) -> serde_json::Value {
             self.await_calls.fetch_add(1, Ordering::SeqCst);
-            assert_eq!(job_id, self.job_id, "must look up the id drive read from ctx.metadata");
+            assert_eq!(
+                job_id, self.job_id,
+                "must look up the id drive read from ctx.metadata"
+            );
             self.outcome_ready.notified().await;
             self.resolved.store(true, Ordering::SeqCst);
             self.outcome.clone()
@@ -465,7 +477,10 @@ mod tests {
                 struct RequestPlainSuspendNode;
                 #[async_trait::async_trait]
                 impl Node for RequestPlainSuspendNode {
-                    async fn process(&self, mut ctx: TaskContext) -> Result<TaskContext, NodeError> {
+                    async fn process(
+                        &self,
+                        mut ctx: TaskContext,
+                    ) -> Result<TaskContext, NodeError> {
                         suspend::request_suspension(&mut ctx.metadata);
                         Ok(ctx)
                     }
@@ -480,7 +495,10 @@ mod tests {
                     "RequestPlainSuspendNode".to_string(),
                     NodeConfig::new("RequestPlainSuspendNode", vec!["SuccessNode".to_string()]),
                 );
-                nodes.insert("SuccessNode".to_string(), NodeConfig::new("SuccessNode", vec![]));
+                nodes.insert(
+                    "SuccessNode".to_string(),
+                    NodeConfig::new("SuccessNode", vec![]),
+                );
                 let schema = WorkflowSchema::new("linear", "RequestPlainSuspendNode", nodes);
                 let plain_workflow = Workflow::new(registry, schema);
                 let direct_ctx = plain_workflow
@@ -588,7 +606,10 @@ mod tests {
             suspension.map(|s| s.suspended).unwrap_or(false) == false,
             "walk must no longer be suspended once resumed to completion"
         );
-        assert!(ctx.nodes.contains_key("SuccessNode"), "SuccessNode must have run after resume");
+        assert!(
+            ctx.nodes.contains_key("SuccessNode"),
+            "SuccessNode must have run after resume"
+        );
 
         // The job's outcome was injected under the SAME key `TestTaskNode`'s
         // own inline output uses.
@@ -694,12 +715,18 @@ mod tests {
         registry.register(Box::new(SuccessNode));
 
         let mut nodes = HashMap::new();
-        nodes.insert("ParkA".to_string(), NodeConfig::new("ParkA", vec!["ParkB".to_string()]));
+        nodes.insert(
+            "ParkA".to_string(),
+            NodeConfig::new("ParkA", vec!["ParkB".to_string()]),
+        );
         nodes.insert(
             "ParkB".to_string(),
             NodeConfig::new("ParkB", vec!["SuccessNode".to_string()]),
         );
-        nodes.insert("SuccessNode".to_string(), NodeConfig::new("SuccessNode", vec![]));
+        nodes.insert(
+            "SuccessNode".to_string(),
+            NodeConfig::new("SuccessNode", vec![]),
+        );
         let schema = WorkflowSchema::new("linear", "ParkA", nodes);
         let workflow = Workflow::new(registry, schema);
 
