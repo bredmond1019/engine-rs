@@ -171,6 +171,48 @@ Both, plus the four-layer precedence that decides which setting actually wins, a
 [policy-and-profiles.md](policy-and-profiles.md). SDLC_FLOW's own knobs are in
 [sdlc-flow-policy.md](sdlc-flow-policy.md).
 
+### `agent_backend` — which coding agent SDLC_TASK's implement stage drives
+
+`SDLC_TASK`'s implement stage (`ImplementTaskNode`) is driven by one of two backends, chosen by the
+`agent_backend` knob on `SdlcTaskPolicy` (per-run `policy` override > named `profile` bundle >
+`planning/harness.json`'s `sdlc_task.policy`/`sdlc_task.profiles` defaults > the built-in default):
+
+| Value | What runs | Cost |
+|---|---|---|
+| `claude_cli` (default) | The `claude` CLI, as every SDLC_TASK run has always used. | Billed, reported exactly as before. |
+| `pi` | `pi_agent_rust` (`crates/engine-core/src/nodes/pi_transport.rs`'s `PiTransport`) against a local Ollama model, read from the resolved policy's existing `local.{endpoint, model}` block — `pi` introduces no separate model/endpoint knob of its own. | $0 in principle, but reported as **cost unknown**, never a silent `$0.00` — see below. |
+
+`agent_backend` is present and set to `claude_cli` in `sdlc_task.policy` and all three
+`sdlc_task.profiles` bundles in `planning/harness.json`, next to an `_agent_backend_comment`
+restating the safety boundary below; every run that never sets it dispatches exactly as before.
+
+**Cost honesty.** A `pi` invocation can report tokens with no dollar figure at all. Rather than
+writing that as an indistinguishable `cost_usd: 0.0`, the engine tracks it as *unknown* on both
+channels that record spend: the node's `ctx.nodes` result omits `cost_usd` entirely (flagging
+`BudgetLedger`'s unknown-cost step), and the run's Claude-session ledger entry
+(`metadata.claude_sessions[]`, [data-contract.md](../data-contract.md)) records `cost_known: false`.
+`RunTelemetry` surfaces a count of unknown-cost invocations alongside the dollar total, so a run
+that mixed `pi` and `claude_cli` work reports a visibly incomplete total rather than one that
+understates spend without saying so.
+
+**A `pi` reply is not required to be schema-parseable JSON.** Only the `claude` CLI enforces
+`Config.json_schema`; `pi --mode json` is an event stream, not a schema-constrained answer. A `pi`
+run that edits the right files and replies in prose is a SUCCESS, not a parse failure — for a
+non-`claude_cli` backend, `modified_files` is read from the worktree's git state instead of the
+model's self-report. The existing guard against a run that did nothing is unchanged: a task
+declaring `expects_writes` still fails write-verification if the worktree is untouched.
+
+**Safety boundary — named, accepted for a local model on the operator's own machine, not closed.**
+`PiTransport` shells to `pi` with `--approval-mode yolo`, which lets the model's own output run
+shell, file and network actions with no per-tool gate — `policy/command_floor.rs` cannot reach it
+(it scopes to `default_command_runner`, a structural gap this block does not close). The scoped git
+worktree passed as the subprocess's `current_dir` is **not containment**: it only sets where
+relative paths resolve, so the model can still write anywhere the operator's user can (the home
+directory, `~/.cargo`, the HQ vault behind the worktree's `planning/` symlink), use the operator's
+`git`/`gh` credentials, and reach the network. Never point `agent_backend: pi` at an untrusted task
+description or a cloud-hosted model without revisiting this boundary. See `pi_transport.rs`'s module
+doc for the same statement kept next to the code.
+
 ## See also
 
 - [index.md](index.md) — navigation table for this directory.
