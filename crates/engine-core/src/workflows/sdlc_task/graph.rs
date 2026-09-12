@@ -71,6 +71,7 @@ use std::sync::Arc;
 
 use crate::cancellation::CancellationToken;
 use crate::node::NodeRegistry;
+use crate::nodes::aider_meta_transport_live;
 use crate::nodes::openai_compat_transport::openai_compat_meta_transport_live;
 use crate::nodes::pi_meta_transport_live;
 use crate::schema::{NodeConfig, WorkflowSchema};
@@ -325,11 +326,14 @@ pub fn registry_for_policy_with_cancellation(
     }
 
     let pi_backend = policy.agent_backend == AgentBackend::Pi;
-    if pi_backend || token.is_some() {
+    let aider_backend = policy.agent_backend == AgentBackend::Aider;
+    if pi_backend || aider_backend || token.is_some() {
         let mut node =
             ImplementTaskNode::new().with_config(agentic_write_config("claude-sonnet-4-5"));
         if pi_backend {
             node = node.with_meta_transport(pi_meta_transport_live(policy.local.clone()));
+        } else if aider_backend {
+            node = node.with_meta_transport(aider_meta_transport_live(policy.local.clone()));
         }
         if let Some(t) = token {
             node = node.with_cancellation_token(t);

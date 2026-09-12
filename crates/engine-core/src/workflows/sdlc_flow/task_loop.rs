@@ -264,6 +264,67 @@ fn git_worktree_changed_files(runner: &CommandRunner, worktree: &Path) -> Vec<St
         .collect()
 }
 
+/// Capture the worktree's current `HEAD` commit sha via the injectable
+/// [`CommandRunner`] seam, for backends (currently only `Aider`) that
+/// auto-commit their own edits mid-call — see [`git_files_changed_since`]'s
+/// doc comment for why this is needed at all. Returns `None` on any runner
+/// failure or non-zero exit, never panics; callers treat `None` the same as
+/// "nothing changed" rather than failing the node.
+fn git_worktree_head_sha(runner: &CommandRunner, worktree: &Path) -> Option<String> {
+    let output = runner("git", &["rev-parse", "HEAD"], worktree).ok()?;
+    if output.status != 0 {
+        return None;
+    }
+    let sha = output.stdout.trim();
+    if sha.is_empty() {
+        None
+    } else {
+        Some(sha.to_string())
+    }
+}
+
+/// List every path that differs between `pre_call_sha` and the worktree's
+/// current `HEAD`, via the injectable [`CommandRunner`] seam.
+///
+/// Used by [`ImplementTaskNode`] for the `Aider` backend only: Aider
+/// auto-commits its own edits DURING the call, so by the time `process`
+/// reaches the `modified_files` branch the working tree is already clean —
+/// [`git_worktree_changed_files`]'s `git status --porcelain` would report
+/// nothing changed even on a fully successful edit. Diffing against the
+/// commit captured immediately before the call (`pre_call_sha`, from
+/// [`git_worktree_head_sha`]) instead sees exactly the commit(s) Aider made
+/// during this attempt. Degrades to an empty list — never panics — both
+/// when `pre_call_sha` is `None` (the pre-call `git rev-parse HEAD` itself
+/// failed) and when this `git diff` invocation fails, matching
+/// `git_worktree_changed_files`'s own degrade-to-"nothing changed" contract.
+fn git_files_changed_since(
+    runner: &CommandRunner,
+    worktree: &Path,
+    pre_call_sha: Option<&str>,
+) -> Vec<String> {
+    let Some(pre_call_sha) = pre_call_sha else {
+        return Vec::new();
+    };
+    let output = runner(
+        "git",
+        &["diff", "--name-only", pre_call_sha, "HEAD"],
+        worktree,
+    )
+    .unwrap_or(CommandOutput {
+        status: -1,
+        stdout: String::new(),
+        stderr: String::new(),
+    });
+
+    output
+        .stdout
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
 /// A review with more than this many distinct issues is treated as a
 /// structural failure (re-implementation is unlikely to converge) rather
 /// than a minor, fixable one. Mirrors
@@ -1378,6 +1439,20 @@ impl Node for ImplementTaskNode {
             step = step.with_cancellation_token(token);
         }
 
+        // Aider auto-commits its own edits DURING the call (see
+        // `git_files_changed_since`'s doc comment), so the working tree is
+        // already clean by the time the `modified_files` branch below runs.
+        // Capture HEAD now, before the call, ONLY for that backend —
+        // ClaudeCli/Pi never commit mid-call, so paying an extra
+        // `git rev-parse` for them would be pure waste.
+        let pre_call_sha = if policy.agent_backend == AgentBackend::Aider {
+            worktree
+                .as_deref()
+                .and_then(|worktree| git_worktree_head_sha(&self.runner, Path::new(worktree)))
+        } else {
+            None
+        };
+
         // Baseline taken immediately before the billed call, per EN.14.C —
         // any wrapper `Err` returned below this line carries whatever the
         // inner `AgentCodeStep` appended to the ledger, so a billed session
@@ -1410,14 +1485,29 @@ impl Node for ImplementTaskNode {
         // sibling unreliability even for `claude_cli`). For any other
         // backend, take `modified_files` from the worktree's actual git
         // state instead; `summary` keeps the existing text fallback
-        // regardless of backend.
-        let modified_files = if policy.agent_backend == AgentBackend::ClaudeCli {
-            parsed.modified_files
-        } else {
-            worktree
+        // regardless of backend. `Aider` gets its own branch: it
+        // auto-commits mid-call, so `git status --porcelain`
+        // (`git_worktree_changed_files`) would see a clean tree even on a
+        // successful edit — diff against the pre-call `HEAD` instead (see
+        // `git_files_changed_since`). Pi (and any future non-committing,
+        // non-claude_cli backend) falls through to the existing
+        // worktree-status derivation, unchanged.
+        let modified_files = match policy.agent_backend {
+            AgentBackend::ClaudeCli => parsed.modified_files,
+            AgentBackend::Aider => worktree
+                .as_deref()
+                .map(|worktree| {
+                    git_files_changed_since(
+                        &self.runner,
+                        Path::new(worktree),
+                        pre_call_sha.as_deref(),
+                    )
+                })
+                .unwrap_or_default(),
+            _ => worktree
                 .as_deref()
                 .map(|worktree| git_worktree_changed_files(&self.runner, Path::new(worktree)))
-                .unwrap_or_default()
+                .unwrap_or_default(),
         };
 
         let mut result = json!({
