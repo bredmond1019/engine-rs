@@ -27,11 +27,11 @@ slow-timeout = { period = "5s", terminate-after = 1 }
 # process and waits for it to touch a marker file under a wall-clock budget. Under this repo's
 # own full `--workspace --all-features` gate run, competing for CPU against ~4300 other tests
 # (and possibly other concurrent fleet lanes on the same machine — up to 4 native-build lanes
-# run at once per D66), the child can take well over the local wait budget just to get scheduled
-# — not a defect in the transport under test (it passes standalone every time; see the sibling
-# `_on_cancel` test in the same file, which has never flaked). One retry absorbs a genuine
-# scheduling-contention spike without weakening the actual assertions (timeout error text, and
-# the child was truly killed) — a real defect there fails identically on retry.
+# run at once per D66, or a `/sdlc-flow` engine's own ~20-35 concurrent subagents), the child can
+# take well over the local wait budget just to get scheduled — not a defect in the transport under
+# test (it passes standalone every time). One retry absorbs a genuine scheduling-contention spike
+# without weakening the actual assertions (timeout error text, and the child was truly killed) —
+# a real defect there fails identically on retry.
 [[profile.default.overrides]]
 filter = 'test(agent_backend_pi_transport_kills_child_on_timeout)'
 retries = 2
@@ -41,4 +41,22 @@ retries = 2
 # same fix.
 [[profile.default.overrides]]
 filter = 'test(nodes::pi_transport::tests::timeout_kills_the_child_process)'
+retries = 2
+
+# `nodes::pi_transport::tests::cancellation_kills_the_child_process` uses the identical
+# fake-child/marker-file pattern and is equally exposed to scheduling contention — added
+# 2026-09-12 (EN.16.D): a prior comment on the sibling override above claimed this test "has never
+# flaked", which stopped being true under heavy concurrent load (a `/sdlc-flow` run's own ~20-35
+# subagents twice reproduced "child never started" on this test while the identical code passed
+# cleanly every time it was run in isolation or under a normal `--workspace` gate outside that
+# engine). Same fix as its siblings.
+[[profile.default.overrides]]
+filter = 'test(cancellation_kills_the_child_process)'
+retries = 2
+
+# `agent_backend_pi_transport_kills_child_on_cancel` (`tests/it/agent_backend.rs`) is the
+# integration-test sibling of the override immediately above — same pattern, same contention
+# exposure, same fix; also observed flaking under the same heavy-concurrent-load condition.
+[[profile.default.overrides]]
+filter = 'test(agent_backend_pi_transport_kills_child_on_cancel)'
 retries = 2
