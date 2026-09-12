@@ -366,6 +366,29 @@ pub struct OrchestrationPolicy {
     /// anyway and records the failure kind; `OnUnjudged::Bail` stops the
     /// step exactly like a false load-bearing claim.
     pub preflight_on_unjudged: OnUnjudged,
+    /// `EN.17.E` Task 1: the EFFECTIVE switch — whether the boundary drain
+    /// (`super::integrate::integrate_chain_impl_inner`) acts on EDGE_RELEASED/
+    /// FINDING/QUERY at all. `false` (the built-in default) is
+    /// behaviour-stable per CLAUDE.md standing rule 6: those three message
+    /// kinds are dropped exactly as they were before this knob existed
+    /// (today's `_ => {}` drain arm). The effective switch for a real chain
+    /// lives in HQ's `planning/harness.json`
+    /// (`orchestration.policy.inbox_triage_enabled`), not in this repo's own
+    /// harness file — mirroring `preflight_enabled` above; see the block
+    /// record's `notes` field.
+    pub inbox_triage_enabled: bool,
+    /// The [`ModelTier`] the FINDING/QUERY `JudgmentNode` call runs at.
+    /// `Haiku` (the built-in default) is the cheapest tier, matching
+    /// `preflight_model_tier`'s reasoning.
+    pub inbox_triage_model_tier: ModelTier,
+    /// `Config.max_turns` forwarded to the inbox-triage `JudgmentSpec`.
+    /// `None` (the built-in default) leaves the call unbounded on turns.
+    pub inbox_triage_max_turns: Option<u32>,
+    /// The per-slice byte cap applied to the envelope's `subject`/`body` and
+    /// the chain's block-list-with-statuses excerpt before either reaches
+    /// the judgment call. `4_000` (the built-in default) matches
+    /// `preflight_slice_max_bytes`.
+    pub inbox_triage_slice_max_bytes: usize,
 }
 
 impl Default for OrchestrationPolicy {
@@ -398,6 +421,10 @@ impl Default for OrchestrationPolicy {
             preflight_programs: None,
             preflight_command_timeout_ms: 5_000,
             preflight_on_unjudged: OnUnjudged::Proceed,
+            inbox_triage_enabled: false,
+            inbox_triage_model_tier: ModelTier::Haiku,
+            inbox_triage_max_turns: None,
+            inbox_triage_slice_max_bytes: 4_000,
         }
     }
 }
@@ -434,6 +461,10 @@ pub struct PartialOrchestrationPolicy {
     pub preflight_programs: Option<Option<Vec<String>>>,
     pub preflight_command_timeout_ms: Option<u64>,
     pub preflight_on_unjudged: Option<OnUnjudged>,
+    pub inbox_triage_enabled: Option<bool>,
+    pub inbox_triage_model_tier: Option<ModelTier>,
+    pub inbox_triage_max_turns: Option<Option<u32>>,
+    pub inbox_triage_slice_max_bytes: Option<usize>,
 }
 
 impl crate::policy::Policy for OrchestrationPolicy {
@@ -512,6 +543,22 @@ impl crate::policy::Policy for OrchestrationPolicy {
                 self.preflight_on_unjudged,
                 over.preflight_on_unjudged,
             ),
+            inbox_triage_enabled: crate::policy::merge_opt(
+                self.inbox_triage_enabled,
+                over.inbox_triage_enabled,
+            ),
+            inbox_triage_model_tier: crate::policy::merge_opt(
+                self.inbox_triage_model_tier,
+                over.inbox_triage_model_tier,
+            ),
+            inbox_triage_max_turns: crate::policy::merge_opt(
+                self.inbox_triage_max_turns,
+                over.inbox_triage_max_turns,
+            ),
+            inbox_triage_slice_max_bytes: crate::policy::merge_opt(
+                self.inbox_triage_slice_max_bytes,
+                over.inbox_triage_slice_max_bytes,
+            ),
         }
     }
 }
@@ -561,6 +608,12 @@ pub fn baseline() -> PartialOrchestrationPolicy {
         preflight_programs: Some(None),
         preflight_command_timeout_ms: Some(5_000),
         preflight_on_unjudged: Some(OnUnjudged::Proceed),
+        // EN.17.E Task 1: restate all four built-in inbox-triage values
+        // verbatim — baseline's no-op contract extends to inbox triage too.
+        inbox_triage_enabled: Some(false),
+        inbox_triage_model_tier: Some(ModelTier::Haiku),
+        inbox_triage_max_turns: Some(None),
+        inbox_triage_slice_max_bytes: Some(4_000),
     }
 }
 
@@ -614,6 +667,12 @@ pub fn cheap_fast() -> PartialOrchestrationPolicy {
         // HQ-set `orchestration.policy.preflight_enabled` still governs a
         // chain naming this profile. See the block record's own `notes`
         // field (`PROFILE RULE`).
+        //
+        // EN.17.E Task 1 PROFILE RULE: the same reasoning extends to all
+        // four inbox-triage knobs — deliberately left UNSET here so an
+        // HQ-set `orchestration.policy.inbox_triage_enabled` still governs
+        // a chain naming this profile. See this block's own `notes` field
+        // (`PROFILE RULE`).
         ..Default::default()
     }
 }
@@ -652,6 +711,9 @@ pub fn thorough() -> PartialOrchestrationPolicy {
         //
         // EN.17.D Task 4 PROFILE RULE: same for all eight preflight knobs
         // — see `cheap_fast`'s own comment.
+        //
+        // EN.17.E Task 1 PROFILE RULE: same for all four inbox-triage
+        // knobs — see `cheap_fast`'s own comment.
         ..Default::default()
     }
 }
