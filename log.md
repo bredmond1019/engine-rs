@@ -5,7 +5,7 @@ description: Chronological log of work completed for engine-rs.
 doc_id: log
 layer: [factory]
 status: active
-timestamp: "2026-09-12T11:21:05Z"
+timestamp: "2026-09-12T13:52:00Z"
 keywords: [work log, session history, development log]
 related: [status, context]
 ---
@@ -15,6 +15,26 @@ related: [status, context]
 *Append-only working log. One dated entry per session. Newest entries at the top.*
 
 ## [2026-09-12]
+
+### Closed both operator gates on pluggable-code-agent-transport; filed EN.16.E; captured eval-harness idea
+
+- **What:** Closed `first-real-pi-engine-run` and `install-aider-and-capture-a-real-cli-run` via
+  real dispatches (a temp-swapped `bastion serve` tracking `EN.16.B-flow` for the pi run; a fresh
+  `uv tool install --python 3.12 aider-chat` for the aider run), unblocking `EN.16.D` and `EN.16.C`
+  to dependency-clear. Found and fixed a real `PiTransport` arg-order defect (`86ac183` on
+  `EN.16.B-flow`). A follow-up pi-vs-aider comparison then found the model's real weakness wasn't
+  general capability but Ollama tool-call format adherence (`qwen2.5-coder:7b` fails, `qwen2.5:7b-
+  instruct` doesn't) and a real `pi_agent_rust` v0.3.0 print-mode approval-bypass bug, fixed in
+  v0.5.0. Filed `EN.16.E` to move the shared `LocalConfig` default off the weaker model and
+  document the version floor. Captured a `local-model-eval-harness` idea (programmatic
+  {model}x{backend}x{task} comparison, no cloud model needed per test) as a pre-plan note +
+  backlog ticket.
+- **Why:** The operator asked to close both real-run operator gates, then asked for a direct
+  pi-vs-aider comparison on identical tasks, which surfaced that the earlier "3B model too weak"
+  verdict conflated two separable, fixable causes rather than one intrinsic limitation.
+- **Refs:** `evidence/{pi-real-engine-run,aider-real-cli-run,pi-approval-bug-fixed-in-v0.5.0}.md`
+  (HQ vault, `planning/open-work/pre-plan/pluggable-code-agent-transport/`), `EN.16.E`,
+  `local-model-eval-harness` capture note.
 
 ### `/begin-orchestration` — EN.16.B closed (pluggable-code-agent-transport), PR #90
 
