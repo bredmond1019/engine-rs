@@ -4,6 +4,12 @@
 //! `agent_code_step` (`EN.2.A`) wires the `core/claude-code-rs` SDK's async
 //! `execute()` into a `Node`, mapping its `Outcome` into `NodeRun`/`TaskContext`.
 //!
+//! `agent_outcome` (`EN.16.B` task 3) is `AgentOutcome`/`CostEstimate` — the
+//! backend-agnostic shape a non-`claude_cli` transport reports its result in
+//! — plus `translate`, the single function mapping that shape onto
+//! `(claude_code_rs::Outcome, TransportInfo)` so such a transport slots into
+//! `MetaTransport` unchanged.
+//!
 //! `openai_compat_transport` (`EN.3.C` task 5) builds a `ModelTransport` for
 //! the `local` model tier: an OpenAI-compatible HTTP transport with the same
 //! signature as `claude_code_rs::execute`, so it slots into
@@ -119,6 +125,13 @@
 //! session-naming helper plus the per-struct `session_input: InputBinding`
 //! field/builder convention the module's nodes follow.
 //!
+//! `pi_transport` (`EN.16.B` task 6) is `pi_meta_transport` — the
+//! `AgentBackend::Pi` implementation of the existing `MetaTransport` alias,
+//! shelling to `pi_agent_rust` against a local Ollama model instead of the
+//! `claude` CLI. Mirrors `openai_compat_transport`'s shape (a builder
+//! closing over a `LocalConfig`); see the module for the safety boundary on
+//! `--approval-mode yolo` and the worktree cwd NOT being containment.
+//!
 //! `judgment` (`EN.17.D` task 1) is `JudgmentNode` — a reusable, bounded,
 //! schema-constrained `claude` call: byte-capped input slices (truncated at
 //! a UTF-8 boundary, with a marker naming the slice and bytes dropped), a
@@ -132,6 +145,7 @@
 //! (`EN.17.D` task 2) is its first consumer.
 
 pub mod agent_code_step;
+pub mod agent_outcome;
 pub mod aggregate;
 pub mod brain_client;
 pub mod channel_transport;
@@ -147,10 +161,12 @@ pub mod materialize_doc;
 pub mod merge_contacts;
 pub mod openai_compat_transport;
 pub mod opportunity_edit;
+pub mod pi_transport;
 pub mod suspend;
 pub mod terminal;
 
 pub use agent_code_step::{AgentCodeStep, MetaTransport, TransportInfo};
+pub use agent_outcome::{translate as translate_agent_outcome, AgentOutcome, CostEstimate};
 pub use aggregate::AggregateNode;
 pub use brain_client::{
     http_get_live, BrainConfig, BrainConfigError, HttpGet, RecallNode, RecallResult,
@@ -180,4 +196,5 @@ pub use openai_compat_transport::{
     openai_compat_transport, openai_compat_transport_live, LocalHttpPost,
 };
 pub use opportunity_edit::{OpportunityEditNode, OpportunityEditOp};
+pub use pi_transport::{pi_meta_transport, pi_meta_transport_live};
 pub use suspend::{SuspendNode, DEFAULT_IDENTITY as SUSPEND_NODE_DEFAULT_IDENTITY};

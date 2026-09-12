@@ -66,6 +66,14 @@ pub struct RunTelemetry {
     /// stamp). Cache creation bills at ~125% of an uncached input token.
     #[serde(default)]
     pub total_cache_creation_tokens: u64,
+    /// Count of invocations, out of the session ledger (`crate::sessions::ledger_totals`), whose
+    /// cost could not be reported (`ClaudeSession::cost_known == false` — e.g. a Pi/local-model
+    /// run, `EN.16.B`). `0` for a run with no such invocations, including every run recorded
+    /// before this field existed (`#[serde(default)]`). A nonzero value is what tells a reader
+    /// [`Self::total_cost_usd`] is an UNDERCOUNT rather than the run's complete, confirmed spend —
+    /// never a run that quietly cost nothing.
+    #[serde(default)]
+    pub unknown_cost_invocations: u32,
     /// Per-stage model tier actually used this run, keyed by whatever
     /// identity the caller chooses (e.g. `SdlcPolicy::ModelTiers`' field
     /// names).
@@ -294,6 +302,14 @@ pub fn harvest(
     } else {
         total_cost_usd(ctx, inputs.cost_bearing_stages)
     };
+    // `EN.16.B` task 5: only the ledger tracks `cost_known` per invocation — the per-stage `ctx`
+    // scans below it (the fallback for a pre-ledger state, or a workflow whose cost-bearing nodes
+    // don't stamp a session at all) have no such channel, so they report `0` rather than guessing.
+    let unknown_cost_invocations = if use_ledger {
+        u32::try_from(ledger.unknown_cost_invocations).unwrap_or(u32::MAX)
+    } else {
+        0
+    };
 
     // Observed (task 9's transport stamp) overlays caller-supplied (the
     // resolved policy's intent): the caller-supplied map is the fallback
@@ -314,6 +330,7 @@ pub fn harvest(
         total_cost_usd: resolved_cost_usd,
         total_cache_read_tokens,
         total_cache_creation_tokens,
+        unknown_cost_invocations,
         model_tier_used,
     }
 }
@@ -785,6 +802,7 @@ mod tests {
             total_cost_usd: 0.02,
             total_cache_read_tokens: 40,
             total_cache_creation_tokens: 8,
+            unknown_cost_invocations: 0,
             model_tier_used: BTreeMap::from([("implement".to_string(), "sonnet".to_string())]),
         };
         let value = serde_json::to_value(&telemetry).unwrap();
@@ -802,11 +820,66 @@ mod tests {
                 "total_cost_usd": 0.02,
                 "total_cache_read_tokens": 40,
                 "total_cache_creation_tokens": 8,
+                "unknown_cost_invocations": 0,
                 "model_tier_used": { "implement": "sonnet" },
             })
         );
         let round_tripped: RunTelemetry = serde_json::from_value(value).unwrap();
         assert_eq!(round_tripped, telemetry);
+    }
+
+    /// `EN.16.B` task 5: a run whose ledger holds an unknown-cost invocation (e.g. a Pi transport
+    /// run) must have `harvest` surface that count on `RunTelemetry`, not silently drop it —
+    /// `total_cost_usd` alone cannot distinguish "nothing cost anything" from "some cost went
+    /// unreported".
+    #[test]
+    fn harvest_surfaces_the_ledgers_unknown_cost_invocation_count() {
+        let mut ctx = ctx_with(HashMap::new(), HashMap::new());
+        crate::sessions::append_session(
+            &mut ctx.metadata,
+            crate::sessions::ClaudeSession {
+                node: "ImplementTaskNode".to_string(),
+                session_id: Some("known-1".to_string()),
+                ok: true,
+                cost_usd: 1.5,
+                input_tokens: 100,
+                output_tokens: 10,
+                cache_read_input_tokens: 0,
+                cache_creation_input_tokens: 0,
+                model: "claude-sonnet-4-5".to_string(),
+                started_at: None,
+                cost_known: true,
+            },
+        );
+        crate::sessions::append_session(
+            &mut ctx.metadata,
+            crate::sessions::ClaudeSession {
+                node: "ImplementTaskNode".to_string(),
+                session_id: None,
+                ok: true,
+                cost_usd: 0.0,
+                input_tokens: 50,
+                output_tokens: 5,
+                cache_read_input_tokens: 0,
+                cache_creation_input_tokens: 0,
+                model: "qwen2.5-coder:7b".to_string(),
+                started_at: None,
+                cost_known: false,
+            },
+        );
+
+        let inputs = RunTelemetryInputs {
+            cost_bearing_stages: &["ImplementTaskNode"],
+            ..Default::default()
+        };
+        let telemetry = harvest(&ctx, Utc::now(), inputs);
+
+        assert_eq!(telemetry.total_cost_usd, 1.5);
+        assert_eq!(
+            telemetry.unknown_cost_invocations, 1,
+            "the one cost_known: false invocation must be counted, even though total_cost_usd \
+             alone reads as a plausible, complete $1.50"
+        );
     }
 
     // --- EN.14.A task 4: the two readers this block exists for -----------

@@ -64,6 +64,7 @@
 use serde::{Deserialize, Serialize};
 
 pub use crate::policy::tier::{LocalConfig, ModelTier};
+pub use crate::policy::AgentBackend;
 pub use crate::policy::PartialLocalConfig;
 use crate::policy::{merge_opt, Overlay};
 use crate::workflows::sdlc_flow::policy::SdlcPolicy;
@@ -277,6 +278,13 @@ pub struct SdlcTaskPolicy {
     /// planning-fallback path. Built-in `None` — unbounded, byte-identical
     /// to before this knob existed.
     pub generate_context_max_bytes: Option<usize>,
+    /// Which coding-agent transport `ImplementTaskNode` dispatches to
+    /// (`EN.16.B`) — `ClaudeCli` (the existing, billed transport) or `Pi`
+    /// (`pi_agent_rust` against a local model). Resolves through this
+    /// workflow's own four layers exactly like every other knob here. Not
+    /// a new model/endpoint knob: `Pi` reads the resolved policy's
+    /// existing `local.{endpoint, model}` block (standing rule 6).
+    pub agent_backend: AgentBackend,
 }
 
 impl Default for SdlcTaskPolicy {
@@ -301,6 +309,7 @@ impl Default for SdlcTaskPolicy {
             transport_retry: TransportRetry::default(),
             node_invocation_payload_cap_bytes: crate::invocations::DEFAULT_PAYLOAD_CAP_BYTES,
             generate_context_max_bytes: None,
+            agent_backend: AgentBackend::default(),
         }
     }
 }
@@ -368,6 +377,7 @@ impl SdlcTaskPolicy {
             // GenerateTasksNode`), registered and run unmodified — see this
             // module's doc comment.
             generate_context_max_bytes: self.generate_context_max_bytes,
+            agent_backend: self.agent_backend,
         }
     }
 }
@@ -399,6 +409,7 @@ pub struct PartialSdlcTaskPolicy {
     /// mirroring `sdlc_flow::policy::PartialPolicy::
     /// generate_context_max_bytes`.
     pub generate_context_max_bytes: Option<Option<usize>>,
+    pub agent_backend: Option<AgentBackend>,
 }
 
 fn merge_retry_feedback(mut base: RetryFeedback, over: &PartialRetryFeedback) -> RetryFeedback {
@@ -469,6 +480,7 @@ impl crate::policy::Policy for SdlcTaskPolicy {
                 base.generate_context_max_bytes,
                 over.generate_context_max_bytes,
             ),
+            agent_backend: merge_opt(base.agent_backend, over.agent_backend),
         }
     }
 }
@@ -739,6 +751,7 @@ mod tests {
             }),
             node_invocation_payload_cap_bytes: Some(65536),
             generate_context_max_bytes: Some(None),
+            agent_backend: Some(AgentBackend::ClaudeCli),
         };
         let value = serde_json::to_value(&full).expect("serialize PartialSdlcTaskPolicy");
         let expected: std::collections::BTreeSet<String> = value
@@ -920,6 +933,14 @@ mod tests {
         assert_ne!(
             p.to_sdlc_policy().generate_context_max_bytes,
             default_projection.generate_context_max_bytes
+        );
+
+        let mut p = default.clone();
+        p.agent_backend = AgentBackend::Pi;
+        assert_eq!(p.to_sdlc_policy().agent_backend, AgentBackend::Pi);
+        assert_ne!(
+            p.to_sdlc_policy().agent_backend,
+            default_projection.agent_backend
         );
     }
 

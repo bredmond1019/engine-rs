@@ -5,7 +5,7 @@ description: Chronological log of work completed for engine-rs.
 doc_id: log
 layer: [factory]
 status: active
-timestamp: "2026-09-11T21:18:30Z"
+timestamp: "2026-09-12T03:09:44Z"
 keywords: [work log, session history, development log]
 related: [status, context]
 ---
@@ -13,6 +13,190 @@ related: [status, context]
 # Log — engine-rs
 
 *Append-only working log. One dated entry per session. Newest entries at the top.*
+
+## [run: 2026-09-12]
+
+### `/sdlc-flow EN.16.B` wrap-up — PASS
+
+Full spec is done. `/sdlc-flow` on branch `EN.16.B-flow` (worktree), all 10 tasks passed with
+confirmed work assertions, PASS review. Implemented across tasks: `AgentBackend { ClaudeCli, Pi }`
+plumbed through `SdlcTaskPolicy`'s four-layer resolution and `SdlcPolicy`'s pass-through projection
+(task 1); additive `TransportInfo.backend`/`cost_known` fields on the existing `MetaTransport` seam
+(task 2); `AgentOutcome`/`CostEstimate` and a single `translate()` to `(Outcome, TransportInfo)`
+(task 3); cost-honesty on both channels — `AgentCodeStep` omits `cost_usd` (never a silent $0.0) and
+`BudgetLedger::has_unknown_cost_node` when unknown (task 4); `ClaudeSession.cost_known` plus
+ledger/`RunTelemetry` unknown-cost surfacing (task 5); `PiTransport` — a real `MetaTransport` shelling
+to `pi_agent_rust` against local Ollama, with timeout/cancellation kill-on-drop and a parser built
+from a real capture fixture (task 6); `ImplementTaskNode.with_meta_transport` plus git-status-derived
+`modified_files` for non-`claude_cli` backends (task 7); Pi dispatch wired on both SDLC_TASK
+registration paths, closing the token:None gap (task 8); an 11-test `agent_backend.rs` integration
+suite (task 9); docs (task 10). Notable decision: a prior AC10 regex (`"qwen|llama|ollama_chat/"`)
+was unsatisfiable as written — it substring-matched the required `ollama`/`OLLAMA_HOST` literals the
+block's own other ACs require present — and was corrected to a backslash-free character class that
+no longer self-triggers; re-review then returned PASS (this spec had bailed MAJOR twice on the
+identical defect across the prior two wrap-up attempts, visible in the branch's own commit history).
+Full gate green. Closes `EN.16.B`. Next: `EN.16.D` — Pi backend in SDLC_FLOW, with the backend
+attributed in run telemetry.
+
+```
+c347009 docs: update docs for EN.16.B
+2b5c87c fix: replace fragile \b AC10 escape with a backslash-free character class
+0a32ab1 chore: wrap up EN.16.B
+a1dedc1 fix: rephrase pi_transport.rs's AC10 comment to not self-trigger the check
+b888b8d chore: wrap up EN.16.B
+587489e fix: fix pass 1 for EN.16.B-task10
+a52e74c fix: unblock EN.16.B task 10's gate — worktree path resolution, timing flakes, baseline drift
+09f52a2 chore: wrap up EN.16.B
+```
+
+## [run: 2026-09-12 — earlier attempt, superseded]
+
+### `/sdlc-flow EN.16.B` wrap-up (2nd attempt) — PARTIAL (review-verdict bail persists after AC-comment fix)
+
+All 10 tasks (1-10) confirmed passed with confirmed work assertions, unchanged from the prior
+wrap-up: `AgentBackend { ClaudeCli, Pi }` plumbed through `SdlcTaskPolicy`'s four-layer resolution
+(task 1); `TransportInfo`'s additive `backend`/`cost_known` fields (task 2); `AgentOutcome`/
+`CostEstimate` and `translate()` (task 3); cost-omission-when-unknown on `AgentCodeStep` plus
+`BudgetLedger::has_unknown_cost_node` (task 4); `ClaudeSession.cost_known` and ledger/telemetry
+unknown-cost surfacing (task 5); `PiTransport` — a real `MetaTransport` shelling to
+`pi_agent_rust` against local Ollama, with timeout/cancellation kill-on-drop and a real-capture
+JSON parser (task 6); `ImplementTaskNode`'s `with_meta_transport` plus git-status-derived
+`modified_files` for non-`claude_cli` backends (task 7); Pi dispatch wired on both SDLC_TASK
+registration paths (task 8); the 11-test `agent_backend.rs` integration suite (task 9); docs
+(task 10). Between the prior wrap-up (commit `b888b8d`) and this run, one further fix commit
+(`a1dedc1`) rephrased `pi_transport.rs`'s AC10-adjacent comment text to avoid self-triggering the
+`rg -n '"qwen|llama|ollama_chat/'` check — but this does not and cannot fix the underlying defect:
+the AC regex's `llama` alternative substring-matches inside the required, spec-mandated literals
+`ollama`/`OLLAMA_HOST` that the file must contain (`--provider ollama`, `OLLAMA_HOST` env var), so
+`rg -n '"qwen|llama|ollama_chat/' pi_transport.rs` still exits 0 (matches on lines 8, 10, 11, 13,
+18, 148, 160, 161, 234, 639, 641 — all `ollama`/`OLLAMA_HOST` occurrences, no hardcoded model name).
+The run's end review returned **PARTIAL and bailed again, on the identical defect**: the AC as
+written can never pass while the block's own other ACs require those literals present. The
+underlying intent (no hardcoded model name; model always read from the resolved policy's
+`local.model`) is independently verified satisfied at `pi_transport.rs:150`
+(`.arg(&local.model)`). This is the second bail on the same root cause — a corrected AC regex
+(e.g. word-boundary or an explicit exclusion for the `ollama` provider name) needs to come from a
+human, not another implementation or comment-rephrasing attempt. Next: get the AC regex corrected
+by a human, then close `EN.16.B`.
+
+```
+a1dedc1 fix: rephrase pi_transport.rs's AC10 comment to not self-trigger the check
+b888b8d chore: wrap up EN.16.B
+587489e fix: fix pass 1 for EN.16.B-task10
+a52e74c fix: unblock EN.16.B task 10's gate — worktree path resolution, timing flakes, baseline drift
+09f52a2 chore: wrap up EN.16.B
+514d27d feat: implement EN.16.B-task10
+bc78604 feat: implement EN.16.B-task9
+6255502 feat: implement EN.16.B-task8
+```
+
+### `/sdlc-flow EN.16.B` wrap-up — PARTIAL (review-verdict bail, AC regex self-contradictory)
+
+All 10 tasks passed with confirmed work assertions: the `AgentBackend { ClaudeCli, Pi }` knob
+plumbed through `SdlcTaskPolicy`'s four-layer resolution and `SdlcPolicy`'s projection (task 1);
+`TransportInfo` gained additive `backend`/`cost_known` fields across every existing transport
+literal (task 2); `AgentOutcome`/`CostEstimate` plus the single `translate()` to `(Outcome,
+TransportInfo)` (task 3); `AgentCodeStep` omits `cost_usd` (rather than writing `0.0`) when cost
+is unknown, and `BudgetLedger` gained `has_unknown_cost_node` (task 4); `ClaudeSession.cost_known`
+plus `ledger_totals`/`RunTelemetry` surfacing an unknown-cost-invocation count (task 5);
+`PiTransport` — a real `MetaTransport` shelling to `pi_agent_rust` against local Ollama, with
+timeout + cancellation kill-on-drop, a `--mode json` parser built from a real capture fixture, and
+exit-3-vs-ordinary-failure handling (task 6); `ImplementTaskNode` gained `with_meta_transport` and
+derives `modified_files` from git-status for any non-`claude_cli` backend (task 7); Pi dispatch
+wired on both `registry_for_policy_with_cancellation` registration paths, including the
+previously-silent `token: None` path (task 8); the 11-test `agent_backend.rs` integration suite
+proving Pi dispatch, subprocess lifecycle, the real-capture parse, and the cost-honesty chain end
+to end (task 9); docs (`data-contract.md`, `docs/workflows/README.md`) plus a note on the
+pi_transport timeout test's known CPU-contention flake (task 10). The run's end review returned
+**PARTIAL and bailed**: the block's own acceptance-criterion regex (`rg -n '"qwen|llama|ollama_chat/'
+pi_transport.rs` must exit 1) is self-contradictory — it forbids any match of `llama`, but the
+block's own required literal `--provider ollama` / `OLLAMA_HOST` necessarily contains `llama` as a
+substring, so the check can never pass regardless of implementation. The underlying intent (no
+hardcoded model name; the model is always read from the resolved policy's `local.model`) is
+independently verified satisfied at `pi_transport.rs:150`. This is a defect in the AC's own regex,
+not in the implementation, and was flagged by the implementing agent itself in task 6's decisions
+log. Next: correct the AC regex (e.g. a word-boundary match or an explicit exclusion for the
+`ollama` provider name) so the block can close; no code change is expected to be needed.
+
+```
+587489e fix: fix pass 1 for EN.16.B-task10
+a52e74c fix: unblock EN.16.B task 10's gate — worktree path resolution, timing flakes, baseline drift
+09f52a2 chore: wrap up EN.16.B
+514d27d feat: implement EN.16.B-task10
+bc78604 feat: implement EN.16.B-task9
+6255502 feat: implement EN.16.B-task8
+e17c4b1 feat: implement EN.16.B-task7
+93fe176 feat: implement EN.16.B-task6
+```
+
+### `/sdlc-flow EN.16.B` — BAILED after task 10 (docs-only), 9 of 10 tasks passed
+
+- **What:** Ran `/sdlc-flow EN.16.B` on branch `EN.16.B-flow` in a worktree. Tasks 1-9 all passed
+  with confirmed work assertions: the `AgentBackend { ClaudeCli, Pi }` knob plumbed through
+  `SdlcTaskPolicy`'s four-layer resolution and `SdlcPolicy`'s projection (task 1); `TransportInfo`
+  gained additive `backend`/`cost_known` fields across every existing transport literal (task 2);
+  `AgentOutcome`/`CostEstimate` plus the single `translate()` to `(Outcome, TransportInfo)` (task
+  3); `AgentCodeStep` omits `cost_usd` (rather than writing `0.0`) when cost is unknown, and
+  `BudgetLedger` gained `has_unknown_cost_node` (task 4); `ClaudeSession.cost_known` plus
+  `ledger_totals`/`RunTelemetry` surfacing an unknown-cost-invocation count (task 5); `PiTransport`
+  — a real `MetaTransport` shelling to `pi_agent_rust` against local Ollama, with timeout +
+  cancellation kill-on-drop, a `--mode json` parser built from a real capture fixture, and
+  exit-3-vs-ordinary-failure handling (task 6); `ImplementTaskNode` gained `with_meta_transport`
+  and derives `modified_files` from git-status for any non-`claude_cli` backend (task 7); Pi
+  dispatch wired on both `registry_for_policy_with_cancellation` registration paths, including the
+  previously-silent `token: None` path (task 8); the 11-test `agent_backend.rs` integration suite
+  proving Pi dispatch, subprocess lifecycle, the real-capture parse, and the cost-honesty chain
+  end to end (task 9). Task 10 (docs: `data-contract.md`, `docs/workflows/README.md`) ran but the
+  run **BAILED** rather than reaching review — see below.
+- **Why it bailed:** Two test failures surfaced at task 10's validation gate, neither a code
+  defect. `hq_orchestration_policy_real_hq_file_sets_the_switches` only fails inside this task's
+  worktree because its `harness.json` resolves to engine-rs's own copy instead of HQ's root file
+  (verified 2026-09-12: the identical test PASSES, exit 0, against the main engine-rs tree at
+  `e3bab71`). `agent_backend_pi_transport_kills_child_on_timeout` is a known CPU-contention timing
+  flake, already documented as such by task 9's own decisions. Task 10 is docs-only and cannot fix
+  either failure; retrying the same docs task would not change the outcome. The spec status stays
+  "In progress" — `planning/state.json` was left untouched this run (no flip to closed).
+- **Notable decisions:** see each task's own `decisions[]` in
+  `planning/EN.16.B/sdlc/sdlc-flow-state.json` — most notably the `PiTransport` timing-margin
+  widening in task 9's integration tests (host CPU-contention headroom, not a logic fix) and the
+  `agent_backend` field being carried on `SdlcPolicy` ahead of `SDLC_FLOW`'s own dispatch wiring
+  (EN.16.D).
+
+Next: resolve the two task-10 gate failures out of band (HQ harness.json resolution in a worktree;
+the timing-flake threshold), then resume `/sdlc-flow EN.16.B --resume` to finish task 10 and reach
+review/PR. EN.16.D (Pi backend in SDLC_FLOW) remains the next block after EN.16.B closes.
+
+```
+514d27d feat: implement EN.16.B-task10
+bc78604 feat: implement EN.16.B-task9
+6255502 feat: implement EN.16.B-task8
+e17c4b1 feat: implement EN.16.B-task7
+93fe176 feat: implement EN.16.B-task6
+0e191c3 feat: implement EN.16.B-task5
+365c462 feat: implement EN.16.B-task4
+aea0740 feat: implement EN.16.B-task3
+```
+
+### `/close-out` — EN.17.G/I/J closed this session, EN.17.E gap caught before handoff
+
+### `/close-out` — EN.17.G/I/J closed this session, EN.17.E gap caught before handoff
+
+- **What:** Ran the full `/close-out` gate suite (fmt, clippy, full-workspace test 4317/4317,
+  release build, nextest-hang, micro-spec-runner, fleet-build-wrapper, diff-scoped emoji gate over
+  `475a234...HEAD`) — all green. Coverage confirmed adequate (every changed `.rs` file already has
+  dedicated new tests). Docs audit scoped to the session's diff found one real gap:
+  `docs/workflows/sdlc-flow-policy.md`'s knob table was missing `test_dispatch`, added by
+  `EN.17.J` everywhere except that one reference table — fixed. Rewrote `planning/handoff.md` for
+  the next session.
+- **Why:** Operator asked to `/close-out` after `EN.17.J`, plus verify all four orchestration-run
+  artifacts and get a plain-English per-block summary. Re-deriving readiness for the handoff
+  (`mev blocks --startable`) caught that `EN.17.E` was never actually launched this session —
+  its dependencies (`EN.17.D`, `EN.17.C`, `okf-core:OK.ticket.message-envelope-field-caps`) were
+  all closed and it sat startable the whole time, but the lane picked G → I → J and never
+  circled back. Corrected in the handoff and to the operator directly rather than reporting a
+  false "chain complete."
+- **Refs:** `planning/orchestration-run/coordination-layer-port/{notes.md,review.md}`;
+  `planning/handoff.md`.
 
 ## [run: 2026-09-11]
 

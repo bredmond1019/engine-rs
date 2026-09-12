@@ -90,6 +90,10 @@ fn billed_failure(
             cache_creation_input_tokens: usage.cache_creation_input_tokens,
             model: model.to_string(),
             started_at: Some(started_at.to_string()),
+            // A billed API failure only ever comes from the `claude` CLI transport (the match arm
+            // above is `claude_code_rs::Error::Api`, which no other transport can raise), so this
+            // is a real, known cost exactly like every other pre-`EN.16.B` entry.
+            cost_known: true,
         }),
         _ => None,
     }
@@ -231,6 +235,16 @@ pub struct TransportInfo {
     /// `None` for subprocess-based (cloud CLI) calls, and for any cloud
     /// fallback — there is no single "endpoint" for the `claude` CLI.
     pub endpoint: Option<String>,
+    /// The transport family that actually ran, e.g. `"claude_cli"`.
+    /// Additive (`EN.16.B` task 2): every pre-existing transport stamps
+    /// `"claude_cli"` unconditionally — this field does not yet change what
+    /// any writer reads, it only records the fact for a future consumer.
+    pub backend: String,
+    /// Whether the transport that ran can report a real dollar cost.
+    /// Additive (`EN.16.B` task 2): every pre-existing transport stamps
+    /// `true` unconditionally, since every one of them bills through the
+    /// `claude` CLI today. No writer reads this yet.
+    pub cost_known: bool,
 }
 
 /// The injectable transport signature for transports that know their own
@@ -503,6 +517,8 @@ impl Node for AgentCodeStep {
                     tier: "cloud".to_string(),
                     model,
                     endpoint: None,
+                    backend: "claude_cli".to_string(),
+                    cost_known: true,
                 };
                 (outcome, info)
             }
@@ -514,7 +530,7 @@ impl Node for AgentCodeStep {
         // fallback belongs here, at the seam, rather than in the contract type.
         let model = outcome.primary_model().unwrap_or(UNKNOWN_MODEL).to_string();
 
-        let output = serde_json::json!({
+        let mut output = serde_json::json!({
             "content": outcome.text,
             "cost_usd": outcome.cost_usd,
             "model": model,
@@ -523,6 +539,11 @@ impl Node for AgentCodeStep {
                 "tier": transport_info.tier,
                 "model": transport_info.model,
                 "endpoint": transport_info.endpoint,
+                // Additive (`EN.16.B` task 4): the transport family that
+                // actually ran (e.g. `"claude_cli"`, `"pi"`). Copied
+                // wholesale by `carry_forward_billing`'s `"transport"` key,
+                // so this survives every SDLC wrapper's overwrite for free.
+                "backend": transport_info.backend,
             },
             // Additive, non-contract channels (`EN.ticket.token-usage-drops-cache-channels`
             // task 1): `engine_contract::Usage` only carries uncached input/output
@@ -540,6 +561,22 @@ impl Node for AgentCodeStep {
             // keeps every one of them.
             "session_id": outcome.session_id,
         });
+
+        // `EN.16.B` task 4: when the transport that ran cannot report a real
+        // dollar cost (`TransportInfo::cost_known == false`, e.g. a Pi/local
+        // model run), OMIT `cost_usd` entirely rather than writing a `0.0`
+        // placeholder. `crate::workflow::node_cost_usd` reads this key as
+        // `Option<f64>` via `.get("cost_usd")?.as_f64()`, so an absent key
+        // reads as `None` — which is what makes `BudgetLedger::from_context`
+        // and `node_cost_usd`'s other callers treat this run's cost as
+        // UNKNOWN rather than as a confirmed, silent zero. Every
+        // `cost_known: true` transport (every one that existed before this
+        // block) is unaffected: the key is written exactly as before.
+        if !transport_info.cost_known {
+            if let Some(map) = output.as_object_mut() {
+                map.remove("cost_usd");
+            }
+        }
         ctx.nodes.insert(self.name.clone(), output);
 
         // Order matters: the failed attempts happened BEFORE the one that succeeded, and the
@@ -563,6 +600,11 @@ impl Node for AgentCodeStep {
                 // the node entry can never disagree.
                 model: model.clone(),
                 started_at: Some(last_attempt_started_at.clone()),
+                // `EN.16.B` task 5: the transport's own `cost_known` (task 2's `TransportInfo`
+                // field) travels onto the ledger entry, not a hardcoded `true` — this is what lets
+                // `sessions::ledger_totals` count a Pi/local-model invocation as unknown-cost
+                // rather than as a confirmed, silent zero.
+                cost_known: transport_info.cost_known,
             },
         );
 
@@ -754,6 +796,8 @@ mod tests {
                             tier: "local".to_string(),
                             model: "qwen2.5-coder:7b".to_string(),
                             endpoint: Some("http://localhost:11434".to_string()),
+                            backend: "claude_cli".to_string(),
+                            cost_known: true,
                         },
                     ))
                 })
@@ -772,6 +816,123 @@ mod tests {
         // transport variant supplied the outcome.
         assert_eq!(output["content"], "ok");
         assert_eq!(output["model"], "claude-sonnet-4-5");
+    }
+
+    /// `EN.16.B` task 4: the `backend` field is stamped onto the
+    /// `"transport"` sub-object regardless of `cost_known`, and survives
+    /// `carry_forward_billing`'s copy of the whole `"transport"` value.
+    #[tokio::test]
+    async fn backend_is_stamped_onto_the_transport_sub_object_and_survives_carry_forward() {
+        let step = AgentCodeStep::new("ImplementTaskNode", Config::default(), "do the thing")
+            .with_meta_transport(|_config, _prompt| {
+                Box::pin(async {
+                    Ok((
+                        stub_outcome(),
+                        TransportInfo {
+                            tier: "local".to_string(),
+                            model: "qwen2.5-coder:7b".to_string(),
+                            endpoint: None,
+                            backend: "pi".to_string(),
+                            cost_known: true,
+                        },
+                    ))
+                })
+            });
+
+        let ctx = step
+            .process(empty_context())
+            .await
+            .expect("process should succeed");
+
+        let output = ctx.nodes.get("ImplementTaskNode").expect("output present");
+        assert_eq!(output["transport"]["backend"], "pi");
+
+        let mut wrapper_result = serde_json::json!({ "verdict": "PASS" });
+        crate::workflows::sdlc_flow::carry_forward_billing(
+            &ctx,
+            "ImplementTaskNode",
+            &mut wrapper_result,
+        );
+        assert_eq!(wrapper_result["transport"]["backend"], "pi");
+    }
+
+    /// `EN.16.B` task 4: when the transport that ran cannot report a real
+    /// dollar cost (`cost_known: false`), `cost_usd` must be ABSENT from the
+    /// node's `ctx.nodes` entry — not written as `0.0` — so
+    /// `crate::workflow::node_cost_usd` sees `None` and
+    /// `BudgetLedger::from_context` treats the run's cost as unknown rather
+    /// than a confirmed zero.
+    #[tokio::test]
+    async fn cost_known_false_omits_cost_usd_from_ctx_nodes() {
+        let step = AgentCodeStep::new("AgentCodeStep", Config::default(), "do the thing")
+            .with_meta_transport(|_config, _prompt| {
+                Box::pin(async {
+                    Ok((
+                        stub_outcome(),
+                        TransportInfo {
+                            tier: "local".to_string(),
+                            model: "qwen2.5-coder:7b".to_string(),
+                            endpoint: None,
+                            backend: "pi".to_string(),
+                            cost_known: false,
+                        },
+                    ))
+                })
+            });
+
+        let ctx = step
+            .process(empty_context())
+            .await
+            .expect("process should succeed");
+
+        let output = ctx.nodes.get("AgentCodeStep").expect("output present");
+        assert!(
+            output.get("cost_usd").is_none(),
+            "cost_usd must be entirely absent, not a 0.0 placeholder, when cost_known is false"
+        );
+        assert_eq!(output["transport"]["backend"], "pi");
+        assert_eq!(
+            crate::workflow::node_cost_usd(&ctx, "AgentCodeStep"),
+            None,
+            "node_cost_usd must see an absent value, not Some(0.0)"
+        );
+    }
+
+    /// The `cost_known: true` path (every pre-`EN.16.B` transport) is
+    /// unaffected: `cost_usd` is still written exactly as before, even when
+    /// the underlying SDK-reported figure happens to be `0.0`.
+    #[tokio::test]
+    async fn cost_known_true_writes_cost_usd_exactly_as_before_even_when_zero() {
+        let step = AgentCodeStep::new("AgentCodeStep", Config::default(), "do the thing")
+            .with_meta_transport(|_config, _prompt| {
+                Box::pin(async {
+                    let mut outcome = stub_outcome();
+                    outcome.cost_usd = 0.0;
+                    Ok((
+                        outcome,
+                        TransportInfo {
+                            tier: "cloud".to_string(),
+                            model: "claude-sonnet-4-5".to_string(),
+                            endpoint: None,
+                            backend: "claude_cli".to_string(),
+                            cost_known: true,
+                        },
+                    ))
+                })
+            });
+
+        let ctx = step
+            .process(empty_context())
+            .await
+            .expect("process should succeed");
+
+        let output = ctx.nodes.get("AgentCodeStep").expect("output present");
+        assert_eq!(output["cost_usd"], 0.0);
+        assert_eq!(
+            crate::workflow::node_cost_usd(&ctx, "AgentCodeStep"),
+            Some(0.0),
+            "a real, known $0.0 cost must remain distinguishable from an absent one"
+        );
     }
 
     /// `EN.ticket.token-usage-drops-cache-channels` task 1: a transport that

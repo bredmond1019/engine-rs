@@ -72,10 +72,11 @@ use std::sync::Arc;
 use crate::cancellation::CancellationToken;
 use crate::node::NodeRegistry;
 use crate::nodes::openai_compat_transport::openai_compat_meta_transport_live;
+use crate::nodes::pi_meta_transport_live;
 use crate::schema::{NodeConfig, WorkflowSchema};
 use crate::workflow::Workflow;
 
-use crate::policy::PolicyConfigSource;
+use crate::policy::{AgentBackend, PolicyConfigSource};
 use crate::workflows::sdlc_flow::close_block::CloseBlockNode;
 use crate::workflows::sdlc_flow::final_validation::{FinalValidationNode, ValidationScope};
 use crate::workflows::sdlc_flow::graph::agentic_write_config;
@@ -288,6 +289,19 @@ pub fn registry_for_policy(policy: &SdlcTaskPolicy) -> NodeRegistry {
 /// `sdlc_flow::graph::registry_for_policy_with_cancellation`. `SDLC_TASK`
 /// registers no `ConsolidatedReviewNode`, so there is no third node here.
 /// `token: None` reproduces [`registry_for_policy`] exactly.
+///
+/// **`ImplementTaskNode` re-registration is gated on `policy.agent_backend`
+/// being [`AgentBackend::Pi`], OR on `token` being given — not on `token`
+/// alone (`EN.16.B` task 8).** The base [`registry`] this function starts
+/// from always registers the `claude_cli` `ImplementTaskNode` (no meta
+/// transport); the real production call site
+/// (`orchestration::execute::EngineKind::Task`) goes through
+/// [`registry_for_policy`], i.e. `token: None`. Gating the re-registration
+/// on `token.is_some()` alone — the shape this had before task 8 — meant
+/// `agent_backend: pi` with no cancellation token silently kept the base
+/// registry's billed `claude_cli` node: the knob had no effect on the one
+/// path that actually runs in production. Mirrors the `triage_local ||
+/// token.is_some()` shape already used for `TriageTaskNode` above.
 #[must_use]
 pub fn registry_for_policy_with_cancellation(
     policy: &SdlcTaskPolicy,
@@ -310,12 +324,17 @@ pub fn registry_for_policy_with_cancellation(
         registry.register(Box::new(node));
     }
 
-    if let Some(t) = token {
-        registry.register(Box::new(
-            ImplementTaskNode::new()
-                .with_config(agentic_write_config("claude-sonnet-4-5"))
-                .with_cancellation_token(t),
-        ));
+    let pi_backend = policy.agent_backend == AgentBackend::Pi;
+    if pi_backend || token.is_some() {
+        let mut node =
+            ImplementTaskNode::new().with_config(agentic_write_config("claude-sonnet-4-5"));
+        if pi_backend {
+            node = node.with_meta_transport(pi_meta_transport_live(policy.local.clone()));
+        }
+        if let Some(t) = token {
+            node = node.with_cancellation_token(t);
+        }
+        registry.register(Box::new(node));
     }
 
     registry
@@ -549,8 +568,19 @@ mod tests {
         assert!(registry.contains("ImplementTaskNode"));
     }
 
+    /// Renamed for `EN.16.B` task 8 (was
+    /// `registry_for_policy_never_rewires_implement_task_node`): the OLD name,
+    /// doc and single `contains` assert all contradicted this block's actual
+    /// behaviour and kept passing regardless of which transport got wired.
+    /// `model_tiers.implement: Local` still never rewires `ImplementTaskNode`
+    /// — the local tier is scoped to single-shot judgment calls, not the
+    /// agentic implement stage (module doc) — but `policy.agent_backend` now
+    /// DOES, including on this exact `token: None` path. The behavioral proof
+    /// of that (which transport actually gets invoked, per backend, on both
+    /// the `token: None` and `token: Some` registration paths) lives in the
+    /// three `#[tokio::test]`s immediately below.
     #[test]
-    fn registry_for_policy_never_rewires_implement_task_node() {
+    fn registry_for_policy_never_rewires_implement_task_node_for_model_tier() {
         let policy = SdlcTaskPolicy {
             model_tiers: super::super::policy::SdlcTaskModelTiers {
                 implement: ModelTier::Local,
@@ -562,6 +592,223 @@ mod tests {
 
         let registry = registry_for_policy(&policy);
         assert!(registry.contains("ImplementTaskNode"));
+        assert_eq!(registry.len(), super::registry().len());
+    }
+
+    // --- EN.16.B task 8: behavioral proof of per-backend dispatch, on BOTH
+    // registration paths ------------------------------------------------
+
+    /// Minimal ctx `ImplementTaskNode::process` needs: a durable `SDLCState`
+    /// carrying one task (`LoadTaskStateNode`), that task dequeued
+    /// (`TaskQueueRouterNode`), and a resolved `SdlcPolicy` stamp
+    /// (`RESOLVED_POLICY_IDENTITY`) — mirrors `task_loop.rs`'s own
+    /// `ctx_with_current_task`/`ctx_with_policy` test helpers, which are
+    /// private to that module and so cannot be imported here. No
+    /// `SetupWorktreeNode` entry: `worktree_path` fails gracefully to `None`
+    /// (module doc on `ImplementTaskNode::process`), which in turn makes the
+    /// non-`claude_cli` `modified_files` derivation a no-op (no real
+    /// subprocess spawned for that part of `process`).
+    fn ctx_for_implement(agent_backend: AgentBackend) -> engine_contract::TaskContext {
+        use crate::workflows::sdlc_flow::schema::{SDLCState, SDLCTask};
+
+        let task = SDLCTask::new(1, "One", "d1");
+        let mut state = SDLCState::new("EN.16.B-task8-test");
+        state.tasks = vec![task.clone()];
+
+        let mut nodes = std::collections::HashMap::new();
+        nodes.insert(
+            "LoadTaskStateNode".to_string(),
+            serde_json::to_value(&state).expect("SDLCState serializes"),
+        );
+        nodes.insert(
+            "TaskQueueRouterNode".to_string(),
+            serde_json::json!({
+                "current_task_id": task.task_id,
+                "title": task.title,
+                "description": task.description,
+                "acceptance_criteria": task.acceptance_criteria,
+                "attempt_count": task.attempt_count,
+                "max_attempts": task.max_attempts,
+            }),
+        );
+        let policy = crate::workflows::sdlc_flow::policy::SdlcPolicy {
+            agent_backend,
+            ..crate::workflows::sdlc_flow::policy::SdlcPolicy::default()
+        };
+        nodes.insert(
+            crate::policy::RESOLVED_POLICY_IDENTITY.to_string(),
+            serde_json::to_value(&policy).expect("SdlcPolicy serializes"),
+        );
+
+        engine_contract::TaskContext {
+            event: serde_json::json!({}),
+            nodes,
+            metadata: serde_json::json!({}),
+            node_runs: std::collections::HashMap::new(),
+        }
+    }
+
+    /// Writes an executable `/bin/sh` script with `body`, mirroring
+    /// `claude_code_rs::execute`'s and `pi_transport`'s own
+    /// `write_fake_binary` test helpers (both private to their modules).
+    #[cfg(unix)]
+    fn write_fake_binary(body: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let script_path = dir.path().join("fake-binary.sh");
+        let mut file = std::fs::File::create(&script_path).expect("create script");
+        std::io::Write::write_all(&mut file, format!("#!/bin/sh\n{body}\n").as_bytes())
+            .expect("write script");
+        drop(file);
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod +x");
+        (dir, script_path)
+    }
+
+    /// Serializes every test in this block that mutates the process-global
+    /// `PI_BINARY`/`CLAUDE_BINARY` env vars — `cargo nextest run` (standing
+    /// rule 8) forks one process per test, so this only guards a stray plain
+    /// `cargo test` run, mirroring `pi_transport.rs`'s own
+    /// `PI_BINARY_ENV_LOCK`.
+    #[cfg(unix)]
+    static BACKEND_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// With `token: None` — [`registry_for_policy`], the actual production
+    /// call site (`orchestration::execute::EngineKind::Task`) — and
+    /// `agent_backend: Pi`, `ImplementTaskNode` must dispatch `PiTransport`,
+    /// not the base registry's `claude_cli` node. This is the exact bug
+    /// task 8 fixes: before it, the `if let Some(t) = token` gate meant a
+    /// `token: None` run with `agent_backend: pi` silently kept the billed
+    /// `claude_cli` node from `registry()`. Would fail if that fix were
+    /// reverted.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn implement_task_node_dispatches_pi_transport_for_pi_backend_with_no_token() {
+        let _guard = BACKEND_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        let (_script_dir, script) = write_fake_binary(
+            r#"printf '{"type":"agent_end","messages":[{"role":"assistant","content":[{"type":"text","text":"hi"}]}]}\n'
+printf '{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"done"}],"usage":{"totalTokens":1}}}\n'
+"#,
+        );
+        // SAFETY: single-threaded within this test's own process
+        // (`cargo nextest run` forks one process per test), scoped to this
+        // test and serialized via `BACKEND_ENV_LOCK`.
+        unsafe {
+            std::env::set_var("PI_BINARY", &script);
+        }
+
+        let policy = SdlcTaskPolicy {
+            agent_backend: AgentBackend::Pi,
+            ..SdlcTaskPolicy::default()
+        };
+        let registry = registry_for_policy(&policy);
+        let node = registry
+            .get("ImplementTaskNode")
+            .expect("ImplementTaskNode registered");
+        let ctx = ctx_for_implement(AgentBackend::Pi);
+        let result = node.process(ctx).await;
+
+        unsafe {
+            std::env::remove_var("PI_BINARY");
+        }
+
+        let out = result.expect("process should succeed against the fake pi script");
+        let backend = out.nodes["ImplementTaskNode"]["transport"]["backend"].clone();
+        assert_eq!(
+            backend,
+            serde_json::json!("pi"),
+            "agent_backend: pi with token: None must dispatch PiTransport \
+             (transport.backend == \"pi\"), not silently fall back to the \
+             billed claude_cli node — got {out:#?}"
+        );
+    }
+
+    /// Same as the previous test but with `token: Some(..)` —
+    /// `registry_for_policy_with_cancellation`'s cancellation-token path —
+    /// proving attaching a token does not clobber or bypass the
+    /// `agent_backend: Pi` meta-transport wiring.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn implement_task_node_dispatches_pi_transport_for_pi_backend_with_token() {
+        let _guard = BACKEND_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        let (_script_dir, script) = write_fake_binary(
+            r#"printf '{"type":"agent_end","messages":[{"role":"assistant","content":[{"type":"text","text":"hi"}]}]}\n'
+printf '{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"done"}],"usage":{"totalTokens":1}}}\n'
+"#,
+        );
+        // SAFETY: see the sibling `token: None` test above.
+        unsafe {
+            std::env::set_var("PI_BINARY", &script);
+        }
+
+        let policy = SdlcTaskPolicy {
+            agent_backend: AgentBackend::Pi,
+            ..SdlcTaskPolicy::default()
+        };
+        let token = CancellationToken::new();
+        let registry = registry_for_policy_with_cancellation(&policy, Some(token));
+        let node = registry
+            .get("ImplementTaskNode")
+            .expect("ImplementTaskNode registered");
+        let ctx = ctx_for_implement(AgentBackend::Pi);
+        let result = node.process(ctx).await;
+
+        unsafe {
+            std::env::remove_var("PI_BINARY");
+        }
+
+        let out = result.expect("process should succeed against the fake pi script");
+        let backend = out.nodes["ImplementTaskNode"]["transport"]["backend"].clone();
+        assert_eq!(
+            backend,
+            serde_json::json!("pi"),
+            "agent_backend: pi with token: Some(..) must ALSO dispatch \
+             PiTransport, not just the token: None path — got {out:#?}"
+        );
+    }
+
+    /// With the default `agent_backend: ClaudeCli` and `token: None`,
+    /// `ImplementTaskNode` must keep dispatching the plain `claude_cli`
+    /// transport (`transport.backend == "claude_cli"`, `AgentCodeStep`'s own
+    /// stamp for "no meta transport set") — proving the task-8 fix is scoped
+    /// to `agent_backend: Pi` and does not change behavior for every other
+    /// run, matching this block's "every run that never sets `agent_backend`
+    /// dispatches exactly as before" acceptance criterion.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn implement_task_node_keeps_claude_cli_dispatch_for_default_backend_with_no_token() {
+        let _guard = BACKEND_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        let (_script_dir, script) = write_fake_binary(
+            r#"printf '{"total_cost_usd":0.0,"usage":{},"is_error":false,"result":"done"}'"#,
+        );
+        // SAFETY: see the `PI_BINARY` tests above; same single-test scope.
+        unsafe {
+            std::env::set_var("CLAUDE_BINARY", &script);
+        }
+
+        let policy = SdlcTaskPolicy::default();
+        let registry = registry_for_policy(&policy);
+        let node = registry
+            .get("ImplementTaskNode")
+            .expect("ImplementTaskNode registered");
+        let ctx = ctx_for_implement(AgentBackend::ClaudeCli);
+        let result = node.process(ctx).await;
+
+        unsafe {
+            std::env::remove_var("CLAUDE_BINARY");
+        }
+
+        let out = result.expect("process should succeed against the fake claude script");
+        let backend = out.nodes["ImplementTaskNode"]["transport"]["backend"].clone();
+        assert_eq!(
+            backend,
+            serde_json::json!("claude_cli"),
+            "the default agent_backend must keep dispatching claude_cli \
+             unchanged — got {out:#?}"
+        );
     }
 
     /// Mechanical pin for the AC "the registry uses

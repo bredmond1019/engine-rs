@@ -91,6 +91,17 @@ pub enum BudgetDecision {
 pub struct BudgetLedger {
     total_tokens: u64,
     total_cost_usd: f64,
+    /// Set once [`BudgetLedger::from_context`] finds at least one node
+    /// entry in `ctx.nodes` with no `"cost_usd"` key at all — i.e.
+    /// [`crate::workflow::node_cost_usd`] returned `None` for that
+    /// identity. Mirrors [`CampaignLedger::has_unknown_cost_step`]: an
+    /// absent cost is never counted toward `total_cost_usd` (treating it
+    /// as `$0` would understate real spend, e.g. `EN.16.B`'s Pi transport,
+    /// which reports `cost_known: false` by omitting the key rather than
+    /// writing a placeholder zero), so this flag is what keeps "nothing
+    /// cost anything" distinguishable from "at least one node's cost went
+    /// unreported" for a caller inspecting a reconstructed ledger.
+    has_unknown_cost_node: bool,
 }
 
 impl BudgetLedger {
@@ -108,6 +119,7 @@ impl BudgetLedger {
         Self {
             total_tokens,
             total_cost_usd,
+            has_unknown_cost_node: false,
         }
     }
 
@@ -135,9 +147,11 @@ impl BudgetLedger {
 
         let mut total_cost_usd = 0.0;
         let mut cache_tokens = 0u64;
+        let mut has_unknown_cost_node = false;
         for identity in ctx.nodes.keys() {
-            if let Some(cost) = node_cost_usd(ctx, identity) {
-                total_cost_usd += cost;
+            match node_cost_usd(ctx, identity) {
+                Some(cost) => total_cost_usd += cost,
+                None => has_unknown_cost_node = true,
             }
             if let Some(tokens) = node_cache_tokens(ctx, identity) {
                 cache_tokens += tokens;
@@ -147,6 +161,7 @@ impl BudgetLedger {
         Self {
             total_tokens: usage_tokens + cache_tokens,
             total_cost_usd,
+            has_unknown_cost_node,
         }
     }
 
@@ -190,6 +205,16 @@ impl BudgetLedger {
     /// Accumulated cost (USD) across every [`record`] call so far.
     pub fn total_cost_usd(&self) -> f64 {
         self.total_cost_usd
+    }
+
+    /// `true` once [`BudgetLedger::from_context`] found at least one node
+    /// with no `"cost_usd"` key at all. Always `false` for a ledger built
+    /// via [`record`](BudgetLedger::record)/[`from_parts`](BudgetLedger::from_parts)
+    /// — reconstruction from a `TaskContext` is the only path that can
+    /// observe an absent key versus a caller who never had a cost figure
+    /// to pass in the first place.
+    pub fn has_unknown_cost_node(&self) -> bool {
+        self.has_unknown_cost_node
     }
 
     /// The pre-dispatch gate: `budget: None` always allows (no config = no
@@ -648,6 +673,46 @@ mod tests {
             }
             BudgetDecision::Allow => panic!("expected a halt below one step's cost"),
         }
+    }
+
+    #[test]
+    fn from_context_flags_unknown_cost_node_but_not_a_real_zero() {
+        // A node with a real, known $0 cost (`cost_usd: 0.0` present) must
+        // NOT set the flag — this is the case `EN.16.B`'s translation
+        // distinguishes via `TransportInfo::cost_known` before it ever
+        // reaches `ctx.nodes`.
+        let mut nodes_known_zero = HashMap::new();
+        nodes_known_zero.insert(
+            "KnownZero".to_string(),
+            serde_json::json!({"cost_usd": 0.0}),
+        );
+        let ctx_known_zero = TaskContext {
+            event: serde_json::json!({}),
+            nodes: nodes_known_zero,
+            metadata: serde_json::json!({}),
+            node_runs: HashMap::new(),
+        };
+        let ledger_known_zero = BudgetLedger::from_context(&ctx_known_zero);
+        assert!((ledger_known_zero.total_cost_usd() - 0.0).abs() < f64::EPSILON);
+        assert!(!ledger_known_zero.has_unknown_cost_node());
+
+        // A node whose result carries NO `cost_usd` key at all (e.g. a Pi
+        // transport run with `cost_known: false`) must set the flag, and
+        // must not be silently counted as $0 spend.
+        let mut nodes_absent = HashMap::new();
+        nodes_absent.insert(
+            "UnknownCost".to_string(),
+            serde_json::json!({"transport": {"backend": "pi"}}),
+        );
+        let ctx_absent = TaskContext {
+            event: serde_json::json!({}),
+            nodes: nodes_absent,
+            metadata: serde_json::json!({}),
+            node_runs: HashMap::new(),
+        };
+        let ledger_absent = BudgetLedger::from_context(&ctx_absent);
+        assert!((ledger_absent.total_cost_usd() - 0.0).abs() < f64::EPSILON);
+        assert!(ledger_absent.has_unknown_cost_node());
     }
 
     #[test]

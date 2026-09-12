@@ -12,6 +12,7 @@
 //! second engine, and `nodes::terminal::send`, can reach it without
 //! importing `sdlc_flow`.
 
+pub mod agent_backend;
 pub mod aggregate;
 pub mod command_floor;
 pub mod emit_state;
@@ -23,6 +24,7 @@ pub mod shaping;
 pub mod telemetry;
 pub mod tier;
 
+pub use agent_backend::AgentBackend;
 pub use aggregate::{aggregate, aggregate_state_files, extract_policy_telemetry, PolicyAggregate};
 pub use emit_state::{CommandOutputLike, EmitStateNode, Runner as EmitStateRunner};
 pub use overlay::{merge_local, Overlay, PartialLocalConfig};

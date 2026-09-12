@@ -200,6 +200,7 @@ then the inline `policy` fields override individual knobs on top of it.
 | `max_attempts` | `u32` | Retry budget per task before it's marked `FAILED`. |
 | `close_out.reuse.{validation,review,docs}` | `bool` each | Which `close-out` (EN.2.x) stages are allowed to reuse a prior flow record's result rather than re-running. |
 | `test_depth` | `full` \| `fast` (default `full`) | Which per-task validation checks `TestTaskNode` runs — see [Per-task check selection (`test_depth`)](#per-task-check-selection-test_depth) below. |
+| `test_dispatch` | `Inline` \| `QueuePark` (default `Inline`) | **`EN.17.J`.** `Inline` runs `TestTaskNode`'s selected checks synchronously (today's behavior). `QueuePark` submits them to the heavy-work queue (`EN.17.I`) and suspends the whole walk (`SuspendReason::HeavyWorkQueue`) instead of blocking a thread — resuming at `TriageTaskNode` once the job completes. Built-in default `Inline`, behavior-stable. See [`docs/heavy-work-queue.md`](../heavy-work-queue.md) and [`docs/suspend-resume.md`](../suspend-resume.md) for the queue and suspension mechanics this knob switches between. |
 | `review_diff_max_chars` | `u32` (default `120000`) | Ceiling, in characters, on the working-tree diff embedded in `ConsolidatedReviewNode`'s prompt — the bound on reviewer prompt size, and therefore on the context and cost a large task can spend. Over-budget diffs are **clipped, never dropped**, and the clip is announced to the model in the prompt (`--- DIFF TRUNCATED — YOU ARE SEEING A PARTIAL DIFF ---`, instructing it not to `PASS` on code it could not see); a silent clip would recreate the rubber-stamp failure the real-diff fix eliminated. The resolved value and a `review_diff_truncated` flag are stamped into `ConsolidatedReviewNode`'s result for telemetry. Profile values are a **cost/latency choice**: `cheap-fast*` 20k (the floor) and `pragmatist*` 40k (the middle setting). Both numbers were originally sized by the *reviewer's own context window*, back when those profiles reviewed on the `local` tier; since the 2026-08-01 move to cloud review they are conservative for the window actually available. They are kept unchanged deliberately — still defensible spend floors — and re-tuning them for a cloud reviewer is a separate follow-up. `batch-reviewer` 200k is a ceiling for an unrelated reason (its single `end_only` Sonnet review sees the whole run's accumulated diff); `baseline` 120k restates the built-in default. |
 | `node_invocation_payload_cap_bytes` | `u64` (default `65536`, i.e. 64 KiB — `invocations::DEFAULT_PAYLOAD_CAP_BYTES`) | Per-record cap `node_context` applies to a dispatch's output payload before appending it to the `node_invocations` audit ledger (`EN.14.G`). Read **untyped** off the `ResolvedPolicy` stamp by `invocations::payload_cap_from_resolved_policy` — no new stamping code, since `stamp_resolved_policy` already serializes the whole resolved policy into `ctx.nodes["ResolvedPolicy"]`. A payload over the cap is stored explicitly marked truncated (`payload_truncated: true`), never silently shortened. Profile values are a cost/storage choice: `cheap-fast` `8192` (the floor), `thorough` `262144` (the ceiling), `baseline` `65536` restates the built-in default. |
 
@@ -311,6 +312,13 @@ matters to `model_tier_used`.
 - `tasks_passed` / `tasks_failed`.
 - `review_verdicts` — e.g. `["TriageTaskNode:RETRYABLE", "ConsolidatedReviewNode:PASS"]`.
 - `total_input_tokens` / `total_output_tokens` / `total_cost_usd`.
+- `unknown_cost_invocations` (**`EN.16.B`**) — count of ledger invocations recorded with
+  `cost_known: false` (a non-`claude_cli` `agent_backend`, e.g. `PiTransport`, that reports no
+  dollar figure at all). Mirrors `policy::RunTelemetry::unknown_cost_invocations`; read this
+  alongside `total_cost_usd` before treating that total as complete — a nonzero count here means
+  the dollar figure is an undercount, not a wrong one. See
+  [`agent_backend`](README.md#agent_backend--which-coding-agent-sdlc_tasks-implement-stage-drives)
+  and [data-contract.md](../data-contract.md).
 - `total_cache_read_tokens` / `total_cache_creation_tokens` (`EN.ticket.token-usage-drops-cache-channels`)
   — the two prompt-cache channels. **Read these before drawing any conclusion about input cost.**
   `input_tokens` from the SDK is documented as *excluding cache reads*, so before these existed the
