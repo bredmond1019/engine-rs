@@ -5,7 +5,7 @@ description: Chronological log of work completed for engine-rs.
 doc_id: log
 layer: [factory]
 status: active
-timestamp: "2026-09-11T21:18:30Z"
+timestamp: "2026-09-12T03:09:44Z"
 keywords: [work log, session history, development log]
 related: [status, context]
 ---
@@ -13,6 +13,27 @@ related: [status, context]
 # Log — engine-rs
 
 *Append-only working log. One dated entry per session. Newest entries at the top.*
+
+## [run: 2026-09-12]
+
+### `/close-out` — EN.17.G/I/J closed this session, EN.17.E gap caught before handoff
+
+- **What:** Ran the full `/close-out` gate suite (fmt, clippy, full-workspace test 4317/4317,
+  release build, nextest-hang, micro-spec-runner, fleet-build-wrapper, diff-scoped emoji gate over
+  `475a234...HEAD`) — all green. Coverage confirmed adequate (every changed `.rs` file already has
+  dedicated new tests). Docs audit scoped to the session's diff found one real gap:
+  `docs/workflows/sdlc-flow-policy.md`'s knob table was missing `test_dispatch`, added by
+  `EN.17.J` everywhere except that one reference table — fixed. Rewrote `planning/handoff.md` for
+  the next session.
+- **Why:** Operator asked to `/close-out` after `EN.17.J`, plus verify all four orchestration-run
+  artifacts and get a plain-English per-block summary. Re-deriving readiness for the handoff
+  (`mev blocks --startable`) caught that `EN.17.E` was never actually launched this session —
+  its dependencies (`EN.17.D`, `EN.17.C`, `okf-core:OK.ticket.message-envelope-field-caps`) were
+  all closed and it sat startable the whole time, but the lane picked G → I → J and never
+  circled back. Corrected in the handoff and to the operator directly rather than reporting a
+  false "chain complete."
+- **Refs:** `planning/orchestration-run/coordination-layer-port/{notes.md,review.md}`;
+  `planning/handoff.md`.
 
 ## [run: 2026-09-11]
 
