@@ -16,6 +16,45 @@ related: [status, context]
 
 ## [run: 2026-09-12]
 
+### `/sdlc-flow EN.16.B` wrap-up (2nd attempt) — PARTIAL (review-verdict bail persists after AC-comment fix)
+
+All 10 tasks (1-10) confirmed passed with confirmed work assertions, unchanged from the prior
+wrap-up: `AgentBackend { ClaudeCli, Pi }` plumbed through `SdlcTaskPolicy`'s four-layer resolution
+(task 1); `TransportInfo`'s additive `backend`/`cost_known` fields (task 2); `AgentOutcome`/
+`CostEstimate` and `translate()` (task 3); cost-omission-when-unknown on `AgentCodeStep` plus
+`BudgetLedger::has_unknown_cost_node` (task 4); `ClaudeSession.cost_known` and ledger/telemetry
+unknown-cost surfacing (task 5); `PiTransport` — a real `MetaTransport` shelling to
+`pi_agent_rust` against local Ollama, with timeout/cancellation kill-on-drop and a real-capture
+JSON parser (task 6); `ImplementTaskNode`'s `with_meta_transport` plus git-status-derived
+`modified_files` for non-`claude_cli` backends (task 7); Pi dispatch wired on both SDLC_TASK
+registration paths (task 8); the 11-test `agent_backend.rs` integration suite (task 9); docs
+(task 10). Between the prior wrap-up (commit `b888b8d`) and this run, one further fix commit
+(`a1dedc1`) rephrased `pi_transport.rs`'s AC10-adjacent comment text to avoid self-triggering the
+`rg -n '"qwen|llama|ollama_chat/'` check — but this does not and cannot fix the underlying defect:
+the AC regex's `llama` alternative substring-matches inside the required, spec-mandated literals
+`ollama`/`OLLAMA_HOST` that the file must contain (`--provider ollama`, `OLLAMA_HOST` env var), so
+`rg -n '"qwen|llama|ollama_chat/' pi_transport.rs` still exits 0 (matches on lines 8, 10, 11, 13,
+18, 148, 160, 161, 234, 639, 641 — all `ollama`/`OLLAMA_HOST` occurrences, no hardcoded model name).
+The run's end review returned **PARTIAL and bailed again, on the identical defect**: the AC as
+written can never pass while the block's own other ACs require those literals present. The
+underlying intent (no hardcoded model name; model always read from the resolved policy's
+`local.model`) is independently verified satisfied at `pi_transport.rs:150`
+(`.arg(&local.model)`). This is the second bail on the same root cause — a corrected AC regex
+(e.g. word-boundary or an explicit exclusion for the `ollama` provider name) needs to come from a
+human, not another implementation or comment-rephrasing attempt. Next: get the AC regex corrected
+by a human, then close `EN.16.B`.
+
+```
+a1dedc1 fix: rephrase pi_transport.rs's AC10 comment to not self-trigger the check
+b888b8d chore: wrap up EN.16.B
+587489e fix: fix pass 1 for EN.16.B-task10
+a52e74c fix: unblock EN.16.B task 10's gate — worktree path resolution, timing flakes, baseline drift
+09f52a2 chore: wrap up EN.16.B
+514d27d feat: implement EN.16.B-task10
+bc78604 feat: implement EN.16.B-task9
+6255502 feat: implement EN.16.B-task8
+```
+
 ### `/sdlc-flow EN.16.B` wrap-up — PARTIAL (review-verdict bail, AC regex self-contradictory)
 
 All 10 tasks passed with confirmed work assertions: the `AgentBackend { ClaudeCli, Pi }` knob
