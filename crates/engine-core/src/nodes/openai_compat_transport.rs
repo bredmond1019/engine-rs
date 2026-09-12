@@ -362,7 +362,7 @@ mod tests {
     fn test_local_config() -> LocalConfig {
         LocalConfig {
             endpoint: "http://localhost:11434".to_string(),
-            model: "qwen2.5-coder:7b".to_string(),
+            model: "qwen2.5:7b-instruct".to_string(),
             constrained_json: false,
         }
     }
@@ -471,10 +471,13 @@ mod tests {
         assert_eq!(outcome.usage.output_tokens, 34);
         assert_eq!(
             outcome.primary_model(),
-            Some("local/qwen2.5-coder:7b"),
+            Some("local/qwen2.5:7b-instruct"),
             "modelUsage must carry a single local/<model> entry"
         );
-        assert_eq!(outcome.model_usage["local/qwen2.5-coder:7b"].cost_usd, 0.0);
+        assert_eq!(
+            outcome.model_usage["local/qwen2.5:7b-instruct"].cost_usd,
+            0.0
+        );
     }
 
     #[tokio::test]
@@ -626,7 +629,7 @@ mod tests {
 
         assert_eq!(outcome.text, "local reply");
         assert_eq!(info.tier, "local");
-        assert_eq!(info.model, "qwen2.5-coder:7b");
+        assert_eq!(info.model, "qwen2.5:7b-instruct");
         assert_eq!(info.endpoint.as_deref(), Some("http://localhost:11434"));
     }
 

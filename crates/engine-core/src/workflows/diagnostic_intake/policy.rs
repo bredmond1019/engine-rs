@@ -227,7 +227,7 @@ mod tests {
             }),
             local: Some(PartialLocalConfig {
                 endpoint: Some("http://localhost:11434".to_string()),
-                model: Some("qwen2.5-coder:7b".to_string()),
+                model: Some("qwen2.5:7b-instruct".to_string()),
                 constrained_json: Some(true),
             }),
             ..Default::default()
@@ -235,7 +235,7 @@ mod tests {
         let resolved = resolve(DiagnosticIntakePolicy::default(), None, None, Some(&event));
         assert_eq!(resolved.model_tiers.extract, ModelTier::Local);
         assert_eq!(resolved.local.endpoint, "http://localhost:11434");
-        assert_eq!(resolved.local.model, "qwen2.5-coder:7b");
+        assert_eq!(resolved.local.model, "qwen2.5:7b-instruct");
         assert!(resolved.local.constrained_json);
     }
 

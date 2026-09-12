@@ -4858,7 +4858,7 @@ pub(crate) mod tests {
 
         let local = LocalConfig {
             endpoint: "http://localhost:11434".to_string(),
-            model: "qwen2.5-coder:7b".to_string(),
+            model: "qwen2.5:7b-instruct".to_string(),
             constrained_json: false,
         };
         let local_http_post: crate::nodes::LocalHttpPost = Arc::new(|_url, _body| {
@@ -4903,7 +4903,7 @@ pub(crate) mod tests {
 
         let local = LocalConfig {
             endpoint: "http://localhost:11434".to_string(),
-            model: "qwen2.5-coder:7b".to_string(),
+            model: "qwen2.5:7b-instruct".to_string(),
             constrained_json: false,
         };
         let local_http_post: crate::nodes::LocalHttpPost =
