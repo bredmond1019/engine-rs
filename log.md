@@ -5,7 +5,7 @@ description: Chronological log of work completed for engine-rs.
 doc_id: log
 layer: [factory]
 status: active
-timestamp: "2026-09-12T13:52:00Z"
+timestamp: "2026-09-12T21:30:00Z"
 keywords: [work log, session history, development log]
 related: [status, context]
 ---
@@ -15,6 +15,30 @@ related: [status, context]
 *Append-only working log. One dated entry per session. Newest entries at the top.*
 
 ## [2026-09-12]
+
+### `pluggable-code-agent-transport` lane CLOSED — EN.16.D/EN.16.E/EN.16.C shipped; `target/` cleaned
+
+- **What:** Closed out the lane end to end. Merged EN.16.B's stalled PR #90 (recovering a
+  locally-committed `pi_transport.rs` arg-order fix, `86ac183`, that never reached the PR branch —
+  cherry-picked onto `main` as `036c317` after catching the gap). Shipped `EN.16.D` (Pi backend in
+  SDLC_FLOW + telemetry backend attribution, PR #91 — 3 bail cycles, two caused by a real
+  `nextest.toml` retry-override gap on the cancellation-kill tests, fixed directly). Shipped
+  `EN.16.E` (local-tier default model fix + pi_agent_rust version floor, clean 4/4 `/sdlc-task`
+  run — premise re-derivation caught a real gap: the block record named 1 file, the actual model
+  literal was duplicated across ~22, including a missed production site in
+  `sdlc_flow/profiles.rs`). Shipped `EN.16.C` (Aider backend, PR #92 — clean 6/6 `/sdlc-flow` run,
+  baked the retry-override lesson into its own spec from the start). Closed a real
+  `planning/harness.json` gap (SDLC_FLOW's own `agent_backend` wiring, flagged but left undone by
+  EN.16.D) and patched `docs/workflows/README.md`'s resulting staleness. Ran a full `cargo clean`
+  on `target/` (47G -> reclaimed 98.3GiB after an interrupted first attempt that raced a concurrent
+  `cargo clippy` check — caught via a false-positive piped exit code, stopped, redone cleanly),
+  re-verified all seven `gates:true` checks on the fresh tree.
+- **Why:** Operator asked to keep making autonomous decisions and finish the lane; separately asked
+  how to prevent the EN.16.D-class bails recurring on remaining blocks (answer: baked the fix into
+  EN.16.C's own spec) and whether it was time for a `cargo clean` per `docs/infrastructure.md`'s
+  disproportionate-size trigger.
+- **Refs:** `planning/orchestration-run/pluggable-code-agent-transport/{notes.md,review.md}`,
+  `planning/pluggable-code-agent-transport/lane-log.jsonl`, PRs #90/#91/#92 (all merged)
 
 ### Closed both operator gates on pluggable-code-agent-transport; filed EN.16.E; captured eval-harness idea
 
