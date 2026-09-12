@@ -15,6 +15,7 @@
 //! Do NOT add a new `tests/*.rs` file at this level — that silently reintroduces a second binary.
 
 mod action_dispatch_e2e;
+mod agent_backend;
 mod agent_code_step;
 mod approve_and_run;
 mod artifact_identity;
