@@ -5,7 +5,7 @@ description: Chronological log of work completed for engine-rs.
 doc_id: log
 layer: [factory]
 status: active
-timestamp: "2026-09-12T03:09:44Z"
+timestamp: "2026-09-12T11:21:05Z"
 keywords: [work log, session history, development log]
 related: [status, context]
 ---
@@ -13,6 +13,30 @@ related: [status, context]
 # Log — engine-rs
 
 *Append-only working log. One dated entry per session. Newest entries at the top.*
+
+## [2026-09-12]
+
+### `/begin-orchestration` — EN.16.B closed (pluggable-code-agent-transport), PR #90
+
+- **What:** Resumed the `pluggable-code-agent-transport` lane (`/begin-orchestration --roadmap
+  pluggable-code-agent-transport --lane pluggable-code-agent-transport --execute`), driving
+  `EN.16.B` (`AgentBackend::Pi` in `SDLC_TASK`) through `/sdlc-flow --worktree` to `closed` across
+  3 resumes. Fixed 4 real problems directly along the way: a worktree-only test path-resolution
+  bug in a foreign, pre-existing test (`hq_orchestration_policy`); two CPU-contention timing
+  flakes in `pi_transport` tests (widened budgets + `nextest` `retries=2` overrides); an expected
+  `policy_baseline` fixture drift (regenerated); and a self-contradictory acceptance-criterion
+  regex (`llama` substring-matched inside the required `ollama` literal) — first fix attempt
+  (`\bllama`) silently broke via nested shell/JSON escaping into a literal backspace character,
+  landed on a backslash-free `[^oO]llama|^llama` instead. PR:
+  https://github.com/bredmond1019/engine-rs/pull/90 (open, unmerged). Filed
+  `EN.ticket.roadmap-status-route-500-under-ci` for an unrelated, confirmed-pre-existing hosted-CI
+  failure discovered while checking the PR's checks. `EN.16.D`/`EN.16.C` remain gated on operator
+  sessions (`first-real-pi-engine-run`, `install-aider-and-capture-a-real-cli-run`) — not attempted.
+- **Why:** Operator authorized "make your own decisions... no need to ask the operator" for the
+  lane run, then explicitly approved fixing and finishing `EN.16.B` after it first bailed on
+  environment/test-infra issues unrelated to the block's own scope.
+- **Refs:** `planning/orchestration-run/pluggable-code-agent-transport/{notes.md,review.md}`,
+  `planning/pluggable-code-agent-transport/lane-log.jsonl`
 
 ## [run: 2026-09-12]
 
