@@ -125,6 +125,13 @@
 //! session-naming helper plus the per-struct `session_input: InputBinding`
 //! field/builder convention the module's nodes follow.
 //!
+//! `pi_transport` (`EN.16.B` task 6) is `pi_meta_transport` — the
+//! `AgentBackend::Pi` implementation of the existing `MetaTransport` alias,
+//! shelling to `pi_agent_rust` against a local Ollama model instead of the
+//! `claude` CLI. Mirrors `openai_compat_transport`'s shape (a builder
+//! closing over a `LocalConfig`); see the module for the safety boundary on
+//! `--approval-mode yolo` and the worktree cwd NOT being containment.
+//!
 //! `judgment` (`EN.17.D` task 1) is `JudgmentNode` — a reusable, bounded,
 //! schema-constrained `claude` call: byte-capped input slices (truncated at
 //! a UTF-8 boundary, with a marker naming the slice and bytes dropped), a
@@ -154,6 +161,7 @@ pub mod materialize_doc;
 pub mod merge_contacts;
 pub mod openai_compat_transport;
 pub mod opportunity_edit;
+pub mod pi_transport;
 pub mod suspend;
 pub mod terminal;
 
@@ -188,4 +196,5 @@ pub use openai_compat_transport::{
     openai_compat_transport, openai_compat_transport_live, LocalHttpPost,
 };
 pub use opportunity_edit::{OpportunityEditNode, OpportunityEditOp};
+pub use pi_transport::{pi_meta_transport, pi_meta_transport_live};
 pub use suspend::{SuspendNode, DEFAULT_IDENTITY as SUSPEND_NODE_DEFAULT_IDENTITY};
