@@ -319,6 +319,8 @@ pub fn openai_compat_meta_transport(
                         tier: "local".to_string(),
                         model: local.model.clone(),
                         endpoint: Some(local.endpoint.clone()),
+                        backend: "claude_cli".to_string(),
+                        cost_known: true,
                     };
                     Ok((outcome, info))
                 }
@@ -329,6 +331,8 @@ pub fn openai_compat_meta_transport(
                         tier: "cloud".to_string(),
                         model,
                         endpoint: None,
+                        backend: "claude_cli".to_string(),
+                        cost_known: true,
                     };
                     Ok((outcome, info))
                 }

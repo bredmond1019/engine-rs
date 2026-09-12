@@ -231,6 +231,16 @@ pub struct TransportInfo {
     /// `None` for subprocess-based (cloud CLI) calls, and for any cloud
     /// fallback — there is no single "endpoint" for the `claude` CLI.
     pub endpoint: Option<String>,
+    /// The transport family that actually ran, e.g. `"claude_cli"`.
+    /// Additive (`EN.16.B` task 2): every pre-existing transport stamps
+    /// `"claude_cli"` unconditionally — this field does not yet change what
+    /// any writer reads, it only records the fact for a future consumer.
+    pub backend: String,
+    /// Whether the transport that ran can report a real dollar cost.
+    /// Additive (`EN.16.B` task 2): every pre-existing transport stamps
+    /// `true` unconditionally, since every one of them bills through the
+    /// `claude` CLI today. No writer reads this yet.
+    pub cost_known: bool,
 }
 
 /// The injectable transport signature for transports that know their own
@@ -503,6 +513,8 @@ impl Node for AgentCodeStep {
                     tier: "cloud".to_string(),
                     model,
                     endpoint: None,
+                    backend: "claude_cli".to_string(),
+                    cost_known: true,
                 };
                 (outcome, info)
             }
@@ -754,6 +766,8 @@ mod tests {
                             tier: "local".to_string(),
                             model: "qwen2.5-coder:7b".to_string(),
                             endpoint: Some("http://localhost:11434".to_string()),
+                            backend: "claude_cli".to_string(),
+                            cost_known: true,
                         },
                     ))
                 })
