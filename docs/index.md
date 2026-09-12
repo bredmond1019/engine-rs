@@ -43,7 +43,7 @@ the engine can do, and [architecture.md](architecture.md) for how it's built.
 |---|---|
 | [deployment-launchd.md](deployment-launchd.md) | The environment variables a permanently-running `bastion serve` needs, and how to verify the installed plist |
 | [testing.md](testing.md) | Which test commands to run, the one-binary-per-crate test layout, and the hermetic-test conventions |
-| [diesel-migration.md](diesel-migration.md) | The ordered playbook for replacing `sqlx` with `diesel-async`: the two mandatory conventions, every measured trap, and how to verify the port |
+| [diesel-migration.md](diesel-migration.md) | The ordered playbook for porting `engine-store`'s queries to `diesel-async` while `sqlx` stays in the workspace: the two mandatory conventions, every measured trap, and how to verify the port |
 
 ## Contracts and boundaries
 

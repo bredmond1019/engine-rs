@@ -575,13 +575,19 @@ the same four gate commands as `planning/harness.json`: `cargo fmt --check`,
 
 `crates/engine-store/migrations/` is engine-rs's first tracked migration directory, applied with
 plain `sqlx::migrate!` — the `migrate` feature of the workspace's existing `sqlx` dependency, not a
-second database stack or a second connection pool. A `diesel-async` spike ran ahead of this choice
-(`planning/archive/EN.14.E/spike-fork-9.md`) and found it workable against this workspace's tokio/actix
-runtime, but adding it would mean a second Postgres driver stack alongside sqlx's for no compile-time
-safety gain: `engine-store` has zero `query!`/`query_as!` macro calls today, so there is no `.sqlx`
-offline-query cache to lose by staying on sqlx and no compile-time-checked-query benefit to gain by
-adopting diesel here either. `OP.fork-9-orm-choice` is the operator gate that ratifies an ORM choice
-for the crates downstream of this block (`EN.14.F`, `EN.14.I`); this block's own choice is `sqlx`.
+second database stack or a second connection pool. That was `EN.14.E`'s own choice, and it still
+holds for migrations.
+
+**The ORM for `engine-store`'s queries is a separate, later decision — and it is `diesel-async`.**
+`OP.fork-9-orm-choice` closed 2026-09-07 in its favour (brain D84 Amendment 3), on three spikes
+(`planning/archive/EN.14.E/spike-fork-9*.md`): it works under this tokio/actix runtime, holds up
+under pooled concurrency, and its typed DSL turns a wrong column, type or table — all runtime
+failures in today's unchecked `sqlx::query` strings — into compile errors. **`sqlx` is not removed**
+(D84 Amendment 4, 2026-09-12): spike 2 measured both stacks coexisting in one binary, so the port is
+staged beside it. That port is `EN.ticket.engine-store-queries-move-to-diesel-async`; until it lands,
+every query below is still `sqlx`. Playbook: [`diesel-migration.md`](diesel-migration.md).
+*Corrected 2026-09-12: this paragraph previously said `engine-store` stayed on sqlx with no
+compile-time safety gain from diesel.*
 
 Files under `crates/engine-store/migrations/` follow sqlx's `<VERSION>_<description>.sql` naming
 convention (leading integer version, underscore, description, `.sql`); a file that does not match
@@ -621,7 +627,7 @@ Postgres service — `migrations_apply_cleanly.rs`'s scratch-database test is `#
 reason `crates/engine-store/tests/postgres_round_trip.rs` already was (see above): it needs a live
 Postgres role with `CREATEDB`, which CI does not provide. `sqlx::migrate!`/`embed_migrations!`-style
 tooling only reads `.sql` files from disk at compile time — no live database is needed to *build*,
-only to *run* the ignored test, so choosing sqlx over diesel-async changed nothing about CI's shape.
+only to *run* the ignored test, so the ORM choice changes nothing about CI's shape.
 Run it explicitly:
 
 ```sh
