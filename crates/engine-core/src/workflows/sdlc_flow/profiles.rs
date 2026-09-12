@@ -308,6 +308,11 @@ pub fn thorough() -> PartialPolicy {
         // `.md` file's content in full when generating a task list, never
         // truncated.
         generate_context_max_bytes: Some(None),
+        // Out of scope for this block (EN.16.D task 1 only wires the merge
+        // arm) — every bundle stays `claude_cli` (the built-in default), so
+        // left unset here to fall through rather than restating the
+        // default explicitly ahead of EN.16.D task 5's harness.json wiring.
+        agent_backend: None,
     }
 }
 
