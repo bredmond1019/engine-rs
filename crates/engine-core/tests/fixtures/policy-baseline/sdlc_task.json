@@ -1,4 +1,5 @@
 {
+  "agent_backend": "claude_cli",
   "generate_context_max_bytes": null,
   "llm_triage": false,
   "local": {

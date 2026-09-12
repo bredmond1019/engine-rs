@@ -495,6 +495,14 @@ pub struct RunOutcomes {
     /// still deserializes.
     #[serde(default)]
     pub total_cache_creation_tokens: u64,
+    /// Count of session-ledger invocations whose cost could not be reported
+    /// (`ClaudeSession::cost_known == false` — e.g. a Pi/local-model run,
+    /// `EN.16.B`). Mirrors `crate::policy::RunTelemetry::unknown_cost_invocations`.
+    /// `#[serde(default)]` so a state file written before this field existed
+    /// still deserializes, reading as `0` — the same "known" default every
+    /// pre-`EN.16.B` invocation actually was.
+    #[serde(default)]
+    pub unknown_cost_invocations: u32,
     /// Per-stage model tier actually used this run, keyed by the resolved
     /// policy's `ModelTiers` field names (`"implement"`, `"triage"`,
     /// `"review"`, `"implement_simple"`, `"generate"`) — so
@@ -517,6 +525,7 @@ impl From<crate::policy::RunTelemetry> for RunOutcomes {
             total_cost_usd: telemetry.total_cost_usd,
             total_cache_read_tokens: telemetry.total_cache_read_tokens,
             total_cache_creation_tokens: telemetry.total_cache_creation_tokens,
+            unknown_cost_invocations: telemetry.unknown_cost_invocations,
             model_tier_used: telemetry.model_tier_used,
         }
     }
@@ -536,6 +545,7 @@ impl From<RunOutcomes> for crate::policy::RunTelemetry {
             total_cost_usd: outcomes.total_cost_usd,
             total_cache_read_tokens: outcomes.total_cache_read_tokens,
             total_cache_creation_tokens: outcomes.total_cache_creation_tokens,
+            unknown_cost_invocations: outcomes.unknown_cost_invocations,
             model_tier_used: outcomes.model_tier_used,
         }
     }
@@ -1431,6 +1441,7 @@ mod tests {
             total_cost_usd: 0.02,
             total_cache_read_tokens: 40,
             total_cache_creation_tokens: 8,
+            unknown_cost_invocations: 0,
             model_tier_used: BTreeMap::from([("implement".to_string(), "sonnet".to_string())]),
         });
 
@@ -1502,6 +1513,7 @@ mod tests {
             total_cost_usd: 0.02,
             total_cache_read_tokens: 40,
             total_cache_creation_tokens: 8,
+            unknown_cost_invocations: 0,
             model_tier_used: BTreeMap::from([("implement".to_string(), "sonnet".to_string())]),
         };
 
@@ -2352,6 +2364,7 @@ mod tests {
             total_cost_usd: 0.02,
             total_cache_read_tokens: 40,
             total_cache_creation_tokens: 8,
+            unknown_cost_invocations: 0,
             model_tier_used: BTreeMap::from([("implement".to_string(), "sonnet".to_string())]),
         });
 

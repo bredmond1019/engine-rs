@@ -279,6 +279,7 @@ fn make_telemetry(
         total_cost_usd: cost,
         total_cache_read_tokens: 0,
         total_cache_creation_tokens: 0,
+        unknown_cost_invocations: 0,
         model_tier_used: BTreeMap::new(),
     }
 }

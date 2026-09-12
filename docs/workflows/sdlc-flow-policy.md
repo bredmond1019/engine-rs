@@ -312,6 +312,13 @@ matters to `model_tier_used`.
 - `tasks_passed` / `tasks_failed`.
 - `review_verdicts` — e.g. `["TriageTaskNode:RETRYABLE", "ConsolidatedReviewNode:PASS"]`.
 - `total_input_tokens` / `total_output_tokens` / `total_cost_usd`.
+- `unknown_cost_invocations` (**`EN.16.B`**) — count of ledger invocations recorded with
+  `cost_known: false` (a non-`claude_cli` `agent_backend`, e.g. `PiTransport`, that reports no
+  dollar figure at all). Mirrors `policy::RunTelemetry::unknown_cost_invocations`; read this
+  alongside `total_cost_usd` before treating that total as complete — a nonzero count here means
+  the dollar figure is an undercount, not a wrong one. See
+  [`agent_backend`](README.md#agent_backend--which-coding-agent-sdlc_tasks-implement-stage-drives)
+  and [data-contract.md](../data-contract.md).
 - `total_cache_read_tokens` / `total_cache_creation_tokens` (`EN.ticket.token-usage-drops-cache-channels`)
   — the two prompt-cache channels. **Read these before drawing any conclusion about input cost.**
   `input_tokens` from the SDK is documented as *excluding cache reads*, so before these existed the

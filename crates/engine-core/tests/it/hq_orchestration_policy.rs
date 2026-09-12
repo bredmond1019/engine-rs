@@ -490,8 +490,20 @@ async fn hq_orchestration_policy_brain_root_enables_preflight() {
 #[tokio::test]
 async fn hq_orchestration_policy_real_hq_file_sets_the_switches() {
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    // crates/engine-core -> engine-rs repo root -> core -> agentic-portfolio (HQ root).
-    let hq_harness_path = manifest_dir.join("../../../../planning/harness.json");
+    // Walk up for `brain.toml` (engine_core::brain_root) rather than a
+    // hardcoded `../../../../` depth: that hardcoded depth is correct in the
+    // main tree but wrong inside a `trees/<branch>` worktree, where two extra
+    // path components sit between `crates/engine-core` and the repo root,
+    // making the old path resolve to engine-rs's own harness.json instead of
+    // HQ's.
+    let Ok(hq_root) = engine_core::brain_root::resolve_brain_root_from(manifest_dir) else {
+        eprintln!(
+            "SKIP: no HQ (brain.toml) checkout found walking up from {manifest_dir:?} — this \
+             test only runs when a real HQ checkout sits alongside this repo"
+        );
+        return;
+    };
+    let hq_harness_path = hq_root.join("planning/harness.json");
 
     let Ok(contents) = std::fs::read_to_string(&hq_harness_path) else {
         eprintln!(

@@ -80,6 +80,9 @@ pub fn baseline() -> PartialSdlcTaskPolicy {
         // Restates the built-in default verbatim (EN.17.F task 6):
         // unbounded, matching baseline's no-op contract.
         generate_context_max_bytes: Some(d.generate_context_max_bytes),
+        // Restates the built-in default verbatim — baseline's no-op
+        // contract (EN.16.B). No profile picks a non-default backend yet.
+        agent_backend: Some(d.agent_backend),
     }
 }
 
@@ -140,6 +143,9 @@ pub fn cheap_fast() -> PartialSdlcTaskPolicy {
         // a tight cap on how much of a spec's `.md` content reaches the
         // task-generation prompt.
         generate_context_max_bytes: Some(Some(20_000)),
+        // No non-default backend for the cost/latency floor yet (EN.16.B):
+        // wiring PiTransport as this profile's dispatch is a later task.
+        agent_backend: Some(super::policy::AgentBackend::ClaudeCli),
     }
 }
 
@@ -205,6 +211,9 @@ pub fn thorough() -> PartialSdlcTaskPolicy {
         // see every spec `.md` file's content in full when generating a
         // task list, never truncated.
         generate_context_max_bytes: Some(None),
+        // No non-default backend for the quality ceiling yet (EN.16.B):
+        // wiring PiTransport as this profile's dispatch is a later task.
+        agent_backend: Some(super::policy::AgentBackend::ClaudeCli),
     }
 }
 

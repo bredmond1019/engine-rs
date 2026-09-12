@@ -105,6 +105,8 @@ mod tests {
                 tier: tier.to_string(),
                 model: "stub-model".to_string(),
                 endpoint: None,
+                backend: "claude_cli".to_string(),
+                cost_known: true,
             };
             Box::pin(async move { Ok((outcome, info)) })
                 as BoxFuture<'static, claude_code_rs::Result<(Outcome, TransportInfo)>>
