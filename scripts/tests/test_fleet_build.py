@@ -387,5 +387,89 @@ class StrandedPermitTtlTest(unittest.TestCase):
             )
 
 
+class PreadmittedTest(unittest.TestCase):
+    """`FLEET_BUILD_PREADMITTED` bypasses permit acquisition (and `_sweep_stale`) entirely --
+    proven against a lock dir already holding `FLEET_BUILD_MAX` live permits, where the ordinary
+    path would still be waiting for a slot."""
+
+    def test_preadmitted_runs_without_a_permit_while_slots_are_full(self) -> None:
+        import json
+
+        with tempfile.TemporaryDirectory() as tmp:
+            lock_dir = Path(tmp) / ".fleet-locks" / "builds"
+            lock_dir.mkdir(parents=True)
+
+            # A live, non-stale permit occupying the fleet's only slot -- this test process's
+            # own pid, which stays running for the whole test, so `_sweep_stale` can never
+            # reclaim it out from under either assertion below.
+            (lock_dir / "holder.json").write_text(
+                json.dumps({"pid": os.getpid(), "started_at": time.time()})
+            )
+
+            env = _isolated_env(
+                tmp,
+                FLEET_BUILD_MAX="1",
+                FLEET_BUILD_TTL_SECONDS="3600",
+            )
+
+            # Positive control: WITHOUT FLEET_BUILD_PREADMITTED, the wrapper must still be
+            # waiting for the (occupied) permit slot at 2s -- proving the slot really is full
+            # and that this scenario would otherwise gate on it.
+            waiting = subprocess.Popen(
+                [sys.executable, str(WRAPPER), "--", "echo", "should-not-run-yet"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                env=env,
+            )
+            try:
+                time.sleep(2)
+                self.assertIsNone(
+                    waiting.poll(),
+                    "wrapper finished before the occupied permit was ever freed -- the "
+                    "positive control did not actually gate on a full slot",
+                )
+            finally:
+                waiting.kill()
+                waiting.wait(timeout=5)
+
+            # With FLEET_BUILD_PREADMITTED set, the identical invocation must skip admission
+            # entirely and return within 5s even though the slot is (still) full.
+            preadmitted_env = dict(env)
+            preadmitted_env["FLEET_BUILD_PREADMITTED"] = "1"
+
+            start = time.time()
+            result = subprocess.run(
+                [sys.executable, str(WRAPPER), "--", "echo", "preadmitted"],
+                capture_output=True,
+                text=True,
+                env=preadmitted_env,
+                timeout=5,
+            )
+            elapsed = time.time() - start
+
+            self.assertEqual(result.returncode, 0)
+            self.assertEqual(result.stdout.strip(), "preadmitted")
+            self.assertEqual(
+                result.stderr,
+                "",
+                "the preadmitted path must print nothing extra of its own",
+            )
+            self.assertLess(
+                elapsed,
+                5.0,
+                f"preadmitted run took {elapsed:.2f}s -- looks like it still went through "
+                "permit acquisition",
+            )
+
+            # No permit file was created (or removed) for the preadmitted run -- it never
+            # touched the store at all.
+            entries = sorted(p.name for p in lock_dir.glob("*.json"))
+            self.assertEqual(
+                entries,
+                ["holder.json"],
+                f"preadmitted run must not write/remove permit files: {entries!r}",
+            )
+
+
 if __name__ == "__main__":
     unittest.main()

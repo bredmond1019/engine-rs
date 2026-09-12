@@ -57,6 +57,7 @@ Where this engine meets something it does not own — the Brain, the operator, a
 | [operator-payload-contract.md](operator-payload-contract.md) | What the engine may send a human: payload limits, the operator queue, and run-failure notifications |
 | [approval-ledger.md](approval-ledger.md) | The append-only record of every gate decision — who approved what, and when |
 | [email-adapter.md](email-adapter.md) | The email channel: outbound sending, both inbound webhooks, and their auth |
+| [heavy-work-queue.md](heavy-work-queue.md) | The FIFO heavy-work queue: per-class admission, liveness-only reclaim, the SDLC test-stage consumers, and the status route |
 
 ## The terminal stack
 

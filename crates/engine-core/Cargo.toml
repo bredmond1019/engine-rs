@@ -21,6 +21,7 @@ engine-contract = { path = "../engine-contract" }
 mev = { workspace = true }
 okf-core = { workspace = true }
 sha2 = { workspace = true }
+toml = { workspace = true }
 term-core = { path = "../term-core", features = ["tokio"] }
 thiserror = { workspace = true }
 tracing = { workspace = true }

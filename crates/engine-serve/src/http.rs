@@ -134,6 +134,13 @@
 //!   `drain`/`complete` always `200` — an empty drain and a `complete` that matched nothing are
 //!   both normal answers, not faults, matching those functions' own `Ok` contracts. See
 //!   `coord_register` and its seven siblings below.
+//! - `GET /api/coordination/heavy-work` (`EN.17.I` task 7) — a read-only view over
+//!   `engine_core::coord::heavy_work`'s queue, read fresh on every request:
+//!   `{ enabled, free_mb, classes: [{ name, limit, min_free_mb, running, queued }], jobs: [...] }`.
+//!   `jobs` holds every currently `Queued`/`Running` job plus the 50 most recently finished
+//!   `Done`/`Cancelled`/`Abandoned` ones, newest first. No `X-API-Key` gate, copying
+//!   `/api/coordination` and `/api/roadmaps/{slug}/status` above. Always `200` except an outright
+//!   failure to resolve the brain root. See `get_heavy_work`.
 
 use std::collections::HashMap as StdHashMap;
 use std::sync::{Arc, OnceLock, RwLock};
@@ -349,6 +356,14 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         .route(
             "/api/roadmaps/{slug}/status",
             web::get().to(get_roadmap_status),
+        )
+        // `EN.17.I` task 7. A literal path segment under `/api/coordination/`, colliding with no
+        // dynamic extractor anywhere in this file (and a different HTTP method than the eight
+        // write verbs below, which share the same `/api/coordination/` prefix) — registration
+        // order relative to them does not matter.
+        .route(
+            "/api/coordination/heavy-work",
+            web::get().to(get_heavy_work),
         )
         // `EN.15.C` task 6. Eight literal path segments under `/api/coordination/`, colliding
         // with no dynamic extractor anywhere in this file — registration order among them (and
@@ -1029,6 +1044,103 @@ async fn get_roadmap_status(path: web::Path<String>) -> impl Responder {
             "error": err.to_string(),
         })),
     }
+}
+
+/// `GET /api/coordination/heavy-work` (`EN.17.I` task 7) — a read-only view over
+/// `engine_core::coord::heavy_work`'s queue: whether `[heavy_work]` is configured at all, the
+/// current free-memory reading, each configured class's bound alongside its live
+/// running/queued counts, and the job records themselves (every `Queued`/`Running` job, plus the
+/// 50 most recently finished `Done`/`Cancelled`/`Abandoned` ones), newest first.
+///
+/// **No `X-API-Key` gate.** Copies `/api/coordination` and `/api/roadmaps/{slug}/status` above —
+/// the only two `/api/`-prefixed routes this file carried before this one — rather than
+/// inventing a fourth auth policy under `/api/`.
+///
+/// **Always `200`.** A disabled queue (no `[heavy_work]` table), an unreadable `brain.toml`
+/// (treated as disabled, matching `HeavyWorkConfig`'s own fail-open posture for a missing file),
+/// or an empty/missing jobs directory are normal, useful answers — `enabled: false` and/or empty
+/// `classes`/`jobs` arrays ARE the answer, not a fault. A `5xx` is reserved for an outright
+/// failure to resolve the fleet's brain root at all, matching `get_coordination`'s own contract.
+async fn get_heavy_work() -> impl Responder {
+    use engine_core::coord::heavy_work::{
+        jobs_dir, read_job, FreeMemoryProbe, HeavyWorkConfig, JobState, VmStatFreeMemoryProbe,
+    };
+
+    let brain_root = match engine_core::brain_root::resolve_brain_root() {
+        Ok(root) => root,
+        Err(err) => {
+            return HttpResponse::InternalServerError().json(serde_json::json!({
+                "error": format!("cannot resolve brain root: {err}"),
+            }));
+        }
+    };
+
+    let lock_dir = engine_core::coord::resolve_lock_dir(&brain_root);
+    // An unreadable/malformed `brain.toml` reads as disabled here, same as "no `[heavy_work]`
+    // table at all" — this route is a status view, never the thing that should surface a
+    // config-parse failure (that already happens loudly wherever the queue is actually admitted
+    // from).
+    let config = HeavyWorkConfig::load(&brain_root.join("brain.toml"))
+        .unwrap_or_else(|_| HeavyWorkConfig::disabled());
+    let free_mb = VmStatFreeMemoryProbe.free_mb();
+
+    let mut all_jobs = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(jobs_dir(&lock_dir)) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                continue; // a `.tmp-<pid>-<uuid>` in-flight write, or something else entirely
+            }
+            if let Ok(job) = read_job(&path) {
+                all_jobs.push(job);
+            }
+        }
+    }
+
+    let mut class_names: Vec<&String> = config.classes.keys().collect();
+    class_names.sort();
+    let classes: Vec<serde_json::Value> = class_names
+        .into_iter()
+        .map(|name| {
+            let limit = config.classes.get(name).expect("name came from this map");
+            let running = all_jobs
+                .iter()
+                .filter(|j| j.class == *name && j.state == JobState::Running)
+                .count();
+            let queued = all_jobs
+                .iter()
+                .filter(|j| j.class == *name && j.state == JobState::Queued)
+                .count();
+            serde_json::json!({
+                "name": name,
+                "limit": limit.limit,
+                "min_free_mb": limit.min_free_mb,
+                "running": running,
+                "queued": queued,
+            })
+        })
+        .collect();
+
+    // Every still-active job (`Queued`/`Running`) is always shown; only the terminal states are
+    // capped at the 50 most recent, so the cap never hides work that is currently happening.
+    let (active, mut terminal): (Vec<_>, Vec<_>) = all_jobs
+        .into_iter()
+        .partition(|j| matches!(j.state, JobState::Queued | JobState::Running));
+    let newest_key =
+        |j: &engine_core::coord::heavy_work::HeavyWorkJob| j.finished_at.unwrap_or(j.enqueued_at);
+    terminal.sort_by_key(|j| std::cmp::Reverse(newest_key(j)));
+    terminal.truncate(50);
+
+    let mut jobs = active;
+    jobs.extend(terminal);
+    jobs.sort_by_key(|j| std::cmp::Reverse(newest_key(j)));
+
+    HttpResponse::Ok().json(serde_json::json!({
+        "enabled": config.enabled,
+        "free_mb": free_mb,
+        "classes": classes,
+        "jobs": jobs,
+    }))
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -4759,6 +4871,129 @@ mod tests {
             );
 
             clear_coord_env();
+        }
+    }
+
+    /// `EN.17.I` task 7: `GET /api/coordination/heavy-work`.
+    mod heavy_work {
+        use super::*;
+        use engine_core::coord::heavy_work::{write_job, HeavyWorkJob, JobState};
+
+        fn set_brain_root(root: &std::path::Path) {
+            std::env::set_var("ENGINE_BRAIN_ROOT", root);
+        }
+
+        fn clear_brain_root() {
+            std::env::remove_var("ENGINE_BRAIN_ROOT");
+        }
+
+        fn fixture_job(job_id: Uuid, class: &str, state: JobState) -> HeavyWorkJob {
+            HeavyWorkJob {
+                job_id,
+                class: class.to_string(),
+                state,
+                repo: "engine-rs".to_string(),
+                cwd: std::path::PathBuf::from("/tmp/engine-rs"),
+                commands: vec!["cargo nextest run --workspace".to_string()],
+                run_id: None,
+                holder_pid: None,
+                enqueued_at: Utc::now(),
+                admitted_at: None,
+                heartbeat_at: None,
+                finished_at: None,
+                passed: None,
+            }
+        }
+
+        /// AC: `GET /api/coordination/heavy-work` returns 200 with `enabled`, `classes` and
+        /// `jobs` keys in a tempdir-brain-root route test — a disabled queue (no `[heavy_work]`
+        /// table, since this tempdir carries no `brain.toml` at all) reports `enabled: false`
+        /// and empty arrays rather than erroring.
+        #[actix_web::test]
+        async fn route_returns_200_with_enabled_classes_and_jobs_keys_in_a_tempdir_brain_root() {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            set_brain_root(tmp.path());
+            let app = test::init_service(App::new().configure(configure)).await;
+
+            let resp = test::call_service(
+                &app,
+                test::TestRequest::get()
+                    .uri("/api/coordination/heavy-work")
+                    .to_request(),
+            )
+            .await;
+            assert_eq!(resp.status(), 200);
+            let body: serde_json::Value = test::read_body_json(resp).await;
+            assert_eq!(body["enabled"], false);
+            assert_eq!(body["classes"], serde_json::json!([]));
+            assert_eq!(body["jobs"], serde_json::json!([]));
+            assert!(body.get("free_mb").is_some());
+
+            clear_brain_root();
+        }
+
+        /// AC: the route lists a queued job's `job_id`, `class`, and `state == "queued"` when
+        /// one exists in the fixture lock dir.
+        #[actix_web::test]
+        async fn route_lists_a_queued_jobs_job_id_class_and_state_when_one_exists() {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            set_brain_root(tmp.path());
+
+            let lock_dir = engine_core::coord::resolve_lock_dir(tmp.path());
+            let job_id = Uuid::new_v4();
+            let job = fixture_job(job_id, "test", JobState::Queued);
+            write_job(&lock_dir, &job).expect("write fixture job");
+
+            let app = test::init_service(App::new().configure(configure)).await;
+            let resp = test::call_service(
+                &app,
+                test::TestRequest::get()
+                    .uri("/api/coordination/heavy-work")
+                    .to_request(),
+            )
+            .await;
+            assert_eq!(resp.status(), 200);
+            let body: serde_json::Value = test::read_body_json(resp).await;
+            let jobs = body["jobs"].as_array().expect("jobs must be an array");
+            let found = jobs
+                .iter()
+                .find(|j| j["job_id"] == serde_json::json!(job_id))
+                .unwrap_or_else(|| panic!("queued job {job_id} must be listed in {jobs:?}"));
+            assert_eq!(found["class"], "test");
+            assert_eq!(found["state"], "queued");
+
+            clear_brain_root();
+        }
+
+        /// AC: `read_coordination_view`'s serialized top-level key set is unchanged from before
+        /// this task — this route adds a new, separate JSON shape rather than touching
+        /// `CoordinationView` (see this task's own `files[]` note: bastion's `coord_cli.rs`
+        /// tests construct `CoordinationView` as a struct literal, so a new field there would
+        /// break that build).
+        #[std::prelude::v1::test]
+        fn read_coordination_views_key_set_is_unchanged_by_this_task() {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let view = engine_core::coord::read_coordination_view(tmp.path());
+            let value = serde_json::to_value(&view).expect("serialize CoordinationView");
+            let obj = value.as_object().expect("view serializes to an object");
+            let mut keys: Vec<&str> = obj.keys().map(|k| k.as_str()).collect();
+            keys.sort();
+            assert_eq!(
+                keys,
+                vec![
+                    "degradation_reasons",
+                    "escalations",
+                    "heartbeats",
+                    "leases",
+                    "messages",
+                    "registry",
+                    "run_records",
+                    "slots",
+                    "status",
+                ],
+                "adding GET /api/coordination/heavy-work must not change CoordinationView's own \
+                 serialized shape"
+            );
         }
     }
 }

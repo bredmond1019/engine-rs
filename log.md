@@ -16,6 +16,42 @@ related: [status, context]
 
 ## [run: 2026-09-11]
 
+### EN.17.I done — heavy-work queue for Rust check jobs
+
+Ran `/sdlc-flow` on branch `EN.17.I-flow` across all 8 tasks (all passed), PASS review. Tasks 1-2
+added a generic heavy-work queue in engine-core's coordination layer (`coord::heavy_work`):
+`HeavyWorkJob`/`JobState`/`HeavyWorkConfig`/`FreeMemoryProbe`, an atomic temp-file-plus-rename JSON
+job store, a brain.toml `[heavy_work]`/`[heavy_work.classes.<name>]` config table (an absent table
+disables the queue, a behavior-stable default), FIFO admission per class bounded by a configured
+limit plus a free-memory floor re-read on every dequeue, and reclaim by holder-pid liveness and
+heartbeat staleness only — never by admission or enqueue age. Task 3 added the `tests/it/heavy_work.rs`
+integration suite (FIFO order, limit-bounded concurrency with its own positive control, memory-floor
+re-read, dead-holder reclaim, disabled/degraded pass-through), including an OBSERVED RED demonstration
+of `fleet_build.py`'s pre-existing live-permit TTL-sweep defect. Task 4 fixed an unrelated nextest
+substring-filter mismatch on `admitted_command_runner`'s test. Tasks 5-6 wired `TestTaskNode` (class
+`test`) and `FinalValidationNode` (class `build`) to admit their checks through the queue when
+configured, always stamping `heavy_work: {mode, job_id, class, waited_ms, degraded}` regardless of
+setting, defaulting to a disabled queue that reproduces prior inline behavior. Task 7 added
+`GET /api/coordination/heavy-work` (a new route; `CoordinationView` itself is untouched) and
+`scripts/fleet_build.py`'s `FLEET_BUILD_PREADMITTED=1` passthrough, which skips permit acquisition
+entirely for an admitted Rust caller. Task 8 documented the wiring seam in `docs/heavy-work-queue.md`
+— both SDLC nodes default to a disabled queue and `sdlc_flow::graph` registers them with `::new()`,
+so a real production run stays unqueued until a caller opts in via `with_heavy_work` — plus the
+`docs/index.md` row, `planning/harness.json` `_comment`, and HQ's cross-tree `brain.toml`
+`[heavy_work]` table (`test`/`build` at `limit=2`, `min_free_mb=2048`). Full validation gate green.
+Closes `EN.17.I`. Next: `EN.17.H` — a real unattended chain on the installed binary.
+
+```
+edfe8e6 fix: fix pass 2 for EN.17.I-task8
+a387bcb fix: fix pass 1 for EN.17.I-task8
+3340fc4 feat: implement EN.17.I-task8
+bca6faf feat: implement EN.17.I-task7
+5d401a7 feat: implement EN.17.I-task6
+8b24990 feat: implement EN.17.I-task5
+841983d fix: fix pass 1 for EN.17.I-task4
+b3b55b3 feat: implement EN.17.I-task4
+```
+
 ### EN.17.G done — pre-run baseline snapshot + escalate failure class
 
 Ran `/sdlc-flow` on branch `EN.17.G-flow` across all 5 tasks (all passed), PASS review. Task 1

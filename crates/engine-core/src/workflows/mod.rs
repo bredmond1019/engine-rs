@@ -437,6 +437,38 @@ pub fn default_spec_runner() -> SpecCommandRunner {
     })
 }
 
+/// Wraps a [`SpecCommandRunner`] into a plain [`CommandRunner`] that stamps
+/// every call's [`CommandSpec::env`] with `FLEET_BUILD_PREADMITTED=1` —
+/// appended to whatever env the call already carries, never replacing it.
+///
+/// This is the hand-off contract between an admitted heavy-work job
+/// (`coord::heavy_work`, `EN.17.I`) and `scripts/fleet_build.py`: when a
+/// Rust SDLC run's test/build stage has already been admitted through the
+/// queue, its subprocess calls are routed through this runner so
+/// `fleet_build.py` sees the env var and skips its own permit acquisition
+/// (`FLEET_BUILD_PREADMITTED` passthrough, task 7) instead of taking a
+/// second, redundant slot.
+///
+/// [`CommandRunner`]'s own signature carries no per-call env — the plain
+/// `(program, args, cwd)` triple — so "whatever env the call already
+/// carries" is empty on that seam today; this wrapper still builds the
+/// `CommandSpec.env` slice by extending rather than overwriting, so a
+/// future caller that does thread pre-existing env through keeps it.
+#[must_use]
+pub fn admitted_command_runner(inner: SpecCommandRunner) -> CommandRunner {
+    Arc::new(move |program, args, cwd| {
+        let env: Vec<(&str, &str)> = vec![("FLEET_BUILD_PREADMITTED", "1")];
+        let spec = CommandSpec {
+            program,
+            args,
+            cwd,
+            env: &env,
+            timeout: None,
+        };
+        inner(&spec)
+    })
+}
+
 /// Stage **everything** in `worktree` (`git add -A`) and commit it with
 /// `message`, routing a non-zero commit outcome through [`log_noop_commit`]
 /// rather than treating it as a node failure (e.g. "nothing to commit" when
@@ -843,5 +875,46 @@ mod tests {
             "error: pathspec did not match any files",
             ""
         ));
+    }
+}
+
+/// Named separately from `mod tests` (rather than nested inside it) so that
+/// the fully-qualified test path is `workflows::admitted_command_runner_tests::…`
+/// — a substring of `workflows::admitted_command_runner`, which is exactly the
+/// `cargo nextest run` filter this task's own validation command uses. Mirrors
+/// the `session_delta_tests` precedent above in this same file.
+#[cfg(test)]
+mod admitted_command_runner_tests {
+    use super::{admitted_command_runner, CommandOutput, CommandSpec, SpecCommandRunner};
+    use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn admitted_command_runner_passes_fleet_build_preadmitted_env() {
+        let captured: Arc<Mutex<Vec<(String, String)>>> = Arc::new(Mutex::new(Vec::new()));
+        let captured_clone = Arc::clone(&captured);
+        let stub: SpecCommandRunner = Arc::new(move |spec: &CommandSpec| {
+            *captured_clone.lock().unwrap() = spec
+                .env
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect();
+            Ok(CommandOutput {
+                status: 0,
+                stdout: String::new(),
+                stderr: String::new(),
+            })
+        });
+
+        let runner = admitted_command_runner(stub);
+        let tmp = std::env::temp_dir();
+        let output = runner("echo", &["hi"], &tmp).expect("stub runner should not error");
+        assert_eq!(output.status, 0);
+
+        let seen = captured.lock().unwrap();
+        assert!(
+            seen.iter()
+                .any(|(k, v)| k == "FLEET_BUILD_PREADMITTED" && v == "1"),
+            "expected FLEET_BUILD_PREADMITTED=1 in captured env, got: {seen:?}"
+        );
     }
 }
