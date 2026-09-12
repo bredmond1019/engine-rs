@@ -243,7 +243,7 @@ mod tests {
         policy.model_tiers.extract = ModelTier::Local;
         policy.local = LocalConfig {
             endpoint: "http://localhost:11434".to_string(),
-            model: "qwen2.5-coder:7b".to_string(),
+            model: "qwen2.5:7b-instruct".to_string(),
             constrained_json: false,
         };
 
@@ -322,7 +322,7 @@ mod tests {
 
         let local = LocalConfig {
             endpoint: "http://localhost:11434".to_string(),
-            model: "qwen2.5-coder:7b".to_string(),
+            model: "qwen2.5:7b-instruct".to_string(),
             constrained_json: false,
         };
 

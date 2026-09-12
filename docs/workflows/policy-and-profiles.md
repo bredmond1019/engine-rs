@@ -116,8 +116,15 @@ The four tiers, from [`policy/tier.rs`](../../crates/engine-core/src/policy/tier
 | Field | Default | What it does |
 |---|---|---|
 | `endpoint` | `http://localhost:11434` | Base URL of the OpenAI-compatible server |
-| `model` | `qwen2.5-coder:7b` | Model name to request |
+| `model` | `qwen2.5:7b-instruct` | Model name to request |
 | `constrained_json` | `false` | Pass the stage's JSON schema as a constrained-decoding `response_format`, and skip the JSON-repair retry for that stage |
+
+The prior default — the coder-tuned 7B variant of the same model family — was rejected: three
+direct calls each to Ollama's OpenAI-compat and native `/api/chat` endpoints, bypassing any
+transport, showed it does not reliably emit Ollama's native `<tool_call>` wrapper tags — every
+response returned the tool call as plain text inside `message.content`, never populating
+`tool_calls`. The same test against `qwen2.5:7b-instruct` returned a correctly-structured
+`tool_calls` field 3/3.
 
 **No stage defaults to `local`** — the code says so explicitly. It is opt-in.
 

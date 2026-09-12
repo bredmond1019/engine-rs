@@ -1,7 +1,7 @@
 ---
 type: Guide
 title: Porting engine-store to diesel-async
-description: The ordered playbook for replacing sqlx with diesel-async in engine-store and engine-serve — the two mandatory conventions, every measured trap, what each query becomes, and how to verify the port.
+description: The ordered playbook for porting engine-store's queries from sqlx to diesel-async while sqlx stays in the workspace — the two mandatory conventions, every measured trap, what each query becomes, and how to verify the port.
 doc_id: diesel-migration
 layer: [engine]
 project: engine-rs
@@ -13,7 +13,10 @@ related: [architecture, data-contract, engine-rs-testing, docs-index, brain:D84-
 # Porting `engine-store` to `diesel-async`
 
 **Decision:** [brain D84 Amendment 3](file:///Users/brandon/Dev/agentic-portfolio/docs/decisions/D84-engine-rs-owns-the-engine-tables.md)
-settled the ORM fork in favour of `diesel-async`, replacing `sqlx` rather than joining it.
+settled the ORM fork in favour of `diesel-async`. **Amendment 4 (2026-09-12) keeps `sqlx` in the
+workspace beside it** — the operator ruled against removing it, since spike 2 measured both stacks
+coexisting in one binary — so this is a staged port of the queries, not a swap. The port is
+registered as `EN.ticket.engine-store-queries-move-to-diesel-async`.
 This doc is the playbook so none of it is re-derived. It is written to be *worked through*, in
 order.
 
@@ -96,10 +99,10 @@ Smaller than it looks. All query logic is in one file.
 
 | Location | What changes |
 |---|---|
-| `crates/engine-store/src/postgres.rs` (305 lines, 8 queries) | The whole port. The only place query logic lives |
+| `crates/engine-store/src/postgres.rs` (411 lines, 10 query functions at `036c317`; the spikes measured 305 lines and 8, before `EN.14.F` added the two `node_invocations` functions) | The whole port. The only place query logic lives |
 | `crates/engine-store/src/schema.rs` | New — generated, not written |
 | `crates/engine-serve/src/durable.rs`, `journal.rs`, `orphan.rs` | **Type alias only.** They thread `PgPool` as an opaque handle and delegate every query to `engine_store::*`. No query logic to port |
-| `crates/engine-store/migrations/` | One migration to carry over |
+| `crates/engine-store/migrations/` | Nothing required — `sqlx` stays (D84 Amendment 4), so `sqlx::migrate!` can keep applying these unless the port finds a concrete reason to move them |
 
 ### The four query shapes, and how each translates
 
@@ -122,8 +125,9 @@ All four were verified working against the real table shapes.
 ))
 ```
 
-That is a raw, unchecked string — today's safety level, so not a regression, but **7 of 8 queries
-gain compile-time checking and this one does not**. Migrating `task_context` to `jsonb` may close
+That is a raw, unchecked string — today's safety level, so not a regression, but **9 of the 10 query
+functions gain compile-time checking and this one filter does not** (the spikes counted 7 of 8,
+before `node_invocations` existed). Migrating `task_context` to `jsonb` may close
 it; that is a schema change and was not tested.
 
 ## What you gain, concretely

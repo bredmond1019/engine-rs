@@ -52,7 +52,7 @@ pub fn model_tier_to_model_string(tier: ModelTier, local_model: &str) -> String 
 pub struct LocalConfig {
     /// Base URL of the OpenAI-compatible endpoint, e.g. `http://localhost:11434`.
     pub endpoint: String,
-    /// Model name to request, e.g. `qwen2.5-coder:7b`.
+    /// Model name to request, e.g. `qwen2.5:7b-instruct`.
     pub model: String,
     /// Whether to pass the stage's JSON schema as a constrained-decoding
     /// `response_format` and skip the JSON-repair retry for that stage.
@@ -63,7 +63,7 @@ impl Default for LocalConfig {
     fn default() -> Self {
         Self {
             endpoint: "http://localhost:11434".to_string(),
-            model: "qwen2.5-coder:7b".to_string(),
+            model: "qwen2.5:7b-instruct".to_string(),
             constrained_json: false,
         }
     }
@@ -90,7 +90,7 @@ mod tests {
         );
         assert_eq!(
             model_tier_to_model_string(ModelTier::Local, &local.model),
-            "qwen2.5-coder:7b"
+            "qwen2.5:7b-instruct"
         );
     }
 
@@ -116,7 +116,7 @@ mod tests {
     fn local_config_default_matches_pre_hoist_baseline() {
         let local = LocalConfig::default();
         assert_eq!(local.endpoint, "http://localhost:11434");
-        assert_eq!(local.model, "qwen2.5-coder:7b");
+        assert_eq!(local.model, "qwen2.5:7b-instruct");
         assert!(!local.constrained_json);
     }
 }

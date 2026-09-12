@@ -794,7 +794,7 @@ mod tests {
                         stub_outcome(),
                         TransportInfo {
                             tier: "local".to_string(),
-                            model: "qwen2.5-coder:7b".to_string(),
+                            model: "qwen2.5:7b-instruct".to_string(),
                             endpoint: Some("http://localhost:11434".to_string()),
                             backend: "claude_cli".to_string(),
                             cost_known: true,
@@ -810,7 +810,7 @@ mod tests {
 
         let output = ctx.nodes.get("AgentCodeStep").expect("output present");
         assert_eq!(output["transport"]["tier"], "local");
-        assert_eq!(output["transport"]["model"], "qwen2.5-coder:7b");
+        assert_eq!(output["transport"]["model"], "qwen2.5:7b-instruct");
         assert_eq!(output["transport"]["endpoint"], "http://localhost:11434");
         // Existing readers of `content`/`model` are unaffected by which
         // transport variant supplied the outcome.
@@ -830,7 +830,7 @@ mod tests {
                         stub_outcome(),
                         TransportInfo {
                             tier: "local".to_string(),
-                            model: "qwen2.5-coder:7b".to_string(),
+                            model: "qwen2.5:7b-instruct".to_string(),
                             endpoint: None,
                             backend: "pi".to_string(),
                             cost_known: true,
@@ -871,7 +871,7 @@ mod tests {
                         stub_outcome(),
                         TransportInfo {
                             tier: "local".to_string(),
-                            model: "qwen2.5-coder:7b".to_string(),
+                            model: "qwen2.5:7b-instruct".to_string(),
                             endpoint: None,
                             backend: "pi".to_string(),
                             cost_known: false,

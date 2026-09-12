@@ -23,7 +23,9 @@ use std::time::Duration;
 
 use claude_code_rs::{Config, Outcome};
 use engine_contract::TaskContext;
-use engine_core::nodes::{pi_meta_transport, translate_agent_outcome, AgentOutcome, CostEstimate};
+use engine_core::nodes::{
+    aider_meta_transport, pi_meta_transport, translate_agent_outcome, AgentOutcome, CostEstimate,
+};
 use engine_core::policy::telemetry::{harvest as harvest_telemetry, RunTelemetryInputs};
 use engine_core::policy::{AgentBackend, LocalConfig, Policy, RESOLVED_POLICY_IDENTITY};
 use engine_core::sessions;
@@ -841,6 +843,520 @@ async fn agent_backend_pi_dollars_unknown_is_unknown_on_every_channel() {
         "dollars: Some(0.0) must clear the unknown-cost count — this is what \
          proves the test tells the two cases apart"
     );
+}
+
+// -- EN.16.C: AgentBackend::Aider -----------------------------------------
+//
+// Mirrors the Pi suite above test-for-test (dispatch on both registration
+// paths in both graphs, subprocess lifecycle through the public transport
+// seam, missing-binary, cost honesty). The one shape difference from Pi's
+// coverage: Aider's cost is the OUTER `None` (task 2's AC9), never
+// `Some(CostEstimate { dollars: None, .. })`, and Aider auto-commits its own
+// edits mid-call, so `modified_files` is derived from a pre/post-call git
+// diff (task 4) rather than a bare `git status` snapshot.
+
+/// Serializes every test in this module that mutates the process-global
+/// `AIDER_BINARY` env var — mirrors [`PI_BINARY_ENV_LOCK`] and
+/// `aider_transport.rs`'s own crate-local `AIDER_BINARY_ENV_LOCK` (that lock
+/// only serializes that module's own unit tests; this is a separate
+/// `static` scoped to this integration binary).
+static AIDER_BINARY_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+/// A fake `aider` script body that prints one `Applied edit to <file>` line
+/// — enough for the real, non-mocked parser (exercised here only indirectly,
+/// through the public transport) to report one modified file and no commit.
+const AIDER_SUCCESS_OUTPUT: &str = r#"printf 'Applied edit to hello.txt\n'
+"#;
+
+#[cfg(unix)]
+fn write_fake_aider_binary(body: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let script_path = dir.path().join("fake-aider.sh");
+    std::fs::write(&script_path, format!("#!/bin/sh\n{body}\n")).expect("write script");
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755))
+        .expect("chmod +x");
+    (dir, script_path)
+}
+
+/// `agent_backend: aider` must dispatch `AiderTransport` on
+/// `ImplementTaskNode` through BOTH SDLC_TASK's and SDLC_FLOW's
+/// `registry_for_policy_with_cancellation` — mirrors
+/// [`agent_backend_task_dispatch_wires_pi_transport`] and
+/// [`agent_backend_flow_dispatch_wires_pi_transport`], combined into one
+/// test per this task's naming (one test, not a per-workflow pair, unlike
+/// the Pi suite it mirrors).
+#[cfg(unix)]
+#[tokio::test]
+async fn agent_backend_aider_dispatch_wires_aider_transport() {
+    let _guard = AIDER_BINARY_ENV_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let (_dir, script) = write_fake_aider_binary(AIDER_SUCCESS_OUTPUT);
+    unsafe {
+        std::env::set_var("AIDER_BINARY", &script);
+    }
+
+    // SDLC_TASK
+    let task_policy = SdlcTaskPolicy {
+        agent_backend: AgentBackend::Aider,
+        ..SdlcTaskPolicy::default()
+    };
+    let task_registry = registry_for_policy_with_cancellation(&task_policy, None);
+    let task_node = task_registry
+        .get("ImplementTaskNode")
+        .expect("ImplementTaskNode registered");
+    let task_result = task_node.process(sdlc_task_ctx(AgentBackend::Aider)).await;
+
+    // SDLC_FLOW
+    let flow_policy = SdlcPolicy {
+        agent_backend: AgentBackend::Aider,
+        ..SdlcPolicy::default()
+    };
+    let token = CancellationToken::new();
+    let flow_registry =
+        sdlc_flow_registry_for_policy_with_cancellation(&flow_policy, Some(token), None);
+    let flow_node = flow_registry
+        .get("ImplementTaskNode")
+        .expect("ImplementTaskNode registered");
+    let flow_result = flow_node.process(sdlc_task_ctx(AgentBackend::Aider)).await;
+
+    unsafe {
+        std::env::remove_var("AIDER_BINARY");
+    }
+
+    let task_out =
+        task_result.expect("SDLC_TASK process should succeed against the fake aider script");
+    assert_eq!(
+        task_out.nodes["ImplementTaskNode"]["transport"]["backend"],
+        serde_json::json!("aider"),
+        "SDLC_TASK's agent_backend: aider must dispatch AiderTransport — got {task_out:#?}"
+    );
+
+    let flow_out =
+        flow_result.expect("SDLC_FLOW process should succeed against the fake aider script");
+    assert_eq!(
+        flow_out.nodes["ImplementTaskNode"]["transport"]["backend"],
+        serde_json::json!("aider"),
+        "SDLC_FLOW's agent_backend: aider must dispatch AiderTransport — got {flow_out:#?}"
+    );
+}
+
+/// The SAME `agent_backend: aider` policy through BOTH workflows' plain
+/// `registry_for_policy` (`token: None`) — the real production call sites
+/// (`orchestration::execute::EngineKind::{Task,Flow}`) — must STILL dispatch
+/// `AiderTransport`. Mirrors
+/// [`agent_backend_task_token_none_does_not_fall_back_to_claude`] and
+/// [`agent_backend_flow_token_none_does_not_fall_back_to_claude`]: this is
+/// what would have caught task 3's dispatch gap (a re-registration gated on
+/// `token.is_some()` alone) if it existed.
+#[cfg(unix)]
+#[tokio::test]
+async fn agent_backend_aider_token_none_does_not_fall_back_to_claude() {
+    let _guard = AIDER_BINARY_ENV_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let (_dir, script) = write_fake_aider_binary(AIDER_SUCCESS_OUTPUT);
+    unsafe {
+        std::env::set_var("AIDER_BINARY", &script);
+    }
+
+    let task_policy = SdlcTaskPolicy {
+        agent_backend: AgentBackend::Aider,
+        ..SdlcTaskPolicy::default()
+    };
+    let task_registry = registry_for_policy(&task_policy);
+    let task_node = task_registry
+        .get("ImplementTaskNode")
+        .expect("ImplementTaskNode registered");
+    let task_result = task_node.process(sdlc_task_ctx(AgentBackend::Aider)).await;
+
+    let flow_policy = SdlcPolicy {
+        agent_backend: AgentBackend::Aider,
+        ..SdlcPolicy::default()
+    };
+    let flow_registry = sdlc_flow_registry_for_policy(&flow_policy);
+    let flow_node = flow_registry
+        .get("ImplementTaskNode")
+        .expect("ImplementTaskNode registered");
+    let flow_result = flow_node.process(sdlc_task_ctx(AgentBackend::Aider)).await;
+
+    unsafe {
+        std::env::remove_var("AIDER_BINARY");
+    }
+
+    let task_out = task_result
+        .expect("SDLC_TASK token:None process should succeed against the fake aider script");
+    assert_eq!(
+        task_out.nodes["ImplementTaskNode"]["transport"]["backend"],
+        serde_json::json!("aider"),
+        "SDLC_TASK token: None must not fall back to the billed claude_cli \
+         node — got {task_out:#?}"
+    );
+
+    let flow_out = flow_result
+        .expect("SDLC_FLOW token:None process should succeed against the fake aider script");
+    assert_eq!(
+        flow_out.nodes["ImplementTaskNode"]["transport"]["backend"],
+        serde_json::json!("aider"),
+        "SDLC_FLOW token: None must not fall back to the billed claude_cli \
+         node — got {flow_out:#?}"
+    );
+}
+
+/// `AiderTransport`'s subprocess runs with `Config.cwd` as its
+/// `current_dir` — mirrors [`agent_backend_pi_transport_uses_worktree_cwd`],
+/// driven through the same public `aider_meta_transport` seam
+/// `ImplementTaskNode` composes against in production.
+#[cfg(unix)]
+#[tokio::test]
+async fn agent_backend_aider_transport_uses_worktree_cwd() {
+    let _guard = AIDER_BINARY_ENV_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let (_dir, script) = write_fake_aider_binary(
+        r#"printf 'cwd_is:%s\n' "$(pwd)"
+printf 'Applied edit to hello.txt\n'
+"#,
+    );
+    unsafe {
+        std::env::set_var("AIDER_BINARY", &script);
+    }
+
+    let cwd_dir = tempfile::tempdir().expect("cwd temp dir");
+    let expected_cwd = cwd_dir.path().canonicalize().expect("canonicalize cwd");
+
+    let config = Config {
+        cwd: Some(expected_cwd.clone()),
+        ..Config::default()
+    };
+
+    let transport = aider_meta_transport(local_config(), None);
+    let result = transport(config, "prompt".to_string()).await;
+
+    unsafe {
+        std::env::remove_var("AIDER_BINARY");
+    }
+
+    let (outcome, _info) = result.expect("fake aider script run must succeed");
+    assert!(
+        outcome.text.contains(&expected_cwd.display().to_string()),
+        "child must have run with the configured worktree cwd: {} not found in {}",
+        expected_cwd.display(),
+        outcome.text
+    );
+}
+
+/// A `CancellationToken` cancellation kills the `aider` child rather than
+/// letting it run to completion — mirrors
+/// [`agent_backend_pi_transport_kills_child_on_cancel`] EXACTLY, including
+/// its own `retries = 2` nextest override for this same
+/// fake-child/marker-file CPU-contention exposure (see `.config/nextest.toml`).
+#[cfg(unix)]
+#[tokio::test]
+async fn agent_backend_aider_transport_kills_child_on_cancel() {
+    let _guard = AIDER_BINARY_ENV_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+
+    let marker_dir = tempfile::tempdir().expect("marker temp dir");
+    let started = marker_dir.path().join("started");
+    let done = marker_dir.path().join("done");
+
+    let (_dir, script) = write_fake_aider_binary(
+        r#"touch "$STARTED"
+sleep 8
+touch "$DONE"
+"#,
+    );
+    unsafe {
+        std::env::set_var("AIDER_BINARY", &script);
+    }
+
+    let token = CancellationToken::new();
+    let config = Config {
+        env: vec![
+            ("STARTED".to_string(), started.display().to_string()),
+            ("DONE".to_string(), done.display().to_string()),
+        ],
+        ..Config::default()
+    };
+
+    let transport = aider_meta_transport(local_config(), Some(token.clone()));
+    let call = transport(config, "prompt".to_string());
+
+    let cancel_token = token.clone();
+    let canceller = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        cancel_token.cancel();
+    });
+
+    let result = call.await;
+    canceller.await.expect("canceller task must not panic");
+
+    unsafe {
+        std::env::remove_var("AIDER_BINARY");
+    }
+
+    let err = result.expect_err("a cancelled call must error, not succeed");
+    assert!(
+        err.to_string().contains("cancel"),
+        "failure text must say a cancellation occurred: {err}"
+    );
+
+    wait_for_marker(&started, "child never started");
+
+    std::thread::sleep(Duration::from_secs(3));
+    assert!(
+        !done.exists(),
+        "child was not actually killed — it ran to completion past the cancellation"
+    );
+}
+
+/// `aider` missing from `PATH` must produce a `NodeError`-shaped failure
+/// naming the binary and its install command — mirrors
+/// [`agent_backend_missing_pi_binary_returns_node_error`].
+#[cfg(unix)]
+#[tokio::test]
+async fn agent_backend_missing_aider_binary_returns_node_error() {
+    let _guard = AIDER_BINARY_ENV_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    unsafe {
+        std::env::set_var("AIDER_BINARY", "/definitely/not/a/real/aider/binary/xyz");
+    }
+
+    let transport = aider_meta_transport(local_config(), None);
+    let result = transport(Config::default(), "hello".to_string()).await;
+
+    unsafe {
+        std::env::remove_var("AIDER_BINARY");
+    }
+
+    let err = result.expect_err("a missing aider binary must error, not panic");
+    let message = err.to_string();
+    assert!(
+        message.contains("/definitely/not/a/real/aider/binary/xyz"),
+        "error must name the missing binary: {message}"
+    );
+    assert!(
+        message.contains("install"),
+        "error must name the install command: {message}"
+    );
+}
+
+/// An `agent_backend: "aider"` harness value round-trips to
+/// `AgentBackend::Aider` at THIS integration-test layer — complementing
+/// task 1's unit test in `policy/agent_backend.rs`, which covers the same
+/// claim through the crate's own `#[cfg(test)]` module rather than its
+/// public API.
+#[test]
+fn agent_backend_aider_harness_value_deserializes_to_variant() {
+    let backend: AgentBackend = serde_json::from_value(serde_json::json!("aider"))
+        .expect("\"aider\" must deserialize to an AgentBackend variant");
+    assert_eq!(backend, AgentBackend::Aider);
+}
+
+/// Run one `AgentCodeStep` through a real `Workflow`, with its meta
+/// transport answering via `translate_agent_outcome` (the SAME function
+/// `AiderTransport::run_aider` calls) tagged `"aider"`, for an
+/// `AgentOutcome` carrying `cost`, returning the resulting `TaskContext`.
+/// Sibling of [`run_pi_shaped_outcome`] — the one difference this task
+/// cares about is exercising the OUTER `None` cost shape (AC9), not Pi's
+/// `Some(CostEstimate { dollars: None, .. })`.
+async fn run_aider_shaped_outcome(cost: Option<CostEstimate>) -> TaskContext {
+    use engine_core::AgentCodeStep;
+
+    let step = engine_core::NodeExt::with_identity(
+        AgentCodeStep::new(IMPLEMENT_NODE, Config::default(), "do the thing").with_meta_transport(
+            move |_config, _prompt| {
+                let outcome = translate_agent_outcome(
+                    AgentOutcome {
+                        success: true,
+                        text: "did the thing".to_string(),
+                        modified_files: vec![],
+                        cost,
+                    },
+                    "aider",
+                );
+                Box::pin(async move { Ok(outcome) })
+            },
+        ),
+        IMPLEMENT_NODE,
+    );
+
+    let mut registry = NodeRegistry::new();
+    registry.register(Box::new(step));
+
+    let workflow = Workflow::new(registry, single_node_schema());
+    let on_progress: engine_core::OnProgress<'_> = Box::new(|_c: &TaskContext| {});
+    workflow
+        .run(serde_json::json!({}), on_progress)
+        .await
+        .expect("workflow should complete successfully")
+}
+
+/// Through the real chain, an Aider outcome whose `cost` is the OUTER
+/// `None` (never `Some(CostEstimate { dollars: None, .. })` — task 2's own
+/// shape decision) must be unknown on every channel that records spend:
+/// `cost_usd` absent from `ctx.nodes`, `BudgetLedger`'s unknown-cost flag
+/// set, the session ledger's `cost_known: false`, and `RunTelemetry`'s
+/// `unknown_cost_invocations >= 1`. Mirrors
+/// [`agent_backend_pi_dollars_unknown_is_unknown_on_every_channel`]'s
+/// structure, including its re-run with a KNOWN cost to prove this test
+/// tells the two cases apart rather than always reporting "unknown" (even
+/// though `AiderTransport` itself never produces a known-cost outcome in
+/// production — this proves the shared chain, not `AiderTransport`, is
+/// what's under test here).
+#[tokio::test]
+async fn agent_backend_aider_cost_none_is_unknown_on_every_channel() {
+    let unknown_ctx = run_aider_shaped_outcome(None).await;
+
+    assert!(
+        unknown_ctx.nodes[IMPLEMENT_NODE].get("cost_usd").is_none(),
+        "cost_usd must be ABSENT from ctx.nodes when an aider outcome's cost \
+         is the outer None: {:#?}",
+        unknown_ctx.nodes[IMPLEMENT_NODE]
+    );
+
+    let ledger = BudgetLedger::from_context(&unknown_ctx);
+    assert!(
+        ledger.has_unknown_cost_node(),
+        "BudgetLedger must flag the unknown-cost node"
+    );
+
+    let sessions = sessions::read_sessions(&unknown_ctx.metadata);
+    assert_eq!(sessions.len(), 1, "one invocation must be ledgered");
+    assert!(
+        !sessions[0].cost_known,
+        "the session ledger entry must record cost_known: false"
+    );
+
+    let totals = sessions::ledger_totals(&unknown_ctx.metadata);
+    assert_eq!(totals.unknown_cost_invocations, 1);
+    assert_eq!(
+        totals.output_tokens, 0,
+        "an aider outcome with cost: None entirely reports zero tokens too — \
+         there is no separate token count to salvage from an absent \
+         CostEstimate, unlike Pi's Some(CostEstimate{{dollars: None, ..}})"
+    );
+
+    let telemetry = harvest_telemetry(
+        &unknown_ctx,
+        chrono::Utc::now(),
+        RunTelemetryInputs::default(),
+    );
+    assert!(
+        telemetry.unknown_cost_invocations >= 1,
+        "RunTelemetry must surface at least one unknown-cost invocation: {telemetry:#?}"
+    );
+
+    // Re-run with a KNOWN cost (never produced by AiderTransport itself, but
+    // proves this test can tell the two cases apart rather than always
+    // reporting "unknown").
+    let known_ctx = run_aider_shaped_outcome(Some(CostEstimate {
+        tokens: 42,
+        dollars: Some(1.5),
+    }))
+    .await;
+
+    assert!(
+        known_ctx.nodes[IMPLEMENT_NODE].get("cost_usd").is_some(),
+        "cost_usd must be PRESENT when dollars is known: {:#?}",
+        known_ctx.nodes[IMPLEMENT_NODE]
+    );
+    assert!(
+        !BudgetLedger::from_context(&known_ctx).has_unknown_cost_node(),
+        "a known dollar cost must not be flagged as unknown-cost"
+    );
+    let known_sessions = sessions::read_sessions(&known_ctx.metadata);
+    assert!(known_sessions[0].cost_known);
+    assert_eq!(
+        sessions::ledger_totals(&known_ctx.metadata).unknown_cost_invocations,
+        0
+    );
+    let known_telemetry = harvest_telemetry(
+        &known_ctx,
+        chrono::Utc::now(),
+        RunTelemetryInputs::default(),
+    );
+    assert_eq!(
+        known_telemetry.unknown_cost_invocations, 0,
+        "a known cost must clear the unknown-cost count — this is what \
+         proves the test tells the two cases apart"
+    );
+}
+
+/// The auto-commit `modified_files` case (task 4's fix), exercised
+/// end-to-end through `ImplementTaskNode::process` against a REAL git
+/// worktree — no stubbed `CommandRunner` here, since the whole point is
+/// that a bare `git status --porcelain` snapshot (the correct derivation
+/// for Pi/ClaudeCli) reads a clean tree as "nothing changed" once the
+/// transport itself has already committed, and only a pre/post-call `git
+/// diff` against the captured pre-call `HEAD` reports the truth. SHOWN
+/// CAPABLE OF FAILING: reverting the `AgentBackend::Aider` arm in
+/// `task_loop.rs` to `git_worktree_changed_files` (a bare `git status`) makes
+/// this assertion fail with an empty `modified_files` — exactly the bug
+/// task 4 fixed.
+#[tokio::test]
+async fn agent_backend_aider_auto_commit_modified_files_reported_correctly() {
+    let worktree = temp_dir("aider-auto-commit");
+
+    let git = |args: &[&str]| {
+        std::process::Command::new("git")
+            .args(args)
+            .current_dir(&worktree)
+            .output()
+            .unwrap_or_else(|err| panic!("git {args:?} failed to run: {err}"))
+    };
+    git(&["init", "-q"]);
+    git(&["config", "user.email", "test@example.com"]);
+    git(&["config", "user.name", "Test"]);
+    std::fs::write(worktree.join("seed.txt"), "seed").expect("write seed file");
+    git(&["add", "-A"]);
+    let seed_commit = git(&["commit", "-q", "-m", "seed"]);
+    assert!(seed_commit.status.success(), "seed commit must succeed");
+
+    let ctx = task_loop_ctx(AgentBackend::Aider, &worktree);
+
+    let worktree_for_transport = worktree.clone();
+    let aider_like_transport: ModelTransport = Arc::new(move |_config, _prompt| {
+        let worktree = worktree_for_transport.clone();
+        Box::pin(async move {
+            std::fs::write(worktree.join("hello.txt"), "hello from aider")
+                .expect("write aider-edited file");
+            std::process::Command::new("git")
+                .args(["add", "-A"])
+                .current_dir(&worktree)
+                .output()
+                .expect("git add");
+            std::process::Command::new("git")
+                .args(["commit", "-q", "-m", "feat: add hello.txt"])
+                .current_dir(&worktree)
+                .output()
+                .expect("git commit");
+            Ok(canned_outcome(
+                "Applied edit to hello.txt\nCommit abc1234 feat: add hello.txt".to_string(),
+            ))
+        })
+    });
+
+    let node = ImplementTaskNode::new().with_transport(aider_like_transport);
+    let out = node
+        .process(ctx)
+        .await
+        .expect("an aider-shaped auto-committing implement call should succeed");
+
+    assert_eq!(
+        out.nodes["ImplementTaskNode"]["modified_files"],
+        serde_json::json!(["hello.txt"]),
+        "an auto-committed edit must be reported via the pre/post-call git \
+         diff, not read as 'nothing changed' from a bare git status against \
+         an already-clean worktree: {:#?}",
+        out.nodes["ImplementTaskNode"]
+    );
+
+    std::fs::remove_dir_all(&worktree).ok();
 }
 
 // -- what counts as success / write-verification ------------------------

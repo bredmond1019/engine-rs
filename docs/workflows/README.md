@@ -181,6 +181,7 @@ Both, plus the four-layer precedence that decides which setting actually wins, a
 |---|---|---|
 | `claude_cli` (default) | The `claude` CLI, as every SDLC_TASK run has always used. | Billed, reported exactly as before. |
 | `pi` | `pi_agent_rust` (`crates/engine-core/src/nodes/pi_transport.rs`'s `PiTransport`) against a local Ollama model, read from the resolved policy's existing `local.{endpoint, model}` block — `pi` introduces no separate model/endpoint knob of its own. | $0 in principle, but reported as **cost unknown**, never a silent `$0.00` — see below. |
+| `aider` | `aider` (`crates/engine-core/src/nodes/aider_transport.rs`'s `AiderTransport`) against a local Ollama model, using the same `local.{endpoint, model}` block as `pi` — but a different model-prefix convention: `aider` is invoked with `--model ollama_chat/<local.model>` and reads the endpoint from `OLLAMA_API_BASE` (aider's own env var), where `pi` uses `--provider ollama` and `OLLAMA_HOST`. `aider` auto-commits its edits by default; this transport passes `--no-attribute-co-authored-by` so those commits never carry aider's own `Co-authored-by` trailer. | $0 in principle, but reported as **cost unknown** on every channel, exactly like `pi` — see below. |
 
 `agent_backend` is present and set to `claude_cli` in `sdlc_task.policy` and all three
 `sdlc_task.profiles` bundles in `planning/harness.json`, next to an `_agent_backend_comment`
@@ -212,6 +213,12 @@ directory, `~/.cargo`, the HQ vault behind the worktree's `planning/` symlink), 
 `git`/`gh` credentials, and reach the network. Never point `agent_backend: pi` at an untrusted task
 description or a cloud-hosted model without revisiting this boundary. See `pi_transport.rs`'s module
 doc for the same statement kept next to the code.
+
+**Safety boundary — `aider` shares `pi`'s, not a new one.** `AiderTransport` shells to `aider` with
+`--yes-always`, which bypasses per-tool approval exactly as `pi`'s `--approval-mode yolo` does, and
+the scoped git worktree passed as `current_dir` is **not containment** for the same reasons given
+above for `pi` — see that note; it is not restated here. `aider_transport.rs`'s own module doc
+carries the same statement next to the code.
 
 **A known flaky test, not a functional gap.** `pi_transport`'s own subprocess-lifecycle tests spawn a
 fake child and wait on a marker file it writes; under the full `--workspace --all-features` run's CPU

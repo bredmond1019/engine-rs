@@ -96,7 +96,7 @@ mod tests {
     fn local_config_overlay_merges_field_by_field_without_clobbering_untouched_fields() {
         let base = LocalConfig {
             endpoint: "http://localhost:11434".to_string(),
-            model: "qwen2.5-coder:7b".to_string(),
+            model: "qwen2.5:7b-instruct".to_string(),
             constrained_json: false,
         };
         let over = PartialLocalConfig {

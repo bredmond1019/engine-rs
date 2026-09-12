@@ -740,7 +740,7 @@ mod tests {
         let mut nodes = HashMap::new();
         nodes.insert(
             "StageA".to_string(),
-            serde_json::json!({ "transport": { "tier": "local", "model": "qwen2.5-coder:7b", "endpoint": "http://localhost:11434" } }),
+            serde_json::json!({ "transport": { "tier": "local", "model": "qwen2.5:7b-instruct", "endpoint": "http://localhost:11434" } }),
         );
         let ctx = ctx_with(nodes, HashMap::new());
         let observed = observed_model_tiers(&ctx, &["StageA"]);
@@ -991,7 +991,7 @@ mod tests {
                 output_tokens: 5,
                 cache_read_input_tokens: 0,
                 cache_creation_input_tokens: 0,
-                model: "qwen2.5-coder:7b".to_string(),
+                model: "qwen2.5:7b-instruct".to_string(),
                 started_at: None,
                 cost_known: false,
             },

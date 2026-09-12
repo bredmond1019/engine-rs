@@ -79,14 +79,14 @@ mod tests {
 
     #[test]
     fn apply_model_tier_sets_config_model() {
-        let config = apply_model_tier(Config::default(), ModelTier::Haiku, "qwen2.5-coder:7b");
+        let config = apply_model_tier(Config::default(), ModelTier::Haiku, "qwen2.5:7b-instruct");
         assert_eq!(config.model.as_deref(), Some("claude-haiku-4-5"));
     }
 
     #[test]
     fn apply_model_tier_local_uses_local_model_name() {
-        let config = apply_model_tier(Config::default(), ModelTier::Local, "qwen2.5-coder:7b");
-        assert_eq!(config.model.as_deref(), Some("qwen2.5-coder:7b"));
+        let config = apply_model_tier(Config::default(), ModelTier::Local, "qwen2.5:7b-instruct");
+        assert_eq!(config.model.as_deref(), Some("qwen2.5:7b-instruct"));
     }
 
     #[test]

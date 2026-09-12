@@ -1645,7 +1645,7 @@ mod tests {
             Some(&event),
         );
 
-        let expected = "{\"output_verbosity\":\"terse\",\"prompt_cache\":false,\"review_mode\":\"trivial_skip\",\"review_skip_max_files\":2,\"review_skip_max_diff_lines\":40,\"test_depth\":\"fast\",\"model_tiers\":{\"implement\":\"haiku\",\"implement_simple\":\"sonnet\",\"review\":\"haiku\",\"triage\":\"haiku\",\"generate\":\"haiku\",\"docs\":\"haiku\"},\"timeouts\":{\"implement\":null,\"triage\":null,\"review\":null,\"generate\":null,\"docs\":null},\"local\":{\"endpoint\":\"http://localhost:11434\",\"model\":\"qwen2.5-coder:7b\",\"constrained_json\":false},\"llm_triage\":true,\"max_attempts\":4,\"retry_feedback\":{\"enabled\":true,\"max_chars\":4000}}";
+        let expected = "{\"output_verbosity\":\"terse\",\"prompt_cache\":false,\"review_mode\":\"trivial_skip\",\"review_skip_max_files\":2,\"review_skip_max_diff_lines\":40,\"test_depth\":\"fast\",\"model_tiers\":{\"implement\":\"haiku\",\"implement_simple\":\"sonnet\",\"review\":\"haiku\",\"triage\":\"haiku\",\"generate\":\"haiku\",\"docs\":\"haiku\"},\"timeouts\":{\"implement\":null,\"triage\":null,\"review\":null,\"generate\":null,\"docs\":null},\"local\":{\"endpoint\":\"http://localhost:11434\",\"model\":\"qwen2.5:7b-instruct\",\"constrained_json\":false},\"llm_triage\":true,\"max_attempts\":4,\"retry_feedback\":{\"enabled\":true,\"max_chars\":4000}}";
 
         let expected: serde_json::Value =
             serde_json::from_str(expected).expect("pinned baseline literal parses as JSON");

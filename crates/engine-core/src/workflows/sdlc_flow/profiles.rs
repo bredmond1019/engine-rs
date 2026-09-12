@@ -269,7 +269,7 @@ pub fn thorough() -> PartialPolicy {
             // to the `local` tier in this bundle) — set explicitly per rule
             // 6 rather than left `None`.
             endpoint: Some("http://localhost:11434".to_string()),
-            model: Some("qwen2.5-coder:7b".to_string()),
+            model: Some("qwen2.5:7b-instruct".to_string()),
             constrained_json: Some(false),
         }),
         llm_triage: Some(true),

@@ -543,7 +543,7 @@ mod tests {
                 ..ProposalGeneratorPolicy::default().model_tiers
             },
             local: super::super::policy::LocalConfig {
-                model: "qwen2.5-coder:7b".to_string(),
+                model: "qwen2.5:7b-instruct".to_string(),
                 ..super::super::policy::LocalConfig::default()
             },
             ..ProposalGeneratorPolicy::default()
@@ -583,7 +583,7 @@ mod tests {
         node.process(ctx).await.expect("process should succeed");
 
         let (config, prompt) = captured.lock().unwrap().take().expect("transport called");
-        assert_eq!(config.model.as_deref(), Some("qwen2.5-coder:7b"));
+        assert_eq!(config.model.as_deref(), Some("qwen2.5:7b-instruct"));
         assert_eq!(config.system_prompt.as_deref(), Some(STABLE_SYSTEM_PROMPT));
         assert!(prompt.contains("Be terse"));
         assert!(config.allowed_tools.is_empty());
