@@ -132,6 +132,13 @@
 //! closing over a `LocalConfig`); see the module for the safety boundary on
 //! `--approval-mode yolo` and the worktree cwd NOT being containment.
 //!
+//! `aider_transport` (`EN.16.C` task 2) is `aider_meta_transport` — the
+//! `AgentBackend::Aider` implementation of the same `MetaTransport` alias,
+//! mirroring `pi_transport`'s shape but shelling to `aider` (plain-text
+//! output, auto-commits by default, cost always the outer `None`) instead of
+//! `pi_agent_rust`'s `--mode json` stream. See the module for the same
+//! safety boundary and the auto-commit trailer decision.
+//!
 //! `judgment` (`EN.17.D` task 1) is `JudgmentNode` — a reusable, bounded,
 //! schema-constrained `claude` call: byte-capped input slices (truncated at
 //! a UTF-8 boundary, with a marker naming the slice and bytes dropped), a
@@ -147,6 +154,7 @@
 pub mod agent_code_step;
 pub mod agent_outcome;
 pub mod aggregate;
+pub mod aider_transport;
 pub mod brain_client;
 pub mod channel_transport;
 pub mod doc_materializer;
@@ -168,6 +176,7 @@ pub mod terminal;
 pub use agent_code_step::{AgentCodeStep, MetaTransport, TransportInfo};
 pub use agent_outcome::{translate as translate_agent_outcome, AgentOutcome, CostEstimate};
 pub use aggregate::AggregateNode;
+pub use aider_transport::{aider_meta_transport, aider_meta_transport_live};
 pub use brain_client::{
     http_get_live, BrainConfig, BrainConfigError, HttpGet, RecallNode, RecallResult,
     ReqwestHttpGet, StubHttpGet, BRAIN_API_KEY_ENV, BRAIN_API_URL_ENV, DEFAULT_RECALL_HYBRID,

@@ -60,3 +60,13 @@ retries = 2
 [[profile.default.overrides]]
 filter = 'test(agent_backend_pi_transport_kills_child_on_cancel)'
 retries = 2
+
+# `nodes::aider_transport::tests::timeout_kills_the_child_process` (`EN.16.C` task 2) is the
+# identical fake-child/marker-file pattern, duplicated for the `AgentBackend::Aider` transport —
+# reproduced flaking under a scoped `--lib nodes::aider_transport` run within the first few
+# invocations while passing cleanly in isolation, exactly the contention signature documented on
+# the `pi_transport` overrides above. Same fix. (`cancellation_kills_the_child_process` above
+# already covers this module's own cancellation test via its unqualified substring filter.)
+[[profile.default.overrides]]
+filter = 'test(nodes::aider_transport::tests::timeout_kills_the_child_process)'
+retries = 2
