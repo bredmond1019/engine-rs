@@ -19,6 +19,19 @@
 //! a fake script doesn't care what order its arguments arrive in — only a
 //! real `pi` binary does.
 //!
+//! **Version floor: `pi_agent_rust` >= 0.5.0.** v0.3.0 ignores
+//! `--approval-mode` entirely in `-p` (print/non-interactive) mode and
+//! hardcodes always-ask for the write tool — confirmed via `--approval-mode
+//! yolo`, `--approval-mode write`, the (nonexistent) `PI_APPROVAL_MODE` env
+//! var, and a project `.pi/settings.json`, none of which worked. Re-tested
+//! identically on v0.5.0 (installed via the pinned curl installer,
+//! `--version v0.5.0`) and the bug is gone — the tool call executes. No
+//! change to this transport's command construction was needed —
+//! `--approval-mode yolo` was always correct; the bug lived in the
+//! installed binary, not here. See
+//! `planning/open-work/pre-plan/pluggable-code-agent-transport/evidence/pi-approval-bug-fixed-in-v0.5.0.md`
+//! in the HQ vault.
+//!
 //! `local.endpoint` has no direct `pi` CLI flag on the `ollama` provider, so
 //! it is honored best-effort via the `OLLAMA_HOST` environment variable the
 //! child inherits — the widely-used convention for redirecting an
