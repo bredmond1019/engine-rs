@@ -64,6 +64,12 @@ use okf_core::{
 /// write goes through (schema-validate, stamp `host`, snapshot to `.prev/`, then write).
 pub mod write;
 
+/// The heavy-work queue — `EN.17.I`. Job records under `<lock_dir>/heavy-work/jobs/`, FIFO
+/// admission per class bounded by a `brain.toml` `[heavy_work]` limit and a free-memory floor,
+/// and reclaim by holder liveness (pid + heartbeat), never by start age. Task 1 lands only the
+/// record/config/store types and the `FreeMemoryProbe` seam; the queue/worker land in task 2.
+pub mod heavy_work;
+
 /// The env var honoured as the first-precedence lock-dir override, mirroring
 /// `base-template/scripts/fleet_concurrency_check.py`'s `--lock-dir` / `FLEET_LOCK_DIR`.
 pub const FLEET_LOCK_DIR_ENV: &str = "FLEET_LOCK_DIR";

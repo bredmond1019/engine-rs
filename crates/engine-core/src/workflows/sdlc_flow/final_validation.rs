@@ -35,13 +35,17 @@
 //! whether this run covers the whole spec. Implementing it here too would
 //! give the guard two owners.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use engine_contract::TaskContext;
 use serde_json::json;
 
+use crate::coord::heavy_work::{HeavyWorkConfig, HeavyWorkQueue, HeavyWorkSpec};
 use crate::node::{Node, NodeError};
+use crate::workflows::{admitted_command_runner, CommandSpec, SpecCommandRunner};
 
+use super::close_block::DEFAULT_REPO_SLUG;
 use super::policy::TestDepth;
 use super::task_loop::{
     resolve_harness_path, resolved_policy, select_task_checks, spec_dir_for_baseline,
@@ -125,6 +129,12 @@ pub(crate) fn select_reconcile_checks(checks: &[serde_json::Value]) -> Vec<serde
 pub struct FinalValidationNode {
     runner: CommandRunner,
     scope: ValidationScope,
+    /// The heavy-work admission queue this node's check run is submitted
+    /// through, class `build` (`EN.17.I` task 6, mirroring `TestTaskNode`'s
+    /// task 5 seam). Defaults to a disabled queue via [`Self::new`] —
+    /// behavior-identical to every run before this block: every check runs
+    /// inline, unqueued, immediately. Override with [`Self::with_heavy_work`].
+    heavy_work: HeavyWorkQueue,
 }
 
 impl FinalValidationNode {
@@ -133,6 +143,11 @@ impl FinalValidationNode {
         Self {
             runner: super::default_command_runner(),
             scope: ValidationScope::Full,
+            // The lock dir is never touched while `HeavyWorkConfig::disabled()`
+            // is in effect (the disabled branch runs inline without ever
+            // reading/writing the store), so an empty placeholder path is
+            // safe here — same reasoning as `TestTaskNode::new`.
+            heavy_work: HeavyWorkQueue::new(PathBuf::new(), HeavyWorkConfig::disabled()),
         }
     }
 
@@ -141,6 +156,16 @@ impl FinalValidationNode {
     #[must_use]
     pub fn with_runner(mut self, runner: CommandRunner) -> Self {
         self.runner = runner;
+        self
+    }
+
+    /// Configure the heavy-work admission queue this node's check run is
+    /// submitted through (class `build`). Mirrors [`Self::with_runner`]'s
+    /// builder convention and `TestTaskNode::with_heavy_work`'s contract:
+    /// leaving this unset (the [`Self::new`] default) is behavior-stable.
+    #[must_use]
+    pub fn with_heavy_work(mut self, heavy_work: HeavyWorkQueue) -> Self {
+        self.heavy_work = heavy_work;
         self
     }
 
@@ -164,7 +189,7 @@ impl FinalValidationNode {
     /// entirely leaves `reconcileFailed` at its initial `false`).
     ///
     /// Never returns `Err` — see the module doc's NEVER-`Err` property.
-    fn run_and_stamp(
+    async fn run_and_stamp(
         &self,
         ctx: &mut TaskContext,
         checks: &[serde_json::Value],
@@ -172,23 +197,95 @@ impl FinalValidationNode {
         skipped: bool,
         skip_reason: String,
     ) {
-        let (check_results, failed_names): (Vec<CheckResult>, Vec<String>) = if skipped {
-            (Vec::new(), Vec::new())
+        let (check_results, failed_names, heavy_work_json): (
+            Vec<CheckResult>,
+            Vec<String>,
+            serde_json::Value,
+        ) = if skipped {
+            // Nothing runs on a skip branch, so it never touches the
+            // heavy-work queue — `heavy_work` is stamped `disabled` on its
+            // own terms here, not by consulting `self.heavy_work`'s
+            // configured state, since no admission was ever attempted
+            // (mirrors `TestTaskNode::process`'s `harness-missing` branch).
+            (
+                Vec::new(),
+                Vec::new(),
+                json!({
+                    "mode": "disabled",
+                    "job_id": null,
+                    "class": "build",
+                    "waited_ms": 0,
+                    "degraded": false,
+                }),
+            )
         } else {
-            // Share `TestTaskNode::run_checks` — the check-kind dispatch,
-            // the `enabled: false` skip, and the `gates` semantics —
-            // rather than forking a second executor. This throwaway
-            // `TestTaskNode` is only ever used as a handle onto that
-            // shared method; it is never `process`ed as a node itself.
-            //
             // `spec_dir_for_baseline` (`EN.17.G` task 3) locates the same
             // pre-run baseline snapshot directory `TestTaskNode::process`
             // does, so this run-level gate reads the identical snapshot a
             // per-task `baseline-diff` check already read.
             let spec_dir = spec_dir_for_baseline(ctx, worktree);
-            TestTaskNode::new()
-                .with_runner(self.runner.clone())
-                .run_checks(checks, worktree, &spec_dir)
+
+            let repo = ctx
+                .event
+                .get("repo")
+                .and_then(|v| v.as_str())
+                .unwrap_or(DEFAULT_REPO_SLUG)
+                .to_string();
+
+            let heavy_work_spec = HeavyWorkSpec {
+                class: "build".to_string(),
+                repo,
+                cwd: worktree.to_path_buf(),
+                commands: checks
+                    .iter()
+                    .filter_map(|check| {
+                        check
+                            .get("command")
+                            .and_then(|v| v.as_str())
+                            .map(str::to_string)
+                    })
+                    .collect(),
+                run_id: None,
+            };
+
+            // The admitted job's own subprocess calls go through
+            // `admitted_command_runner` (task 4) so `fleet_build.py`'s
+            // separate permit sees `FLEET_BUILD_PREADMITTED=1` and skips its
+            // own (redundant) acquisition — same wiring as `TestTaskNode`
+            // (task 5).
+            let admitted_runner: CommandRunner = {
+                let base = self.runner.clone();
+                let spec_runner: SpecCommandRunner =
+                    Arc::new(move |spec: &CommandSpec| (base)(spec.program, spec.args, spec.cwd));
+                admitted_command_runner(spec_runner)
+            };
+
+            // Share `TestTaskNode::run_checks` — the check-kind dispatch,
+            // the `enabled: false` skip, and the `gates` semantics — rather
+            // than forking a second executor. This throwaway `TestTaskNode`
+            // is only ever used as a handle onto that shared method; it is
+            // never `process`ed as a node itself.
+            let job_node = TestTaskNode::new().with_runner(admitted_runner);
+            let checks_for_job = checks.to_vec();
+            let worktree_for_job = worktree.to_path_buf();
+            let spec_dir_for_job = spec_dir.clone();
+
+            let outcome = self
+                .heavy_work
+                .run(heavy_work_spec, move || {
+                    job_node.run_checks(&checks_for_job, &worktree_for_job, &spec_dir_for_job)
+                })
+                .await;
+
+            let heavy_work_json = json!({
+                "mode": serde_json::to_value(outcome.mode).unwrap_or(serde_json::Value::Null),
+                "job_id": outcome.job_id.map(|id| id.to_string()),
+                "class": outcome.class,
+                "waited_ms": outcome.waited_ms,
+                "degraded": outcome.degraded,
+            });
+            let (results, failed) = outcome.output;
+            (results, failed, heavy_work_json)
         };
 
         let all_passed = failed_names.is_empty();
@@ -207,6 +304,7 @@ impl FinalValidationNode {
                 "failure_summary": failure_summary,
                 "skipped": skipped,
                 "skip_reason": skip_reason,
+                "heavy_work": heavy_work_json,
             }),
         );
     }
@@ -257,7 +355,8 @@ impl Node for FinalValidationNode {
                 // applies.
                 let (selected_checks, _selection) =
                     select_task_checks(&harness_checks, &[], TestDepth::Full, false);
-                self.run_and_stamp(&mut ctx, &selected_checks, worktree, false, String::new());
+                self.run_and_stamp(&mut ctx, &selected_checks, worktree, false, String::new())
+                    .await;
             }
             ValidationScope::Reconcile => {
                 // Skip condition 1 (JS: `testDepth === 'fast'` guards
@@ -278,7 +377,8 @@ impl Node for FinalValidationNode {
                         "test_depth=full: every check already ran authoritative on every \
                          per-task pass; reconciling again would be a pure double-run"
                             .to_string(),
-                    );
+                    )
+                    .await;
                     return Ok(ctx);
                 }
 
@@ -296,13 +396,15 @@ impl Node for FinalValidationNode {
                         "no gating check needed reconciling (no fastCommand substitutions, no \
                          perTask:false checks) - skipped, zero added cost"
                             .to_string(),
-                    );
+                    )
+                    .await;
                     return Ok(ctx);
                 }
 
                 // Run the reconcile checks' authoritative `command` — never
                 // `fastCommand` — at full depth, no per-task filter.
-                self.run_and_stamp(&mut ctx, &reconcile_checks, worktree, false, String::new());
+                self.run_and_stamp(&mut ctx, &reconcile_checks, worktree, false, String::new())
+                    .await;
             }
         }
 
@@ -742,5 +844,180 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("build"));
+    }
+
+    // --- heavy-work admission (EN.17.I task 6) ---
+
+    #[tokio::test]
+    async fn final_validation_stamps_heavy_work_disabled_by_default() {
+        let dir = tempfile::tempdir().unwrap();
+        write_harness(dir.path());
+        let (runner, _recorded) = recording_command_runner();
+
+        // No `with_heavy_work` call — the default queue is disabled.
+        let node = FinalValidationNode::new().with_runner(runner);
+        let ctx = ctx_with_worktree(dir.path());
+        let ctx = node.process(ctx).await.unwrap();
+
+        let result = get_result(&ctx, "FinalValidationNode").unwrap();
+        let heavy_work = &result["heavy_work"];
+        assert_eq!(heavy_work["mode"], json!("disabled"));
+        assert!(heavy_work["job_id"].is_null());
+        assert_eq!(heavy_work["degraded"], json!(false));
+        assert_eq!(result["all_passed"], json!(true));
+    }
+
+    #[tokio::test]
+    async fn final_validation_admits_through_configured_queue_with_class_build() {
+        let dir = tempfile::tempdir().unwrap();
+        write_harness(dir.path());
+        let (runner, _recorded) = recording_command_runner();
+
+        let lock_dir = tempfile::tempdir().expect("tempdir");
+        let mut classes = HashMap::new();
+        classes.insert(
+            "build".to_string(),
+            crate::coord::heavy_work::ClassLimit {
+                limit: 1,
+                min_free_mb: 0,
+            },
+        );
+        let config = crate::coord::heavy_work::HeavyWorkConfig {
+            enabled: true,
+            heartbeat_interval_secs: 60,
+            stale_after_secs: 300,
+            poll_interval_ms: 5,
+            classes,
+        };
+        let queue = HeavyWorkQueue::new(lock_dir.path().to_path_buf(), config);
+
+        let node = FinalValidationNode::new()
+            .with_runner(runner)
+            .with_heavy_work(queue);
+        let ctx = ctx_with_worktree(dir.path());
+        let ctx = node.process(ctx).await.unwrap();
+
+        let result = get_result(&ctx, "FinalValidationNode").unwrap();
+        let heavy_work = &result["heavy_work"];
+        assert_eq!(heavy_work["mode"], json!("enabled"));
+        assert_eq!(heavy_work["class"], json!("build"));
+        assert!(!heavy_work["job_id"].is_null());
+        assert_eq!(heavy_work["degraded"], json!(false));
+        assert_eq!(result["all_passed"], json!(true));
+    }
+
+    #[tokio::test]
+    async fn final_validation_degrades_when_lock_dir_unwritable_but_still_runs_checks() {
+        let dir = tempfile::tempdir().unwrap();
+        write_harness(dir.path());
+        let (runner, recorded) = recording_command_runner();
+
+        // A lock "dir" that is actually a regular file: the store write
+        // errors and the job runs inline, degraded — same fixture shape as
+        // `TestTaskNode`'s task 5 test.
+        let unwritable = tempfile::NamedTempFile::new().expect("tempfile");
+        let mut classes = HashMap::new();
+        classes.insert(
+            "build".to_string(),
+            crate::coord::heavy_work::ClassLimit {
+                limit: 1,
+                min_free_mb: 0,
+            },
+        );
+        let config = crate::coord::heavy_work::HeavyWorkConfig {
+            enabled: true,
+            heartbeat_interval_secs: 60,
+            stale_after_secs: 300,
+            poll_interval_ms: 5,
+            classes,
+        };
+        let queue = HeavyWorkQueue::new(unwritable.path().to_path_buf(), config);
+
+        let node = FinalValidationNode::new()
+            .with_runner(runner)
+            .with_heavy_work(queue);
+        let ctx = ctx_with_worktree(dir.path());
+        let ctx = node.process(ctx).await.unwrap();
+
+        let result = get_result(&ctx, "FinalValidationNode").unwrap();
+        assert_eq!(result["all_passed"], json!(true));
+        let heavy_work = &result["heavy_work"];
+        assert_eq!(heavy_work["degraded"], json!(true));
+
+        let joined = recorded.lock().unwrap().join(" | ");
+        assert!(
+            joined.contains("cargo build --release"),
+            "checks must still run inline when the lock dir is unwritable: {joined}"
+        );
+    }
+
+    #[tokio::test]
+    async fn final_validation_no_heavy_work_table_behaviour_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        write_harness(dir.path());
+        let (runner, recorded) = recording_command_runner();
+
+        // Explicitly constructed disabled config (equivalent to no
+        // `[heavy_work]` table in brain.toml) rather than `FinalValidationNode`'s
+        // own default, to pin that the disabled path stays behavior-stable
+        // even when a queue is wired in but turned off.
+        let queue = HeavyWorkQueue::new(PathBuf::new(), HeavyWorkConfig::disabled());
+        let node = FinalValidationNode::new()
+            .with_runner(runner)
+            .with_heavy_work(queue);
+        let ctx = ctx_with_worktree(dir.path());
+        let ctx = node.process(ctx).await.unwrap();
+
+        let result = get_result(&ctx, "FinalValidationNode").unwrap();
+        assert_eq!(result["heavy_work"]["mode"], json!("disabled"));
+        assert_eq!(result["all_passed"], json!(true));
+        let joined = recorded.lock().unwrap().join(" | ");
+        assert!(joined.contains("cargo nextest run --workspace"));
+        assert!(joined.contains("cargo build --release"));
+    }
+
+    #[tokio::test]
+    async fn final_validation_skip_branch_stamps_disabled_heavy_work_with_zero_calls() {
+        let dir = tempfile::tempdir().unwrap();
+        write_harness(dir.path());
+        let (runner, recorded) = recording_command_runner();
+
+        let lock_dir = tempfile::tempdir().expect("tempdir");
+        let mut classes = HashMap::new();
+        classes.insert(
+            "build".to_string(),
+            crate::coord::heavy_work::ClassLimit {
+                limit: 1,
+                min_free_mb: 0,
+            },
+        );
+        let config = crate::coord::heavy_work::HeavyWorkConfig {
+            enabled: true,
+            heartbeat_interval_secs: 60,
+            stale_after_secs: 300,
+            poll_interval_ms: 5,
+            classes,
+        };
+        let queue = HeavyWorkQueue::new(lock_dir.path().to_path_buf(), config);
+
+        // Reconcile scope at test_depth=full is the module's own skip
+        // branch (zero CommandRunner calls) — even with a live queue
+        // configured, the skip path must never attempt admission.
+        let node = FinalValidationNode::new()
+            .with_scope(ValidationScope::Reconcile)
+            .with_runner(runner)
+            .with_heavy_work(queue);
+        let ctx = ctx_with_worktree(dir.path());
+        let ctx = ctx_with_test_depth(ctx, TestDepth::Full);
+        let ctx = node.process(ctx).await.unwrap();
+
+        let result = get_result(&ctx, "FinalValidationNode").unwrap();
+        assert_eq!(result["skipped"], json!(true));
+        assert_eq!(result["heavy_work"]["mode"], json!("disabled"));
+        assert!(result["heavy_work"]["job_id"].is_null());
+        assert!(
+            recorded.lock().unwrap().is_empty(),
+            "the skip branch must never attempt admission"
+        );
     }
 }

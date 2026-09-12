@@ -67,6 +67,14 @@ Environment variables:
                                   next line (the last line repeats once
                                   exhausted). Proves the memory check runs
                                   per-dequeue-attempt, not once at enqueue.
+    FLEET_BUILD_PREADMITTED       Any truthy value skips permit acquisition
+                                  and `_sweep_stale` entirely and runs the
+                                  wrapped command directly -- for a caller
+                                  (`EN.17.I`'s `coord::heavy_work` queue) that
+                                  already gated admission itself and would
+                                  otherwise double-queue behind this
+                                  wrapper's own, separate `builds/` permit
+                                  store.
 """
 
 from __future__ import annotations
@@ -90,6 +98,20 @@ POLL_INTERVAL_SECONDS = 0.05
 
 _VM_STAT_PAGE_SIZE_RE = re.compile(r"page size of (\d+) bytes")
 _VM_STAT_FIELD_RE = re.compile(r"^(Pages [a-z ]+):\s+(\d+)\.?\s*$", re.MULTILINE)
+
+
+def _env_truthy(name: str) -> bool:
+    """Whether env var `name` is set to any truthy value.
+
+    Present and non-empty, excluding the case-insensitive spellings of
+    "false" and "0" -- so `FLEET_BUILD_PREADMITTED=1` / `=true` / `=yes` all
+    count, but an unset or empty var, or an explicit `=0` / `=false`, does
+    not.
+    """
+    value = os.environ.get(name)
+    if value is None:
+        return False
+    return value.strip().lower() not in ("", "0", "false")
 
 
 def find_brain_root(start: Optional[Path] = None) -> Optional[Path]:
@@ -284,6 +306,14 @@ def main(argv: list[str]) -> int:
             file=sys.stderr,
         )
         return 2
+
+    if _env_truthy("FLEET_BUILD_PREADMITTED"):
+        # The caller (e.g. `coord::heavy_work`'s queue) already gated
+        # admission itself -- skip permit acquisition and `_sweep_stale`
+        # entirely and run the wrapped command directly, passing through
+        # its real exit code with no extra stdout/stderr of our own.
+        result = subprocess.run(command, check=False)
+        return result.returncode
 
     max_permits = int(os.environ.get("FLEET_BUILD_MAX", str(DEFAULT_FLEET_BUILD_MAX)))
     min_free_mb = float(
