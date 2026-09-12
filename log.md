@@ -16,6 +16,39 @@ related: [status, context]
 
 ## [2026-09-12]
 
+### `/sdlc-flow EN.16.D` — BAILED after task 5 (foreign broken dependency in mev)
+
+- **What:** Ran tasks 1-5 of EN.16.D (Pi backend attribution in SDLC_FLOW). Tasks 1-4 passed:
+  `agent_backend` now resolves through `sdlc_flow`'s `PartialPolicy`/`Policy::apply` (task 1);
+  `registry_for_policy_with_cancellation`'s token-gated `ImplementTaskNode` branch dispatches
+  `PiTransport` even with `token: None` (task 2); three new SDLC_FLOW Pi-dispatch integration
+  tests prove it end-to-end (task 3); `RunTelemetry`/`RunOutcomes` both carry `backend_used`,
+  harvested from `ctx.nodes[stage]["transport"]["backend"]`, keeping the two serde-identical
+  (task 4). Task 5 (a `PolicyAggregate` test proving pi/claude_cli runs never merge into one row,
+  plus the `docs/workflows/sdlc-flow-policy.md` knob-table entry) was implemented and its own
+  diff is clean, but the run's validation gate failed to compile: `core/mev`'s working tree
+  carries uncommitted changes on an unrelated ticket (`MV.ticket.create-block-graduates-a-
+  carryover-flow`) in `src/brain/block_create.rs` — `GraduationPlan` derives `Clone` but its
+  field `EmitPlan` does not, plus an unresolved `HashMap` import. engine-rs path-depends on mev
+  (`mev = { path = "../mev" }`), so this breaks the whole workspace build regardless of
+  engine-rs's own state. Fixing another repo's in-flight, uncommitted work on an unrelated ticket
+  is out of scope for this task, so the run BAILED rather than absorb it.
+- **Why:** A foreign, unrelated repo's broken working tree — not anything in EN.16.D's own
+  diff — made the build gate fail; the correct move is to bail and flag it, not silently patch
+  around another lane's in-progress edit.
+- **Next:** Someone working in `core/mev` needs to commit or fix
+  `MV.ticket.create-block-graduates-a-carryover-flow`'s `block_create.rs` changes (the `Clone`
+  derive / `HashMap` import) so the shared workspace builds again, then re-run `/sdlc-flow
+  EN.16.D` from task 5 (or resume).
+
+```
+9652d48 feat: implement EN.16.D-task5
+9b7cb2c feat: implement EN.16.D-task4
+0d59ea9 feat: implement EN.16.D-task3
+0195559 feat: implement EN.16.D-task2
+dae0fee feat: implement EN.16.D-task1
+```
+
 ### Closed both operator gates on pluggable-code-agent-transport; filed EN.16.E; captured eval-harness idea
 
 - **What:** Closed `first-real-pi-engine-run` and `install-aider-and-capture-a-real-cli-run` via
