@@ -70,3 +70,12 @@ retries = 2
 [[profile.default.overrides]]
 filter = 'test(nodes::aider_transport::tests::timeout_kills_the_child_process)'
 retries = 2
+
+# `agent_backend_aider_transport_kills_child_on_cancel` (`tests/it/agent_backend.rs`, `EN.16.C`
+# task 5) is the integration-test sibling of `agent_backend_pi_transport_kills_child_on_cancel`
+# above — same fake-child/marker-file pattern, same contention exposure, same fix. Added in this
+# task rather than as a follow-up, per the operator's note that shipping the Pi analogue without
+# its retry override cost three extra bail cycles on EN.16.D.
+[[profile.default.overrides]]
+filter = 'test(agent_backend_aider_transport_kills_child_on_cancel)'
+retries = 2
