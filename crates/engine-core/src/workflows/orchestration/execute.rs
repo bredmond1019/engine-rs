@@ -47,12 +47,14 @@ use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
 
+use async_trait::async_trait;
 use uuid::Uuid;
 
 use engine_contract::{NodeRunStatus, TaskContext};
 
 use crate::budget::{Budget, BudgetLedger};
 use crate::cancellation::CancellationToken;
+use crate::coord::heavy_work::{self, HeavyWorkConfig, HeavyWorkQueue, JobState};
 use crate::workflow::node_cost_usd;
 use serde_json::json;
 
@@ -60,7 +62,9 @@ use crate::completion::derive_terminal_status;
 use crate::policy::permission::PermissionProfile;
 use crate::policy::PolicyConfigSource;
 use crate::repo_registry::{RepoRegistry, RepoRegistryError};
+use crate::workflows::queue_park::{self, HeavyJobLookup, RunStart};
 use crate::workflows::sdlc_flow;
+use crate::workflows::sdlc_flow::task_loop::TestTaskNode;
 use crate::workflows::sdlc_task;
 use crate::{OnProgress, RunOptions, Workflow, WorkflowError};
 
@@ -802,11 +806,63 @@ fn sdlc_task_event(invocation: &FlowInvocation) -> serde_json::Value {
 ///
 /// Never reimplements either engine: every node in a run is that engine's
 /// own module's node.
+///
+/// Delegates to [`default_flow_runner_with_heavy_work`] with a real,
+/// disk-backed [`DiskHeavyJobLookup`] bridging `registry.brain_root()`'s own
+/// `coord::heavy_work` store (`EN.17.J` task 5) — the production default. A
+/// test that needs to control a queue-parked child's outcome deterministically
+/// (rather than racing the real on-disk queue) should call
+/// [`default_flow_runner_with_heavy_work`] directly with its own
+/// [`HeavyJobLookup`] stub instead.
 #[must_use]
 pub fn default_flow_runner(registry: Arc<RepoRegistry>) -> FlowRunner {
+    let heavy_work: Arc<dyn HeavyJobLookup> =
+        Arc::new(DiskHeavyJobLookup::new(registry.brain_root().to_path_buf()));
+    default_flow_runner_with_heavy_work(registry, heavy_work)
+}
+
+/// A fresh, `brain.toml`-configured `HeavyWorkQueue` over `lock_dir` — an
+/// absent/unreadable `[heavy_work]` table degrades to
+/// [`HeavyWorkConfig::disabled`], matching every other caller's degraded-open
+/// contract (`TestTaskNode::new`'s own default, `EN.17.I`).
+fn heavy_work_queue_for(lock_dir: &Path) -> HeavyWorkQueue {
+    let config = HeavyWorkConfig::load(&lock_dir.join("brain.toml"))
+        .unwrap_or_else(|_| HeavyWorkConfig::disabled());
+    HeavyWorkQueue::new(lock_dir.to_path_buf(), config)
+}
+
+/// Like [`default_flow_runner`], but the [`HeavyJobLookup`] a queue-parked
+/// child's `TestTaskNode` suspension is driven through (`EN.17.J` task 5) is
+/// supplied by the caller rather than built from `registry.brain_root()`'s
+/// real on-disk store — the seam this task's own integration tests use to
+/// control a parked job's outcome deterministically.
+///
+/// Both `EngineKind::Flow` and `EngineKind::Task` arms build their real
+/// engine's own policy-resolved registry exactly as before this task, then
+/// additionally re-register `TestTaskNode` with a real, `brain.toml`-backed
+/// `HeavyWorkQueue` (`registry_for_policy` on its own never wires one in —
+/// `TestTaskNode::new`'s disabled default otherwise governs, same as every
+/// other caller of `registry_for_policy` today) — the same
+/// re-register-after-`registry_for_policy` pattern `SetupWorktreeNode`
+/// already uses on the line above it. The run itself goes through
+/// [`queue_park::drive`] instead of `Workflow::run_with` directly: a child
+/// whose test stage queue-parks is driven to full completion here, so
+/// [`execute_step`]'s `derive_terminal_status` read never sees a suspended
+/// ctx (see this module's own `execute_step_reads_a_suspended_child_ctx_as_
+/// succeeded_observed_red` test for the defect this closes).
+#[must_use]
+pub fn default_flow_runner_with_heavy_work(
+    registry: Arc<RepoRegistry>,
+    heavy_work: Arc<dyn HeavyJobLookup>,
+) -> FlowRunner {
     Arc::new(move |invocation: FlowInvocation| {
         let registry = registry.clone();
+        let heavy_work = heavy_work.clone();
         Box::pin(async move {
+            let cancel = invocation
+                .cancellation_token
+                .clone()
+                .unwrap_or_default();
             match invocation.engine {
                 EngineKind::Flow => {
                     let event = sdlc_flow_event(&invocation);
@@ -826,6 +882,10 @@ pub fn default_flow_runner(registry: Arc<RepoRegistry>) -> FlowRunner {
                     node_registry.register(Box::new(
                         sdlc_flow::setup::SetupWorktreeNode::new().with_registry(registry.clone()),
                     ));
+                    node_registry.register(Box::new(
+                        TestTaskNode::new()
+                            .with_heavy_work(heavy_work_queue_for(registry.brain_root())),
+                    ));
 
                     let workflow =
                         Workflow::new_validated(node_registry, sdlc_flow::graph::schema())
@@ -841,7 +901,17 @@ pub fn default_flow_runner(registry: Arc<RepoRegistry>) -> FlowRunner {
                         budget: invocation.budget,
                         ..RunOptions::default()
                     };
-                    workflow.run_with(event, on_progress, options).await
+                    queue_park::drive(
+                        &workflow,
+                        RunStart::Fresh {
+                            event,
+                            on_progress,
+                            options,
+                            heavy_work: heavy_work.clone(),
+                        },
+                        &cancel,
+                    )
+                    .await
                 }
                 EngineKind::Task => {
                     let event = sdlc_task_event(&invocation);
@@ -861,6 +931,10 @@ pub fn default_flow_runner(registry: Arc<RepoRegistry>) -> FlowRunner {
                     node_registry.register(Box::new(
                         sdlc_flow::setup::SetupWorktreeNode::new().with_registry(registry.clone()),
                     ));
+                    node_registry.register(Box::new(
+                        TestTaskNode::new()
+                            .with_heavy_work(heavy_work_queue_for(registry.brain_root())),
+                    ));
 
                     let workflow =
                         Workflow::new_validated(node_registry, sdlc_task::graph::schema())
@@ -871,11 +945,99 @@ pub fn default_flow_runner(registry: Arc<RepoRegistry>) -> FlowRunner {
                         budget: invocation.budget,
                         ..RunOptions::default()
                     };
-                    workflow.run_with(event, on_progress, options).await
+                    queue_park::drive(
+                        &workflow,
+                        RunStart::Fresh {
+                            event,
+                            on_progress,
+                            options,
+                            heavy_work: heavy_work.clone(),
+                        },
+                        &cancel,
+                    )
+                    .await
                 }
             }
         })
     })
+}
+
+/// A best-effort, disk-backed [`HeavyJobLookup`] over `coord::heavy_work`'s
+/// on-disk job store — [`default_flow_runner`]'s production default.
+///
+/// **Known limitation, documented rather than fixed here** (outside this
+/// task's declared files): `TestTaskNode::process`'s `QueuePark` branch
+/// (`workflows::sdlc_flow::task_loop`, `EN.17.J` task 3) mints the walk's own
+/// correlation `job_id` BEFORE calling `HeavyWorkQueue::submit` — `submit`
+/// has no synchronous way to hand its own freshly-enqueued id back before
+/// admission, so the disk-persisted `HeavyWorkJob` this lookup polls for is
+/// keyed by a DIFFERENT id than the one carried in `ctx.metadata.heavy_work.
+/// job_id`. Until a follow-on task closes that gap, this lookup polls
+/// forever for a `job_id` that never appears on disk. It regresses nothing
+/// today: before this task, `registry_for_policy` never wired an enabled
+/// `HeavyWorkQueue` into `TestTaskNode` at all (every caller got the
+/// disabled default), so queue-park through `default_flow_runner` was
+/// already unreachable; this struct is the first attempt at a real bridge,
+/// left honest about what it cannot yet do rather than silently
+/// short-circuiting with a fabricated outcome.
+struct DiskHeavyJobLookup {
+    lock_dir: PathBuf,
+    poll_interval: std::time::Duration,
+}
+
+impl DiskHeavyJobLookup {
+    fn new(lock_dir: PathBuf) -> Self {
+        Self {
+            lock_dir,
+            poll_interval: std::time::Duration::from_millis(200),
+        }
+    }
+}
+
+#[async_trait]
+impl HeavyJobLookup for DiskHeavyJobLookup {
+    async fn await_outcome(&self, job_id: Uuid) -> serde_json::Value {
+        let path = heavy_work::job_path(&self.lock_dir, job_id);
+        loop {
+            if let Ok(job) = heavy_work::read_job(&path) {
+                if matches!(
+                    job.state,
+                    JobState::Done | JobState::Cancelled | JobState::Abandoned
+                ) {
+                    let all_passed = job.passed.unwrap_or(false);
+                    return json!({
+                        "all_passed": all_passed,
+                        "check_results": [],
+                        "failure_summary": if all_passed {
+                            String::new()
+                        } else {
+                            "heavy-work job did not report success".to_string()
+                        },
+                        "test_depth": serde_json::Value::Null,
+                        "check_source": serde_json::Value::Null,
+                        "excluded_checks": serde_json::Value::Array(Vec::new()),
+                        "heavy_work": {
+                            "mode": "enabled",
+                            "job_id": job_id.to_string(),
+                            "state": format!("{:?}", job.state).to_lowercase(),
+                        },
+                    });
+                }
+            }
+            tokio::time::sleep(self.poll_interval).await;
+        }
+    }
+
+    async fn cancel_if_queued(&self, job_id: Uuid) {
+        let path = heavy_work::job_path(&self.lock_dir, job_id);
+        if let Ok(mut job) = heavy_work::read_job(&path) {
+            if job.state == JobState::Queued {
+                job.state = JobState::Cancelled;
+                job.finished_at = Some(chrono::Utc::now());
+                let _ = heavy_work::write_job(&self.lock_dir, &job);
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -927,6 +1089,75 @@ mod tests {
             })
         });
         (runner, calls)
+    }
+
+    /// D68 OBSERVED RED (`EN.17.J` task 5, recorded before `default_flow_runner`
+    /// was rewired through `queue_park::drive`): `execute_step` has no
+    /// suspended-aware check anywhere in its own success path — a `FlowRunner`
+    /// that hands back a ctx stamped suspended (exactly what a real
+    /// queue-parked child would return, absent `drive`) is read as an
+    /// ORDINARY SUCCESS. This pins that defect directly: it is what makes
+    /// `drive`'s "never return a suspended ctx to the caller" contract load-
+    /// bearing rather than cosmetic, and it stays green after the fix too —
+    /// `execute_step` itself is never modified by this task; the fix is that
+    /// `default_flow_runner` never hands it a suspended ctx in the first
+    /// place (see `queue_park_orchestration_child_resumes_through_default_
+    /// flow_runner` in `tests/it/queue_park.rs` for the corresponding
+    /// AFTER-the-fix assertion, at the `default_flow_runner_with_heavy_work`
+    /// layer).
+    #[tokio::test]
+    async fn execute_step_reads_a_suspended_child_ctx_as_succeeded_observed_red() {
+        let (_dir, registry) = two_repo_registry();
+        let resolve_engine = |_repo: &str, _id: &str| EngineKind::Flow;
+
+        let suspended_runner: FlowRunner = Arc::new(|_invocation: FlowInvocation| {
+            Box::pin(async {
+                let mut ctx = TaskContext {
+                    event: json!({}),
+                    nodes: std::collections::HashMap::new(),
+                    metadata: json!({}),
+                    node_runs: std::collections::HashMap::new(),
+                };
+                let ledger = BudgetLedger::from_context(&ctx);
+                crate::suspend::stamp_suspended(
+                    &mut ctx.metadata,
+                    crate::suspend::Suspension {
+                        resume_at: "TriageTaskNode",
+                        reason: crate::suspend::SuspendReason::HeavyWorkQueue,
+                        origin_identity: Some("TestTaskNode"),
+                        ledger: &ledger,
+                    },
+                );
+                Ok(ctx)
+            })
+        });
+
+        let s = step("repo-a", "A.1");
+        let outcome = execute_step(
+            &s,
+            &resolve_engine,
+            &registry,
+            &suspended_runner,
+            false,
+            true,
+            Uuid::new_v4(),
+            None,
+            None,
+            PermissionProfile::Standard,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect(
+            "D68 observed red: today's execute_step reads a suspended child ctx as Ok/succeeded",
+        );
+
+        assert!(
+            crate::suspend::is_suspended(&outcome.ctx.metadata),
+            "sanity: the ctx execute_step handed back is still marked suspended — nothing here \
+             ever consulted that marker before returning Ok"
+        );
     }
 
     #[tokio::test]
