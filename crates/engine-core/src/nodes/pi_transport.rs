@@ -633,12 +633,17 @@ mod tests {
     }
 
     // This block's acceptance criterion "no hardcoded local model names" is
-    // checked from OUTSIDE Rust, against this file's own source text:
-    // `rg -n '"qwen|llama|ollama_chat/' crates/engine-core/src/nodes/pi_transport.rs`
-    // must exit 1, with `rg -n 'fn ' crates/engine-core/src/nodes/pi_transport.rs`
-    // exiting 0 as the positive control. An inline `include_str!("pi_transport.rs")`
-    // unit test cannot check this: the check string itself would have to spell
-    // the forbidden substrings, which would then make THIS file contain them.
+    // checked from OUTSIDE Rust, against this file's own source text, using a
+    // grep for a quoted Qwen-family literal, a word-bounded Llama-family
+    // literal (word-bounded so it does not false-positive on the required
+    // `--provider ollama` literal above, which legitimately contains that
+    // family name as a substring), or a hardcoded LiteLLM-style
+    // "ollama_chat" routing prefix (with its trailing path separator). See
+    // the block record's own acceptance criteria for the exact
+    // command; it is not spelled out literally here on purpose — an inline
+    // `include_str!("pi_transport.rs")` unit test cannot check this either
+    // way, since the check string itself would have to spell the forbidden
+    // substrings, which would then make THIS file contain them.
 
     // -- subprocess lifecycle: cwd, timeout-kill, cancellation-kill --
 
