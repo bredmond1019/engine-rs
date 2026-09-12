@@ -35,7 +35,9 @@ use crate::workflows::{admitted_command_runner, CommandSpec, SpecCommandRunner};
 use super::close_block::DEFAULT_REPO_SLUG;
 #[cfg(test)]
 use super::policy::OutputVerbosity;
-use super::policy::{ModelTier, RetryFeedback, ReviewMode, SdlcPolicy, TestDepth, TestDispatch};
+use super::policy::{
+    AgentBackend, ModelTier, RetryFeedback, ReviewMode, SdlcPolicy, TestDepth, TestDispatch,
+};
 use super::schema::{RunMeta, SDLCState, SDLCTask, SDLCTaskStatus};
 use super::setup::baseline_snapshot_path;
 use super::{
@@ -216,6 +218,50 @@ fn classify_trivial(ctx: &TaskContext, runner: &CommandRunner, policy: &SdlcPoli
     }
 
     files_changed <= policy.review_skip_max_files && diff_lines <= policy.review_skip_max_diff_lines
+}
+
+/// List every path `git status --porcelain` reports as changed (modified,
+/// added, deleted, renamed, or untracked) in `worktree`, via the injectable
+/// [`CommandRunner`] seam. Path-only parsing mirrors
+/// `TestTaskNode::changed_files_with_status` (a rename's `orig -> new` line
+/// keeps the destination path); this free function exists because
+/// `ImplementTaskNode` needs the same worktree-derived file list that
+/// function computes for `TestTaskNode`, without either node depending on
+/// the other's private method.
+///
+/// Used by [`ImplementTaskNode`] to derive `modified_files` for a
+/// non-`claude_cli` backend: only the claude CLI enforces
+/// `Config.json_schema`, so a backend's own `modified_files` self-report from
+/// an unconstrained reply cannot be trusted the way `ImplementOutput`'s can.
+/// Returns an empty list (never errors) when the runner invocation itself
+/// fails, matching `changed_files_with_status`'s degrade-to-"nothing
+/// changed" behavior.
+fn git_worktree_changed_files(runner: &CommandRunner, worktree: &Path) -> Vec<String> {
+    let output = runner("git", &["status", "--porcelain"], worktree).unwrap_or(CommandOutput {
+        status: -1,
+        stdout: String::new(),
+        stderr: String::new(),
+    });
+
+    output
+        .stdout
+        .lines()
+        .filter_map(|line| {
+            if line.len() <= 3 {
+                return None;
+            }
+            let rest = line[3..].trim();
+            if rest.is_empty() {
+                return None;
+            }
+            let path = rest.rsplit(" -> ").next().unwrap_or(rest).trim();
+            if path.is_empty() {
+                None
+            } else {
+                Some(path.trim_matches('"').to_string())
+            }
+        })
+        .collect()
 }
 
 /// A review with more than this many distinct issues is treated as a
@@ -1097,13 +1143,21 @@ pub(super) const TRIAGE_STABLE_PROMPT: &str = include_str!("prompts/triage.md");
 /// [`latest_state`] sees it without any reader of `modified_files` changing.
 pub struct ImplementTaskNode {
     config: Config,
-    transport: Option<ModelTransport>,
+    transport: TransportSlot,
     /// Taken through this node's OWN builder, never inferred from context —
     /// mirrors `OrchestrationRunNode::with_cancellation_token` /
     /// `AgentCodeStep::with_cancellation_token`. `None` (the default) is
     /// behavior-stable: no token, no cancellation check, identical to
     /// today. See [`Self::with_cancellation_token`].
     cancellation_token: Option<CancellationToken>,
+    /// Used only to derive `modified_files` from the worktree's git state
+    /// for a non-`claude_cli` backend (`AgentBackend::Pi` and beyond) — see
+    /// [`git_worktree_changed_files`]. The `claude_cli` path never calls
+    /// this, so its default (`super::default_command_runner()`) never runs
+    /// a real subprocess in any test that doesn't set a non-`claude_cli`
+    /// backend. Tests override it via [`Self::with_runner`], mirroring
+    /// `TriageTaskNode`/`TestTaskNode`.
+    runner: CommandRunner,
 }
 
 /// Model output shape `ImplementTaskNode` expects. Non-JSON model output is
@@ -1141,8 +1195,9 @@ impl ImplementTaskNode {
                 model: Some("claude-sonnet-4-5".to_string()),
                 ..Config::default()
             },
-            transport: None,
+            transport: TransportSlot::default(),
             cancellation_token: None,
+            runner: super::default_command_runner(),
         }
     }
 
@@ -1151,7 +1206,30 @@ impl ImplementTaskNode {
     /// the gated suite never spawns a real `claude`.
     #[must_use]
     pub fn with_transport(mut self, transport: ModelTransport) -> Self {
-        self.transport = Some(transport);
+        self.transport.set_plain(transport);
+        self
+    }
+
+    /// Override the transport with a tier-aware [`MetaTransport`] that
+    /// reports the [`TransportInfo`] of whichever call actually executed
+    /// (e.g. `AgentBackend::Pi`'s `PiTransport`), taking precedence over a
+    /// plain transport set via [`Self::with_transport`] — mirrors
+    /// `TriageTaskNode::with_meta_transport`.
+    ///
+    /// [`TransportInfo`]: crate::nodes::TransportInfo
+    #[must_use]
+    pub fn with_meta_transport(mut self, transport: MetaTransport) -> Self {
+        self.transport.set_meta(transport);
+        self
+    }
+
+    /// Override the command runner used to derive `modified_files` from the
+    /// worktree's git state for a non-`claude_cli` backend (see
+    /// [`git_worktree_changed_files`]). Tests use this to stub the
+    /// subprocess.
+    #[must_use]
+    pub fn with_runner(mut self, runner: CommandRunner) -> Self {
+        self.runner = runner;
         self
     }
 
@@ -1295,9 +1373,7 @@ impl Node for ImplementTaskNode {
 
         let mut step = AgentCodeStep::new("ImplementTaskNode", config, prompt)
             .with_retry_policy(policy.transport_retry);
-        if let Some(transport) = self.transport.clone() {
-            step = step.with_transport(move |config, prompt| (transport)(config, prompt));
-        }
+        step = self.transport.apply(step);
         if let Some(token) = self.cancellation_token.clone() {
             step = step.with_cancellation_token(token);
         }
@@ -1326,9 +1402,27 @@ impl Node for ImplementTaskNode {
                 },
             );
 
+        // Only the claude CLI enforces `Config.json_schema`
+        // (`config.json_schema` above) — a non-`claude_cli` backend's reply
+        // is an unconstrained event stream/prose, so its self-reported
+        // `modified_files` cannot be trusted the way `claude_cli`'s can (see
+        // this node's `verify_claimed_writes` doc comment on `parsed`'s
+        // sibling unreliability even for `claude_cli`). For any other
+        // backend, take `modified_files` from the worktree's actual git
+        // state instead; `summary` keeps the existing text fallback
+        // regardless of backend.
+        let modified_files = if policy.agent_backend == AgentBackend::ClaudeCli {
+            parsed.modified_files
+        } else {
+            worktree
+                .as_deref()
+                .map(|worktree| git_worktree_changed_files(&self.runner, Path::new(worktree)))
+                .unwrap_or_default()
+        };
+
         let mut result = json!({
             "summary": parsed.summary,
-            "modified_files": parsed.modified_files,
+            "modified_files": modified_files,
             "tests_added": parsed.tests_added,
             // Stamp the resolved tier so `RunTelemetry`/`PolicyAggregate` can
             // attribute this call's cost to the setting that caused it
@@ -10675,6 +10769,188 @@ pub(crate) mod tests {
             result.is_err(),
             "with no token attached, an in-flight call must NOT be \
              interrupted — behavior must match today exactly"
+        );
+    }
+
+    // --- EN.16.B task 7: `with_meta_transport` + git-derived `modified_files`
+    // for a non-`claude_cli` backend ------------------------------------
+
+    /// A stub [`MetaTransport`] that answers with `text` and a canned
+    /// [`crate::nodes::TransportInfo`] naming `backend`.
+    fn stub_implement_meta_transport(text: String, backend: &'static str) -> MetaTransport {
+        use crate::nodes::TransportInfo;
+        Arc::new(move |_config, _prompt| {
+            let outcome = canned_outcome(text.clone());
+            let info = TransportInfo {
+                tier: "local".to_string(),
+                model: "stub-model".to_string(),
+                endpoint: None,
+                backend: backend.to_string(),
+                cost_known: false,
+            };
+            Box::pin(async move { Ok((outcome, info)) })
+        })
+    }
+
+    /// `with_meta_transport` must take precedence over a plain
+    /// `with_transport`, mirroring `TransportSlot`'s documented precedence
+    /// (and `TriageTaskNode::with_meta_transport`'s own contract): the
+    /// plain transport here panics if it is ever invoked, so a passing test
+    /// proves the meta transport won.
+    #[tokio::test]
+    async fn implement_task_node_meta_transport_takes_precedence_over_plain_transport() {
+        let task = SDLCTask::new(1, "One", "d1");
+        let state = state_with_tasks(vec![task.clone()]);
+        let ctx = ctx_with_current_task(&state, &task);
+
+        let plain: ModelTransport = Arc::new(|_config, _prompt| {
+            Box::pin(async { panic!("plain transport must not be called when meta is set") })
+        });
+        let meta = stub_implement_meta_transport(
+            json!({ "summary": "done", "modified_files": [], "tests_added": [] }).to_string(),
+            "pi",
+        );
+
+        let node = ImplementTaskNode::new()
+            .with_transport(plain)
+            .with_meta_transport(meta);
+        let out = node.process(ctx).await.expect("process should succeed");
+
+        let transport = out.nodes["ImplementTaskNode"]["transport"].clone();
+        assert_eq!(
+            transport.get("backend").and_then(|v| v.as_str()),
+            Some("pi"),
+            "the meta transport's own TransportInfo must be what's stamped, \
+             proving it — not the plain transport — actually ran"
+        );
+    }
+
+    /// With the resolved backend `claude_cli` (the default), `modified_files`
+    /// is unchanged: it comes straight from the model's self-reported JSON,
+    /// exactly as before this task existed.
+    #[tokio::test]
+    async fn implement_task_node_claude_cli_backend_keeps_self_reported_modified_files() {
+        let worktree = temp_worktree();
+        let task = SDLCTask::new(1, "One", "d1");
+        let state = state_with_tasks(vec![task.clone()]);
+        let mut ctx = ctx_with_current_task(&state, &task);
+        ctx.nodes.insert(
+            "SetupWorktreeNode".to_string(),
+            json!({ "worktree_path": worktree.to_string_lossy() }),
+        );
+        // Explicit default policy (`agent_backend: ClaudeCli`) so this test
+        // does not silently start passing for the wrong reason if the
+        // built-in default ever changes.
+        ctx = ctx_with_policy(ctx, &SdlcPolicy::default());
+
+        // `git status --porcelain` on this worktree reports a DIFFERENT file
+        // than the one the model claims — proving `claude_cli` reads the
+        // self-report, not the worktree, when the two disagree.
+        let node = ImplementTaskNode::new()
+            .with_transport(implement_transport())
+            .with_runner(porcelain_runner("?? some/other/file.rs\n"));
+        let out = node.process(ctx).await.expect("process should succeed");
+
+        let modified_files = out.nodes["ImplementTaskNode"]["modified_files"].clone();
+        assert_eq!(
+            modified_files,
+            json!(["src/lib.rs"]),
+            "claude_cli must use the model's self-reported modified_files \
+             (from `implement_transport`), not the worktree's git state"
+        );
+    }
+
+    /// With the resolved backend NOT `claude_cli` (`AgentBackend::Pi`),
+    /// `modified_files` comes from the worktree's actual git state instead
+    /// of the model's self-report — because only the claude CLI enforces
+    /// `Config.json_schema`, so a Pi reply's own claim cannot be trusted the
+    /// way `claude_cli`'s can.
+    #[tokio::test]
+    async fn implement_task_node_pi_backend_derives_modified_files_from_worktree_git_state() {
+        let worktree = temp_worktree();
+        let task = SDLCTask::new(1, "One", "d1");
+        let state = state_with_tasks(vec![task.clone()]);
+        let mut ctx = ctx_with_current_task(&state, &task);
+        ctx.nodes.insert(
+            "SetupWorktreeNode".to_string(),
+            json!({ "worktree_path": worktree.to_string_lossy() }),
+        );
+        ctx = ctx_with_policy(
+            ctx,
+            &SdlcPolicy {
+                agent_backend: AgentBackend::Pi,
+                ..SdlcPolicy::default()
+            },
+        );
+
+        // The model claims a file that never actually changed; the
+        // worktree's porcelain status names a DIFFERENT one. Only the
+        // porcelain-derived path may end up in `modified_files`.
+        let node = ImplementTaskNode::new()
+            .with_transport(implement_transport())
+            .with_runner(porcelain_runner("M  src/real_change.rs\n"));
+        let out = node.process(ctx).await.expect("process should succeed");
+
+        let modified_files = out.nodes["ImplementTaskNode"]["modified_files"].clone();
+        assert_eq!(
+            modified_files,
+            json!(["src/real_change.rs"]),
+            "a non-claude_cli backend must derive modified_files from the \
+             worktree's git state, ignoring the model's self-report \
+             ({modified_files:?})"
+        );
+    }
+
+    /// A Pi reply in plain PROSE (not the `{\"summary\": ..., \
+    /// \"modified_files\": [...]}` shape `claude_cli` is schema-constrained
+    /// to) must not fail this node — the existing text fallback still
+    /// supplies `summary` — and `modified_files` still comes from the
+    /// worktree's git state, proving the parse failure has no bearing on
+    /// which file list is used.
+    #[tokio::test]
+    async fn implement_task_node_pi_backend_prose_reply_is_not_failed_and_uses_git_modified_files()
+    {
+        let worktree = temp_worktree();
+        let task = SDLCTask::new(1, "One", "d1");
+        let state = state_with_tasks(vec![task.clone()]);
+        let mut ctx = ctx_with_current_task(&state, &task);
+        ctx.nodes.insert(
+            "SetupWorktreeNode".to_string(),
+            json!({ "worktree_path": worktree.to_string_lossy() }),
+        );
+        ctx = ctx_with_policy(
+            ctx,
+            &SdlcPolicy {
+                agent_backend: AgentBackend::Pi,
+                ..SdlcPolicy::default()
+            },
+        );
+
+        let prose_transport: ModelTransport = Arc::new(|_config, _prompt| {
+            let outcome = canned_outcome(
+                "I edited the file and everything works now, no JSON here.".to_string(),
+            );
+            Box::pin(async move { Ok(outcome) })
+        });
+
+        let node = ImplementTaskNode::new()
+            .with_transport(prose_transport)
+            .with_runner(porcelain_runner("M  src/real_change.rs\n"));
+        let out = node
+            .process(ctx)
+            .await
+            .expect("a non-JSON prose reply must not fail this node");
+
+        assert_eq!(
+            out.nodes["ImplementTaskNode"]["summary"],
+            json!("I edited the file and everything works now, no JSON here."),
+            "the text fallback must still supply summary from the raw reply"
+        );
+        assert_eq!(
+            out.nodes["ImplementTaskNode"]["modified_files"],
+            json!(["src/real_change.rs"]),
+            "modified_files must still come from the worktree's git state \
+             even though the reply didn't parse as ImplementOutput"
         );
     }
 
