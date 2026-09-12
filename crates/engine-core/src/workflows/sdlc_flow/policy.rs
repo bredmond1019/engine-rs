@@ -27,6 +27,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 pub use crate::policy::tier::{LocalConfig, ModelTier, OutputVerbosity};
+pub use crate::policy::AgentBackend;
 pub use crate::policy::PartialLocalConfig;
 use crate::policy::{merge_opt, Overlay};
 
@@ -385,6 +386,14 @@ pub struct SdlcPolicy {
     /// and a marker naming the file and dropped-byte count is appended, so
     /// one oversized spec file cannot starve a later, smaller one.
     pub generate_context_max_bytes: Option<usize>,
+    /// Which coding-agent transport `ImplementTaskNode` dispatches to
+    /// (`EN.16.B`). Plain field only, no partial/merge arm and no profile
+    /// bundle entry on this workflow yet — SDLC_TASK carries the full
+    /// four-layer resolution for this knob (`sdlc_task::policy`) and
+    /// projects it onto this field via `to_sdlc_policy()`; SDLC_FLOW's own
+    /// resolution is a follow-on (`EN.16.D`). Built-in default
+    /// `AgentBackend::ClaudeCli` — behavior-stable.
+    pub agent_backend: AgentBackend,
 }
 
 impl Default for SdlcPolicy {
@@ -425,6 +434,7 @@ impl Default for SdlcPolicy {
             review_diff_max_chars: 120_000,
             node_invocation_payload_cap_bytes: crate::invocations::DEFAULT_PAYLOAD_CAP_BYTES,
             generate_context_max_bytes: None,
+            agent_backend: AgentBackend::default(),
         }
     }
 }
@@ -660,6 +670,9 @@ impl crate::policy::Policy for SdlcPolicy {
                 base.generate_context_max_bytes,
                 over.generate_context_max_bytes,
             ),
+            // No `PartialPolicy` field yet (SDLC_FLOW's own resolution is
+            // EN.16.D) — passes through unchanged on every layer.
+            agent_backend: base.agent_backend,
         }
     }
 }
@@ -1809,6 +1822,10 @@ mod tests {
             "generate_context_max_bytes",
             "setup.rs::gather_context, called from GenerateTasksNode::process",
         ),
+        (
+            "agent_backend",
+            "sdlc_task::policy::SdlcTaskPolicy::to_sdlc_policy (projected from SDLC_TASK's own resolved policy); this task adds the plain field only — SDLC_FLOW's own dispatch wiring is a follow-on EN.16.D task",
+        ),
     ];
 
     #[test]
@@ -1839,6 +1856,7 @@ mod tests {
             review_diff_max_chars,
             node_invocation_payload_cap_bytes,
             generate_context_max_bytes,
+            agent_backend,
         );
 
         let mut actual: Vec<&str> = field_names.to_vec();
