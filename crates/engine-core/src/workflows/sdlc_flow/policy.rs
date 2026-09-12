@@ -458,6 +458,7 @@ pub struct PartialPolicy {
     pub max_turns: Option<PartialStageTurnCeilings>,
     pub local: Option<PartialLocalConfig>,
     pub llm_triage: Option<bool>,
+    pub agent_backend: Option<AgentBackend>,
     pub max_attempts: Option<u32>,
     pub max_review_attempts: Option<u32>,
     pub retry_feedback: Option<PartialRetryFeedback>,
@@ -670,9 +671,7 @@ impl crate::policy::Policy for SdlcPolicy {
                 base.generate_context_max_bytes,
                 over.generate_context_max_bytes,
             ),
-            // No `PartialPolicy` field yet (SDLC_FLOW's own resolution is
-            // EN.16.D) — passes through unchanged on every layer.
-            agent_backend: base.agent_backend,
+            agent_backend: merge_opt(base.agent_backend, over.agent_backend),
         }
     }
 }
@@ -735,6 +734,26 @@ mod tests {
         assert!(!policy.llm_triage);
         assert_eq!(policy.max_attempts, 3);
         assert_eq!(policy.max_review_attempts, 3);
+    }
+
+    /// EN.16.D task 1: `agent_backend`'s override layer actually merges
+    /// (`Some` wins, `None` falls through), matching every other plain
+    /// `Option<T>` field's `merge_opt` arm in `SdlcPolicy::apply`.
+    #[test]
+    fn apply_merges_agent_backend_override() {
+        use crate::policy::Policy;
+
+        let base = SdlcPolicy::default();
+        assert_eq!(base.agent_backend, AgentBackend::ClaudeCli);
+
+        let overridden = base.clone().apply(&PartialPolicy {
+            agent_backend: Some(AgentBackend::Pi),
+            ..PartialPolicy::default()
+        });
+        assert_eq!(overridden.agent_backend, AgentBackend::Pi);
+
+        let unchanged = base.clone().apply(&PartialPolicy::default());
+        assert_eq!(unchanged.agent_backend, base.agent_backend);
     }
 
     /// EN.14.G task 3's central round-trip: `stamp_resolved_policy` puts

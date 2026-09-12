@@ -509,6 +509,12 @@ pub struct RunOutcomes {
     /// local-vs-cloud quality is measurable across runs.
     #[serde(default)]
     pub model_tier_used: BTreeMap<String, String>,
+    /// Per-stage code-agent backend actually used this run. Mirrors
+    /// `crate::policy::RunTelemetry::backend_used` (`EN.16.D`).
+    /// `#[serde(default)]` so a state file written before this field existed
+    /// still deserializes, reading as an empty map.
+    #[serde(default)]
+    pub backend_used: BTreeMap<String, String>,
 }
 
 impl From<crate::policy::RunTelemetry> for RunOutcomes {
@@ -527,6 +533,7 @@ impl From<crate::policy::RunTelemetry> for RunOutcomes {
             total_cache_creation_tokens: telemetry.total_cache_creation_tokens,
             unknown_cost_invocations: telemetry.unknown_cost_invocations,
             model_tier_used: telemetry.model_tier_used,
+            backend_used: telemetry.backend_used,
         }
     }
 }
@@ -547,6 +554,7 @@ impl From<RunOutcomes> for crate::policy::RunTelemetry {
             total_cache_creation_tokens: outcomes.total_cache_creation_tokens,
             unknown_cost_invocations: outcomes.unknown_cost_invocations,
             model_tier_used: outcomes.model_tier_used,
+            backend_used: outcomes.backend_used,
         }
     }
 }
@@ -1443,6 +1451,7 @@ mod tests {
             total_cache_creation_tokens: 8,
             unknown_cost_invocations: 0,
             model_tier_used: BTreeMap::from([("implement".to_string(), "sonnet".to_string())]),
+            ..RunOutcomes::default()
         });
 
         let json = serde_json::to_string(&state).expect("serializes");
@@ -1515,6 +1524,7 @@ mod tests {
             total_cache_creation_tokens: 8,
             unknown_cost_invocations: 0,
             model_tier_used: BTreeMap::from([("implement".to_string(), "sonnet".to_string())]),
+            ..RunOutcomes::default()
         };
 
         let telemetry: crate::policy::RunTelemetry = outcomes.clone().into();
@@ -2366,6 +2376,7 @@ mod tests {
             total_cache_creation_tokens: 8,
             unknown_cost_invocations: 0,
             model_tier_used: BTreeMap::from([("implement".to_string(), "sonnet".to_string())]),
+            ..RunOutcomes::default()
         });
 
         let meta = RunMeta {

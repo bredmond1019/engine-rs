@@ -108,6 +108,7 @@ mod tests {
             total_cache_creation_tokens: 0,
             unknown_cost_invocations: 0,
             model_tier_used: BTreeMap::new(),
+            ..RunOutcomes::default()
         }
     }
 
