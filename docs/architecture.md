@@ -739,6 +739,13 @@ block.
   this the ceiling was reading roughly one of three input channels. A node reporting neither cache
   key contributes zero rather than erroring. `engine_contract::Usage` is deliberately unchanged —
   the channels travel via `ctx.nodes`, so no D78 contract bump was triggered.
+  **`EN.16.B`:** `BudgetLedger::from_context` (used on resume/crash-recovery) now also sets
+  `has_unknown_cost_node` whenever any `ctx.nodes` entry lacks a `cost_usd` key at all — the
+  per-node counterpart to `CampaignLedger::has_unknown_cost_step` above, coarse in the same way
+  (any node, not only agent/LLM-shaped ones). It exists because `ImplementTaskNode` can now run
+  under a non-`claude_cli` `agent_backend` (`PiTransport`) that omits `cost_usd` rather than
+  writing `0.0`, so a caller can tell "this run's total is genuinely incomplete" apart from a
+  confirmed `$0` spend.
   `check()` is the pre-dispatch gate `Workflow::run_with` calls before each node: returns
   `Allow` or `Halt(BudgetHaltReason)` when accumulated spend is *reached* (`>=`) the configured
   cap — a cap hit exactly by the last completed node stops the walk before the node that would
