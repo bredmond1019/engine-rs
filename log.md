@@ -14,6 +14,21 @@ related: [status, context]
 
 *Append-only working log. One dated entry per session. Newest entries at the top.*
 
+## [run: 2026-09-12]
+
+`/sdlc-flow` on branch `EN.16.D-flow` ran tasks 1-5 of EN.16.D (Pi backend in SDLC_FLOW, with the backend attributed in run telemetry). Task 1 added `agent_backend` to sdlc_flow's `PartialPolicy` with a `merge_opt` arm in `Policy::apply` (dae0fee); task 2 wired Pi dispatch into `registry_for_policy_with_cancellation`'s token-gated `ImplementTaskNode` branch (0195559); task 3 added three SDLC_FLOW Pi-dispatch integration tests proving the task 1/2 wiring end-to-end (0d59ea9); task 4 added `backend_used` to `RunTelemetry`, harvested from `ctx.nodes[stage][transport][backend]`, with matching parity added to `RunOutcomes` and three pre-existing struct-literal call sites fixed to compile (9b7cb2c); task 5 proved `PolicyAggregate` already keeps a pi run and a claude_cli run in separate rows and documented the `agent_backend` knob in `sdlc-flow-policy.md` (9652d48), then this attempt tried to run the full authoritative validation suite to completion for the first time on this branch. The run BAILED: `agent_backend_pi_transport_kills_child_on_cancel` / `cancellation_kills_the_child_process` / `timeout_kills_the_child_process` all center on the Pi transport child process never starting or not being reliably killed on cancel/timeout (`agent_backend.rs:199`), and `task_validation_5`'s `cargo nextest` run hanging past 60s (terminate-after not firing) is consistent with the same child-process-not-terminating defect blocking the test runner. This is structural in the Pi transport's cancellation/kill path, not flaky/transient — a second, materially different bail from the same task 5 attempt (the first bail this run, "resumed-clean" in state, was an unrelated foreign broken dependency in `core/mev`). Tasks 1-4 and task 5's own code+doc diff are committed; the workspace-wide validation suite has still not been run to a clean pass. Next: fix the Pi transport's kill-on-cancel/timeout path in `agent_backend.rs` (around line 199) before re-attempting task 5's full validation.
+
+```
+ecc8271 chore: wrap up EN.16.D
+9652d48 feat: implement EN.16.D-task5
+9b7cb2c feat: implement EN.16.D-task4
+0d59ea9 feat: implement EN.16.D-task3
+0195559 feat: implement EN.16.D-task2
+dae0fee feat: implement EN.16.D-task1
+036c317 fix(pi_transport): move -p/<prompt> after --provider/--model/--mode
+80c3087 Merge origin/main: EN.16.B squash-merge (#90)
+```
+
 ## [2026-09-12]
 
 ### `/sdlc-flow EN.16.D` — BAILED after task 5 (foreign broken dependency in mev)
