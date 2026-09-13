@@ -1,6 +1,7 @@
 {
   "agent_backend": "claude_cli",
   "generate_context_max_bytes": null,
+  "isolated": true,
   "llm_triage": false,
   "local": {
     "constrained_json": false,
