@@ -56,11 +56,13 @@
 //! Amendment Log for the retryable/non-retryable classification.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use claude_code_rs::Config;
 
 use crate::cancellation::CancellationToken;
+use crate::coord::heavy_work::{HeavyWorkConfig, HeavyWorkQueue};
 use crate::node::NodeRegistry;
 use crate::nodes::aider_meta_transport_live;
 use crate::nodes::openai_compat_transport::openai_compat_meta_transport_live;
@@ -273,6 +275,34 @@ pub fn schema() -> WorkflowSchema {
 /// headless write permission via [`agentic_write_config`] so a `bastion
 /// serve`-mounted `/sdlc-flow` run is not a silent no-op on the codebase
 /// (see `planning/decisions/D8-autonomous-node-write-permission.md`).
+/// Resolve a real, brain-root-backed [`HeavyWorkQueue`] for
+/// [`TestTaskNode`]'s production registration, so `test_dispatch:
+/// queue_park` in `planning/harness.json` actually parks under a real
+/// `/sdlc-flow` run rather than only inside this crate's own hand-built
+/// integration tests (`EN.ticket.test-task-node-queue-park-has-no-
+/// production-graph-wiring`).
+///
+/// Mirrors `workflows::orchestration::execute::heavy_work_queue_for`
+/// exactly, but that function takes an already-resolved `lock_dir` from a
+/// `RepoRegistry`; `registry()` here takes no arguments, so this resolves
+/// the brain root itself via [`crate::brain_root::resolve_brain_root`] —
+/// the same no-argument resolution every other brain-root-needing call
+/// site in this crate uses. Resolution failure (no `ENGINE_BRAIN_ROOT` and
+/// no `brain.toml` walking up from cwd, or an invalid override) degrades
+/// open to a disabled queue — behavior-identical to `TestTaskNode::new()`'s
+/// own prior bare default — rather than panicking or erroring the whole
+/// registry build.
+fn heavy_work_queue() -> HeavyWorkQueue {
+    match crate::brain_root::resolve_brain_root() {
+        Ok(root) => {
+            let config = HeavyWorkConfig::load(&root.join("brain.toml"))
+                .unwrap_or_else(|_| HeavyWorkConfig::disabled());
+            HeavyWorkQueue::new(root, config)
+        }
+        Err(_) => HeavyWorkQueue::new(PathBuf::new(), HeavyWorkConfig::disabled()),
+    }
+}
+
 #[must_use]
 pub fn registry() -> NodeRegistry {
     let mut registry = NodeRegistry::new();
@@ -284,7 +314,9 @@ pub fn registry() -> NodeRegistry {
     registry.register(Box::new(
         ImplementTaskNode::new().with_config(agentic_write_config("claude-sonnet-4-5")),
     ));
-    registry.register(Box::new(TestTaskNode::new()));
+    registry.register(Box::new(
+        TestTaskNode::new().with_heavy_work(heavy_work_queue()),
+    ));
     registry.register(Box::new(TriageTaskNode::new()));
     registry.register(Box::new(TriageRouterNode));
     registry.register(Box::new(ConsolidatedReviewNode::new()));
@@ -565,6 +597,38 @@ mod tests {
             );
         }
         assert_eq!(registry.len(), expected.len());
+    }
+
+    // `ENGINE_BRAIN_ROOT` is process-global state. Guard behind a mutex so
+    // this test cannot race any other test in the suite that touches it
+    // (mirrors `brain_root.rs`'s own `ENV_GUARD` convention).
+    static ENV_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn heavy_work_queue_degrades_open_on_brain_root_resolution_failure() {
+        let _guard = ENV_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let previous = std::env::var(crate::brain_root::ENGINE_BRAIN_ROOT_ENV).ok();
+
+        // An `ENGINE_BRAIN_ROOT` override pointing at a path that does not
+        // exist forces `resolve_brain_root()`'s `Err` branch deterministically
+        // -- unlike relying on cwd having no reachable `brain.toml`, which
+        // does not hold in this fleet's own working tree.
+        std::env::set_var(
+            crate::brain_root::ENGINE_BRAIN_ROOT_ENV,
+            "/definitely/not/a/real/brain-root/en-17-k",
+        );
+
+        let queue = heavy_work_queue();
+        assert!(
+            !queue.config().enabled,
+            "resolution failure must degrade to a disabled queue, matching \
+             TestTaskNode::new()'s own prior default"
+        );
+
+        match previous {
+            Some(v) => std::env::set_var(crate::brain_root::ENGINE_BRAIN_ROOT_ENV, v),
+            None => std::env::remove_var(crate::brain_root::ENGINE_BRAIN_ROOT_ENV),
+        }
     }
 
     #[test]
