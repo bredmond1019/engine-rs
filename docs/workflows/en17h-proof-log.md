@@ -250,3 +250,16 @@ All worktrees/branches this task created were removed (`git worktree remove --fo
 shows only the two unrelated worktrees present before this task began. `main` was confirmed back
 at its pre-task commit (`d18851c`) with a clean working tree. Full evidence, verbatim, including
 the exact source lines each finding traces to, in `planning/EN.17.H/evidence/queue.md`.
+
+## Task 4 — cleanup and close
+
+All three fixture tickets (`HQ.ticket.en17h-fixture-bail`, `HQ.ticket.en17h-fixture-false-premise`,
+`HQ.ticket.en17h-fixture-dependent`) closed `wontfix` in HQ's `planning/state.json` via
+`mev set-block-status brain:<id> wontfix --write` — `wontfix` is a valid authored status per
+`docs/state/state-schema.md`, despite not being enumerated in `mev set-block-status --help`'s
+`open|in_progress|deferred|closed` list; confirmed accepted with a dry run before writing.
+`bastion validate-brain --state` exits 0 (0 errors) afterward. `planning/EN.17.H/index.md` created
+and linked from `planning/index.md`; this proof log's own row already existed in
+`docs/workflows/index.md` from task 1. All three fixtures closed, evidence in
+[run.md](../../planning/EN.17.H/evidence/run.md) and [queue.md](../../planning/EN.17.H/evidence/queue.md)
+per the block's evidence table.
