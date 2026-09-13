@@ -688,10 +688,23 @@ impl HeavyWorkQueue {
         F: FnOnce() -> T + Send + 'static,
         T: Send + 'static,
     {
+        self.submit_with_id(Uuid::new_v4(), spec, work).await
+    }
+
+    /// Same as [`Self::submit`], but the on-disk job record (and every id in the returned
+    /// [`HeavyWorkOutcome`]) is minted from the caller-supplied `id` rather than a fresh
+    /// [`Uuid::new_v4`] — this is what lets a caller (e.g. `TestTaskNode`) learn the job's real
+    /// on-disk id *before* submitting, so a production [`crate::workflows::queue_park::HeavyJobLookup`]
+    /// can later resolve the same job by that same id.
+    pub async fn submit_with_id<F, T>(&self, id: Uuid, spec: HeavyWorkSpec, work: F) -> JobHandle<T>
+    where
+        F: FnOnce() -> T + Send + 'static,
+        T: Send + 'static,
+    {
         let (tx, rx) = oneshot::channel();
         let this = self.clone();
         tokio::spawn(async move {
-            let outcome = this.run_to_completion(spec, work).await;
+            let outcome = this.run_to_completion_with_id(id, spec, work).await;
             let _ = tx.send(outcome);
         });
         JobHandle { receiver: rx }
@@ -707,7 +720,27 @@ impl HeavyWorkQueue {
         self.submit(spec, work).await.await
     }
 
+    // Kept as a thin, behavior-preserving wrapper over `run_to_completion_with_id` (mirroring
+    // `submit`'s own delegation to `submit_with_id`) even though nothing currently calls it
+    // directly — `submit` now goes straight through `submit_with_id`. Retained rather than
+    // deleted so a future caller needing "run to completion, don't care about the id" has an
+    // obvious, already-correct seam instead of re-deriving it.
+    #[allow(dead_code)]
     async fn run_to_completion<F, T>(&self, spec: HeavyWorkSpec, work: F) -> HeavyWorkOutcome<T>
+    where
+        F: FnOnce() -> T + Send + 'static,
+        T: Send + 'static,
+    {
+        self.run_to_completion_with_id(Uuid::new_v4(), spec, work)
+            .await
+    }
+
+    async fn run_to_completion_with_id<F, T>(
+        &self,
+        id: Uuid,
+        spec: HeavyWorkSpec,
+        work: F,
+    ) -> HeavyWorkOutcome<T>
     where
         F: FnOnce() -> T + Send + 'static,
         T: Send + 'static,
@@ -724,7 +757,7 @@ impl HeavyWorkQueue {
             return self.run_inline(HeavyWorkMode::Enabled, spec, work).await;
         };
 
-        match self.enqueue(&spec) {
+        match self.enqueue_with_id(id, &spec) {
             Ok(job) => self.admit_and_run(job, class_limit, work).await,
             Err(err) => {
                 tracing::warn!(
@@ -761,10 +794,24 @@ impl HeavyWorkQueue {
     }
 
     /// Persist the initial `Queued` record for `spec`, stamping `enqueued_at` from this queue's
-    /// (possibly injected) clock.
+    /// (possibly injected) clock. Kept as a thin wrapper over `enqueue_with_id` (mirroring
+    /// `run_to_completion`'s own delegation) even though `run_to_completion_with_id` now calls
+    /// `enqueue_with_id` directly — retained as the obvious "don't care about the id" seam.
+    #[allow(dead_code)]
     fn enqueue(&self, spec: &HeavyWorkSpec) -> Result<HeavyWorkJob, HeavyWorkStoreError> {
+        self.enqueue_with_id(Uuid::new_v4(), spec)
+    }
+
+    /// Same as [`Self::enqueue`], but the persisted [`HeavyWorkJob::job_id`] is `id` rather than
+    /// a freshly-minted [`Uuid`] — the seam [`Self::submit_with_id`] needs so a caller's own
+    /// correlation id and the on-disk job's id are the same value.
+    fn enqueue_with_id(
+        &self,
+        id: Uuid,
+        spec: &HeavyWorkSpec,
+    ) -> Result<HeavyWorkJob, HeavyWorkStoreError> {
         let job = HeavyWorkJob {
-            job_id: Uuid::new_v4(),
+            job_id: id,
             class: spec.class.clone(),
             state: JobState::Queued,
             repo: spec.repo.clone(),
@@ -1508,5 +1555,46 @@ Swapouts:                                      0.\n";
         let job = read_job(&job_path(dir.path(), job_id)).expect("job record persisted");
         assert_eq!(job.state, JobState::Done);
         assert!(job.finished_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn submit_with_id_persists_the_caller_chosen_id_to_disk() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut classes = HashMap::new();
+        classes.insert(
+            "test".to_string(),
+            ClassLimit {
+                limit: 1,
+                min_free_mb: 0,
+            },
+        );
+        let config = HeavyWorkConfig {
+            enabled: true,
+            heartbeat_interval_secs: 30,
+            stale_after_secs: 300,
+            poll_interval_ms: 5,
+            classes,
+        };
+        let queue = HeavyWorkQueue::new(dir.path().to_path_buf(), config);
+        let caller_chosen_id = Uuid::new_v4();
+
+        let outcome = queue
+            .submit_with_id(caller_chosen_id, heavy_work_spec(dir.path(), "test"), || 99)
+            .await
+            .await;
+
+        assert_eq!(outcome.output, 99);
+        assert_eq!(
+            outcome.job_id,
+            Some(caller_chosen_id),
+            "outcome must report the caller-chosen id, not a freshly minted one"
+        );
+
+        let job = read_job(&job_path(dir.path(), caller_chosen_id))
+            .expect("job record persisted under the caller-chosen id");
+        assert_eq!(
+            job.job_id, caller_chosen_id,
+            "on-disk job_id must round-trip as the exact id the caller supplied"
+        );
     }
 }
