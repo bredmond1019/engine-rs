@@ -2583,21 +2583,25 @@ impl Node for TestTaskNode {
                     .is_some();
 
             if queue_park_active {
-                // This id is minted here, not read back from the queue's own
-                // on-disk job record (`HeavyWorkQueue::submit` has no
-                // synchronous way to hand that back before admission) — it is
-                // this walk's own correlation id for the suspended job,
-                // carried in `ctx.metadata.heavy_work`/this node's output for
-                // whatever resumes the walk to key off of.
+                // This id is minted here and threaded through to
+                // `submit_with_id` below, so it IS also the on-disk job's
+                // real id — the queue no longer mints its own independent
+                // id, it persists this exact one. It is this walk's own
+                // correlation id for the suspended job, carried in
+                // `ctx.metadata.heavy_work`/this node's output for whatever
+                // resumes the walk to key off of, and a production
+                // `HeavyJobLookup` can resolve the on-disk record by this
+                // same id.
                 let job_id = uuid::Uuid::new_v4();
 
-                // Submitted, not awaited: `submit` returns a `JobHandle`
-                // immediately without blocking on admission or the check run
-                // itself, so the stub check runner in a "still queued" test
-                // is invoked zero times before this function returns.
+                // Submitted, not awaited: `submit_with_id` returns a
+                // `JobHandle` immediately without blocking on admission or
+                // the check run itself, so the stub check runner in a "still
+                // queued" test is invoked zero times before this function
+                // returns.
                 let _job_handle = self
                     .heavy_work
-                    .submit(heavy_work_spec, move || {
+                    .submit_with_id(job_id, heavy_work_spec, move || {
                         job_node.run_checks(&checks_for_job, &worktree_for_job, &spec_dir_for_job)
                     })
                     .await;
