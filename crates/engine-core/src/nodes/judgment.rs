@@ -253,6 +253,16 @@ impl<T: DeserializeOwned> JudgmentNode<T> {
         let mut config = Config {
             json_schema: Some(spec.json_schema.clone()),
             max_turns: spec.max_turns,
+            // A judgment call runs concurrently with whatever else is
+            // touching this machine's `claude` session — another judgment
+            // call in the same preflight/inbox-triage pass, an
+            // `ImplementTaskNode` call elsewhere in the same run, an
+            // interactive session. `isolated: false` (the default) leaves
+            // it reading the shared `~/.claude/.credentials.json`/Keychain
+            // directly, exactly the collision `IsolatedConfigDir` exists to
+            // prevent (see that module's doc comment) — observed live as a
+            // `CliError` under exactly this kind of concurrency.
+            isolated: true,
             ..Config::default()
         };
         config = crate::policy::apply_model_tier(config, spec.tier, &local_model);
