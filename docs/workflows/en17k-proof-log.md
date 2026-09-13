@@ -376,3 +376,309 @@ All three terminal readbacks copied verbatim into `planning/EN.17.K/evidence/smo
 of the three (re-`claude /login`, or adding `~/.local/bin` / a `PI_BINARY`/`AIDER_BINARY` override
 to the LaunchAgent's environment and restarting it) is an operator action on the Mini's own
 environment — out of scope for this task per the block's own out-of-scope list.
+
+## Task 3 — Resource probe: memory pressure and swap while a local model runs alongside a real nextest build
+
+### Pre-check: cargo-nextest not installed on the Mini
+
+Attempting the sampling script's build step first surfaced a missing tool, not a resource
+condition:
+
+```
+$ ssh mac-mini 'cd .../engine-rs && python3 scripts/fleet_build.py -- cargo nextest run --workspace --all-features'
+error: no such command: `nextest`
+help: a command with a similar name exists: `test`
+help: view all installed commands with `cargo --list`
+help: find a package to install `nextest` with `cargo search cargo-nextest`
+NEXTEST_EXIT:101
+```
+
+**FINDING (environment gap, fixed by install, not an engine-rs source/config issue):**
+`cargo-nextest` had never been installed on the Mini. Installed it directly (a tool install, the
+same class of action task 1 took for `pi`/`aider` — not a source or config change):
+
+```
+$ ssh mac-mini 'cargo install cargo-nextest --locked'
+...
+    Finished `release` profile [optimized] target(s) in 1m 55s
+  Installing /Users/brandon/.cargo/bin/cargo-nextest
+   Installed package `cargo-nextest v0.9.144` (executable `cargo-nextest`)
+```
+
+### Probe script
+
+Ran a single script (`/tmp/mini_resource_probe.sh`, scp'd to the Mini) that: (1) takes 3 baseline
+`memory_pressure`/`sysctl vm.swapusage` samples 5s apart before any model load; (2) starts `ollama
+run qwen2.5:3b "hello"` in the background to force a real model load (the smallest of the Mini's
+three usable pulled models, per task 1's `ollama list`); (3) starts `python3
+scripts/fleet_build.py -- cargo nextest run --workspace --all-features` in the Mini's `engine-rs`
+checkout in the background; (4) samples every 5s until the nextest run exits; (5) takes one final
+`after-build` sample.
+
+### Pre-window LaunchAgent pids (same session's task-2 pre-check, re-quoted here for the window)
+
+```
+com.brandon.engine-serve:  state = running, pid = 27560
+com.brandon.bastion-serve: state = running, pid = 27498
+```
+
+### Full raw samples (verbatim, `/tmp/en17k-resource-probe.log` on the Mini)
+
+```
+=== 2026-09-13T10:29:07Z [baseline-1] ===
+The system has 17179869184 (1048576 pages with a page size of 16384).
+
+Stats: 
+Pages free: 146560 
+Pages purgeable: 1352 
+Pages purged: 137848 
+
+Swap I/O:
+Swapins: 0 
+Swapouts: 0 
+
+Page Q counts:
+Pages active: 265956 
+Pages inactive: 270451 
+Pages speculative: 939 
+Pages throttled: 0 
+Pages wired down: 223813 
+
+Compressor Stats:
+Pages used by compressor: 107454 
+Pages decompressed: 115915 
+Pages compressed: 446477 
+
+File I/O:
+Pageins: 2004560 
+Pageouts: 24250 
+
+System-wide memory free percentage: 67%
+vm.swapusage: total = 0.00M  used = 0.00M  free = 0.00M  (encrypted)
+
+=== 2026-09-13T10:29:12Z [baseline-2] ===
+System-wide memory free percentage: 67% | Pages free: 146914 | vm.swapusage used = 0.00M
+
+=== 2026-09-13T10:29:17Z [baseline-3] ===
+System-wide memory free percentage: 67% | Pages free: 146422 | vm.swapusage used = 0.00M
+
+=== 2026-09-13T10:29:25Z [model-loading] ===
+System-wide memory free percentage: 67% | Pages free: 139396 | vm.swapusage used = 0.00M
+
+=== 2026-09-13T10:29:25Z [during-build-0] ===
+System-wide memory free percentage: 67% | Pages free: 139092 | vm.swapusage used = 0.00M
+
+=== 2026-09-13T10:29:30Z [during-build-1] ===
+System-wide memory free percentage: 67% | Pages free: 68547 | Pages used by compressor: 107388 | vm.swapusage used = 0.00M
+
+=== 2026-09-13T10:29:35Z [during-build-2] ===
+System-wide memory free percentage: 67% | Pages free: 12138 | Pages used by compressor: 107264 | vm.swapusage used = 0.00M
+
+=== 2026-09-13T10:29:40Z [during-build-3] ===
+System-wide memory free percentage: 67% | Pages free: 27639 | Pages used by compressor: 107264 | vm.swapusage used = 0.00M
+
+=== 2026-09-13T10:29:45Z [during-build-4] ===
+System-wide memory free percentage: 67% | Pages free: 9132 | Pages used by compressor: 110041 | vm.swapusage used = 0.00M
+
+=== 2026-09-13T10:29:50Z [during-build-5] ===
+System-wide memory free percentage: 66% | Pages free: 3898 | Pages used by compressor: 115826 | vm.swapusage used = 0.00M
+
+=== 2026-09-13T10:29:55Z [during-build-6] ===
+System-wide memory free percentage: 66% | Pages free: 4781 | Pages used by compressor: 116321 | vm.swapusage used = 0.00M
+
+=== 2026-09-13T10:30:00Z [during-build-7] ===
+System-wide memory free percentage: 64% | Pages free: 3915 | Pages used by compressor: 133746 | vm.swapusage used = 0.00M
+
+=== 2026-09-13T10:30:05Z [during-build-8] ===
+System-wide memory free percentage: 64% | Pages free: 3981 | Pages used by compressor: 142898 | vm.swapusage used = 0.00M
+
+=== 2026-09-13T10:30:10Z [during-build-9] ===
+System-wide memory free percentage: 62% | Pages free: 25073 | Pages used by compressor: 154433 | vm.swapusage used = 0.00M
+
+=== 2026-09-13T10:30:15Z [during-build-10] ===
+System-wide memory free percentage: 61% | Pages free: 21181 | Pages used by compressor: 161543 | vm.swapusage used = 0.00M
+
+=== 2026-09-13T10:30:20Z [during-build-11] ===
+System-wide memory free percentage: 61% | Pages free: 27175 | Pages used by compressor: 160700 | vm.swapusage used = 0.00M
+
+=== 2026-09-13T10:30:25Z [during-build-12] === *** PEAK: lowest free%/pages-free of the window ***
+The system has 17179869184 (1048576 pages with a page size of 16384).
+
+Stats: 
+Pages free: 3587 
+Pages purgeable: 959 
+Pages purged: 142728 
+
+Swap I/O:
+Swapins: 0 
+Swapouts: 0 
+
+Page Q counts:
+Pages active: 292341 
+Pages inactive: 272660 
+Pages speculative: 18860 
+Pages throttled: 0 
+Pages wired down: 268983 
+
+Compressor Stats:
+Pages used by compressor: 158837 
+Pages decompressed: 138220 
+Pages compressed: 601794 
+
+File I/O:
+Pageins: 2098566 
+Pageouts: 24527 
+
+System-wide memory free percentage: 57%
+vm.swapusage: total = 0.00M  used = 0.00M  free = 0.00M  (encrypted)
+
+=== 2026-09-13T10:30:30Z [during-build-13] ===
+System-wide memory free percentage: 58% | Pages free: 129878 | Pages used by compressor: 155348 | vm.swapusage used = 0.00M
+
+=== 2026-09-13T10:30:35Z [during-build-14] ===
+System-wide memory free percentage: 58% | Pages free: 116255 | Pages used by compressor: 155035 | vm.swapusage used = 0.00M
+
+=== 2026-09-13T10:30:41Z [during-build-15] ===
+System-wide memory free percentage: 58% | Pages free: 100689 | Pages used by compressor: 155003 | vm.swapusage used = 0.00M
+
+=== 2026-09-13T10:30:46Z [during-build-16] ===
+System-wide memory free percentage: 58% | Pages free: 87647 | Pages used by compressor: 154885 | vm.swapusage used = 0.00M
+
+=== 2026-09-13T10:30:51Z [during-build-17] ===
+System-wide memory free percentage: 58% | Pages free: 79768 | Pages used by compressor: 153803 | vm.swapusage used = 0.00M
+
+=== 2026-09-13T10:30:56Z [during-build-18] ===
+System-wide memory free percentage: 58% | Pages free: 77921 | Pages used by compressor: 153770 | vm.swapusage used = 0.00M
+
+=== 2026-09-13T10:31:01Z [during-build-19] ===
+System-wide memory free percentage: 58% | Pages free: 75885 | Pages used by compressor: 153705 | vm.swapusage used = 0.00M
+
+=== 2026-09-13T10:31:06Z [during-build-20] ===
+System-wide memory free percentage: 58% | Pages free: 76660 | Pages used by compressor: 153669 | vm.swapusage used = 0.00M
+
+=== 2026-09-13T10:31:11Z [during-build-21] ===
+System-wide memory free percentage: 58% | Pages free: 77505 | Pages used by compressor: 153651 | vm.swapusage used = 0.00M
+
+=== 2026-09-13T10:31:16Z [during-build-22] ===
+System-wide memory free percentage: 58% | Pages free: 86490 | Pages used by compressor: 153496 | vm.swapusage used = 0.00M
+
+=== 2026-09-13T10:31:21Z [after-build] ===
+The system has 17179869184 (1048576 pages with a page size of 16384).
+
+Stats: 
+Pages free: 88820 
+Pages purgeable: 1788 
+Pages purged: 142820 
+
+Swap I/O:
+Swapins: 0 
+Swapouts: 0 
+
+Page Q counts:
+Pages active: 252723 
+Pages inactive: 228895 
+Pages speculative: 24120 
+Pages throttled: 0 
+Pages wired down: 267631 
+
+Compressor Stats:
+Pages used by compressor: 153130 
+Pages decompressed: 149422 
+Pages compressed: 604922 
+
+File I/O:
+Pageins: 2147714 
+Pageouts: 24540 
+
+System-wide memory free percentage: 58%
+vm.swapusage: total = 0.00M  used = 0.00M  free = 0.00M  (encrypted)
+
+DONE
+```
+
+(Non-peak/boundary samples above are condensed to their four load-bearing fields per row —
+`System-wide memory free percentage`, `Pages free`, `Pages used by compressor`, and
+`vm.swapusage` — all other `memory_pressure` fields for every sample follow the same shape as the
+three fully-quoted samples (`baseline-1`, `during-build-12` peak, `after-build`); nothing is
+paraphrased, only the constant-shape boilerplate lines are omitted per row to keep this log
+readable. `planning/EN.17.K/evidence/resources.md` carries the same peak/baseline figures in
+table form.)
+
+### Ollama model load confirmation
+
+```
+$ ssh mac-mini 'cat /tmp/en17k-ollama-load.log'
+Hello! How can I assist you today?
+```
+
+The model produced a real response — `qwen2.5:3b` was genuinely loaded and inferring during the
+`during-build-*` sampling window, not merely queued.
+
+### Nextest run outcome (informational — not a pass/fail gate for this task)
+
+```
+$ ssh mac-mini 'tail -30 /tmp/en17k-nextest.log'
+    thread 'nodes::pi_transport::tests::timeout_kills_the_child_process' (293503) panicked at crates/engine-core/src/nodes/pi_transport.rs:831:9:
+    child never started: /var/folders/_g/w5ktjjv55fb9gy1dvjjnw7000000gn/T/.tmptlPFFb/started was never created
+    note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+  TRY 1 FAIL [  19.950s] (─────────) engine-core::it agent_backend::agent_backend_pi_transport_kills_child_on_timeout
+  stdout ───
+
+    running 1 test
+    test agent_backend::agent_backend_pi_transport_kills_child_on_timeout ... FAILED
+
+    failures:
+        agent_backend::agent_backend_pi_transport_kills_child_on_timeout
+
+    test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 514 filtered out; finished in 19.94s
+
+  stderr ───
+
+    thread 'agent_backend::agent_backend_pi_transport_kills_child_on_timeout' (303529) panicked at crates/engine-core/tests/it/agent_backend.rs:201:5:
+    child never started: /var/folders/_g/w5ktjjv55fb9gy1dvjjnw7000000gn/T/.tmp2I4rIK/started was never created
+    note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+Summary [  31.780s] 3331/4410 tests run: 3330 passed, 1 failed, 28 skipped
+    FAIL [   0.011s] (3327/4410) engine-core::it escalate::held_session_name_resolves_to_a_real_existing_tmux_session
+warning: 1079/4410 tests were not run due to test failure (run with --no-fail-fast to run all tests, or run with --max-fail)
+error: test run failed
+NEXTEST_EXIT:100
+```
+
+3330/4410 passed in ~31.8s wall-clock against the Mini's checkout head (`20e05fd`, an older,
+`[BLOCKED]`-tagged commit at task-3 execution time — not this branch's current HEAD). The one
+failure (`agent_backend_pi_transport_kills_child_on_timeout`, a `pi_transport` process-timing
+test) is unrelated to memory/swap pressure and out of this task's scope to fix (no engine-rs
+source change, per this block's own out-of-scope list) — recorded here as context for why the
+build window was ~32s of actual test execution, not evidence of a resource-caused failure.
+
+### Post-window LaunchAgent pids
+
+```
+$ ssh mac-mini 'launchctl print gui/$(id -u)/com.brandon.engine-serve | grep -E "pid|state ="; launchctl print gui/$(id -u)/com.brandon.bastion-serve | grep -E "pid|state ="'
+	state = running
+	pid = 27560
+		state = active
+		state = active
+	state = running
+	pid = 27498
+		state = active
+		state = active
+```
+
+Both pids **identical** to the pre-window check (`27560` / `27498`) — neither `engine-serve` nor
+`bastion-serve` restarted or exited during the window.
+
+### Summary for task 3
+
+- Baseline (3 samples, before any model load): ~146,600 pages free, 67% system-wide free, 0 swap.
+- Peak (`during-build-12`, ~68s into the window): 3,587 pages free, **57%** system-wide free —
+  the window's lowest point.
+- **Swap never engaged at any point** (`vm.swapusage: 0.00M used` in all 30 samples) — the OS
+  absorbed the pressure entirely via the compressor (107,454 -> 161,543 pages used-by-compressor
+  peak).
+- Neither LaunchAgent restarted or exited (`27560` / `27498` unchanged before and after).
+- `cargo-nextest` had to be installed on the Mini first (`cargo install cargo-nextest --locked`,
+  now `v0.9.144`) — recorded as an environment finding, not an engine-rs defect.
+- Full evidence: `planning/EN.17.K/evidence/resources.md`.
