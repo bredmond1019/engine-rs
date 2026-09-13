@@ -5,7 +5,7 @@ description: Chronological log of work completed for engine-rs.
 doc_id: log
 layer: [factory]
 status: active
-timestamp: "2026-09-12T21:30:00Z"
+timestamp: "2026-09-13T13:50:00Z"
 keywords: [work log, session history, development log]
 related: [status, context]
 ---
@@ -13,6 +13,32 @@ related: [status, context]
 # Log — engine-rs
 
 *Append-only working log. One dated entry per session. Newest entries at the top.*
+
+## [2026-09-13]
+
+### engine-rs orchestration repair items 1-4 closed out — two real credential-isolation defects found and fixed
+
+- **What:** Worked `agentic-portfolio/planning/open-work/focus/engine-rs-orchestration-repair.md`
+  items 1-4. Pushed 95 unpushed local commits. Fixed the Mini's LaunchAgent `PATH` for Pi/Aider —
+  and found `launchctl kickstart -k` doesn't reload the plist, only `bootout`+`bootstrap` does. Re-ran
+  the 3 backend smoke dispatches: Pi and Aider now pass end-to-end; Claude Code failed with a
+  different root cause than the assumed "expired OAuth" — a background watcher caught the isolated
+  credentials file holding a transient, valid-JSON-but-empty placeholder
+  (`accessToken:"", expiresAt:0`) mid-dispatch. Fixed in `core/claude-code-rs/src/isolation.rs`:
+  `IsolatedConfigDir` now validates the access token before trusting a read, retrying (4x/150ms) on
+  a transiently-empty one, failing clearly if it never recovers (commit `2672ab5`). Re-checked the
+  `en17k-inbox-triage-judgment-cli-error-always-defers` finding and found a **second, distinct**
+  defect sharing the same `cli_error` symptom: `JudgmentNode::judge()`
+  (`crates/engine-core/src/nodes/judgment.rs`) never set `Config::isolated`, so preflight/
+  inbox-triage's judgment calls ran against the shared credential store — exactly the collision
+  isolation exists to prevent. One-line fix, `isolated: true` (commit `c09eeb1`). Both deployed to
+  the Mini and re-verified live against fresh fixtures before calling this done.
+- **Why:** The checklist's own items 3/4 had misdiagnosed both failures as environment issues
+  (expired OAuth, fixable by `/login`) — re-testing after a fresh re-authentication still failed,
+  which is what triggered the deeper investigation that found the real code defects.
+- **Refs:** `core/engine-rs/planning/EN.17.K/evidence/smoke-2.md` (full evidence, commit hashes,
+  live-verification JSON); `agentic-portfolio/planning/open-work/focus/engine-rs-orchestration-repair.md`
+  (updated tracker, item 5 next).
 
 ## [2026-09-12]
 
