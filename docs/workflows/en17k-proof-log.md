@@ -790,3 +790,45 @@ $ mev set-block-status brain:HQ.ticket.en17k-fixture-bail-b wontfix --write
   `en17k-coord-queue-is-per-machine-not-shared-brain-root`,
   `en17k-inbox-triage-judgment-cli-error-always-defers`.
 - Full evidence: `planning/EN.17.K/evidence/run.md` and `planning/EN.17.K/evidence/queue.md`.
+
+## Task 5 — Evidence consolidation, index.md, and full Validate
+
+### Evidence files produced by this block
+
+| File | Task | Contents |
+|---|---|---|
+| `planning/EN.17.K/evidence/mini-install.md` | (operator edge, pre-existing) | Install precondition: build-stamp, `launchctl print` before/after, boot log |
+| `planning/EN.17.K/evidence/smoke.md` | 2 | Per-backend (Claude Code, Pi, Aider) dispatch commands, models, terminal readbacks |
+| `planning/EN.17.K/evidence/resources.md` | 3 | Baseline/peak `memory_pressure`/`vm.swapusage` samples, LaunchAgent pid stability |
+| `planning/EN.17.K/evidence/run.md` | 4 | Fixture-chain re-run against the Mini's serve: `chain_report`, FINDING/inbox round trip |
+| `planning/EN.17.K/evidence/queue.md` | 4 | Heavy-work-queue criterion re-check against the Mini |
+| `planning/EN.17.K/index.md` | 5 | Directory index for the spec dir and its `evidence/` (standing rule 7) |
+
+### Discrepancies and findings filed across this block
+
+- `en17k-running-service-key-differs-from-both-env-files` (task 2) — the Mini's running
+  `engine-serve` LaunchAgent authenticates with a key baked into its plist that matches neither
+  this MacBook's nor the Mini's own on-disk `scripts/.env`.
+- `en17k-coord-queue-is-per-machine-not-shared-brain-root` (task 4) — `.fleet-locks/` coordination
+  state is per-machine, not a shared brain-root tree as the block record's own operator-edge text
+  assumed; `bastion coord send` must run on the machine that dispatched the run.
+- `en17k-inbox-triage-judgment-cli-error-always-defers` (task 4) — inbox triage now engages and
+  replies at the corrected `queue/brain/brain/inbox/` path (an improvement over EN.17.H's `[]`),
+  but its judgment mechanism itself errors, so every FINDING gets a blanket `ACK DEFERRED
+  (judgment cli_error)` verdict rather than a real triage decision.
+- Environment/PATH/credential preconditions recorded as findings, not engine-rs defects (task 2):
+  the Mini's Claude Code CLI OAuth session was expired, and both `pi` and `aider` were off the
+  `engine-serve` LaunchAgent's restricted `PATH` even though both binaries were actually present
+  on the Mini (task 1 corrected the earlier "neither exists" reading — `aider` had been installed
+  since 2025-05-31 and was only invisible to a bare non-interactive-PATH `which` check).
+- `cargo-nextest` was missing on the Mini and had to be installed before the resource probe (task
+  3) — an environment gap, not an engine-rs defect.
+- No engine-rs, bastion, or base-template source change was made or needed by this block, per its
+  own out-of-scope list; every discrepancy above is either an operator-actionable environment
+  finding or a defect already filed against its owning block/repo, not patched here.
+
+### Full validation suite
+
+Ran the five `validation_commands` from `planning/blocks/EN.17.K.json` — this block made no
+engine-rs source changes, so none of these were expected to be affected by it; see the commit for
+the actual pass/fail readback of each.
