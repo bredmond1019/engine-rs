@@ -62,7 +62,8 @@ use engine_core::schema::{NodeConfig, WorkflowSchema};
 use engine_core::suspend::{self, SuspendReason};
 use engine_core::workflow::{OnProgress, Workflow, WorkflowError};
 use engine_core::workflows::orchestration::execute::{
-    default_flow_runner_with_heavy_work, execute_step, EngineKind, FlowInvocation,
+    default_flow_runner_with_heavy_work, execute_step, DiskHeavyJobLookup, EngineKind,
+    FlowInvocation,
 };
 use engine_core::workflows::queue_park::{self, HeavyJobLookup, RunStart};
 use engine_core::workflows::sdlc_flow::close_block::CloseBlockNode;
@@ -94,6 +95,21 @@ const TASK_SLUG: &str = "fixture-queue-park-task";
 const FLOW_SLUG: &str = "fixture-queue-park-flow";
 
 // ── shared fixture plumbing ────────────────────────────────────────────────
+
+/// EN.ticket.test-task-node-queue-park-has-no-production-graph-wiring task
+/// 3: `DiskHeavyJobLookup` is production's real, disk-backed
+/// [`HeavyJobLookup`] (`default_flow_runner`'s own default), widened from
+/// module-private to `pub` so this integration-test binary can construct it
+/// directly rather than a hand-rolled stub. This smoke assertion proves the
+/// public path this task establishes actually compiles from `tests/it/`; it
+/// is a real fixture helper, not a throwaway — task 5's production
+/// end-to-end park+resume test constructs its own `DiskHeavyJobLookup` the
+/// same way.
+#[tokio::test]
+async fn queue_park_disk_heavy_job_lookup_is_constructible_from_integration_tests() {
+    let lock_dir = temp_dir("disk-lookup-smoke");
+    let _lookup = DiskHeavyJobLookup::new(lock_dir);
+}
 
 fn temp_dir(tag: &str) -> PathBuf {
     static COUNTER: AtomicUsize = AtomicUsize::new(0);

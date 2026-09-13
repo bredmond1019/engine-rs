@@ -977,13 +977,13 @@ pub fn default_flow_runner_with_heavy_work(
 /// already unreachable; this struct is the first attempt at a real bridge,
 /// left honest about what it cannot yet do rather than silently
 /// short-circuiting with a fabricated outcome.
-struct DiskHeavyJobLookup {
+pub struct DiskHeavyJobLookup {
     lock_dir: PathBuf,
     poll_interval: std::time::Duration,
 }
 
 impl DiskHeavyJobLookup {
-    fn new(lock_dir: PathBuf) -> Self {
+    pub fn new(lock_dir: PathBuf) -> Self {
         Self {
             lock_dir,
             poll_interval: std::time::Duration::from_millis(200),
