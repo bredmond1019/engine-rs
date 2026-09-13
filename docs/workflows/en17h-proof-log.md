@@ -200,3 +200,53 @@ not patched (out of scope: no engine-rs/bastion source change):
 HQ's tree was left with only these roadmap-artifact changes (no fixture-ticket state.json
 mutation, no other unrelated edit). Full evidence, verbatim, in
 `planning/EN.17.H/evidence/run.md`.
+
+## Task 3 — the heavy-work queue proof: limit+1 concurrent SDLC_TASK dispatches
+
+Verified `planning/harness.json`'s `test_dispatch` is literally `queue_park` (both occurrences,
+lines 119/438), and read `[heavy_work.classes.test].limit = 2` live from `brain.toml`. Dispatched
+`limit + 1 = 3` concurrent `SDLC_TASK` runs directly via `POST /events/` against the installed
+`bastion serve`, exactly as this task's own curl body specifies.
+
+**Neither acceptance criterion 2 nor 3 could be produced — not from bad luck, but from two
+structural findings**, both traced to source, not merely observed:
+
+1. **The worktree collision is guaranteed, not probabilistic, for this exact recipe.**
+   `SetupWorktreeNode` names the worktree/branch deterministically as `task/<spec_slug>` with no
+   run/event id in it. Dispatching all `limit + 1` runs against the SAME `spec_slug` (as the
+   task's own literal curl body does) means only 1 of 3 can ever win the worktree; the other 2 die
+   at `SetupWorktreeNode` in seconds, long before reaching the heavy-work "test" class at all.
+2. **`test_dispatch: queue_park` has no effect on a directly-dispatched `SDLC_TASK`/`SDLC_FLOW`
+   run, regardless of the worktree issue.** `sdlc_task::graph::registry()` /
+   `registry_for_policy()` — what `engine-serve`'s `POST /events/` path actually calls — register
+   `TestTaskNode::new()`, which hardcodes a `HeavyWorkConfig::disabled()` queue, and never call
+   `.with_heavy_work(...)` to wire a real one. The ONLY production call site that does is
+   `orchestration::execute::default_flow_runner_with_heavy_work`, and it does so
+   UNCONDITIONALLY — not gated on `policy.test_dispatch` at all — for `SDLC_TASK`/`SDLC_FLOW`
+   children of an `ORCHESTRATION` run. So today, whether heavy-work actually engages is decided
+   entirely by the dispatch route (direct HTTP vs. `ORCHESTRATION` child), never by the
+   `test_dispatch` policy value. Confirmed empirically: the one run that reached its test stage
+   stamped `heavy_work: {"mode": "disabled", ...}` despite the file setting.
+
+A second attempt using two distinct specs (`micro-spec-small`, `micro-spec-large`) plus a
+`use_worktree:false` third dispatch avoided the worktree collision and got 2 lanes running
+concurrently, but hit the same `mode: disabled` wall — confirming finding 2 is the binding
+constraint, not the worktree race. That third dispatch also surfaced an unplanned, self-contained
+operational hazard: `use_worktree:false` checks out the task branch directly in the dispatch
+target's own repo root, which — because that root is this exact session's own working directory —
+switched this session off `main` mid-task. Recovered cleanly (aborted the run, discarded the two
+disposable fixture-file mutations, checked back out to `main` at the same commit the branch
+started at) with no data lost; recorded as a finding, not patched (out of scope).
+
+`GET /api/coordination/heavy-work` (the route this task's snapshot criterion needs) also could not
+be reached at all: every `/api/*` engine route returned 401 for every `X-API-Key` value tried
+(including the confirmed-correct one from `/events/`), consistent with `bastion`'s own
+bearer-protected `/api` scope claiming the prefix ahead of the engine's route table on this
+installed binary.
+
+All worktrees/branches this task created were removed (`git worktree remove --force` +
+`git branch -D` for both `task/micro-spec-small` and `task/micro-spec-large`, plus
+`scripts/run_micro_spec.sh --spec <slug> --clean` for both specs); `git worktree list` afterward
+shows only the two unrelated worktrees present before this task began. `main` was confirmed back
+at its pre-task commit (`d18851c`) with a clean working tree. Full evidence, verbatim, including
+the exact source lines each finding traces to, in `planning/EN.17.H/evidence/queue.md`.
