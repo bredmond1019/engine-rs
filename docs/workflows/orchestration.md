@@ -683,6 +683,38 @@ now passes a real `QueueHoldSource` — backed by the same coordination-tree lea
 the placeholder `NeverHeld`, so an operator hold taken through the coordination layer is honored by
 this registration path too.
 
+### An explicit `blocks[]` event's own `lane` field never reaches `CoordHandle`
+
+`OrchestrationEventSchema` accepts a `lane: Option<String>` field regardless of whether the event
+names an explicit `blocks[]` array or a `roadmap`+`lane` pair. **Only the `roadmap`+`lane` branch
+ever uses it.** For an explicit `blocks[]` dispatch, `resolved_lane` stays `None` for the whole
+call, and the `CoordHandle` built afterward falls back to `lane = repo` (the chain's first step's
+own repo) — never the event's stated `lane`.
+
+This is deliberate, not an oversight: `held_session_name_falls_back_to_repo_as_lane_for_an_explicit_blocks_chain`
+(`crates/engine-core/src/workflows/orchestration/graph.rs`) documents the fallback in its own
+words — an explicit `blocks[]` chain "has no `roadmap`+`lane` pair to resolve a lane from," so it
+degrades to `lane == repo` "rather than panicking or inventing a third scheme." The sibling test
+`held_session_name_follows_lane_repo_lane_exactly_for_a_resolved_roadmap_lane_chain` is the
+positive case, for contrast.
+
+**The practical consequence, easy to miss without reading the source:** if you launch an explicit
+`blocks[]` chain with `"lane": "my-proof-lane"` expecting to `bastion coord send --repo <repo>
+--lane my-proof-lane` and have the chain's boundary drain pick the message up, it never will — the
+message needs to go to `--lane <repo>` instead (the same string as the first block's `repo` field).
+An `event.lane` value on an explicit-`blocks[]` chain is not wasted — `chain.rs`'s resolver still
+reads it for other purposes — but it is **not** the coordination lane. Confirmed live 2026-09-13
+(`planning/EN.17.H/evidence/run.md`'s RE-VERIFICATION section): a message sent to the event's
+stated `lane` sat undrained through a full chain run. **Sending to the corrected `queue/<repo>/<repo>/inbox/`
+path did not resolve the drain either** in that same session's testing — `inbox_report` stayed
+empty even there, across 5 attempts with varying chain lengths and timing. That second gap is not
+yet root-caused; do not read this section as a guarantee that the corrected path drains messages
+today, only that it is the path the code is designed to read from.
+
+If you need the event's own `lane` value to actually be the coordination lane, use the
+`roadmap`+`lane` dispatch shape instead of `blocks[]` — that is the one path `resolved_lane` reads
+it from.
+
 ## Campaign identity
 
 Every `ORCHESTRATION` run resolves a `campaign_id` (`EN.11.E`) — the event's own `campaign_id` when
