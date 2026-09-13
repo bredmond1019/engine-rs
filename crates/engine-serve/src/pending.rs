@@ -532,4 +532,123 @@ mod tests {
         let resp = test::call_service(&app, req).await;
         assert_eq!(resp.status(), 200);
     }
+
+    // ── Dispatch and route-shadowing invariants ────────────────────────
+
+    #[actix_web::test]
+    async fn post_pending_returns_202_and_dispatches_nothing() {
+        let queue = InMemoryPendingQueue::new();
+        let state = test_app_state();
+        let live = state.live.clone();
+        let app = test::init_service(
+            App::new()
+                .app_data(web::Data::new(state))
+                .app_data(queue_data(queue))
+                .configure(configure),
+        )
+        .await;
+
+        let req = test::TestRequest::post()
+            .uri("/events/pending")
+            .insert_header(("X-API-Key", API_KEY))
+            .set_json(serde_json::json!({
+                "workflow_type": "fixture",
+                "data": { "test": "value" }
+            }))
+            .to_request();
+        let resp = test::call_service(&app, req).await;
+        assert_eq!(resp.status(), 202);
+        let body: serde_json::Value = test::read_body_json(resp).await;
+        let pending_id = body["pending_id"].as_str().unwrap();
+
+        // A pending_id must not resolve as a run_id: nothing was dispatched.
+        assert!(
+            live.list_active().is_empty(),
+            "queuing a run must not start it"
+        );
+        assert!(
+            live.list_live_records().is_empty(),
+            "queuing a run must not start it"
+        );
+
+        let req = test::TestRequest::get()
+            .uri(&format!("/events/{pending_id}"))
+            .insert_header(("X-API-Key", API_KEY))
+            .to_request();
+        let resp = test::call_service(&app, req).await;
+        assert_eq!(
+            resp.status(),
+            404,
+            "a pending_id must not resolve through GET /events/{{event_id}}"
+        );
+    }
+
+    #[actix_web::test]
+    async fn pending_route_resolves_as_a_literal_not_an_event_id() {
+        // RUNTIME INVERSION (mirrors resume.rs's suspended_route_resolves_as_a_literal_not_an_event_id,
+        // strengthened): build BOTH route orderings and assert the shadowed one
+        // actually fails to reach the handler. Asserting only the correct
+        // ordering proves nothing — a route table with no {event_id} route at
+        // all would also pass it.
+        let queue = InMemoryPendingQueue::new();
+        let app_correct_order = test::init_service(
+            App::new()
+                .app_data(web::Data::new(test_app_state()))
+                .app_data(queue_data(queue))
+                .configure(configure),
+        )
+        .await;
+
+        let req = test::TestRequest::get()
+            .uri("/events/pending")
+            .insert_header(("X-API-Key", API_KEY))
+            .to_request();
+        let resp = test::call_service(&app_correct_order, req).await;
+        assert_eq!(
+            resp.status(),
+            200,
+            "the literal /events/pending path must not be swallowed by the {{event_id}} extractor"
+        );
+        let body: serde_json::Value = test::read_body_json(resp).await;
+        assert!(body["runs"].is_array());
+
+        // Now register the routes in the SHADOWED order: {event_id} first.
+        // The {event_id} handler's own behavior is irrelevant here — only
+        // actix-web's first-registration-wins route-pattern precedence is
+        // under test, so a stub handler stands in for the real get_event
+        // (which is private to http.rs). It returns a distinctive marker
+        // body so the assertion can tell "the event_id route was hit"
+        // apart from "list_pending was hit" without depending on status
+        // codes the two handlers might coincidentally share.
+        async fn stub_event_handler() -> actix_web::HttpResponse {
+            actix_web::HttpResponse::Ok().json(serde_json::json!({ "stub": "event_id_route" }))
+        }
+
+        let queue = InMemoryPendingQueue::new();
+        let app_shadowed_order = test::init_service(
+            App::new()
+                .app_data(web::Data::new(test_app_state()))
+                .app_data(queue_data(queue))
+                .route("/events/{event_id}", web::get().to(stub_event_handler))
+                .route(
+                    "/events/pending",
+                    web::get().to(crate::pending::list_pending),
+                ),
+        )
+        .await;
+
+        let req = test::TestRequest::get()
+            .uri("/events/pending")
+            .insert_header(("X-API-Key", API_KEY))
+            .to_request();
+        let resp = test::call_service(&app_shadowed_order, req).await;
+        let body: serde_json::Value = test::read_body_json(resp).await;
+        assert_eq!(
+            body["stub"], "event_id_route",
+            "with {{event_id}} registered first, the literal \"pending\" segment must be \
+             swallowed by the uuid extractor and reach the stub, never list_pending — an \
+             array-with-\"runs\" body here means the inversion did not actually exercise the \
+             shadowing this test claims to prove"
+        );
+    }
 }
