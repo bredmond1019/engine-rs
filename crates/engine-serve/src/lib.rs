@@ -14,6 +14,7 @@ pub mod http;
 pub mod journal;
 pub mod live_state;
 pub mod orphan;
+pub mod pending;
 pub mod resume;
 pub mod schedule;
 pub mod stream;

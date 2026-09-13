@@ -272,6 +272,18 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         .route("/events/", web::post().to(post_events))
         // MUST be registered before `/events/{event_id}` -- actix-web
         // resolves routes first-registration-wins, so the literal
+        // "pending" segment would otherwise be swallowed by the
+        // `{event_id}` uuid extractor.
+        .route(
+            "/events/pending",
+            web::post().to(crate::pending::post_pending),
+        )
+        .route(
+            "/events/pending",
+            web::get().to(crate::pending::list_pending),
+        )
+        // MUST be registered before `/events/{event_id}` -- actix-web
+        // resolves routes first-registration-wins, so the literal
         // "suspended" segment would otherwise be swallowed by the
         // `{event_id}` uuid extractor.
         .route(
