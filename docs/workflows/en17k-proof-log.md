@@ -682,3 +682,111 @@ Both pids **identical** to the pre-window check (`27560` / `27498`) — neither 
 - `cargo-nextest` had to be installed on the Mini first (`cargo install cargo-nextest --locked`,
   now `v0.9.144`) — recorded as an environment finding, not an engine-rs defect.
 - Full evidence: `planning/EN.17.K/evidence/resources.md`.
+
+## Task 4 — Re-run EN.17.H's fixture-chain proof against the Mini's serve
+
+### API key: the running service's key matches NEITHER machine's `scripts/.env`
+
+Both machines' `scripts/.env` copies of `BASTION_ENGINE_API_KEY` are identical to each other, but
+a `POST /events/` dispatch using that value returned `401 unauthorized` against the Mini's serve.
+The correct key was read from the LaunchAgent's own live environment:
+
+```
+$ ssh mac-mini 'launchctl print gui/$(id -u)/com.brandon.engine-serve' | grep BASTION_ENGINE_API_KEY
+BASTION_ENGINE_API_KEY => 0ecce93c669e54391166e475cc42d44925dda473d45eb45c
+```
+
+That key authenticated successfully. Filed as a finding (`en17k-running-service-key-differs-from-both-env-files`),
+not chased further — no engine-rs source change, and reading the live key worked around it.
+
+### Fixture registration, push, and the Mini's non-fast-forward pull
+
+Registered `HQ.ticket.en17k-fixture-bail-a`/`-b` via `mev create-block --write` (same no-`tasks.json`
+BAIL shape as EN.17.H's fixtures), committed with an explicit pathspec
+(`planning/blocks/HQ.ticket.en17k-fixture-bail-{a,b}.json` + the purely-additive `planning/state.json`
+diff, 80 insertions / 0 deletions), pushed (`a5c7d0ea0`).
+
+**First dispatch attempt, pre-pull**, confirmed the block's own "separate clone" warning:
+
+```
+$ curl ... POST http://100.104.113.100:8090/events/ -d '{"blocks":[{"repo":"brain","block_id":"HQ.ticket.en17k-fixture-bail-a"},...]}'
+{"event_id":"8843f310-...","run_id":"8843f310-..."}
+$ curl .../events/8843f310-... -> chain_report.skipped: [{"reason":"block id is not in tracks[]; not dispatched"}, ...] (both blocks)
+```
+
+Pulling on the Mini hit `git pull --ff-only` refusing (the Mini's own uncommitted
+`lane-log.jsonl` append from that skip-run, plus a large un-pulled backlog). Committed the Mini's
+own append, then `git merge origin/main --no-edit` — one real content conflict in `lane-log.jsonl`
+(both clones had appended different lines since the last common ancestor), resolved by keeping the
+union ordered by timestamp. Merge commit `aa8e070f5` pushed back to origin.
+
+### The FINDING-send path is ALSO per-machine — the operator edge's premise does not hold
+
+The block record instructs sending the FINDING "from THIS MacBook, since HQ's coordination tree
+lives at the shared brain root regardless of which machine's serve is dispatching." Verified
+directly that this is false: `.fleet-locks/` does not exist at all on the Mini until something on
+the Mini writes to it —
+
+```
+$ ssh mac-mini 'find /Users/brandon/Dev/agentic-portfolio/.fleet-locks/queue/brain -maxdepth 3'
+find: ... No such file or directory
+```
+
+Two `bastion coord send` attempts from the MacBook (against a Mini-dispatched run) both left the
+message undrained — not because of timing, but because they wrote to the MacBook's own, disjoint
+`.fleet-locks/` tree. Corrected by running `bastion coord send` on the Mini itself
+(`ssh mac-mini 'cd .../agentic-portfolio && bastion coord send ...'`). Filed as
+`en17k-coord-queue-is-per-machine-not-shared-brain-root`.
+
+### Timing: no usable inter-block gap for this fixture shape
+
+EN.17.H's ~15-25s gap between bails came from a 3-block chain with real work between them. This
+2-block, both-immediate-BAIL fixture chain reaches terminal `status: failed` in **under 2 seconds**
+end-to-end (confirmed polling every 2s). The FINDING was sent as fast as possible after dispatch
+return (same second) rather than after an artificial 15-25s wait, since waiting that long
+guarantees the run has already gone terminal.
+
+### Result: the message WAS drained and got a real reply — an improvement over EN.17.H
+
+```
+$ ssh mac-mini 'find .../.fleet-locks/queue/brain -type f'
+.../queue/brain/brain/receipts.jsonl
+.../queue/brain/brain/done/20260913T104500Z-en17k-mini-proof-finding-9d2f7a1c.json
+.../queue/brain/en17k-mini-proof/inbox/20260913T104554.724244+0000-4515ace3-262e-4c95-8e14-f7c8e9f69320.json
+```
+
+Reply body: `"ACK DEFERRED (judgment cli_error)"`. The run record's own `inbox_report` is
+**non-empty** (message_id, reply_path, `error_kind: "cli_error"`) — EN.17.H's suspected "second,
+not-yet-root-caused issue" (inbox triage not engaging even at the corrected path) does **not**
+reproduce here. Narrower finding filed instead:
+`en17k-inbox-triage-judgment-cli-error-always-defers` — triage engages and replies, but its
+judgment mechanism itself errors, so every FINDING gets a blanket DEFERRED verdict.
+
+### chain_report and cleanup
+
+```json
+{"bailed": ["brain:HQ.ticket.en17k-fixture-bail-a", "brain:HQ.ticket.en17k-fixture-bail-b"], "closed": [], "skipped": []}
+```
+
+Both fixtures closed `wontfix` afterward:
+
+```
+$ mev set-block-status brain:HQ.ticket.en17k-fixture-bail-a wontfix --write
+$ mev set-block-status brain:HQ.ticket.en17k-fixture-bail-b wontfix --write
+```
+
+### Summary for task 4
+
+- chain_report: HELD (2 bailed, 0 skipped, 0 closed).
+- FINDING/inbox_report: HELD, and better than EN.17.H — a real drained reply, not `[]`.
+- Notification/escalations routing and preflight_report: not independently re-verified this run
+  (unchanged mechanisms; EN.17.H's own discrepancies stand).
+- Heavy-work "queue" criterion: not independently re-run — see `planning/EN.17.K/evidence/queue.md`
+  for why (code-path defects, not host-specific, confirmed unchanged by diff across the relevant
+  commit range).
+- HQ git tree before/after: not byte-identical, entirely accounted for by this task's own
+  registration/close-out writes (as this block's own criterion anticipates).
+- New findings filed: `en17k-running-service-key-differs-from-both-env-files`,
+  `en17k-coord-queue-is-per-machine-not-shared-brain-root`,
+  `en17k-inbox-triage-judgment-cli-error-always-defers`.
+- Full evidence: `planning/EN.17.K/evidence/run.md` and `planning/EN.17.K/evidence/queue.md`.
