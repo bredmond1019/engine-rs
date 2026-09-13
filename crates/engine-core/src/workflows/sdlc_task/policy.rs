@@ -378,6 +378,17 @@ impl SdlcTaskPolicy {
             // module's doc comment.
             generate_context_max_bytes: self.generate_context_max_bytes,
             agent_backend: self.agent_backend,
+            // NOT one of the six knobs this module omits — `apply_policy_
+            // config` applies isolation to every stage uniformly, including
+            // implement/triage/generate, all of which this workflow's
+            // registry actually runs. Falls back to `SdlcPolicy::default()`
+            // (`true`) rather than exposing its own `SdlcTaskPolicy` field:
+            // there is no known case where SDLC_TASK would want isolation
+            // off independently of `sdlc_flow`. Promote to a real
+            // four-layer `SdlcTaskPolicy` knob (mirroring
+            // `implement_final_attempt`'s EN.17.F task 6 precedent) the day
+            // one actually shows up.
+            isolated: fallback.isolated,
         }
     }
 }

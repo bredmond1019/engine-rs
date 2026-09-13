@@ -128,6 +128,11 @@ pub(super) fn apply_policy_config(config: Config, policy: &SdlcPolicy, stage: St
     if let Some(turns) = max_turns {
         config.max_turns = Some(turns);
     }
+    // Policy is the single source of truth for isolation — never a
+    // per-node literal (`SdlcPolicy::isolated`'s doc comment has the full
+    // reasoning). This runs for every stage, so a node's own `Config`
+    // literal need not (and should not) set `isolated` itself.
+    config.isolated = policy.isolated;
     config
 }
 
@@ -3243,27 +3248,13 @@ impl ConsolidatedReviewNode {
     #[must_use]
     pub fn new() -> Self {
         Self {
+            // Deliberately no `isolated` here — `apply_policy_config` sets
+            // it from `SdlcPolicy::isolated` on every call, for every stage.
+            // A per-node literal is exactly the footgun that let this node
+            // ship unisolated in the first place; see that field's doc
+            // comment.
             config: Config {
                 model: Some("claude-sonnet-4-5".to_string()),
-                // `EN.ticket.queue-not-run-event-ingress` review, Session 3:
-                // this is the SDLC_FLOW loop's only genuinely unisolated
-                // model call — `TriageTaskNode` shares the same unisolated
-                // Config but its deterministic-classification fast path
-                // (a conclusive `command`/`write-verification` failure, or
-                // "all checks passed") means it almost never actually reaches
-                // the API, so it never exercised this. Reproduced live on
-                // the Mac Mini's long-running `engine-serve` daemon: this
-                // call failed "OAuth session expired and could not be
-                // refreshed" twice, identically, across a full process
-                // restart, while the on-disk credential was hours from
-                // expiry and a fresh ad-hoc `claude -p` call against the
-                // SAME credential succeeded — `isolated`'s own doc comment
-                // names the exact mechanism ("a concurrent subprocess
-                // session cannot log out an interactive session"). Setting
-                // this mirrors `ImplementTaskNode`/`PatchDocsNode`
-                // (`agentic_write_config`), which already run isolated and
-                // have never shown this failure.
-                isolated: true,
                 ..Config::default()
             },
             transport: TransportSlot::default(),
@@ -7713,20 +7704,37 @@ pub(crate) mod tests {
     // --- ConsolidatedReviewNode ------------------------------------------
 
     /// `EN.ticket.queue-not-run-event-ingress` review, Session 3, Finding B:
-    /// this is the SDLC_FLOW loop's only node whose real model call runs
-    /// unisolated against `engine-serve`'s long-lived, possibly-concurrent
-    /// credential store — `TriageTaskNode` shares an unisolated `Config` too
-    /// but almost always short-circuits to a deterministic verdict before
-    /// ever calling the model. Pins the fix so a future edit to `new()`
-    /// can't silently drop it back to unisolated.
+    /// every stage runs isolated by default, resolved from policy rather
+    /// than hardcoded per node — `SdlcPolicy::isolated`'s doc comment has
+    /// the reproduced-OAuth-failure evidence. `ConsolidatedReviewNode`
+    /// itself carries no `isolated` literal at all any more (a per-node
+    /// literal is exactly the footgun that let this ship broken); this
+    /// pins the policy-application path instead of the node's own default.
     #[test]
-    fn consolidated_review_node_runs_isolated_by_default() {
-        let node = ConsolidatedReviewNode::new();
-        assert!(
-            node.config.isolated,
-            "ConsolidatedReviewNode must run isolated — see its `new()` doc \
-             comment for the reproduced OAuth failure this prevents"
-        );
+    fn apply_policy_config_isolates_every_stage_by_default() {
+        let policy = SdlcPolicy::default();
+        for stage in [
+            Stage::Implement,
+            Stage::Triage,
+            Stage::Review,
+            Stage::Generate,
+            Stage::Docs,
+        ] {
+            let config = apply_policy_config(Config::default(), &policy, stage);
+            assert!(config.isolated, "{stage:?} must be isolated by default");
+        }
+    }
+
+    /// The escape hatch: an operator who explicitly opts out via policy
+    /// (not a per-node edit) gets every stage unisolated.
+    #[test]
+    fn apply_policy_config_honors_an_explicit_isolated_false_override() {
+        let policy = SdlcPolicy {
+            isolated: false,
+            ..SdlcPolicy::default()
+        };
+        let config = apply_policy_config(Config::default(), &policy, Stage::Review);
+        assert!(!config.isolated);
     }
 
     #[tokio::test]

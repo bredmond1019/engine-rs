@@ -49,6 +49,11 @@ pub fn baseline() -> PartialPolicy {
         // Restates the built-in default verbatim — baseline's no-op
         // contract (EN.14.G).
         node_invocation_payload_cap_bytes: Some(crate::invocations::DEFAULT_PAYLOAD_CAP_BYTES),
+        // Restates the built-in default verbatim — baseline's no-op
+        // contract. Not a "leave it off" knob: see `SdlcPolicy::isolated`'s
+        // doc comment for why `true` is the only safe value on every
+        // profile, this one included.
+        isolated: Some(true),
         ..Default::default()
     }
 }
@@ -104,6 +109,11 @@ pub fn cheap_fast() -> PartialPolicy {
         // below the built-in default, so a dispatch's retained output
         // truncates sooner on this profile.
         node_invocation_payload_cap_bytes: Some(8_192),
+        // Isolation's per-call Keychain-read latency is real, but not a
+        // cost/latency lever this profile trades away — see
+        // `SdlcPolicy::isolated`'s doc comment. Restated explicitly rather
+        // than left to fall through.
+        isolated: Some(true),
         ..Default::default()
     }
 }
@@ -143,6 +153,8 @@ pub fn pragmatist() -> PartialPolicy {
         // default, since `pragmatist` is not the profile trading away
         // review thoroughness.
         max_review_attempts: Some(3),
+        // See `SdlcPolicy::isolated`'s doc comment — every profile isolates.
+        isolated: Some(true),
         ..Default::default()
     }
 }
@@ -182,6 +194,9 @@ pub fn batch_reviewer() -> PartialPolicy {
         // quality-oriented bundle wants the full built-in default rather
         // than a truncated one.
         max_review_attempts: Some(3),
+        // `EndReviewNode`'s single end-of-run call is exactly the shape
+        // this knob exists for — see `SdlcPolicy::isolated`'s doc comment.
+        isolated: Some(true),
         ..Default::default()
     }
 }
@@ -313,6 +328,10 @@ pub fn thorough() -> PartialPolicy {
         // left unset here to fall through rather than restating the
         // default explicitly ahead of EN.16.D task 5's harness.json wiring.
         agent_backend: None,
+        // The quality ceiling still isolates every call — see
+        // `SdlcPolicy::isolated`'s doc comment. Set explicitly per this
+        // bundle's own "every field explicit" contract.
+        isolated: Some(true),
     }
 }
 
@@ -400,6 +419,7 @@ mod tests {
         assert!(transport_retry.initial_backoff_ms.is_some());
         assert!(p.review_diff_max_chars.is_some());
         assert!(p.node_invocation_payload_cap_bytes.is_some());
+        assert!(p.isolated.is_some());
     }
 
     #[test]
@@ -513,6 +533,30 @@ mod tests {
             assert!(
                 tiers.docs.is_some(),
                 "profile `{name}` must set model_tiers.docs explicitly"
+            );
+        }
+    }
+
+    /// CLAUDE.md standing rule 6 + `SdlcPolicy::isolated`'s doc comment: an
+    /// isolation choice left to per-node judgment is exactly the footgun
+    /// that shipped `ConsolidatedReviewNode` unisolated. Every named
+    /// profile must pin it explicitly, and to `true` — there is no profile
+    /// this repo ships where trading away isolation is the intended
+    /// behavior.
+    #[test]
+    fn every_named_profile_sets_isolated_true() {
+        for name in [
+            "baseline",
+            "cheap-fast",
+            "thorough",
+            "pragmatist",
+            "batch-reviewer",
+        ] {
+            let p = profile_by_name(name).expect("known profile name");
+            assert_eq!(
+                p.isolated,
+                Some(true),
+                "profile `{name}` must set isolated: Some(true) explicitly"
             );
         }
     }

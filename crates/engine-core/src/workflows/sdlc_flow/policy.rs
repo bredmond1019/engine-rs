@@ -394,14 +394,37 @@ pub struct SdlcPolicy {
     /// resolution is a follow-on (`EN.16.D`). Built-in default
     /// `AgentBackend::ClaudeCli` — behavior-stable.
     pub agent_backend: AgentBackend,
+    /// Whether every stage's real model call runs under `claude-code-rs`'s
+    /// isolated `CLAUDE_CONFIG_DIR` (a throwaway, refresh-token-stripped
+    /// copy of the credentials) rather than the shared `~/.claude` store —
+    /// applied uniformly to every stage by `apply_policy_config`, never set
+    /// per-node. **Default `true`, NOT behavior-stable** — a deliberate
+    /// correctness fix, not a preserved default. A concurrent Claude Code
+    /// session (an interactive login, another workflow's call, this same
+    /// run's own concurrent lanes) sharing the unisolated store can refresh
+    /// and silently revoke whatever session an unisolated call was using
+    /// mid-flight. Reproduced live, twice, identically, against
+    /// `engine-serve`'s long-running daemon: `ConsolidatedReviewNode` (the
+    /// one node whose real call was unisolated — `TriageTaskNode` shares an
+    /// unisolated `Config` too but almost always short-circuits to a
+    /// deterministic verdict without reaching the API) failed "OAuth
+    /// session expired and could not be refreshed" across a full process
+    /// restart, with a verified-valid, unexpired, unchanged-fingerprint
+    /// credential. See `EN.ticket.queue-not-run-event-ingress` Session 3.
+    /// Set `false` only for a debug/local run with no concurrent Claude
+    /// Code session, to avoid isolation's per-call macOS-Keychain-read
+    /// latency.
+    pub isolated: bool,
 }
 
 impl Default for SdlcPolicy {
-    /// The safe default: reproduces today's (pre-EN.3.C) behavior exactly.
-    /// Normal verbosity, `per_task` review, all-Sonnet tiers, no close-out
-    /// reuse, prompt-cache off, `llm_triage` false, `max_attempts` 3,
-    /// `test_depth: full`, and no per-stage call-timeout overrides (all
-    /// `None` — `claude-code-rs`'s own 300s default applies).
+    /// The safe default: reproduces today's (pre-EN.3.C) behavior exactly,
+    /// with one deliberate exception — [`Self::isolated`] defaults to
+    /// `true`, not the pre-existing unisolated behavior; see its own doc
+    /// comment. Otherwise: normal verbosity, `per_task` review, all-Sonnet
+    /// tiers, no close-out reuse, prompt-cache off, `llm_triage` false,
+    /// `max_attempts` 3, `test_depth: full`, and no per-stage call-timeout
+    /// overrides (all `None` — `claude-code-rs`'s own 300s default applies).
     fn default() -> Self {
         Self {
             output_verbosity: OutputVerbosity::Normal,
@@ -435,6 +458,7 @@ impl Default for SdlcPolicy {
             node_invocation_payload_cap_bytes: crate::invocations::DEFAULT_PAYLOAD_CAP_BYTES,
             generate_context_max_bytes: None,
             agent_backend: AgentBackend::default(),
+            isolated: true,
         }
     }
 }
@@ -459,6 +483,7 @@ pub struct PartialPolicy {
     pub local: Option<PartialLocalConfig>,
     pub llm_triage: Option<bool>,
     pub agent_backend: Option<AgentBackend>,
+    pub isolated: Option<bool>,
     pub max_attempts: Option<u32>,
     pub max_review_attempts: Option<u32>,
     pub retry_feedback: Option<PartialRetryFeedback>,
@@ -672,6 +697,7 @@ impl crate::policy::Policy for SdlcPolicy {
                 over.generate_context_max_bytes,
             ),
             agent_backend: merge_opt(base.agent_backend, over.agent_backend),
+            isolated: merge_opt(base.isolated, over.isolated),
         }
     }
 }
@@ -1845,6 +1871,10 @@ mod tests {
             "agent_backend",
             "sdlc_task::policy::SdlcTaskPolicy::to_sdlc_policy (projected from SDLC_TASK's own resolved policy); this task adds the plain field only — SDLC_FLOW's own dispatch wiring is a follow-on EN.16.D task",
         ),
+        (
+            "isolated",
+            "task_loop.rs::apply_policy_config (sets Config::isolated for every stage — Implement/Triage/Review/Generate/Docs alike)",
+        ),
     ];
 
     #[test]
@@ -1876,6 +1906,7 @@ mod tests {
             node_invocation_payload_cap_bytes,
             generate_context_max_bytes,
             agent_backend,
+            isolated,
         );
 
         let mut actual: Vec<&str> = field_names.to_vec();
