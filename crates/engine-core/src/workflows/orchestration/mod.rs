@@ -105,6 +105,7 @@ pub mod escalate;
 pub mod execute;
 pub mod gates;
 pub mod graph;
+pub mod inbox_triage;
 pub mod integrate;
 pub mod ledger;
 pub mod operator_edge;

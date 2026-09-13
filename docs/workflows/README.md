@@ -173,9 +173,12 @@ Both, plus the four-layer precedence that decides which setting actually wins, a
 
 ### `agent_backend` — which coding agent SDLC_TASK's implement stage drives
 
-`SDLC_TASK`'s implement stage (`ImplementTaskNode`) is driven by one of two backends, chosen by the
-`agent_backend` knob on `SdlcTaskPolicy` (per-run `policy` override > named `profile` bundle >
-`planning/harness.json`'s `sdlc_task.policy`/`sdlc_task.profiles` defaults > the built-in default):
+`SDLC_TASK`'s implement stage (`ImplementTaskNode`) is driven by one of three backends, chosen by
+the `agent_backend` knob on `SdlcTaskPolicy` (per-run `policy` override > named `profile` bundle >
+`planning/harness.json`'s `sdlc_task.policy`/`sdlc_task.profiles` defaults > the built-in default).
+`SDLC_FLOW` resolves the identical knob on its own `SdlcPolicy` via `planning/harness.json`'s
+`sdlc.policy`/`sdlc.profiles` section — same three values, same dispatch shape, a separate harness
+section because the two workflows resolve their policies independently:
 
 | Value | What runs | Cost |
 |---|---|---|
@@ -184,7 +187,8 @@ Both, plus the four-layer precedence that decides which setting actually wins, a
 | `aider` | `aider` (`crates/engine-core/src/nodes/aider_transport.rs`'s `AiderTransport`) against a local Ollama model, using the same `local.{endpoint, model}` block as `pi` — but a different model-prefix convention: `aider` is invoked with `--model ollama_chat/<local.model>` and reads the endpoint from `OLLAMA_API_BASE` (aider's own env var), where `pi` uses `--provider ollama` and `OLLAMA_HOST`. `aider` auto-commits its edits by default; this transport passes `--no-attribute-co-authored-by` so those commits never carry aider's own `Co-authored-by` trailer. | $0 in principle, but reported as **cost unknown** on every channel, exactly like `pi` — see below. |
 
 `agent_backend` is present and set to `claude_cli` in `sdlc_task.policy` and all three
-`sdlc_task.profiles` bundles in `planning/harness.json`, next to an `_agent_backend_comment`
+`sdlc_task.profiles` bundles, and separately in `sdlc.policy` and all seven `sdlc.profiles`
+bundles, in `planning/harness.json` — each section carries its own `_agent_backend_comment`
 restating the safety boundary below; every run that never sets it dispatches exactly as before.
 
 **Cost honesty.** A `pi` invocation can report tokens with no dollar figure at all. Rather than

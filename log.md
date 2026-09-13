@@ -5,7 +5,7 @@ description: Chronological log of work completed for engine-rs.
 doc_id: log
 layer: [factory]
 status: active
-timestamp: "2026-09-12T13:52:00Z"
+timestamp: "2026-09-12T21:30:00Z"
 keywords: [work log, session history, development log]
 related: [status, context]
 ---
@@ -13,6 +13,120 @@ related: [status, context]
 # Log — engine-rs
 
 *Append-only working log. One dated entry per session. Newest entries at the top.*
+
+## [run: 2026-09-12]
+
+### `EN.17.E` — FAIL: feature ships fully inert, no task wires the production dispatch path
+
+- **What:** Ran `/sdlc-flow` on branch `EN.17.E-flow`, tasks 1-6, all six passed their own
+  implement/fix/test loop with a confirmed `workAssertionPassed`. Task 1 added the four
+  inbox-triage policy knobs to `OrchestrationPolicy`. Task 2 added the `inbox_triage` module
+  (`InboxVerdict`, the deterministic EDGE_RELEASED re-check, the judged FINDING/QUERY path, reply
+  and escalation composition) with 9 unit tests, wired nowhere yet. Task 3 routed all five
+  message kinds through a NEW entry point, `integrate_chain_with_inbox_triage`, while leaving the
+  production wrapper `integrate_chain_with_preflight` — the only one `graph.rs`'s
+  `OrchestrationRunNode::process` actually calls — hard-coded to `inbox_triage_enabled: false`.
+  Task 4 added a 12-case integration suite over the new entry point plus two `hq_orchestration_policy`
+  tests, one of which stops at policy resolution rather than a real chain run, its own comment
+  noting the `graph.rs` wiring is "out of this task's scope." Task 5 added D64 fixture evidence via
+  `check_messages.py` (exit 0). Task 6 documented the mechanism and flipped HQ's real
+  `planning/harness.json` `orchestration.policy.inbox_triage_enabled` to `true`; the full gate
+  (fmt, clippy, nextest workspace, release build, hang-test, micro-spec, fleet-build tests) passed
+  clean. The consolidated review returned **FAIL**: no task in this spec's 6-task breakdown ever
+  wires `graph.rs`'s production dispatch onto the new inbox-triage path, so setting HQ's harness
+  switch to `true` governs nothing — a real unattended chain still silently drops
+  EDGE_RELEASED/FINDING/QUERY exactly as it did before this block. This needed re-planning to add
+  the missing `graph.rs` wiring task, not a targeted fix, so the run bailed rather than looping a
+  fix attempt against work that was already correct on its own declared scope.
+- **Why:** The spec's own block record (`EN.17.E`) named `graph.rs`'s "JudgmentNode seam wiring,
+  and one `put_result` of `inbox_report`" as a file to modify, but the 6-task breakdown never
+  assigned that change to any task — each task individually did exactly what it was scoped to do.
+- **Refs:** `planning/EN.17.E/sdlc/sdlc-flow-state.json`, `planning/blocks/EN.17.E.json` (Amendment
+  Log), commits `e75faf7`..`09b96a6` on `EN.17.E-flow`.
+
+```
+09b96a6 feat: implement EN.17.E-task6
+2151162 feat: implement EN.17.E-task5
+f05428b feat: implement EN.17.E-task4
+37f62c8 feat: implement EN.17.E-task3
+26c0c99 feat: implement EN.17.E-task2
+e75faf7 feat: implement EN.17.E-task1
+fa10788 docs: log pluggable-code-agent-transport lane close (EN.16.D/E/C shipped)
+4dce1fa docs: note SDLC_FLOW's own sdlc.policy/profiles agent_backend wiring in README.md
+```
+
+Next: re-plan `EN.17.E` to add the missing `graph.rs` production-dispatch wiring task (route a real
+`OrchestrationRunNode` chain through `integrate_chain_with_inbox_triage`, or fold its behavior into
+`integrate_chain_with_preflight`), then re-run `/sdlc-flow` before the HQ harness switch means
+anything.
+
+## [2026-09-12]
+
+### `pluggable-code-agent-transport` lane CLOSED — EN.16.D/EN.16.E/EN.16.C shipped; `target/` cleaned
+
+- **What:** Closed out the lane end to end. Merged EN.16.B's stalled PR #90 (recovering a
+  locally-committed `pi_transport.rs` arg-order fix, `86ac183`, that never reached the PR branch —
+  cherry-picked onto `main` as `036c317` after catching the gap). Shipped `EN.16.D` (Pi backend in
+  SDLC_FLOW + telemetry backend attribution, PR #91 — 3 bail cycles, two caused by a real
+  `nextest.toml` retry-override gap on the cancellation-kill tests, fixed directly). Shipped
+  `EN.16.E` (local-tier default model fix + pi_agent_rust version floor, clean 4/4 `/sdlc-task`
+  run — premise re-derivation caught a real gap: the block record named 1 file, the actual model
+  literal was duplicated across ~22, including a missed production site in
+  `sdlc_flow/profiles.rs`). Shipped `EN.16.C` (Aider backend, PR #92 — clean 6/6 `/sdlc-flow` run,
+  baked the retry-override lesson into its own spec from the start). Closed a real
+  `planning/harness.json` gap (SDLC_FLOW's own `agent_backend` wiring, flagged but left undone by
+  EN.16.D) and patched `docs/workflows/README.md`'s resulting staleness. Ran a full `cargo clean`
+  on `target/` (47G -> reclaimed 98.3GiB after an interrupted first attempt that raced a concurrent
+  `cargo clippy` check — caught via a false-positive piped exit code, stopped, redone cleanly),
+  re-verified all seven `gates:true` checks on the fresh tree.
+- **Why:** Operator asked to keep making autonomous decisions and finish the lane; separately asked
+  how to prevent the EN.16.D-class bails recurring on remaining blocks (answer: baked the fix into
+  EN.16.C's own spec) and whether it was time for a `cargo clean` per `docs/infrastructure.md`'s
+  disproportionate-size trigger.
+- **Refs:** `planning/orchestration-run/pluggable-code-agent-transport/{notes.md,review.md}`,
+  `planning/pluggable-code-agent-transport/lane-log.jsonl`, PRs #90/#91/#92 (all merged)
+
+### Closed both operator gates on pluggable-code-agent-transport; filed EN.16.E; captured eval-harness idea
+
+- **What:** Closed `first-real-pi-engine-run` and `install-aider-and-capture-a-real-cli-run` via
+  real dispatches (a temp-swapped `bastion serve` tracking `EN.16.B-flow` for the pi run; a fresh
+  `uv tool install --python 3.12 aider-chat` for the aider run), unblocking `EN.16.D` and `EN.16.C`
+  to dependency-clear. Found and fixed a real `PiTransport` arg-order defect (`86ac183` on
+  `EN.16.B-flow`). A follow-up pi-vs-aider comparison then found the model's real weakness wasn't
+  general capability but Ollama tool-call format adherence (`qwen2.5-coder:7b` fails, `qwen2.5:7b-
+  instruct` doesn't) and a real `pi_agent_rust` v0.3.0 print-mode approval-bypass bug, fixed in
+  v0.5.0. Filed `EN.16.E` to move the shared `LocalConfig` default off the weaker model and
+  document the version floor. Captured a `local-model-eval-harness` idea (programmatic
+  {model}x{backend}x{task} comparison, no cloud model needed per test) as a pre-plan note +
+  backlog ticket.
+- **Why:** The operator asked to close both real-run operator gates, then asked for a direct
+  pi-vs-aider comparison on identical tasks, which surfaced that the earlier "3B model too weak"
+  verdict conflated two separable, fixable causes rather than one intrinsic limitation.
+- **Refs:** `evidence/{pi-real-engine-run,aider-real-cli-run,pi-approval-bug-fixed-in-v0.5.0}.md`
+  (HQ vault, `planning/open-work/pre-plan/pluggable-code-agent-transport/`), `EN.16.E`,
+  `local-model-eval-harness` capture note.
+
+### `/begin-orchestration` — EN.16.B closed (pluggable-code-agent-transport), PR #90
+
+- **What:** Resumed the `pluggable-code-agent-transport` lane (`/begin-orchestration --roadmap
+  pluggable-code-agent-transport --lane pluggable-code-agent-transport --execute`), driving
+  `EN.16.B` (`AgentBackend::Pi` in `SDLC_TASK`) through `/sdlc-flow --worktree` to `closed` across
+  3 resumes. Fixed 4 real problems directly along the way: a worktree-only test path-resolution
+  bug in a foreign, pre-existing test (`hq_orchestration_policy`); two CPU-contention timing
+  flakes in `pi_transport` tests (widened budgets + `nextest` `retries=2` overrides); an expected
+  `policy_baseline` fixture drift (regenerated); and a self-contradictory acceptance-criterion
+  regex (`llama` substring-matched inside the required `ollama` literal) — first fix attempt
+  (`\bllama`) silently broke via nested shell/JSON escaping into a literal backspace character,
+  landed on a backslash-free `[^oO]llama|^llama` instead. PR:
+  https://github.com/bredmond1019/engine-rs/pull/90 (open, unmerged). Filed
+  `EN.ticket.roadmap-status-route-500-under-ci` for an unrelated, confirmed-pre-existing hosted-CI
+  failure discovered while checking the PR's checks. `EN.16.D`/`EN.16.C` remain gated on operator
+  sessions (`first-real-pi-engine-run`, `install-aider-and-capture-a-real-cli-run`) — not attempted.
+- **Why:** Operator authorized "make your own decisions... no need to ask the operator" for the
+  lane run, then explicitly approved fixing and finishing `EN.16.B` after it first bailed on
+  environment/test-infra issues unrelated to the block's own scope.
+- **Refs:** `planning/orchestration-run/pluggable-code-agent-transport/{notes.md,review.md}`,
+  `planning/pluggable-code-agent-transport/lane-log.jsonl`
 
 ## [run: 2026-09-12]
 
