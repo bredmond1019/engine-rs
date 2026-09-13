@@ -58,6 +58,7 @@ Where this engine meets something it does not own — the Brain, the operator, a
 | [approval-ledger.md](approval-ledger.md) | The append-only record of every gate decision — who approved what, and when |
 | [email-adapter.md](email-adapter.md) | The email channel: outbound sending, both inbound webhooks, and their auth |
 | [heavy-work-queue.md](heavy-work-queue.md) | The FIFO heavy-work queue: per-class admission, liveness-only reclaim, the SDLC test-stage consumers, and the status route |
+| [pending-run-queue.md](pending-run-queue.md) | `POST`/`GET /events/pending` — a queue-not-run ingress for an untrusted caller: durably records a run request and returns 202 without dispatching it |
 
 ## The terminal stack
 
