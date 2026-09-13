@@ -152,11 +152,14 @@ queue — and both expose a builder override, `TestTaskNode::with_heavy_work(que
 `HeavyWorkQueue::new(coord::resolve_lock_dir(..), <config parsed from brain.toml>)` and passing it
 through that builder.
 
-As of this block, `sdlc_flow::graph`'s registry registers `TestTaskNode::new()` and
-`FinalValidationNode::new()` — **no `with_heavy_work` call**, so a real `SDLC_TASK` / `SDLC_FLOW`
-run executes its checks inline and unqueued, exactly as before this block, and the only callers
-passing a live queue today are this repo's own tests. That is the behaviour-stable default standing
-rule 6 requires: landing the queue changes no existing run until a caller opts in at the seam.
+As of `EN.ticket.test-task-node-queue-park-has-no-production-graph-wiring`, both
+`sdlc_flow::graph::registry()` and `sdlc_task::graph::registry()` construct `TestTaskNode` with a
+real, `brain.toml`-resolved `HeavyWorkQueue` via a private `heavy_work_queue()` helper in each file
+(degrading to the disabled default on any resolution failure — never a panic) — so a real
+`SDLC_TASK` / `SDLC_FLOW` run here now honours `test_dispatch: queue_park` end to end, not only this
+repo's own tests. `FinalValidationNode::new()` is unchanged — still registered with no
+`with_heavy_work` call — because parking was always scoped to `TestTaskNode` only (see "What this
+queue does not gate" below).
 
 Both nodes stamp `heavy_work: { mode, job_id, class, waited_ms, degraded }` into their `ctx.nodes`
 output **at every setting** — `mode: "disabled"` with null fields when the queue is off, so the
@@ -202,9 +205,10 @@ un-parks it are documented in [suspend-resume.md](suspend-resume.md) — this do
 suspend/resume mechanism.
 
 **This repo's own `planning/harness.json` sets `sdlc.policy.test_dispatch` /
-`sdlc_task.policy.test_dispatch` to `queue_park`** (`EN.17.J` task 7) — but that alone does not make
-a real `SDLC_TASK`/`SDLC_FLOW` run here actually park: see "What this queue does not gate" below for
-the graph-wiring gap that still applies.
+`sdlc_task.policy.test_dispatch` to `queue_park`** (`EN.17.J` task 7), and a real `SDLC_TASK`/
+`SDLC_FLOW` run here now does park on it — see "How a node gets a queue" above for the production
+wiring, and "What this queue does not gate" below for what's still deliberately out of scope
+(`FinalValidationNode`).
 
 An admitted job's own subprocess calls run through
 `workflows::admitted_command_runner(SpecCommandRunner) -> CommandRunner`
@@ -280,15 +284,11 @@ the `email_adapter` precedent for non-knob configuration.
   checks read `policy.test_dispatch`; `FinalValidationNode` still always awaits its own
   `HeavyWorkQueue::run` call synchronously (queued admission, never a suspended walk) regardless of
   `test_dispatch` — parking is `EN.17.J`'s test-stage feature only, not a queue-wide behavior.
-- **Today's real `SDLC_TASK` / `SDLC_FLOW` runs still do not actually queue-park, even with this
-  repo's own `planning/harness.json` now setting `test_dispatch: queue_park`.** `queue_park_active`
-  (`task_loop.rs`) additionally requires `self.heavy_work.config().enabled` — i.e. the node's own
-  `HeavyWorkQueue` must be a real, enabled one, not the `::new(PathBuf::new(),
-  HeavyWorkConfig::disabled())` every node still gets by default. `sdlc_flow::graph` and
-  `sdlc_task::graph` register both nodes with plain `::new()` — **no `with_heavy_work` call** — so a
-  real production run here executes its checks inline and unqueued today regardless of the policy
-  knob; `test_dispatch: queue_park` is exercised end-to-end only by this repo's own tests, which
-  construct a `TestTaskNode` with a real queue via `with_heavy_work` directly. Wiring `graph.rs` to
-  pass a queue built from `brain.toml`'s `[heavy_work]` table (present at the fleet's brain root,
-  see "Configuration" above) so this repo's real runs actually park is a follow-on, not part of this
-  block.
+- **RESOLVED** (`EN.ticket.test-task-node-queue-park-has-no-production-graph-wiring`): a real
+  `SDLC_TASK` / `SDLC_FLOW` run here now does queue-park, because `sdlc_flow::graph::registry()` and
+  `sdlc_task::graph::registry()` construct `TestTaskNode` with a real, enabled `HeavyWorkQueue` by
+  default (see "How a node gets a queue" above) rather than the disabled one every node used to get.
+  The id `TestTaskNode` mints for `ctx.metadata.heavy_work.job_id` is also now the same id
+  `HeavyWorkQueue::submit_with_id` persists to disk, so a production `DiskHeavyJobLookup` (now
+  `pub`, `crates/engine-core/src/workflows/orchestration/execute.rs`) can resolve a real queued job
+  by that id — closing the id-mismatch gap this doc previously described here.
