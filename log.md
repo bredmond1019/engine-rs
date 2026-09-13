@@ -5,7 +5,7 @@ description: Chronological log of work completed for engine-rs.
 doc_id: log
 layer: [factory]
 status: active
-timestamp: "2026-09-13T13:50:00Z"
+timestamp: "2026-09-13T20:30:00Z"
 keywords: [work log, session history, development log]
 related: [status, context]
 ---
@@ -15,6 +15,43 @@ related: [status, context]
 *Append-only working log. One dated entry per session. Newest entries at the top.*
 
 ## [2026-09-13]
+
+### ConsolidatedReviewNode OAuth failure root-caused and fixed; isolation is now a policy knob
+
+- **What:** Root-caused Session 3's reproducible `ConsolidatedReviewNode` OAuth failure: it was
+  the one node in the whole SDLC_FLOW loop making a genuinely unisolated model call
+  (`TriageTaskNode`'s apparent success was never real evidence — it almost always short-circuits
+  to a deterministic verdict without calling the model). Fixed by making `isolated` a first-class
+  `SdlcPolicy` field (default `true`), resolved through the existing four-layer policy chain and
+  applied uniformly in `apply_policy_config` (`8596f0d`, supersedes an initial per-node hardcode
+  `3dffd32`) — `EndReviewNode`, a sibling node with the identical unfixed gap, was fixed for free.
+  Also fixed a second, unrelated defect: `LoadTaskStateNode`'s fresh-bootstrap path now reconciles
+  against `git log` so an already-committed task isn't re-attempted and zero-diff-bailed
+  (`f6fb381`). `planning/harness.json` documents the new knob; a fleet-wide standing rule 12 was
+  added to the brain's `AGENTS.md` generalizing the fix. Full suite 3792/3792 passing,
+  `fmt`/`clippy` clean. None of this is pushed, deployed to the Mini, or re-verified against a
+  real run yet.
+- **Why:** Continuing engine-rs orchestration repair item 5 (run one real, non-fixture ticket
+  end-to-end via direct `POST /events/` dispatch) — blocked since Session 3 on this exact defect.
+- **Refs:** `planning/open-work/focus/engine-rs-orchestration-repair.md` Session 4 section;
+  `EN.ticket.queue-not-run-event-ingress`.
+
+### Item 5 (real Mini dispatch) blocked on a reproducible OAuth defect; queue-park ticket closed locally
+
+- **What:** Closed `EN.ticket.test-task-node-queue-park-has-no-production-graph-wiring` via
+  `/sdlc-task` (5/5 tasks, PASS) — production `queue_park` wiring, an id-mismatch fix, and a
+  visibility widening, plus a `docs/heavy-work-queue.md` patch. Dispatched
+  `EN.ticket.queue-not-run-event-ingress` for orchestration-repair item 5 directly against the
+  Mini's `engine-serve` via `POST /events/`; task 1 landed clean, task 2 falsely reported passing
+  (its nextest filter collided with task 1's own tests, so its real routes were never written) and
+  the run also hit a reproducible `ConsolidatedReviewNode` OAuth failure independent of that —
+  survived an operator re-login and an `engine-serve` restart. Neither is fixed yet.
+- **Why:** Item 5 of `engine-rs-orchestration-repair.md` — proving engine-rs's native
+  (non-JS-engine) orchestration path can carry one real ticket to a merged PR, which nobody had
+  done before this session.
+- **Refs:** `planning/open-work/focus/engine-rs-orchestration-repair.md` (Session 3 section),
+  carryover `consolidated-review-node-oauth-fails-on-the-mini-served-engine-serve` and
+  `generate-tasks-sibling-tasks-can-share-a-colliding-nextest-filter`, `planning/handoff.md`.
 
 ### engine-rs orchestration repair items 1-4 closed out — two real credential-isolation defects found and fixed
 
