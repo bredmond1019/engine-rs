@@ -1267,6 +1267,21 @@ impl Node for LoadTaskStateNode {
             // value on reattach.
             bootstrapped.block_id = event.block_id.clone();
             bootstrapped.phase_id = event.phase_id.clone();
+            // Reconcile against git history before trusting a fresh
+            // bootstrap's "every task is Pending" default: a task's
+            // `SaveStateNode` commit (`feat(sdlc): {id} — {title}`) can
+            // already be on this branch with no state file surviving to
+            // record it — e.g. a task's own review/PR step failed and the
+            // work was recovered by a hand-made commit that (correctly)
+            // never ran the engine's own save-state path. Without this, a
+            // later `resume: true` dispatch with no state file re-attempts
+            // an already-satisfied task, produces a legitimate zero-diff,
+            // and `TestTaskNode`'s write-verification guard MAJOR_BAILs it
+            // — burning the task's attempt budget on work already done.
+            // Best-effort only: any git failure (no repo, no commits, a
+            // stubbed runner in unit tests) leaves every task Pending,
+            // today's exact behavior.
+            reconcile_tasks_against_git_log(&self.runner, &ctx, &mut bootstrapped);
             bootstrapped
         } else {
             return Err(NodeError::new(format!(
@@ -1309,6 +1324,41 @@ pub(crate) fn baseline_snapshot_path(spec_dir: &Path, check_name: &str) -> PathB
 /// slugging rule for the same purpose.
 fn slugify_check_name(check_name: &str) -> String {
     sanitize_path_component(check_name)
+}
+
+/// Mark any freshly-bootstrapped task `Done` whose `SaveStateNode` commit
+/// message (`feat(sdlc): {task_id} — {title}`, [`task_loop::save_state_commit_message`]'s
+/// exact format) already appears in `git log` on this branch.
+///
+/// Only ever called on the no-prior-state bootstrap path
+/// (`LoadTaskStateNode::process`) — a resumed run already has authoritative,
+/// previously-committed task statuses and must not have git history
+/// re-interpreted over them. Best-effort: `worktree_path` or the `git log`
+/// call failing (no `SetupWorktreeNode` result yet, no repo, a stubbed
+/// runner in unit tests) leaves every task's bootstrap status untouched.
+fn reconcile_tasks_against_git_log(
+    runner: &CommandRunner,
+    ctx: &TaskContext,
+    state: &mut SDLCState,
+) {
+    let Ok(wt) = worktree_path(ctx) else {
+        return;
+    };
+    let Ok(output) = runner("git", &["log", "--format=%s"], Path::new(&wt)) else {
+        return;
+    };
+    if output.status != 0 {
+        return;
+    }
+    let subjects: std::collections::HashSet<&str> = output.stdout.lines().collect();
+    for task in &mut state.tasks {
+        let expected = format!("feat(sdlc): {} — {}", task.task_id, task.title);
+        if subjects.contains(expected.as_str()) {
+            task.status = SDLCTaskStatus::Done;
+            task.attempt_count = 0;
+            task.review_attempt_count = 0;
+        }
+    }
 }
 
 /// Pre-run baseline snapshot (`EN.17.G` task 2): for every check in
@@ -2214,6 +2264,101 @@ mod tests {
         assert_eq!(task_ids, vec![1, 3]);
     }
 
+    /// A runner that answers `git log --format=%s` with the given commit
+    /// subjects (newest-first, one per line, matching real `git log`'s
+    /// shape) and fails any other invocation — narrow by design, so a test
+    /// using it can't accidentally pass by falling through to some other
+    /// git call succeeding.
+    fn git_log_stub(subjects: &[&str]) -> CommandRunner {
+        let stdout = subjects.join("\n");
+        Arc::new(move |program, args, _cwd| {
+            if program == "git" && args == ["log", "--format=%s"] {
+                Ok(CommandOutput {
+                    status: 0,
+                    stdout: stdout.clone(),
+                    stderr: String::new(),
+                })
+            } else {
+                Ok(CommandOutput {
+                    status: 1,
+                    stdout: String::new(),
+                    stderr: format!("unexpected command: {program} {args:?}"),
+                })
+            }
+        })
+    }
+
+    /// A fresh bootstrap (no state file) must not blindly trust "every task
+    /// is Pending" when a task's own `SaveStateNode` commit is already on
+    /// the branch — the exact gap `engine-rs-orchestration-repair.md`
+    /// Session 3 Finding A hit: a task's review step failed, its work was
+    /// recovered via a hand-made commit (which never runs the engine's own
+    /// save-state path), and the next `resume: true` dispatch had no state
+    /// file to tell it task 1 was already done.
+    #[tokio::test]
+    async fn load_marks_a_task_done_when_its_save_state_commit_is_already_in_git_log() {
+        let worktree = temp_dir();
+        let dir = worktree.join("planning").join("my-spec");
+        std::fs::create_dir_all(&dir).unwrap();
+        let tasks = json!([
+            { "task_id": 1, "title": "The durable pending-run store", "description": "d1" },
+            { "task_id": 2, "title": "The two routes and their handlers", "description": "d2" },
+        ]);
+        std::fs::write(
+            dir.join("tasks.json"),
+            serde_json::to_string(&tasks).unwrap(),
+        )
+        .unwrap();
+
+        let mut ctx = ctx_with_worktree("my-spec", &worktree);
+        ctx.event = json!({ "spec_slug": "my-spec" });
+
+        let node = LoadTaskStateNode::new().with_runner(git_log_stub(&[
+            "feat(sdlc): 1 — The durable pending-run store",
+        ]));
+        let out = node.process(ctx).await.expect("load should succeed");
+
+        let state = out.nodes.get("LoadTaskStateNode").unwrap();
+        let tasks = state["tasks"].as_array().unwrap();
+        assert_eq!(
+            tasks[0]["status"],
+            json!("done"),
+            "task 1's commit is in git log"
+        );
+        assert_eq!(tasks[0]["attempt_count"], json!(0));
+        assert_eq!(
+            tasks[1]["status"],
+            json!("pending"),
+            "task 2 has no matching commit and must stay untouched"
+        );
+    }
+
+    /// The mirror case: no commit in `git log` matches any task, so every
+    /// task bootstraps `Pending` exactly as before this fix existed.
+    #[tokio::test]
+    async fn load_leaves_tasks_pending_when_no_commit_matches() {
+        let worktree = temp_dir();
+        let dir = worktree.join("planning").join("my-spec");
+        std::fs::create_dir_all(&dir).unwrap();
+        let tasks = json!([
+            { "task_id": 1, "title": "One", "description": "d1" },
+        ]);
+        std::fs::write(
+            dir.join("tasks.json"),
+            serde_json::to_string(&tasks).unwrap(),
+        )
+        .unwrap();
+
+        let mut ctx = ctx_with_worktree("my-spec", &worktree);
+        ctx.event = json!({ "spec_slug": "my-spec" });
+
+        let node = LoadTaskStateNode::new().with_runner(git_log_stub(&["chore: unrelated commit"]));
+        let out = node.process(ctx).await.expect("load should succeed");
+
+        let state = out.nodes.get("LoadTaskStateNode").unwrap();
+        assert_eq!(state["tasks"][0]["status"], json!("pending"));
+    }
+
     /// EN.ticket.sdlc-flow-dead-policy-knobs task 1, AC1: a non-default
     /// policy `max_attempts` changes the bound a task that omits its own
     /// value actually gets, on the bootstrap-from-`tasks.json` path.
@@ -2993,11 +3138,20 @@ mod tests {
         let calls = Arc::new(Mutex::new(Vec::new()));
         let recorded = calls.clone();
         let runner: CommandRunner = Arc::new(move |program, args, _cwd| {
-            recorded.lock().unwrap().push(
-                std::iter::once(program.to_string())
-                    .chain(args.iter().map(|a| a.to_string()))
-                    .collect(),
-            );
+            // Only record a `baselineCommand` spawn (always `sh -c <cmd>`,
+            // per `snapshot_baselines`) — not every runner call. Since
+            // `EN.ticket.state-file-git-log-reconciliation`,
+            // `LoadTaskStateNode`'s fresh-bootstrap path also unconditionally
+            // asks `git log --format=%s` to reconcile already-committed
+            // tasks; recording that call too would make these tests assert
+            // on git-log's presence, which is not what they exist to check.
+            if program == "sh" {
+                recorded.lock().unwrap().push(
+                    std::iter::once(program.to_string())
+                        .chain(args.iter().map(|a| a.to_string()))
+                        .collect(),
+                );
+            }
             Ok(CommandOutput {
                 status: 0,
                 stdout: stdout.to_string(),
