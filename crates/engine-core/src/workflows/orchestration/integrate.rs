@@ -60,6 +60,7 @@
 //!    complete (a conflict, a rejected push) is [`IntegrateError::StepMergeFailed`]
 //!    and is never recorded as `closed` — see [`merge_step_branch`].
 
+use std::collections::VecDeque;
 use std::fmt;
 use std::fs::OpenOptions;
 use std::io::Write as _;
@@ -89,6 +90,9 @@ use super::escalate::{
 use super::execute::{execute_step, EngineKind, ExecuteError, ExecutionOutcome, FlowRunner};
 use super::gates::{check_dependencies, AdmissionGate, DependencyEdge, GateError};
 use super::graph::{BailChannel, OnBail};
+use super::inbox_triage::{
+    process_drained_message, EscalationContext, InboxTriageRunner, ProcessedMessage,
+};
 use super::preflight::{BlockPreflight, ClaimVerdict, PreflightOutcome};
 use crate::coord::write::RegisterOutcome;
 use crate::nodes::brain_client::RECALL_NODE_NAME;
@@ -981,6 +985,32 @@ fn dependency_edge_to_json(edge: &DependencyEdge) -> serde_json::Value {
             "what": what,
         }),
     }
+}
+
+/// `EN.17.E` task 3: the `"chain_blocks"` slice fed into an inbox-triage
+/// FINDING/QUERY judgment call — every step in the ORIGINAL chain, in
+/// order, with the status this drain currently sees it as (`closed` /
+/// `bailed` / `skipped` / `pending`), read straight off `report` rather
+/// than re-derived, so it always matches what `chain_report` will
+/// eventually show for the same run.
+fn inbox_triage_chain_status_summary(chain: &[ChainStep], report: &ChainReport) -> String {
+    chain
+        .iter()
+        .map(|step| {
+            let id = format!("{}:{}", step.repo, step.block_id);
+            let status = if report.closed.contains(&id) {
+                "closed"
+            } else if report.bailed.contains(&id) {
+                "bailed"
+            } else if report.skipped.iter().any(|s| s.block == id) {
+                "skipped"
+            } else {
+                "pending"
+            };
+            format!("{id} ({status})")
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// Append exactly one JSON line for `entry` to `roadmap_dir/lane-log.jsonl`,
@@ -2086,6 +2116,12 @@ pub async fn integrate_chain(
         &default_preflight,
         OnUnjudged::Proceed,
         &mut Vec::new(),
+        // `EN.17.E` task 3: `false, None` keeps this wrapper's boundary
+        // drain byte-identical to before inbox triage existed — EDGE_RELEASED/
+        // FINDING/QUERY are drained and dropped, exactly as today.
+        false,
+        None,
+        &mut Vec::new(),
     )
     .await
 }
@@ -2155,6 +2191,12 @@ pub async fn integrate_chain_with_journal(
         &default_preflight,
         OnUnjudged::Proceed,
         &mut Vec::new(),
+        // `EN.17.E` task 3: `false, None` keeps this wrapper's boundary
+        // drain byte-identical to before inbox triage existed — EDGE_RELEASED/
+        // FINDING/QUERY are drained and dropped, exactly as today.
+        false,
+        None,
+        &mut Vec::new(),
     )
     .await
 }
@@ -2223,6 +2265,12 @@ pub async fn integrate_chain_with_coord(
         &mut ChainReport::default(),
         &default_preflight,
         OnUnjudged::Proceed,
+        &mut Vec::new(),
+        // `EN.17.E` task 3: `false, None` keeps this wrapper's boundary
+        // drain byte-identical to before inbox triage existed — EDGE_RELEASED/
+        // FINDING/QUERY are drained and dropped, exactly as today.
+        false,
+        None,
         &mut Vec::new(),
     )
     .await
@@ -2315,6 +2363,12 @@ pub async fn integrate_chain_with_coord_and_policy(
         &default_preflight,
         OnUnjudged::Proceed,
         &mut Vec::new(),
+        // `EN.17.E` task 3: `false, None` keeps this wrapper's boundary
+        // drain byte-identical to before inbox triage existed — EDGE_RELEASED/
+        // FINDING/QUERY are drained and dropped, exactly as today.
+        false,
+        None,
+        &mut Vec::new(),
     )
     .await
 }
@@ -2395,6 +2449,102 @@ pub async fn integrate_chain_with_preflight(
         preflight,
         on_unjudged,
         preflight_report,
+        // `EN.17.E` task 3: `false, None` — every caller of THIS function
+        // (unchanged, including `OrchestrationRunNode::process`) keeps
+        // today's boundary-drain behavior; [`integrate_chain_with_inbox_triage`]
+        // is the new entry point that actually wires the switch through.
+        false,
+        None,
+        &mut Vec::new(),
+    )
+    .await
+}
+
+/// Identical to [`integrate_chain_with_preflight`], plus the inbox-triage seam —
+/// `inbox_triage_enabled`/`inbox_triage_runner`/`inbox_report` (`EN.17.E` task 3). Added as a
+/// new entry point rather than widening [`integrate_chain_with_preflight`] itself, the same
+/// "add a new function, keep the existing one's signature stable" shape every seam in this
+/// file since [`integrate_chain_with_run_record`] has used — so
+/// `OrchestrationRunNode::process` (today's only caller of `integrate_chain_with_preflight`)
+/// is unaffected by this addition and a future task can thread its resolved
+/// `OrchestrationPolicy::inbox_triage_*` knobs through THIS function without touching that
+/// call site's existing argument list.
+#[allow(clippy::too_many_arguments)]
+pub async fn integrate_chain_with_inbox_triage(
+    chain: &[ChainStep],
+    resolve_depends_on: &dyn Fn(&str, &str) -> Vec<DependencyEdge>,
+    is_edge_met: &dyn Fn(&str, &str) -> bool,
+    admission: &AdmissionGate,
+    hold_source: &dyn HoldSource,
+    poll_interval: Duration,
+    hold_deadline: Option<Duration>,
+    cancellation_token: Option<&crate::cancellation::CancellationToken>,
+    campaign_budget: Option<&Budget>,
+    resolve_engine: &dyn Fn(&str, &str) -> EngineKind,
+    registry: &RepoRegistry,
+    run_flow: &FlowRunner,
+    roadmap_dir: &Path,
+    lane: Option<&str>,
+    step_observer: &StepObserverFn,
+    default_use_worktree: bool,
+    default_auto_pr: bool,
+    campaign_id: uuid::Uuid,
+    close_block: &CloseBlockFn,
+    coord: Option<&CoordHandle>,
+    child_sdlc_flow_policy: Option<&serde_json::Value>,
+    child_sdlc_task_policy: Option<&serde_json::Value>,
+    on_bail: OnBail,
+    bail_channel: BailChannel,
+    block_status: &dyn Fn(&str, &str) -> BlockPresence,
+    report: &mut ChainReport,
+    preflight: &dyn Fn(&str, &str) -> PreflightOutcome,
+    on_unjudged: OnUnjudged,
+    preflight_report: &mut Vec<BlockPreflight>,
+    // `EN.17.E` task 3: the resolved `OrchestrationPolicy::inbox_triage_enabled`
+    // switch, the already-configured [`InboxTriageRunner`], and the
+    // accumulator this run's `inbox_report` folds into — see
+    // `integrate_chain_impl_inner`'s own doc for each parameter's contract.
+    inbox_triage_enabled: bool,
+    inbox_triage_runner: Option<&InboxTriageRunner>,
+    inbox_report: &mut Vec<ProcessedMessage>,
+) -> Result<Vec<ExecutionOutcome>, IntegrateError> {
+    integrate_chain_impl(
+        chain,
+        resolve_depends_on,
+        is_edge_met,
+        admission,
+        hold_source,
+        poll_interval,
+        hold_deadline,
+        cancellation_token,
+        campaign_budget,
+        resolve_engine,
+        registry,
+        run_flow,
+        roadmap_dir,
+        lane,
+        step_observer,
+        default_use_worktree,
+        default_auto_pr,
+        campaign_id,
+        close_block,
+        None,
+        None,
+        coord,
+        None,
+        None,
+        child_sdlc_flow_policy,
+        child_sdlc_task_policy,
+        on_bail,
+        bail_channel,
+        block_status,
+        report,
+        preflight,
+        on_unjudged,
+        preflight_report,
+        inbox_triage_enabled,
+        inbox_triage_runner,
+        inbox_report,
     )
     .await
 }
@@ -2466,6 +2616,12 @@ pub async fn integrate_chain_with_dispatch(
         &mut ChainReport::default(),
         &default_preflight,
         OnUnjudged::Proceed,
+        &mut Vec::new(),
+        // `EN.17.E` task 3: `false, None` keeps this wrapper's boundary
+        // drain byte-identical to before inbox triage existed — EDGE_RELEASED/
+        // FINDING/QUERY are drained and dropped, exactly as today.
+        false,
+        None,
         &mut Vec::new(),
     )
     .await
@@ -2542,6 +2698,12 @@ pub async fn integrate_chain_with_run_record(
         &mut ChainReport::default(),
         &default_preflight,
         OnUnjudged::Proceed,
+        &mut Vec::new(),
+        // `EN.17.E` task 3: `false, None` keeps this wrapper's boundary
+        // drain byte-identical to before inbox triage existed — EDGE_RELEASED/
+        // FINDING/QUERY are drained and dropped, exactly as today.
+        false,
+        None,
         &mut Vec::new(),
     )
     .await
@@ -2625,6 +2787,11 @@ async fn integrate_chain_impl(
     preflight: &dyn Fn(&str, &str) -> PreflightOutcome,
     on_unjudged: OnUnjudged,
     preflight_report: &mut Vec<BlockPreflight>,
+    // `EN.17.E` task 3: same contract as `integrate_chain_impl_inner`'s own
+    // fields of the same name.
+    inbox_triage_enabled: bool,
+    inbox_triage_runner: Option<&InboxTriageRunner>,
+    inbox_report: &mut Vec<ProcessedMessage>,
 ) -> Result<Vec<ExecutionOutcome>, IntegrateError> {
     if let Some(sink) = run_record_sink {
         sink(RunRecordLifecycle::Started);
@@ -2662,6 +2829,9 @@ async fn integrate_chain_impl(
         preflight,
         on_unjudged,
         preflight_report,
+        inbox_triage_enabled,
+        inbox_triage_runner,
+        inbox_report,
     )
     .await;
     if let Some(sink) = run_record_sink {
@@ -2756,6 +2926,25 @@ async fn integrate_chain_impl_inner(
     // stamps this into `ctx.nodes` as `preflight_report`; this function
     // only builds and threads it out.
     preflight_report: &mut Vec<BlockPreflight>,
+    // `EN.17.E` task 3: the resolved `OrchestrationPolicy::inbox_triage_enabled`
+    // switch (`EN.17.E` task 1). `false` (every wrapper below
+    // `integrate_chain_with_inbox_triage`) keeps the boundary drain's
+    // `_ => {}` arm byte-identical to before this parameter existed —
+    // EDGE_RELEASED/FINDING/QUERY are drained and dropped, exactly as today.
+    inbox_triage_enabled: bool,
+    // `EN.17.E` task 3: the already-configured judge — its `InboxTriageConfig`
+    // (model tier/max turns/slice caps) and transport override are resolved
+    // by the caller. `None` while `inbox_triage_enabled` is true is treated
+    // as "nothing to judge with" and the message is simply left undrained
+    // for this boundary (never a panic) — a caller enabling the switch is
+    // expected to also supply a runner.
+    inbox_triage_runner: Option<&InboxTriageRunner>,
+    // `EN.17.E` task 3: accumulates one `ProcessedMessage` per drained
+    // EDGE_RELEASED/FINDING/QUERY message actually routed through inbox
+    // triage, across every block boundary in this chain — a `&mut`, same
+    // contract as `preflight_report` above, so it is populated on both the
+    // success and the error return path.
+    inbox_report: &mut Vec<ProcessedMessage>,
 ) -> Result<Vec<ExecutionOutcome>, IntegrateError> {
     let total_steps = chain.len();
     let mut outcomes = Vec::with_capacity(chain.len());
@@ -2765,6 +2954,21 @@ async fn integrate_chain_impl_inner(
     // under `OnBail::StopChain` (the loop returns on the first bail, so no
     // later iteration ever runs with a non-empty set).
     let mut bailed_or_skipped: std::collections::HashSet<(String, String)> =
+        std::collections::HashSet::new();
+    // `EN.17.E` task 3: every step this chain has skipped so far (a subset of
+    // `bailed_or_skipped` above, but carrying the full `ChainStep` an
+    // EDGE_RELEASED needs to re-check dependencies and, if now met, requeue
+    // — `bailed_or_skipped` itself only ever holds the `(repo, block_id)`
+    // identity). A step is removed the moment inbox triage requeues it (see
+    // the drain below), so a second, stale EDGE_RELEASED naming the same
+    // block finds nothing to match and reports `NOT-MINE` rather than
+    // re-requeuing it.
+    let mut skipped_steps: Vec<ChainStep> = Vec::new();
+    // `EN.17.E` task 3: `(repo, block_id)` of every step already requeued
+    // once by an accepted EDGE_RELEASED this chain run — a flapping
+    // EDGE_RELEASED for the same step can never append it a second time
+    // (this block's own acceptance criteria).
+    let mut requeued_once: std::collections::HashSet<(String, String)> =
         std::collections::HashSet::new();
     // `EN.11.F` task 1/4: accumulates each completed step's spend across
     // the whole campaign, checked at every block boundary below —
@@ -2865,7 +3069,17 @@ async fn integrate_chain_impl_inner(
             }
         }};
     }
-    for step in chain {
+    // `EN.17.E` task 3: an owned, mutable queue rather than `for step in
+    // chain` — an accepted EDGE_RELEASED appends a now-unblocked skipped
+    // step to the END of the remaining chain (this block's own acceptance
+    // criteria), which an immutable `&[ChainStep]` iteration cannot do.
+    // Seeded with every step of `chain`, in order, so a chain that never
+    // triggers inbox triage behaves exactly like the old `for` loop.
+    let mut step_queue: VecDeque<ChainStep> = chain.iter().cloned().collect();
+    while let Some(step) = step_queue.pop_front() {
+        // Re-borrow as `&ChainStep` so every existing use of `step` below
+        // (which predates this owned queue) is unchanged.
+        let step = &step;
         // `EN.15.D` task 2: drain this chain's own inbox at EVERY block boundary — the very
         // top of this loop, before anything else for `step` runs (including the
         // `pending_skip` short-circuit below). A no-op when `coord` is `None`. Because this is
@@ -2877,10 +3091,15 @@ async fn integrate_chain_impl_inner(
         // per-step `StepLeaseGuard` may already have released it when the prior step's
         // iteration ended, in which case this is a no-op confirmation rather than a new
         // effect). RENDEZVOUS: answer immediately with a reply envelope addressed at the
-        // sender's own `repo`/`lane`, resolved from the received envelope itself. Every other
-        // kind, and a malformed file (already quarantined by `drain` itself — see
-        // `CoordHandle::drain`'s own doc), is drained and otherwise ignored; interpreting the
-        // other three kinds is out of this block's scope.
+        // sender's own `repo`/`lane`, resolved from the received envelope itself.
+        //
+        // `EN.17.E` task 3: EDGE_RELEASED/FINDING/QUERY are routed through `inbox_triage`
+        // when `inbox_triage_enabled` — deterministic re-check for EDGE_RELEASED, one bounded
+        // `JudgmentNode` call for FINDING/QUERY. With the switch off (the built-in default),
+        // or with it on but no runner configured, these three kinds fall through to `_ => {}`
+        // exactly as before this task — drained and otherwise ignored. A malformed file
+        // (already quarantined by `drain` itself — see `CoordHandle::drain`'s own doc) is
+        // likewise untouched.
         if let Some(handle) = coord {
             for drained in handle.drain().unwrap_or_default() {
                 match drained.record.as_ref().map(|r| r.kind) {
@@ -2900,6 +3119,78 @@ async fn integrate_chain_impl_inner(
                                 tracing::warn!(repo = %handle.repo, error = %err, "coord: reply_rendezvous failed");
                             }
                         }
+                    }
+                    Some(
+                        okf_core::MessageKind::EdgeReleased
+                        | okf_core::MessageKind::Finding
+                        | okf_core::MessageKind::Query,
+                    ) if inbox_triage_enabled => {
+                        let Some(message) = drained.record.as_ref() else {
+                            continue;
+                        };
+                        let Some(runner) = inbox_triage_runner else {
+                            // Enabled but no runner configured — nothing to judge with.
+                            // Leave the message undrained-in-effect (no reply, no
+                            // completion) rather than silently dropping it.
+                            continue;
+                        };
+                        let chain_status_summary = inbox_triage_chain_status_summary(chain, report);
+                        let verified_at_sha = registry
+                            .resolve(&message.subject.repo)
+                            .ok()
+                            .as_deref()
+                            .and_then(subject_repo_short_sha)
+                            .unwrap_or_else(|| "unknown".to_string());
+                        let escalation_ctx = EscalationContext {
+                            roadmap: step.roadmap.as_deref().unwrap_or("no-roadmap"),
+                            verified_at_sha: &verified_at_sha,
+                            now_iso: || Utc::now().to_rfc3339(),
+                        };
+                        let inbox_ctx = engine_contract::TaskContext {
+                            event: Value::Object(serde_json::Map::new()),
+                            nodes: std::collections::HashMap::new(),
+                            metadata: Value::Object(serde_json::Map::new()),
+                            node_runs: std::collections::HashMap::new(),
+                        };
+                        let (processed, requeue_step, escalation) = process_drained_message(
+                            runner,
+                            &inbox_ctx,
+                            handle,
+                            message,
+                            &skipped_steps,
+                            resolve_depends_on,
+                            is_edge_met,
+                            &chain_status_summary,
+                            &escalation_ctx,
+                        )
+                        .await;
+
+                        if let Some(step_to_requeue) = requeue_step {
+                            let key = (
+                                step_to_requeue.repo.clone(),
+                                step_to_requeue.block_id.clone(),
+                            );
+                            // At most once per chain — a flapping EDGE_RELEASED for the
+                            // same step cannot loop the chain.
+                            if requeued_once.insert(key.clone()) {
+                                skipped_steps.retain(|s| {
+                                    (s.repo.as_str(), s.block_id.as_str())
+                                        != (key.0.as_str(), key.1.as_str())
+                                });
+                                step_queue.push_back(step_to_requeue);
+                            }
+                        }
+                        if let Some(record) = escalation {
+                            let path = roadmap_dir.join("escalations.jsonl");
+                            if let Err(err) = append_escalation_line(&path, &record) {
+                                tracing::warn!(
+                                    error = %err,
+                                    path = %path.display(),
+                                    "EN.17.E: failed to append escalations.jsonl line for a judged FINDING"
+                                );
+                            }
+                        }
+                        inbox_report.push(processed);
                     }
                     _ => {}
                 }
@@ -3003,6 +3294,10 @@ async fn integrate_chain_impl_inner(
                 reason,
                 blocked_by: None,
             });
+            // `EN.17.E` task 3: carried alongside `report.skipped` so an
+            // EDGE_RELEASED naming this block later in the chain has the
+            // full `ChainStep` to re-check dependencies against.
+            skipped_steps.push(step.clone());
             continue;
         }
 
@@ -3040,6 +3335,7 @@ async fn integrate_chain_impl_inner(
                 reason,
                 blocked_by: Some(blocked_by),
             });
+            skipped_steps.push(step.clone());
             continue;
         }
 
@@ -3083,6 +3379,7 @@ async fn integrate_chain_impl_inner(
                         reason: integrate_err.to_string(),
                         blocked_by: Some(blocked_by),
                     });
+                    skipped_steps.push(step.clone());
                     continue;
                 }
             }

@@ -498,6 +498,109 @@ not a substitute for the authoring-time premise check (`GenerateTasksNode`, out 
 block) — it is the last, cheap check before a chain spends a full engine run on a premise that was
 already false when the block was written.
 
+## Inbox triage: EDGE_RELEASED, FINDING and QUERY at the block boundary (`EN.17.E`)
+
+Before this block the boundary drain (`integrate::integrate_chain_impl_inner`) answered only two of
+the five `okf_core::coord::message::MessageKind` values a peer lane can send: `LEASE_RELEASE` and
+`RENDEZVOUS`. `EDGE_RELEASED`, `FINDING` and `QUERY` fell into a `_ => {}` arm and were silently
+dropped — a sibling lane that released the edge a skipped step was waiting on, or that reported a
+finding or asked a question about this lane's repo, got no reply at all, and a skipped step stayed
+skipped until a human noticed. Timing is unchanged: every message, of all five kinds, is still acted
+on only at the block boundary — `RENDEZVOUS` and `LEASE_RELEASE` remain the only kinds that may
+interrupt a step in flight (ping-agent rule 3), and even those are handled here, at the boundary.
+
+**Disabled by default**, matching standing rule 6: `OrchestrationPolicy::inbox_triage_enabled` is
+`false`, so an existing chain — including every pre-existing `tests/it/coord_chain.rs` case — drains
+`EDGE_RELEASED`/`FINDING`/`QUERY` exactly as before, with no reply and no session.
+
+### EDGE_RELEASED — deterministic, never judged
+
+`inbox_triage::handle_edge_released` takes the chain's own record of steps skipped for an unmet
+`block` edge (the `EN.17.B` skip machinery) and an `EDGE_RELEASED` envelope's `subject`. If a
+skipped step depends on the block the subject names, it re-runs `check_dependencies` for that step
+right there:
+
+- **Now met** — the step is appended once to the end of the chain's remaining steps (a step already
+  re-queued this run is never queued a second time, so a flapping `EDGE_RELEASED` cannot loop the
+  chain), and the reply body begins `ACK ACCEPTED`.
+- **Still unmet** — the step stays skipped, and the reply body begins `ACK VERIFIED-FALSE`.
+- **No skipped step depends on the named subject** — the reply body begins `ACK NOT-MINE`.
+
+None of these three outcomes calls `JudgmentNode` — handling an `EDGE_RELEASED` bills zero sessions.
+
+### FINDING and QUERY — one bounded `JudgmentNode` call each
+
+`InboxTriageRunner::judge_message` builds one `JudgmentSpec` (byte-capped slices: the envelope's
+`subject` and `body`, and the chain's block list with statuses) and makes one `JudgmentNode<
+InboxVerdict>` call. `InboxVerdict { verdict, action, reason }` is a closed, serde-tagged enum pair
+— `Verdict::{Accepted, VerifiedFalse, Deferred, NotMine}` (the four verdicts of the `ping-agent`
+skill's response contract, wire-spelled `ACCEPTED`/`VERIFIED-FALSE`/`DEFERRED`/`NOT-MINE` in the
+reply body) and `Action::{None, Escalate}` — so a reply naming a verdict outside those four values is
+a `JudgmentError::SchemaViolation`, never a silent pass-through.
+
+A `FINDING` judged `Accepted` + `Escalate` composes exactly one notification escalation via
+`inbox_triage::compose_finding_escalation`, reusing the same `EscalationChannel::notification` /
+`EscalationRecord::new` composition `integrate::record_bail_escalation` already uses for a bailed
+step, delivered through `EN.17.C`'s shared `run_sweep_pass` router. `Accepted` + `Action::None` is
+recorded in the run's own result only — no send. A `QUERY` never escalates, whatever its verdict.
+
+**A failed judgment is never treated as judged.** Any `JudgmentError` variant (`Timeout`,
+`CliError`, `NoStructuredResult`, `SchemaViolation`) produces exactly one reply beginning
+`ACK DEFERRED`, naming that error kind, and the message is completed with zero escalation. Billed
+sessions from the failed call are still kept (`NodeError::with_sessions`), the same rule Preflight's
+`Unjudged` path follows above.
+
+### Caps before judgment
+
+Before `InboxTriageRunner` ever constructs a `JudgmentSpec`, it checks the drained envelope's
+`MessageRecord::cap_violations()` (`okf-core`, `OK.ticket.message-envelope-field-caps`). A non-empty
+result short-circuits straight to an `ACK DEFERRED` reply naming the violated field and cap — zero
+`JudgmentNode` sessions for an over-cap envelope, whatever kind it is.
+
+### The reply, and the receipt
+
+Every processed message — of all three newly-handled kinds — gets exactly one reply via
+`inbox_triage::send_reply_and_complete`, sent through `coord::write::send` to the sender's own
+`repo`/`lane` inbox (read from the envelope's `sender`). The reply body always begins `ACK
+<VERDICT>` and names a durable-home reference (a `lane-log.jsonl` line ref or the run-record path) —
+per the `ping-agent` skill's rule that a response with no durable home is not a response. The
+original message is then completed via `coord::write::complete`, so its receipt is written before
+the drain moves to the next message.
+
+### `inbox_report`
+
+A loop-local `Vec<ProcessedMessage>` accumulates one `{message_id, kind, sender, verdict |
+error_kind, action, reply_path}` entry per processed message, across every boundary the chain
+crosses, and is stamped into the node's result exactly once, as `inbox_report`, beside
+`chain_report` — following the same "carried `node_result`, present on the error path too" pattern
+`chain_report` and `preflight_report` already use. No per-message `ctx.nodes` slot is written
+(`ctx-nodes-holds-one-slot-per-node-so-repeat-invocations-overwrite-history`).
+
+### The four knobs, and where the effective switch lives
+
+| Knob | Built-in default | What it trades |
+|---|---|---|
+| `inbox_triage_enabled` | `false` | Whether `EDGE_RELEASED`/`FINDING`/`QUERY` are acted on at all. Behavior-stable — `false` is today's silent drop. |
+| `inbox_triage_model_tier` | `Haiku` | The model tier `JudgmentNode` uses for a FINDING/QUERY judgment call. |
+| `inbox_triage_max_turns` | `None` (unbounded) | `Config.max_turns` on the judgment call. |
+| `inbox_triage_slice_max_bytes` | `4_000` | The byte cap each input slice is truncated to before reaching the model, matching `preflight_slice_max_bytes`. |
+
+Same PROFILE RULE as `preflight_*` above: `baseline` restates all four at their built-in values (the
+explicit no-op); `cheap-fast` and `thorough` leave all four unset, so an HQ-set
+`orchestration.policy.inbox_triage_enabled` still governs a run naming either profile —
+`resolve_profile_from` returns a named bundle whole, with no merge onto the built-in bundle of the
+same name.
+
+**THE EFFECTIVE SWITCH LIVES IN HQ'S OWN `harness.json`, not this repo's** — the same
+`PolicyConfigSource::Worktree(event.brain_root)` reasoning as `on_bail`/`bail_channel`/
+`preflight_enabled` above. This repo's own `planning/harness.json` documents all four knobs at their
+built-in values only, marked not effective for a real chain, for the same reason those knobs are.
+
+**Scope.** `RENDEZVOUS` and `LEASE_RELEASE` handling is unchanged by this block. Writing
+`state.json` or authoring an edge from a message stays out of scope — an accepted `FINDING` goes to
+the run record and, when escalated, to the operator; carryover filing stays with consolidation
+(`EN.15.K`). This block only replies to messages already sent to this lane; it never originates one.
+
 ## A bail or a stuck operator hold now writes an escalation and a bails[] entry (`EN.15.G`)
 
 A step that fails on the BAIL path (`execute_step` returns an error) or the HOLD path

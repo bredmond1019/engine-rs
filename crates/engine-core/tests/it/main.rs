@@ -41,6 +41,8 @@ mod harvest_gate_e2e;
 mod heavy_work;
 mod held_session;
 mod hq_orchestration_policy;
+mod inbox_triage;
+mod inbox_triage_message_check;
 mod judgment;
 mod ledger;
 mod linkedin_post_e2e;

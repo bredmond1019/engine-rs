@@ -125,8 +125,9 @@ use super::conductor::{ConductorProposalError, DroppedCandidate, ProposalOutcome
 use super::coord_lane::CoordHandle;
 use super::execute::{default_flow_runner, EngineKind, ExecutionOutcome, FlowRunner};
 use super::gates::{AdmissionGate, DependencyEdge};
+use super::inbox_triage::{InboxTriageRunner, ProcessedMessage};
 use super::integrate::{
-    integrate_chain_with_preflight, resolve_roadmap_dir, ChainReport, CloseBlockFn, HoldSource,
+    integrate_chain_with_inbox_triage, resolve_roadmap_dir, ChainReport, CloseBlockFn, HoldSource,
     JournalSinkFn, NeverHeld, OnUnjudged, StepProgress,
 };
 use super::preflight::{BlockPreflight, PreflightOutcome};
@@ -366,6 +367,29 @@ pub struct OrchestrationPolicy {
     /// anyway and records the failure kind; `OnUnjudged::Bail` stops the
     /// step exactly like a false load-bearing claim.
     pub preflight_on_unjudged: OnUnjudged,
+    /// `EN.17.E` Task 1: the EFFECTIVE switch — whether the boundary drain
+    /// (`super::integrate::integrate_chain_impl_inner`) acts on EDGE_RELEASED/
+    /// FINDING/QUERY at all. `false` (the built-in default) is
+    /// behaviour-stable per CLAUDE.md standing rule 6: those three message
+    /// kinds are dropped exactly as they were before this knob existed
+    /// (today's `_ => {}` drain arm). The effective switch for a real chain
+    /// lives in HQ's `planning/harness.json`
+    /// (`orchestration.policy.inbox_triage_enabled`), not in this repo's own
+    /// harness file — mirroring `preflight_enabled` above; see the block
+    /// record's `notes` field.
+    pub inbox_triage_enabled: bool,
+    /// The [`ModelTier`] the FINDING/QUERY `JudgmentNode` call runs at.
+    /// `Haiku` (the built-in default) is the cheapest tier, matching
+    /// `preflight_model_tier`'s reasoning.
+    pub inbox_triage_model_tier: ModelTier,
+    /// `Config.max_turns` forwarded to the inbox-triage `JudgmentSpec`.
+    /// `None` (the built-in default) leaves the call unbounded on turns.
+    pub inbox_triage_max_turns: Option<u32>,
+    /// The per-slice byte cap applied to the envelope's `subject`/`body` and
+    /// the chain's block-list-with-statuses excerpt before either reaches
+    /// the judgment call. `4_000` (the built-in default) matches
+    /// `preflight_slice_max_bytes`.
+    pub inbox_triage_slice_max_bytes: usize,
 }
 
 impl Default for OrchestrationPolicy {
@@ -398,6 +422,10 @@ impl Default for OrchestrationPolicy {
             preflight_programs: None,
             preflight_command_timeout_ms: 5_000,
             preflight_on_unjudged: OnUnjudged::Proceed,
+            inbox_triage_enabled: false,
+            inbox_triage_model_tier: ModelTier::Haiku,
+            inbox_triage_max_turns: None,
+            inbox_triage_slice_max_bytes: 4_000,
         }
     }
 }
@@ -434,6 +462,10 @@ pub struct PartialOrchestrationPolicy {
     pub preflight_programs: Option<Option<Vec<String>>>,
     pub preflight_command_timeout_ms: Option<u64>,
     pub preflight_on_unjudged: Option<OnUnjudged>,
+    pub inbox_triage_enabled: Option<bool>,
+    pub inbox_triage_model_tier: Option<ModelTier>,
+    pub inbox_triage_max_turns: Option<Option<u32>>,
+    pub inbox_triage_slice_max_bytes: Option<usize>,
 }
 
 impl crate::policy::Policy for OrchestrationPolicy {
@@ -512,6 +544,22 @@ impl crate::policy::Policy for OrchestrationPolicy {
                 self.preflight_on_unjudged,
                 over.preflight_on_unjudged,
             ),
+            inbox_triage_enabled: crate::policy::merge_opt(
+                self.inbox_triage_enabled,
+                over.inbox_triage_enabled,
+            ),
+            inbox_triage_model_tier: crate::policy::merge_opt(
+                self.inbox_triage_model_tier,
+                over.inbox_triage_model_tier,
+            ),
+            inbox_triage_max_turns: crate::policy::merge_opt(
+                self.inbox_triage_max_turns,
+                over.inbox_triage_max_turns,
+            ),
+            inbox_triage_slice_max_bytes: crate::policy::merge_opt(
+                self.inbox_triage_slice_max_bytes,
+                over.inbox_triage_slice_max_bytes,
+            ),
         }
     }
 }
@@ -561,6 +609,12 @@ pub fn baseline() -> PartialOrchestrationPolicy {
         preflight_programs: Some(None),
         preflight_command_timeout_ms: Some(5_000),
         preflight_on_unjudged: Some(OnUnjudged::Proceed),
+        // EN.17.E Task 1: restate all four built-in inbox-triage values
+        // verbatim — baseline's no-op contract extends to inbox triage too.
+        inbox_triage_enabled: Some(false),
+        inbox_triage_model_tier: Some(ModelTier::Haiku),
+        inbox_triage_max_turns: Some(None),
+        inbox_triage_slice_max_bytes: Some(4_000),
     }
 }
 
@@ -614,6 +668,12 @@ pub fn cheap_fast() -> PartialOrchestrationPolicy {
         // HQ-set `orchestration.policy.preflight_enabled` still governs a
         // chain naming this profile. See the block record's own `notes`
         // field (`PROFILE RULE`).
+        //
+        // EN.17.E Task 1 PROFILE RULE: the same reasoning extends to all
+        // four inbox-triage knobs — deliberately left UNSET here so an
+        // HQ-set `orchestration.policy.inbox_triage_enabled` still governs
+        // a chain naming this profile. See this block's own `notes` field
+        // (`PROFILE RULE`).
         ..Default::default()
     }
 }
@@ -652,6 +712,9 @@ pub fn thorough() -> PartialOrchestrationPolicy {
         //
         // EN.17.D Task 4 PROFILE RULE: same for all eight preflight knobs
         // — see `cheap_fast`'s own comment.
+        //
+        // EN.17.E Task 1 PROFILE RULE: same for all four inbox-triage
+        // knobs — see `cheap_fast`'s own comment.
         ..Default::default()
     }
 }
@@ -996,6 +1059,15 @@ pub struct OrchestrationRunNode {
     /// run behaves exactly as it did before this seam existed (CLAUDE.md
     /// standing rule 6).
     preflight: PreflightFn,
+    /// `EN.17.E` task 7: the production inbox-triage seam — see
+    /// [`Self::with_inbox_triage_runner`]. `None` (the default, [`Self::new`])
+    /// means no [`InboxTriageRunner`] is ever constructed and no
+    /// `JudgmentNode` call is ever made, regardless of the resolved
+    /// `OrchestrationPolicy::inbox_triage_enabled` value — production
+    /// registration (`engine-serve::workflows::register_orchestration_with_registry`)
+    /// always supplies a real one when that switch is on, mirroring
+    /// `preflight`'s own default-to-no-op contract.
+    inbox_triage_runner: Option<Arc<InboxTriageRunner>>,
 }
 
 impl fmt::Debug for OrchestrationRunNode {
@@ -1033,6 +1105,7 @@ impl OrchestrationRunNode {
             coord_agent: None,
             operator_transport: Arc::new(NoopOperatorTransport),
             preflight: Arc::new(|_repo, _block_id| PreflightOutcome::Disabled),
+            inbox_triage_runner: None,
         }
     }
 
@@ -1208,6 +1281,24 @@ impl OrchestrationRunNode {
     #[must_use]
     pub fn with_preflight(mut self, preflight: PreflightFn) -> Self {
         self.preflight = preflight;
+        self
+    }
+
+    /// Install the real inbox-triage runner (`EN.17.E` task 7) — mirrors
+    /// [`Self::with_preflight`]'s exact builder shape. `InboxTriageRunner::judge`
+    /// is already `async` and this seam runs from inside a per-step
+    /// `spawn_blocking`/`block_on` context (like `preflight`'s), so no
+    /// extra thread-spawn bridge is needed here — the runner is called
+    /// directly through `rt.block_on(..)`. With none installed (the
+    /// default, [`Self::new`]'s `None`), inbox triage is a no-op for every
+    /// message regardless of the resolved `inbox_triage_enabled` policy
+    /// value — production registration (`engine-serve::workflows::
+    /// register_orchestration_with_registry`) always supplies a real one
+    /// built from the same event's resolved [`OrchestrationPolicy`] when
+    /// the switch is on.
+    #[must_use]
+    pub fn with_inbox_triage_runner(mut self, runner: Arc<InboxTriageRunner>) -> Self {
+        self.inbox_triage_runner = Some(runner);
         self
     }
 }
@@ -1517,6 +1608,14 @@ impl Node for OrchestrationRunNode {
         // 'static`), `preflight_on_unjudged` is `Copy` (crosses by value).
         let preflight = self.preflight.clone();
         let preflight_on_unjudged = policy.preflight_on_unjudged;
+        // `EN.17.E` task 7: the inbox-triage runner and the resolved
+        // `inbox_triage_enabled` switch, captured before the
+        // `spawn_blocking` closure exactly like `preflight`/
+        // `preflight_on_unjudged` above — `inbox_triage_runner` is an
+        // `Option<Arc<..>>` clone (`Send + Sync + 'static`),
+        // `inbox_triage_enabled` is `Copy` (crosses by value).
+        let inbox_triage_runner = self.inbox_triage_runner.clone();
+        let inbox_triage_enabled = policy.inbox_triage_enabled;
         // `NodeError` now carries an optional `node_result` payload (the
         // `chain_report`-past-revert seam below), which pushes this
         // closure's `Err` variant past clippy's `result_large_err`
@@ -1524,8 +1623,18 @@ impl Node for OrchestrationRunNode {
         // every other caller of `NodeError` still wants it by value.
         #[allow(clippy::type_complexity)]
         let outcomes_result: Result<
-            (Vec<ExecutionOutcome>, ChainReport, Vec<BlockPreflight>),
-            Box<(NodeError, ChainReport, Vec<BlockPreflight>)>,
+            (
+                Vec<ExecutionOutcome>,
+                ChainReport,
+                Vec<BlockPreflight>,
+                Vec<ProcessedMessage>,
+            ),
+            Box<(
+                NodeError,
+                ChainReport,
+                Vec<BlockPreflight>,
+                Vec<ProcessedMessage>,
+            )>,
         > = tokio::task::spawn_blocking(move || {
             tracing::dispatcher::with_default(&current_dispatch, || {
                 let _span_guard = current_span.enter();
@@ -1538,6 +1647,7 @@ impl Node for OrchestrationRunNode {
                         return Err(Box::new((
                             NodeError::new(format!("failed to start orchestration runtime: {err}")),
                             ChainReport::default(),
+                            Vec::new(),
                             Vec::new(),
                         )));
                     }
@@ -1552,7 +1662,13 @@ impl Node for OrchestrationRunNode {
                 // shape as `chain_report` above, for the same reason
                 // (survives the `Err` arm below).
                 let mut preflight_report: Vec<BlockPreflight> = Vec::new();
-                let result = rt.block_on(integrate_chain_with_preflight(
+                // `EN.17.E` task 7: accumulates one `ProcessedMessage` per
+                // drained EDGE_RELEASED/FINDING/QUERY message this chain's
+                // boundary drain processes — same threaded-`&mut` shape as
+                // `chain_report`/`preflight_report` above, for the same
+                // reason (survives the `Err` arm below).
+                let mut inbox_report: Vec<ProcessedMessage> = Vec::new();
+                let result = rt.block_on(integrate_chain_with_inbox_triage(
                     &chain,
                     &move |repo, block_id| resolve_depends_on(repo, block_id),
                     &move |repo, block_id| is_edge_met(repo, block_id),
@@ -1616,13 +1732,21 @@ impl Node for OrchestrationRunNode {
                     &move |repo, block_id| preflight(repo, block_id),
                     preflight_on_unjudged,
                     &mut preflight_report,
+                    // `EN.17.E` task 7: the resolved `inbox_triage_enabled`
+                    // switch and the production `InboxTriageRunner` seam,
+                    // resolved above the same way `preflight`/
+                    // `preflight_on_unjudged` are.
+                    inbox_triage_enabled,
+                    inbox_triage_runner.as_deref(),
+                    &mut inbox_report,
                 ));
                 match result {
-                    Ok(outcomes) => Ok((outcomes, chain_report, preflight_report)),
+                    Ok(outcomes) => Ok((outcomes, chain_report, preflight_report, inbox_report)),
                     Err(err) => Err(Box::new((
                         NodeError::new(err.to_string()),
                         chain_report,
                         preflight_report,
+                        inbox_report,
                     ))),
                 }
             })
@@ -1639,10 +1763,10 @@ impl Node for OrchestrationRunNode {
         // exactly like the success path's own stamp below — the error
         // MESSAGE still names every bailed block too, for a reader who only
         // sees the message.
-        let (outcomes, chain_report, preflight_report) = match outcomes_result {
-            Ok(triple) => triple,
+        let (outcomes, chain_report, preflight_report, inbox_report) = match outcomes_result {
+            Ok(tuple) => tuple,
             Err(boxed) => {
-                let (err, report, preflight_report) = *boxed;
+                let (err, report, preflight_report, inbox_report) = *boxed;
                 // `EN.17.D` task 4: `preflight_report` must reach
                 // `ctx.nodes` even on this error path (block record part 6
                 // / task 4's own acceptance criteria) — unlike
@@ -1661,6 +1785,12 @@ impl Node for OrchestrationRunNode {
                 };
                 let mut node_result = json!({
                     "preflight_report": preflight_policy_stamp(&policy, &preflight_report),
+                    // `EN.17.E` task 7: stamped on EVERY error path here, the
+                    // same "present on both success and error returns" rule
+                    // `preflight_report`'s own comment above states — a run
+                    // with no bailed block can still have triaged inbox
+                    // messages before the error.
+                    "inbox_report": json!(inbox_report),
                 });
                 if !report.bailed.is_empty() {
                     node_result["chain_report"] = json!(report);
@@ -1738,6 +1868,10 @@ impl Node for OrchestrationRunNode {
                 // above — present even on the error path via
                 // `preflight_policy_stamp`'s use above.
                 "preflight_report": preflight_policy_stamp(&policy, &preflight_report),
+                // `EN.17.E` task 7: put_result ONCE, beside `chain_report`/
+                // `preflight_report` above — present even on the error path
+                // via the stamp in the `Err` arm above.
+                "inbox_report": json!(inbox_report),
                 "blocks": outcomes
                     .iter()
                     .map(|o| json!({

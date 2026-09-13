@@ -349,6 +349,12 @@ mod tests {
                     "held_session_name",
                 ],
             ),
+            // No string-typed pub fn on a single line as `pub fn`: `handle_edge_released`
+            // takes closures + refs, `compose_finding_escalation` takes a struct,
+            // `send_reply_and_complete` takes a struct and an owned String — all
+            // multi-line signatures that never land `&str`/`: String` on the same
+            // source line as `pub fn`.
+            ("inbox_triage.rs", &[]),
             // `resolve_roadmap_dir` resolves a roadmap slug to its planning directory —
             // a path lookup, not a runner. `closed`/`bailed`/`cancelled`/`budget_halted`/
             // `held` are `LaneLogEntry` constructors taking a `lane: &str` and a
