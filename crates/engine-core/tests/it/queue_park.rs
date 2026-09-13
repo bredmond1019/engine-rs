@@ -45,13 +45,14 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
 use claude_code_rs::Outcome;
 use engine_contract::{NodeRunStatus, TaskContext};
+use engine_core::brain_root::ENGINE_BRAIN_ROOT_ENV;
 use engine_core::cancellation::CancellationToken;
 use engine_core::coord::heavy_work::{ClassLimit, HeavyWorkConfig, HeavyWorkQueue};
 use engine_core::node::{Node, NodeError, NodeRegistry};
@@ -85,6 +86,7 @@ use engine_core::workflows::sdlc_flow::task_loop::{
 use engine_core::workflows::sdlc_flow::wrap_up::WrapUpNode;
 use engine_core::workflows::sdlc_task::graph as sdlc_task_graph;
 use engine_core::workflows::sdlc_task::lean_bookkeep::LeanBookkeepNode;
+use engine_core::workflows::sdlc_task::policy::{SdlcTaskPolicy, TestDispatch};
 use engine_core::workflows::sdlc_task::profiles::resolve_policy_for_run_from;
 use engine_core::workflows::sdlc_task::task_triage_router::TaskTriageRouterNode;
 use engine_core::workflows::sdlc_task::DEFAULT_STATE_FILENAME;
@@ -1054,6 +1056,302 @@ async fn queue_park_abort_while_queued_never_runs_checks() {
         check_invocations.load(Ordering::SeqCst),
         0,
         "the queued job's check runner must never have been invoked"
+    );
+}
+
+// ── EN.ticket.test-task-node-queue-park-has-no-production-graph-wiring
+//    task 5: production end-to-end park+resume ──────────────────────────
+//
+// Every test above this section drives a HAND-BUILT `NodeRegistry`
+// (`build_task_workflow`/`build_flow_workflow`) with `TestTaskNode`
+// wired to `heavy_work` by the TEST itself via `.with_heavy_work(..)` —
+// exactly the gap this ticket exists to close: setting
+// `test_dispatch: queue_park` in a real `/sdlc-task` run never actually
+// parked, because the PRODUCTION `sdlc_task::graph::registry()`/
+// `registry_for_policy()` never wired a queue into `TestTaskNode` at all
+// (`TestTaskNode::new()`'s own disabled default governed instead). The
+// two tests below build the graph via `sdlc_task_graph::registry_for_
+// policy` itself — never a hand-built registry — so `TestTaskNode`'s
+// `HeavyWorkQueue` comes from this ticket's own production wiring
+// (`ENGINE_BRAIN_ROOT` -> `brain.toml` -> `heavy_work_queue()`), and
+// resolve the resulting real, on-disk job through the REAL,
+// production `DiskHeavyJobLookup` (task 3's now-`pub` type) — never
+// `ScriptedHeavyJobLookup`.
+
+/// `ENGINE_BRAIN_ROOT` is process-global; both tests below set it while
+/// building the graph via `sdlc_task_graph::registry_for_policy` (which
+/// reads it synchronously to resolve `TestTaskNode`'s real
+/// `HeavyWorkQueue`). Guarded the same way `materialize_doc.rs`'s own
+/// `ENV_GUARD` is, belt-and-suspenders: `cargo nextest run` (this repo's
+/// mandated test runner, `AGENTS.md` standing rule 8) forks a fresh OS
+/// process per `#[test]` fn, so no OTHER test in this crate can actually
+/// observe either function's mutation — this guard only protects a future
+/// `cargo test` fallback, or a third test added to this file racing these
+/// two on one process's own thread pool.
+static ENGINE_BRAIN_ROOT_GUARD: Mutex<()> = Mutex::new(());
+
+/// Writes a `brain.toml` at `brain_root` enabling `[heavy_work]` with the
+/// `test` class admitted at `limit` — the same shape
+/// `coord::heavy_work`'s own `config_present_with_valid_classes_parses_
+/// enabled` fixture uses. `poll_interval_ms` is set low so
+/// `DiskHeavyJobLookup::await_outcome`'s poll loop resolves quickly.
+fn write_heavy_work_brain_toml(brain_root: &Path, limit: usize) {
+    std::fs::write(
+        brain_root.join("brain.toml"),
+        format!(
+            "[heavy_work]\npoll_interval_ms = 5\n\n[heavy_work.classes.test]\nlimit = {limit}\nmin_free_mb = 0\n"
+        ),
+    )
+    .unwrap();
+}
+
+/// Writes a single-task, single-check `SDLC_TASK` fixture at `brain_root`
+/// with `test_dispatch: queue_park` and `expects_writes: false` — this
+/// fixture's task never actually writes anything, so `TestTaskNode`'s
+/// write-verification guard (which would otherwise shell out to a real
+/// `git status` via the DEFAULT `CommandRunner` these tests deliberately
+/// leave un-stubbed on the production `TestTaskNode`) never runs. The one
+/// harness check (`command`/`fastCommand: "true"`) is a real,
+/// always-succeeding shell command: the production `TestTaskNode` these
+/// tests drive runs it for real (`sh -c true`) inside the REAL
+/// `HeavyWorkQueue`-admitted job.
+fn write_production_queue_park_task_fixture(brain_root: &Path, max_attempts: u32) {
+    let spec_dir = brain_root.join("planning").join(TASK_SLUG);
+    std::fs::create_dir_all(&spec_dir).unwrap();
+    std::fs::write(
+        spec_dir.join("tasks.json"),
+        serde_json::to_string_pretty(&json!([{
+            "task_id": 1,
+            "title": "Implement thing 1",
+            "description": "Do the work",
+            "acceptance_criteria": ["it works"],
+            "max_attempts": max_attempts,
+            "expects_writes": false,
+        }]))
+        .unwrap(),
+    )
+    .unwrap();
+    std::fs::write(
+        brain_root.join("planning").join("harness.json"),
+        serde_json::to_string_pretty(&json!({
+            "sdlc_task": {
+                "policy": { "test_depth": "fast", "test_dispatch": "queue_park" }
+            },
+            "validation": {
+                "checks": [
+                    {
+                        "name": "tests",
+                        "kind": "command",
+                        "command": "true",
+                        "fastCommand": "true",
+                        "gates": true,
+                    }
+                ]
+            }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+}
+
+/// Builds the REAL `SDLC_TASK` graph via `sdlc_task_graph::registry_for_
+/// policy` — never a hand-built `NodeRegistry` — with `ENGINE_BRAIN_ROOT`
+/// set to `brain_root` for the duration of the call so `TestTaskNode` is
+/// registered wired to a REAL, `brain.toml`-backed `HeavyWorkQueue` over
+/// that same root: this ticket's own production wiring (task 4), not this
+/// suite's `build_task_workflow`'s hand-injected queue. Every OTHER node
+/// this ticket does not touch is re-registered with the SAME test doubles
+/// `build_task_workflow` above uses (mirroring
+/// `orchestration::execute::default_flow_runner_with_heavy_work`'s own
+/// re-register-after-`registry_for_policy` pattern) so the run is
+/// hermetic apart from the one real seam under test — `TestTaskNode`
+/// itself is never re-registered here.
+fn build_production_registry_task_workflow(
+    brain_root: &Path,
+) -> (Workflow, Arc<Mutex<Vec<String>>>) {
+    let policy = SdlcTaskPolicy {
+        test_dispatch: TestDispatch::QueuePark,
+        ..SdlcTaskPolicy::default()
+    };
+
+    let mut registry = {
+        let _guard = ENGINE_BRAIN_ROOT_GUARD.lock().unwrap();
+        let previous = std::env::var(ENGINE_BRAIN_ROOT_ENV).ok();
+        std::env::set_var(ENGINE_BRAIN_ROOT_ENV, brain_root);
+        let registry = sdlc_task_graph::registry_for_policy(&policy);
+        match previous {
+            Some(v) => std::env::set_var(ENGINE_BRAIN_ROOT_ENV, v),
+            None => std::env::remove_var(ENGINE_BRAIN_ROOT_ENV),
+        }
+        registry
+    };
+
+    registry.register(Box::new(TaskFixtureSetupNode {
+        worktree_path: brain_root.to_string_lossy().to_string(),
+    }));
+    let implement_calls: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    registry
+        .register(Box::new(ImplementTaskNode::new().with_transport(
+            implement_transport_recording(implement_calls.clone()),
+        )));
+    registry.register(Box::new(
+        TriageTaskNode::new().with_runner(always_pass_runner()),
+    ));
+    registry.register(Box::new(
+        SaveStateNode::new()
+            .with_runner(always_pass_runner())
+            .with_state_filename(DEFAULT_STATE_FILENAME),
+    ));
+    registry.register(Box::new(
+        LeanBookkeepNode::new()
+            .with_runner(always_pass_runner())
+            .with_state_filename(DEFAULT_STATE_FILENAME),
+    ));
+    registry.register(Box::new(
+        CloseBlockNode::new().with_state_source("LeanBookkeepNode"),
+    ));
+    registry.register(Box::new(GenericEmitStateNode::new(Arc::new(
+        |_program: &str, _args: &[&str], _cwd: &Path| {
+            Ok(CommandOutput {
+                status: 0,
+                stdout: String::new(),
+                stderr: String::new(),
+            })
+        },
+    ))));
+
+    let workflow = Workflow::new_validated(registry, sdlc_task_graph::schema())
+        .expect("SDLC_TASK declared graph must pass WorkflowValidator::validate");
+    (workflow, implement_calls)
+}
+
+/// AC1/AC2: builds the graph via `registry_for_policy` (grep this body for
+/// `registry_for_policy` — never `graph::registry(` hand-assembled), drives
+/// it through [`queue_park::drive`] with a REAL `DiskHeavyJobLookup` over
+/// the SAME `brain_root` `TestTaskNode`'s own queue persists to, and
+/// asserts an INTERMEDIATE suspension with `SuspendReason::HeavyWorkQueue`
+/// was actually observed via `on_progress` before the walk reaches its
+/// terminal state — a queue that never parked at all would still produce a
+/// terminal `final_ctx`, so the terminal check alone would not distinguish
+/// the two.
+#[tokio::test]
+async fn queue_park_sdlc_task_registry_parks_and_resumes_through_disk_heavy_work_queue() {
+    let brain_root = temp_dir("registry-park");
+    write_heavy_work_brain_toml(&brain_root, 4);
+    write_production_queue_park_task_fixture(&brain_root, 1);
+
+    let (workflow, _implement_calls) = build_production_registry_task_workflow(&brain_root);
+
+    let saw_heavy_work_suspend = Arc::new(AtomicBool::new(false));
+    let saw_for_cb = saw_heavy_work_suspend.clone();
+    let on_progress: OnProgress<'_> = Box::new(move |ctx: &TaskContext| {
+        if let Some(susp) = suspend::read_suspension(&ctx.metadata) {
+            if susp.suspended && susp.reason == Some(SuspendReason::HeavyWorkQueue) {
+                saw_for_cb.store(true, Ordering::SeqCst);
+            }
+        }
+    });
+
+    let heavy_work: Arc<dyn HeavyJobLookup> = Arc::new(DiskHeavyJobLookup::new(brain_root.clone()));
+    let cancel = CancellationToken::new();
+    let event = json!({ "spec_slug": TASK_SLUG });
+
+    let final_ctx = queue_park::drive(
+        &workflow,
+        RunStart::Fresh {
+            event,
+            on_progress,
+            options: engine_core::RunOptions::default(),
+            heavy_work,
+        },
+        &cancel,
+    )
+    .await
+    .expect(
+        "a production-registry queue-park run driven by a real DiskHeavyJobLookup should not error",
+    );
+
+    assert!(
+        saw_heavy_work_suspend.load(Ordering::SeqCst),
+        "the walk must have suspended with SuspendReason::HeavyWorkQueue at some point -- a \
+         queue that never actually parked would still reach a terminal final_ctx"
+    );
+    assert!(
+        !suspend::is_suspended(&final_ctx.metadata),
+        "the final ctx must not still be suspended once drive resumed it to completion"
+    );
+
+    let test_task_result = final_ctx.nodes.get("TestTaskNode").cloned().expect(
+        "TestTaskNode must have stamped a result via the injected DiskHeavyJobLookup outcome",
+    );
+    // `DiskHeavyJobLookup::await_outcome` reads `job.passed` off the REAL
+    // on-disk `HeavyWorkJob`, and `HeavyWorkQueue::finish_job` never sets
+    // that field (a known, already-documented limitation of
+    // `DiskHeavyJobLookup` itself -- see its own doc comment in
+    // `orchestration::execute` -- outside this ticket's declared files),
+    // so the injected outcome is always `all_passed: false` regardless of
+    // the admitted check's own real exit code. That IS this fixture's
+    // expected outcome: this test proves the production wiring resolves a
+    // REAL queued job by the REAL id end to end, not that the bridged
+    // pass/fail signal is accurate.
+    assert_eq!(test_task_result["all_passed"], json!(false));
+    let job_id = test_task_result["heavy_work"]["job_id"]
+        .as_str()
+        .expect("TestTaskNode's queue-park output must carry a job_id string");
+    Uuid::parse_str(job_id).expect("job_id must be a real uuid");
+
+    assert!(
+        final_ctx.nodes.contains_key("LeanBookkeepNode"),
+        "a task that never passes must reach the bail tail once its attempt budget is exhausted: {:?}",
+        final_ctx.nodes.keys().collect::<Vec<_>>()
+    );
+}
+
+/// AC3: proves `DiskHeavyJobLookup` resolves a REAL `HeavyWorkQueue`-
+/// admitted job by the SAME id the queue persisted, using an id read back
+/// from the SUSPENDED ctx's own `metadata.heavy_work.job_id` — never a
+/// locally-minted `Uuid` the test constructs itself to match. Drives the
+/// production graph directly via `Workflow::run` (not `queue_park::drive`)
+/// so the walk stops at its first suspension instead of resuming it,
+/// leaving that exact id available to read back.
+#[tokio::test]
+async fn queue_park_disk_heavy_job_lookup_resolves_by_the_same_id_the_queue_persisted() {
+    let brain_root = temp_dir("registry-lookup-by-real-id");
+    write_heavy_work_brain_toml(&brain_root, 4);
+    write_production_queue_park_task_fixture(&brain_root, 2);
+
+    let (workflow, _implement_calls) = build_production_registry_task_workflow(&brain_root);
+
+    let event = json!({ "spec_slug": TASK_SLUG });
+    let suspended_ctx = workflow
+        .run(event, Box::new(|_ctx: &TaskContext| {}))
+        .await
+        .expect("the first TestTaskNode dispatch must suspend, not error");
+
+    let suspension = suspend::read_suspension(&suspended_ctx.metadata)
+        .expect("a queue-park run must produce a suspension marker");
+    assert!(suspension.suspended);
+    assert_eq!(suspension.reason, Some(SuspendReason::HeavyWorkQueue));
+
+    // Read the id from the SUSPENDED ctx's own metadata -- NOT a locally
+    // minted `Uuid` -- per this test's own naming/AC3's requirement.
+    let job_id_str = suspended_ctx.metadata["heavy_work"]["job_id"]
+        .as_str()
+        .expect("a HeavyWorkQueue suspension must stamp ctx.metadata.heavy_work.job_id");
+    let job_id = Uuid::parse_str(job_id_str).expect("job_id must be a real uuid");
+
+    let lookup = DiskHeavyJobLookup::new(brain_root.clone());
+    let outcome = tokio::time::timeout(Duration::from_secs(5), lookup.await_outcome(job_id))
+        .await
+        .expect(
+            "DiskHeavyJobLookup::await_outcome must resolve the REAL on-disk job by the exact \
+             id captured from the suspended ctx's own metadata, not hang/time out",
+        );
+
+    assert_eq!(
+        outcome["heavy_work"]["job_id"].as_str(),
+        Some(job_id_str),
+        "the resolved outcome must echo back the same job id it was looked up by"
     );
 }
 
