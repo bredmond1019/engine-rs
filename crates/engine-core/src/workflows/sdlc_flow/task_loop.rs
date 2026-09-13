@@ -3245,6 +3245,25 @@ impl ConsolidatedReviewNode {
         Self {
             config: Config {
                 model: Some("claude-sonnet-4-5".to_string()),
+                // `EN.ticket.queue-not-run-event-ingress` review, Session 3:
+                // this is the SDLC_FLOW loop's only genuinely unisolated
+                // model call — `TriageTaskNode` shares the same unisolated
+                // Config but its deterministic-classification fast path
+                // (a conclusive `command`/`write-verification` failure, or
+                // "all checks passed") means it almost never actually reaches
+                // the API, so it never exercised this. Reproduced live on
+                // the Mac Mini's long-running `engine-serve` daemon: this
+                // call failed "OAuth session expired and could not be
+                // refreshed" twice, identically, across a full process
+                // restart, while the on-disk credential was hours from
+                // expiry and a fresh ad-hoc `claude -p` call against the
+                // SAME credential succeeded — `isolated`'s own doc comment
+                // names the exact mechanism ("a concurrent subprocess
+                // session cannot log out an interactive session"). Setting
+                // this mirrors `ImplementTaskNode`/`PatchDocsNode`
+                // (`agentic_write_config`), which already run isolated and
+                // have never shown this failure.
+                isolated: true,
                 ..Config::default()
             },
             transport: TransportSlot::default(),
@@ -7692,6 +7711,23 @@ pub(crate) mod tests {
     }
 
     // --- ConsolidatedReviewNode ------------------------------------------
+
+    /// `EN.ticket.queue-not-run-event-ingress` review, Session 3, Finding B:
+    /// this is the SDLC_FLOW loop's only node whose real model call runs
+    /// unisolated against `engine-serve`'s long-lived, possibly-concurrent
+    /// credential store — `TriageTaskNode` shares an unisolated `Config` too
+    /// but almost always short-circuits to a deterministic verdict before
+    /// ever calling the model. Pins the fix so a future edit to `new()`
+    /// can't silently drop it back to unisolated.
+    #[test]
+    fn consolidated_review_node_runs_isolated_by_default() {
+        let node = ConsolidatedReviewNode::new();
+        assert!(
+            node.config.isolated,
+            "ConsolidatedReviewNode must run isolated — see its `new()` doc \
+             comment for the reproduced OAuth failure this prevents"
+        );
+    }
 
     #[tokio::test]
     async fn review_parses_content_and_uses_diff() {
