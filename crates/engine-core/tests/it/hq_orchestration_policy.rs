@@ -476,6 +476,68 @@ async fn hq_orchestration_policy_brain_root_enables_preflight() {
     );
 }
 
+/// `EN.17.E` task 1/4: writes `<brain_root>/planning/harness.json` with an
+/// `orchestration.policy.inbox_triage_enabled: true` switch and nothing else
+/// — no `orchestration.profiles` section, matching the real HQ file's shape
+/// and this file's other `write_*_harness` fixtures.
+fn write_inbox_triage_enabled_harness(brain_root: &Path) {
+    let harness = json!({
+        "orchestration": {
+            "policy": { "inbox_triage_enabled": true }
+        }
+    });
+    std::fs::create_dir_all(brain_root.join("planning")).unwrap();
+    std::fs::write(
+        brain_root.join("planning").join("harness.json"),
+        serde_json::to_string_pretty(&harness).unwrap(),
+    )
+    .unwrap();
+}
+
+/// `EN.17.E` task 4: a temp brain root whose `planning/harness.json` sets
+/// `orchestration.policy.inbox_triage_enabled: true` resolves to
+/// `inbox_triage_enabled == true` through `resolve_policy_for_run_from` with
+/// no inline policy override — mirrors
+/// `hq_orchestration_policy_brain_root_enables_preflight`'s shape for the
+/// analogous `EN.17.D` switch, but stops at policy resolution rather than
+/// driving a full `OrchestrationRunNode` chain: `OrchestrationRunNode` has
+/// no inbox-triage wiring yet (out of this task's scope), so there is no
+/// `inbox_report` node stamp to assert against — only the resolved
+/// `OrchestrationPolicy` value itself, which is the mechanism `EN.17.E`
+/// task 3's boundary drain actually reads.
+#[tokio::test]
+async fn hq_orchestration_policy_brain_root_enables_inbox_triage() {
+    let dir = one_repo_brain_root();
+    write_inbox_triage_enabled_harness(dir.path());
+    let ctx = event_ctx(json!({}));
+    let resolved = resolve_policy_for_run_from(
+        &ctx,
+        &PolicyConfigSource::Worktree(dir.path().to_path_buf()),
+    )
+    .expect("resolves against the temp brain root's harness.json");
+    assert!(
+        resolved.inbox_triage_enabled,
+        "the brain root's harness.json orchestration.policy.inbox_triage_enabled must reach \
+         OrchestrationPolicy with no inline policy override"
+    );
+
+    // A sibling brain root with no `orchestration` key at all resolves to the built-in
+    // default, `false` — proving the switch is the brain root's file, not some other
+    // ambient default.
+    let dir_no_switch = one_repo_brain_root();
+    let ctx_no_switch = event_ctx(json!({}));
+    let resolved_no_switch = resolve_policy_for_run_from(
+        &ctx_no_switch,
+        &PolicyConfigSource::Worktree(dir_no_switch.path().to_path_buf()),
+    )
+    .expect("resolves against a brain root with no orchestration key");
+    assert!(
+        !resolved_no_switch.inbox_triage_enabled,
+        "with no orchestration.policy key at all, inbox_triage_enabled must resolve to its \
+         built-in default, false"
+    );
+}
+
 /// This fleet's REAL HQ `planning/harness.json` — reached from this repo at
 /// `../../planning/harness.json` (engine-rs has no `brain.toml`; HQ is the
 /// brain root a real chain resolves against, per this file's module doc).
@@ -566,6 +628,18 @@ async fn hq_orchestration_policy_real_hq_file_sets_the_switches() {
             "SKIP (partial): HQ harness.json's orchestration.policy has no preflight_enabled \
              key yet -- EN.17.D's cross-tree write has not landed. The rest of this test still \
              runs against on_bail/bail_channel."
+        ),
+    }
+    match policy.get("inbox_triage_enabled") {
+        Some(inbox_triage_enabled) => assert_eq!(
+            inbox_triage_enabled.as_bool(),
+            Some(true),
+            "HQ's real orchestration.policy.inbox_triage_enabled must be true (EN.17.E)"
+        ),
+        None => eprintln!(
+            "SKIP (partial): HQ harness.json's orchestration.policy has no inbox_triage_enabled \
+             key yet -- EN.17.E's cross-tree write has not landed. The rest of this test still \
+             runs against on_bail/bail_channel/preflight_enabled."
         ),
     }
 
