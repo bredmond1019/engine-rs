@@ -162,3 +162,41 @@ never `git add -A` — commit `f3f139b9c`.
 
 Both positive controls recorded PASS, all three fixture tickets registered and validated, HQ's
 `planning/state.json` change committed at HQ root. Ready for task 2 (launch the chain).
+
+## Task 2 — launch the fixture chain, inject the FINDING, capture chain evidence
+
+Run id `f9d40231-87a0-4ddd-a78c-520bb4c302e5`, launched via direct `POST /events/` against the
+installed `bastion serve` (`bastion run ORCHESTRATION` itself hit a client-side decode defect —
+`missing field task_id` — decoding this endpoint's own `{event_id, run_id}` response; recorded as
+a `bastion` CLI defect, not a dispatch failure). Terminal `chain_report`: 2 bailed
+(`HQ.ticket.en17h-fixture-bail`, `HQ.ticket.en17h-fixture-false-premise`), 1 skipped
+(`HQ.ticket.en17h-fixture-dependent`, `blocked_by` naming the BAIL ticket) — matches this task's
+first acceptance criterion.
+
+The remaining criteria did **not** hold, each traced to a real, pre-existing cause rather than
+anything in this task's own execution — filed here and in `planning/EN.17.H/evidence/run.md`,
+not patched (out of scope: no engine-rs/bastion source change):
+
+- Both bails' `check_id` is `orchestration-step` (SetupWorktreeNode, missing `tasks.json` — `mev
+  create-block` never scaffolds a spec dir), not `preflight-premise`. The FALSE PREMISE ticket's
+  `what` field itself was written with an unfilled template placeholder
+  (`"Requires editing the file , which does not exist on disk..."`) during task 1's registration,
+  so preflight's `preflight_report` shows zero claims for it — nothing was there to check.
+- Only one bail's notification was ever routed to the transport (`routed: true`); the other was
+  first suppressed by a per-sweep operator-notify budget of 1, then failed on retry with a real
+  Telegram API 400 (`operator transport failure: unexpected Telegram API status 400`).
+- The inbound FINDING (sent mid-BAIL-step, addressed to `queue/brain/en17h-proof/inbox/`) was
+  never drained or replied to. Root cause: EN.17.E (`inbox_triage.rs`) is `closed` in
+  `planning/state.json` but its commits live only on unmerged branch `EN.17.E-flow` (PR #93,
+  `[BLOCKED]` — "Feature ships fully inert: production dispatch"). `main`'s `integrate.rs`
+  boundary drain only handles `LeaseRelease`/`Rendezvous`; `FINDING` is dropped. The installed
+  binary (built from `main`) cannot ACK it.
+- HQ's `git status --porcelain` (excluding `.fleet-locks/`) is NOT byte-identical before/after:
+  the run's own `lane-log.jsonl`, `bails.jsonl`, `escalations.jsonl` and per-sweep/per-campaign
+  artifacts land under `planning/roadmaps/coordination-layer-port/`, which sits outside the
+  `.fleet-locks/` carve-out this block's criterion names.
+- No inline `policy`/`profile` was passed — held.
+
+HQ's tree was left with only these roadmap-artifact changes (no fixture-ticket state.json
+mutation, no other unrelated edit). Full evidence, verbatim, in
+`planning/EN.17.H/evidence/run.md`.
