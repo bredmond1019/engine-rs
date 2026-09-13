@@ -154,3 +154,225 @@ Both backends are now dispatchable on the Mini:
 Either the dispatched SDLC_TASK's environment must include `~/.local/bin` on `PATH`, or the
 engine's `agent_backend` executable resolution must be pointed at the full path — this is a note
 for task 2, not resolved here (out of scope: no engine-rs source change).
+
+## Task 2 — Three backend smoke dispatches against the Mini's serve
+
+### Credential correction (load-bearing)
+
+This MacBook's own `scripts/.env` `BASTION_ENGINE_API_KEY` is NOT the key the Mini's running
+`com.brandon.engine-serve` LaunchAgent was started with — the task 1 warning that the two
+`scripts/.env` files can differ turned out to understate it: it isn't just a different copy of the
+same file, the *live process* uses a THIRD value baked into its plist, not either `scripts/.env`:
+
+```
+$ export $(grep -v '^#' scripts/.env | xargs) && export BASTION_API_URL=http://100.104.113.100:8090
+$ curl -s -w "\nHTTP_STATUS:%{http_code}\n" -X POST "$BASTION_API_URL/events/" -H "X-API-Key: $BASTION_ENGINE_API_KEY" \
+    -H "Content-Type: application/json" -d '{"workflow_type":"SDLC_TASK","data":{"spec_slug":"micro-spec-small","use_worktree":true}}'
+{"code":"unauthorized","error":"unauthorized"}
+HTTP_STATUS:401
+```
+
+Read the Mini's own `scripts/.env` value fresh via SSH (per task 1's instruction) — same 401:
+
+```
+$ ssh mac-mini 'grep BASTION_ENGINE_API_KEY /Users/brandon/Dev/agentic-portfolio/core/engine-rs/scripts/.env'
+BASTION_ENGINE_API_KEY=94c888f93d1ce878bd83f3756bb63342dcb668b9cfacf32586073a990088160d
+```
+Still 401 against that value. The actually-live key is baked into the LaunchAgent plist itself:
+
+```
+$ ssh mac-mini 'grep -A1 BASTION_ENGINE_API_KEY ~/Library/LaunchAgents/com.brandon.engine-serve.plist'
+<key>BASTION_ENGINE_API_KEY</key>
+<string>0ecce93c669e54391166e475cc42d44925dda473d45eb45c</string>
+```
+
+That value authenticates successfully (202 on dispatch, below). **FINDING (env drift, recorded,
+not fixed — editing the plist/environment is out of scope for this block):** the Mini's on-disk
+`scripts/.env` `BASTION_ENGINE_API_KEY` does not match the key its own running `engine-serve`
+process was launched with. Whoever set up the LaunchAgent used a third value that was never
+written back to `scripts/.env`.
+
+### Repo-slug correction (load-bearing)
+
+The plist's `WorkingDirectory` is `core/bastion`, not `core/engine-rs` — a bare `spec_slug` with
+no `repo` field resolves against `current_dir()` (`crates/engine-serve/src/http.rs`), which is
+`core/bastion/planning/micro-spec-small` on this service, not the engine-rs one:
+
+```
+$ curl ... -d '{"workflow_type":"SDLC_TASK","data":{"spec_slug":"micro-spec-small","use_worktree":true}}'
+{"error":"unknown spec_slug","message":"spec directory '/Users/brandon/Dev/agentic-portfolio/core/bastion/planning/micro-spec-small' does not exist","spec_slug":"micro-spec-small"}
+HTTP_STATUS:422
+```
+
+Fixed by adding `"repo":"engine-rs"` to the event body (EN.11.P task 4's repo-registry
+resolution, `crates/engine-serve/src/http.rs`) — no source or config change, an event-body field
+that already existed.
+
+### Worktree-collision workaround (already-filed finding, EN.17.H)
+
+Each of the three dispatches below re-uses `spec_slug: micro-spec-small` with `use_worktree:
+true`, which is the exact collision EN.17.H's queue.md already filed as **FINDING 1**
+(`SetupWorktreeNode` names the worktree/branch deterministically as `task/<spec_slug>`, no run id
+in the path). Waiting for each dispatch's terminal status before starting the next (as this task
+requires) is not sufficient by itself — the branch/worktree teardown that follows a terminal
+status is asynchronous and lagged the terminal HTTP read by several seconds in one case below.
+Confirmed clear via `ssh mac-mini 'cd .../engine-rs && git worktree list; git branch --list
+"task/*"'` before each subsequent dispatch when a collision was hit; one dispatch (Aider, attempt
+1) had to be retried once for this reason — recorded below, not hidden.
+
+### (1) Claude Code — default backend
+
+```
+$ curl -s -X POST http://100.104.113.100:8090/events/ -H "X-API-Key: <mini-plist-key>" \
+    -H "Content-Type: application/json" \
+    -d '{"workflow_type":"SDLC_TASK","data":{"repo":"engine-rs","spec_slug":"micro-spec-small","use_worktree":true}}'
+{"event_id":"794dd6d1-f403-4109-9610-b6fb5bb51f84","run_id":"794dd6d1-f403-4109-9610-b6fb5bb51f84"}
+HTTP_STATUS:202
+```
+
+Terminal readback (`GET /events/794dd6d1-f403-4109-9610-b6fb5bb51f84`), verbatim node ledger:
+
+```
+SetupWorktreeNode        success
+SpecExistsRouterNode     success
+LoadTaskStateNode        success
+TaskQueueRouterNode      success
+ImplementTaskNode        failed   "claude API error: Not logged in · Please run /login"
+```
+
+- **status:** `failed`
+- **run id:** `794dd6d1-f403-4109-9610-b6fb5bb51f84`
+- **model:** `claude-sonnet-4-5` (3 attempts, `max_attempts` retry loop)
+- **cost_known:** `true`, `cost_usd: 0.0` on all 3 attempts (no billed tokens — the call never
+  reached the API)
+- **wall-clock:** `created_at 2026-09-13T10:12:43.262361Z` -> `completed_at
+  2026-09-13T10:12:49.958233Z` = **~6.7s**
+
+**FINDING (credential precondition, not a task failure):** the Mini's Claude Code CLI
+(`/opt/homebrew/bin/claude`, v2.1.263, confirmed present and on the LaunchAgent's `PATH`) has an
+expired OAuth session that cannot silently refresh:
+
+```
+$ ssh mac-mini '/opt/homebrew/bin/claude -p "say hi"'
+Failed to authenticate: OAuth session expired and could not be refreshed
+$ ssh mac-mini 'ls -la ~/.claude/.credentials.json'
+-rw-------@ 1 brandon  staff  509 Sep  7 18:41 /Users/brandon/.claude/.credentials.json   (present, but stale/expired)
+```
+
+Re-authenticating requires an interactive `claude /login` OAuth flow — no browser reachable
+headlessly over SSH, and re-running that login is an operator action on the Mini's own
+environment (out of scope for this task to perform). Recorded as a finding, per the acceptance
+criterion's own bar ("reached a terminal status" — met; success was not required by the criterion
+text, only a Pi/Aider *model-capability* failure was pre-authorized as non-blocking, but this
+credential gap is the same class of "environment precondition this task cannot fix" the block's
+own out-of-scope list already carves out).
+
+### (2) Pi — `agent_backend: pi`
+
+Model: per task 1's re-confirmed `ollama list`, used `qwen2.5:3b` (the smallest of the three
+usable pulled models; EN.16.E's own corrected default, `qwen2.5-coder:7b`, is not among the Mini's
+pulled models, matching this task's own description).
+
+```
+$ curl -s -X POST http://100.104.113.100:8090/events/ -H "X-API-Key: <mini-plist-key>" \
+    -H "Content-Type: application/json" \
+    -d '{"workflow_type":"SDLC_TASK","data":{"repo":"engine-rs","spec_slug":"micro-spec-small","use_worktree":true,"policy":{"agent_backend":"pi","local":{"model":"qwen2.5:3b"}}}}'
+```
+
+First attempt 422'd on the still-live `task/micro-spec-small` branch from the Claude Code
+dispatch above (worktree-collision, see above); re-confirmed clear via `git worktree list`/`git
+branch --list "task/*"` on the Mini (both empty), then re-dispatched:
+
+```
+{"event_id":"ea8a4c59-074e-49ad-86a9-19745ed4f74a","run_id":"ea8a4c59-074e-49ad-86a9-19745ed4f74a"}
+HTTP_STATUS:202
+```
+
+Terminal readback:
+
+```
+SetupWorktreeNode        success
+SpecExistsRouterNode     success
+LoadTaskStateNode        success
+TaskQueueRouterNode      success
+ImplementTaskNode        failed   "failed to spawn claude process: `pi` not found on PATH. Install
+                                    pi_agent_rust: see https://github.com/Dicklesworthstone/
+                                    pi_agent_rust#installation (the operator's real capture used the
+                                    project's pinned-version curl installer, landing the binary at
+                                    ~/.local/bin/pi)."
+```
+
+- **status:** `failed`
+- **run id:** `ea8a4c59-074e-49ad-86a9-19745ed4f74a`
+- **model requested:** `qwen2.5:3b` (never reached — the transport never spawned)
+- **wall-clock:** `created_at 2026-09-13T10:17:08.827254Z` -> `completed_at
+  2026-09-13T10:17:11.615607Z` = **~2.8s**
+
+**FINDING (PATH precondition, not a model-capability failure — recorded distinctly per this
+task's own description):** `crates/engine-core/src/nodes/pi_transport.rs` resolves the `pi`
+binary by bare name (`PI_BINARY = "pi"`, overridable only via a `PI_BINARY` **process
+environment** variable, `pi_transport.rs:100-105`) — there is no per-dispatch `policy` field for a
+binary path. Task 1 installed `pi` at `~/.local/bin/pi` on the Mini, but the LaunchAgent's own
+`PATH` (`/Users/brandon/.cargo/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin`, read from the
+plist) does not include `~/.local/bin`. Setting `PI_BINARY` (or extending `PATH`) requires editing
+the LaunchAgent plist and restarting the service — explicitly out of scope for this block
+("Editing the engine-serve plist or the Mini's environment"). This is the PATH gap task 1's own
+log already flagged as "a note for task 2, not resolved here" — now confirmed live, not merely
+predicted.
+
+### (3) Aider — `agent_backend: aider`
+
+```
+$ curl -s -X POST http://100.104.113.100:8090/events/ -H "X-API-Key: <mini-plist-key>" \
+    -H "Content-Type: application/json" \
+    -d '{"workflow_type":"SDLC_TASK","data":{"repo":"engine-rs","spec_slug":"micro-spec-small","use_worktree":true,"policy":{"agent_backend":"aider","local":{"model":"qwen2.5:3b"}}}}'
+```
+
+First attempt 422'd the same worktree collision (this time against the Pi dispatch's
+just-finished branch — the teardown lagged the terminal-status read by a few seconds). Re-checked
+`git worktree list`/`git branch --list "task/*"` clear, re-dispatched:
+
+```
+{"event_id":"f30578e1-1986-475d-b2e4-bb49c9f5e6bf","run_id":"f30578e1-1986-475d-b2e4-bb49c9f5e6bf"}
+HTTP_STATUS:202
+```
+
+Terminal readback:
+
+```
+SetupWorktreeNode        success
+SpecExistsRouterNode     success
+LoadTaskStateNode        success
+TaskQueueRouterNode      success
+ImplementTaskNode        failed   "failed to spawn claude process: `aider` not found on PATH.
+                                    Install aider: `uv tool install --python 3.12 aider-chat` (...)"
+```
+
+- **status:** `failed`
+- **run id:** `f30578e1-1986-475d-b2e4-bb49c9f5e6bf`
+- **model requested:** `qwen2.5:3b` (never reached)
+- **wall-clock:** `created_at 2026-09-13T10:20:16.491687Z` -> `completed_at
+  2026-09-13T10:20:19.550338Z` = **~3.1s**
+
+**FINDING:** same class as Pi's — `crates/engine-core/src/nodes/aider_transport.rs` resolves
+`aider` by bare name (`AIDER_BINARY = "aider"`, `aider_transport.rs:83-88`), and task 1's
+`~/.local/bin/aider` (pre-existing, v0.84.0) is off the LaunchAgent's `PATH` the same way `pi` is.
+Same out-of-scope boundary applies.
+
+### Summary for task 2
+
+All three backends reached a terminal status on the Mini, none succeeded, and all three failures
+are environment/PATH/credential preconditions outside this block's scope to fix (never an
+engine-rs source defect and never a model-capability limit — the local model was never actually
+invoked in either the Pi or Aider case, since the transport failed before spawning it):
+
+| Backend | run id | status | wall-clock | failure |
+|---|---|---|---|---|
+| Claude Code | `794dd6d1-f403-4109-9610-b6fb5bb51f84` | failed | ~6.7s | expired OAuth session on the Mini's `claude` CLI |
+| Pi | `ea8a4c59-074e-49ad-86a9-19745ed4f74a` | failed | ~2.8s | `pi` binary off the LaunchAgent's `PATH` |
+| Aider | `f30578e1-1986-475d-b2e4-bb49c9f5e6bf` | failed | ~3.1s | `aider` binary off the LaunchAgent's `PATH` |
+
+All three terminal readbacks copied verbatim into `planning/EN.17.K/evidence/smoke.md`. Fixing any
+of the three (re-`claude /login`, or adding `~/.local/bin` / a `PI_BINARY`/`AIDER_BINARY` override
+to the LaunchAgent's environment and restarting it) is an operator action on the Mini's own
+environment — out of scope for this task per the block's own out-of-scope list.
