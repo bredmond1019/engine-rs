@@ -261,6 +261,19 @@ impl Default for InboxTriageConfig {
     }
 }
 
+/// `EN.17.E` task 7: resolves the three `OrchestrationPolicy::inbox_triage_*` knobs into
+/// this config — mirrors `preflight.rs`'s existing
+/// `impl From<&super::graph::OrchestrationPolicy> for PreflightConfig`.
+impl From<&super::graph::OrchestrationPolicy> for InboxTriageConfig {
+    fn from(policy: &super::graph::OrchestrationPolicy) -> Self {
+        Self {
+            model_tier: policy.inbox_triage_model_tier,
+            max_turns: policy.inbox_triage_max_turns,
+            slice_max_bytes: policy.inbox_triage_slice_max_bytes,
+        }
+    }
+}
+
 /// Judges FINDING/QUERY messages: cap-checks first, then runs at most one
 /// [`JudgmentNode::judge`] call per message. Not a graph node — see `preflight.rs`'s
 /// `PreflightRunner`, which this mirrors, for why the analogous type there isn't one either.
@@ -494,7 +507,11 @@ pub struct EscalationContext<'a> {
 
 /// One processed message's accumulated record — the shape `super::integrate`'s boundary
 /// drain (`EN.17.E` task 3) folds into the chain's `inbox_report`.
-#[derive(Debug, Clone)]
+///
+/// `Serialize` (`EN.17.E` task 7) lets `OrchestrationRunNode::process` stamp the whole
+/// accumulated `inbox_report` into its `ctx.nodes` result via `json!`, mirroring
+/// `BlockPreflight`'s own `Serialize` derive for `preflight_report`.
+#[derive(Debug, Clone, Serialize)]
 pub struct ProcessedMessage {
     pub message_id: String,
     pub kind: MessageKind,

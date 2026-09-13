@@ -499,12 +499,13 @@ fn write_inbox_triage_enabled_harness(brain_root: &Path) {
 /// `inbox_triage_enabled == true` through `resolve_policy_for_run_from` with
 /// no inline policy override — mirrors
 /// `hq_orchestration_policy_brain_root_enables_preflight`'s shape for the
-/// analogous `EN.17.D` switch, but stops at policy resolution rather than
-/// driving a full `OrchestrationRunNode` chain: `OrchestrationRunNode` has
-/// no inbox-triage wiring yet (out of this task's scope), so there is no
-/// `inbox_report` node stamp to assert against — only the resolved
-/// `OrchestrationPolicy` value itself, which is the mechanism `EN.17.E`
-/// task 3's boundary drain actually reads.
+/// analogous `EN.17.D` switch. `OrchestrationRunNode` is now ACTUALLY WIRED
+/// to this switch (`EN.17.E` task 7, `with_inbox_triage_runner`) — see
+/// [`hq_orchestration_policy_inbox_triage_runner_processes_a_real_message`]
+/// immediately below for the full-node proof (a stub `JudgmentNode`
+/// transport, a real FINDING message, a landed reply and a non-empty
+/// `inbox_report` node stamp). This test stays as the narrower policy-only
+/// proof.
 #[tokio::test]
 async fn hq_orchestration_policy_brain_root_enables_inbox_triage() {
     let dir = one_repo_brain_root();
@@ -535,6 +536,197 @@ async fn hq_orchestration_policy_brain_root_enables_inbox_triage() {
         !resolved_no_switch.inbox_triage_enabled,
         "with no orchestration.policy key at all, inbox_triage_enabled must resolve to its \
          built-in default, false"
+    );
+}
+
+/// Writes a message envelope directly into
+/// `<lock_dir>/queue/<to_repo>/<to_lane>/inbox/` — standing in for a sibling
+/// lane's delivery. Duplicated from `tests/it/inbox_triage.rs`'s own
+/// `write_message` (that module's stated convention: fixture helpers are
+/// duplicated per test module rather than exported across the crate
+/// boundary), trimmed to only the fields this file's one FINDING test needs.
+fn write_finding_message(lock_dir: &Path, to_repo: &str, to_lane: &str) {
+    let inbox = lock_dir
+        .join("queue")
+        .join(to_repo)
+        .join(to_lane)
+        .join("inbox");
+    std::fs::create_dir_all(&inbox).unwrap();
+    let envelope = json!({
+        "message_id": "aaaaaaaa-1111-4e21-9f10-000000000099",
+        "sender": {
+            "agent_name": "peer-lane",
+            "repo": "bastion",
+            "lane": "types",
+            "roadmap": "hq-orchestration-policy-fixture",
+        },
+        "sent_at": "2026-09-12T00:00:00Z",
+        "kind": "FINDING",
+        "subject": { "repo": to_repo, "block": "A.1" },
+        "body": "a finding delivered mid-run",
+        "durable_home": {
+            "channel": "lane-log",
+            "ref": "lane-log.jsonl#1",
+        },
+        "verified_by": "test fixture",
+    });
+    std::fs::write(
+        inbox.join("20260912T000000000000000-aaaaaaaa-1111-4e21-9f10-000000000099.json"),
+        serde_json::to_string(&envelope).unwrap(),
+    )
+    .unwrap();
+}
+
+/// A stub [`engine_core::workflows::ModelTransport`] that always returns one canned
+/// `InboxVerdict` JSON reply — `ACCEPTED`/`NONE` — so the gated suite never spawns a real
+/// `claude` subprocess. Mirrors `tests/it/inbox_triage.rs`'s own `queued_transport`, trimmed
+/// to a single fixed reply since this test drives exactly one FINDING.
+fn accepted_transport() -> engine_core::workflows::ModelTransport {
+    use claude_code_rs::parse::Usage as SdkUsage;
+    use claude_code_rs::{Config, Outcome};
+
+    Arc::new(move |_config: Config, _prompt: String| {
+        Box::pin(async move {
+            Ok(Outcome {
+                cost_usd: 0.0,
+                usage: SdkUsage {
+                    input_tokens: 1,
+                    output_tokens: 1,
+                    cache_creation_input_tokens: 0,
+                    cache_read_input_tokens: 0,
+                },
+                model_usage: std::collections::BTreeMap::new(),
+                text: json!({"verdict": "ACCEPTED", "action": "NONE", "reason": "noted"})
+                    .to_string(),
+                is_error: false,
+                api_error_status: None,
+                session_id: None,
+                structured_output: None,
+            })
+        })
+    })
+}
+
+/// `EN.17.E` task 7 — the production wiring's own regression: with
+/// `inbox_triage_enabled` resolved `true` from the brain root's
+/// `planning/harness.json` (no inline policy override, mirroring
+/// [`hq_orchestration_policy_brain_root_enables_inbox_triage`] immediately
+/// above) and a stub-transport [`InboxTriageRunner`] injected via
+/// [`OrchestrationRunNode::with_inbox_triage_runner`] — the same builder
+/// shape `with_preflight` already proved in
+/// [`hq_orchestration_policy_brain_root_enables_preflight`] — a FINDING
+/// message sitting in the run's own inbox (`<brain_root>/.fleet-locks/queue/
+/// repo-a/repo-a/inbox/`, `repo-a` doubling as both repo and lane per
+/// `process`'s own "single-repo lines where lane == repo" convention) is
+/// drained, judged, and answered: a reply lands in the sender's
+/// (`bastion`/`types`) inbox, and `inbox_report` is non-empty in the node's
+/// own `ctx.nodes` result. This replaces
+/// `hq_orchestration_policy_brain_root_enables_inbox_triage`'s prior
+/// documented gap ("OrchestrationRunNode has no inbox-triage wiring yet ...
+/// out of this task's scope").
+#[tokio::test]
+async fn hq_orchestration_policy_inbox_triage_runner_processes_a_real_message() {
+    use engine_core::workflows::orchestration::inbox_triage::{
+        InboxTriageConfig, InboxTriageRunner,
+    };
+
+    let dir = one_repo_brain_root();
+    write_inbox_triage_enabled_harness(dir.path());
+    write_finding_message(&dir.path().join(".fleet-locks"), "repo-a", "repo-a");
+
+    let (run_flow, calls) = recording_run_flow();
+    let inbox_runner = Arc::new(
+        InboxTriageRunner::new(InboxTriageConfig::default()).with_transport(accepted_transport()),
+    );
+    let node = OrchestrationRunNode::new()
+        .with_run_flow(run_flow)
+        .with_coord_agent("engine-rs-inbox-triage-test")
+        .with_inbox_triage_runner(inbox_runner);
+    let ctx = event_ctx(json!({
+        "brain_root": dir.path(),
+        "blocks": [{ "repo": "repo-a", "block_id": "A.1" }],
+        "roadmap_slug": "hq-orchestration-policy-fixture",
+    }));
+
+    let out = node
+        .process(ctx)
+        .await
+        .unwrap_or_else(|err| panic!("orchestration run should succeed: {err}"));
+    assert_eq!(calls.lock().unwrap().len(), 1);
+
+    let inbox_report = out.nodes[NODE_NAME]["inbox_report"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    assert_eq!(
+        inbox_report.len(),
+        1,
+        "the FINDING message must have been drained and judged exactly once: {:?}",
+        out.nodes[NODE_NAME]["inbox_report"]
+    );
+    assert_eq!(inbox_report[0]["verdict"], json!("ACCEPTED"));
+
+    let reply_inbox = dir
+        .path()
+        .join(".fleet-locks")
+        .join("queue")
+        .join("bastion")
+        .join("types")
+        .join("inbox");
+    let entries: Vec<_> = std::fs::read_dir(&reply_inbox)
+        .unwrap_or_else(|err| panic!("reply inbox {reply_inbox:?} must exist: {err}"))
+        .collect();
+    assert_eq!(
+        entries.len(),
+        1,
+        "expected exactly one reply written to the sender's own inbox"
+    );
+}
+
+/// With `inbox_triage_enabled` false (the built-in default), a real
+/// `OrchestrationRunNode::process` run's behavior and node_result shape are
+/// unchanged apart from the new, empty `inbox_report` key — no
+/// `InboxTriageRunner` is ever constructed, and the FINDING message sitting
+/// in the inbox is left undrained (no reply, no completion) rather than
+/// acted on.
+#[tokio::test]
+async fn hq_orchestration_policy_inbox_triage_disabled_leaves_node_result_unchanged() {
+    let dir = one_repo_brain_root();
+    // No harness.json at all — `inbox_triage_enabled` resolves to its
+    // built-in default, `false`.
+    write_finding_message(&dir.path().join(".fleet-locks"), "repo-a", "repo-a");
+
+    let (run_flow, calls) = recording_run_flow();
+    let node = OrchestrationRunNode::new()
+        .with_run_flow(run_flow)
+        .with_coord_agent("engine-rs-inbox-triage-disabled-test");
+    let ctx = event_ctx(json!({
+        "brain_root": dir.path(),
+        "blocks": [{ "repo": "repo-a", "block_id": "A.1" }],
+        "roadmap_slug": "hq-orchestration-policy-fixture",
+    }));
+
+    let out = node
+        .process(ctx)
+        .await
+        .unwrap_or_else(|err| panic!("orchestration run should succeed: {err}"));
+    assert_eq!(calls.lock().unwrap().len(), 1);
+    assert_eq!(
+        out.nodes[NODE_NAME]["inbox_report"],
+        json!([]),
+        "with inbox_triage_enabled false, inbox_report must be the empty-array no-op stamp"
+    );
+
+    let reply_inbox = dir
+        .path()
+        .join(".fleet-locks")
+        .join("queue")
+        .join("bastion")
+        .join("types")
+        .join("inbox");
+    assert!(
+        !reply_inbox.exists(),
+        "no reply should ever be composed when inbox triage is disabled"
     );
 }
 

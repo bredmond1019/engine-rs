@@ -1256,6 +1256,33 @@ fn build_preflight_seam(
     })
 }
 
+/// Build the production inbox-triage seam (`EN.17.E` task 7) — mirrors
+/// [`build_preflight_seam`]'s shape WITHOUT the thread-spawn bridge:
+/// [`engine_core::workflows::orchestration::inbox_triage::InboxTriageRunner::judge_message`]
+/// is already `async` and runs from inside `OrchestrationRunNode::process`'s
+/// own per-step `spawn_blocking`/`block_on` context (like `preflight`'s), so
+/// no extra OS-thread bridge is needed here.
+///
+/// `!policy.inbox_triage_enabled` (the built-in default) returns `None` —
+/// never construct an [`InboxTriageRunner`] (or pay for one) when the switch
+/// is off, matching `build_preflight_seam`'s own `preflight_enabled` guard.
+#[must_use]
+fn build_inbox_triage_runner(
+    policy: &engine_core::workflows::orchestration::graph::OrchestrationPolicy,
+) -> Option<Arc<engine_core::workflows::orchestration::inbox_triage::InboxTriageRunner>> {
+    use engine_core::workflows::orchestration::inbox_triage::{
+        InboxTriageConfig, InboxTriageRunner,
+    };
+
+    if !policy.inbox_triage_enabled {
+        return None;
+    }
+
+    Some(Arc::new(InboxTriageRunner::new(InboxTriageConfig::from(
+        policy,
+    ))))
+}
+
 /// The registry-nickname identity a Rust-driven chain registers,
 /// heartbeats, leases, and drains its inbox as
 /// (`EN.ticket.wire-coord-handle-into-orchestration-run-node`) —
@@ -1444,7 +1471,18 @@ pub fn register_orchestration_with_registry(
             // switch is actually on.
             let preflight_seam = build_preflight_seam(preflight_repo_registry, &preflight_policy);
 
-            let node = engine_core::workflows::orchestration::graph::OrchestrationRunNode::new()
+            // `EN.17.E` task 7: the production inbox-triage runner — `None`
+            // when `preflight_policy.inbox_triage_enabled` is `false` (the
+            // built-in default), so a served run never pays for the
+            // `InboxTriageRunner` construction unless HQ's
+            // `orchestration.policy.inbox_triage_enabled` switch is actually
+            // on. `preflight_policy` is this event's full resolved
+            // `OrchestrationPolicy` (its name predates `EN.17.E`, per its own
+            // doc comment above), not preflight-specific, so it carries the
+            // `inbox_triage_*` knobs too.
+            let inbox_triage_runner = build_inbox_triage_runner(&preflight_policy);
+
+            let mut node = engine_core::workflows::orchestration::graph::OrchestrationRunNode::new()
                 .with_campaign_id(campaign_id)
                 .with_conductor(conductor_seam)
                 .with_close_block(close_block_seam)
@@ -1482,6 +1520,14 @@ pub fn register_orchestration_with_registry(
                 .with_operator_transport(transport.clone())
                 .with_cancellation_token(run_token)
                 .with_step_observer(step_observer);
+
+            // `EN.17.E` task 7: only wire the seam when the factory actually
+            // returned one — `with_inbox_triage_runner` is never called on
+            // the `None` branch, keeping `node`'s default (`None`, no-op
+            // for every message) exactly as it was before this task.
+            if let Some(runner) = inbox_triage_runner {
+                node = node.with_inbox_triage_runner(runner);
+            }
 
             let mut registry = engine_core::NodeRegistry::new();
             registry.register(Box::new(node));
