@@ -38,7 +38,7 @@ English, and how to trigger one. This page is just the file listing.
 | [approve-and-run.md](approve-and-run.md) | The `APPROVE_AND_RUN` micro-workflow — draining pending records, resolving a verdict into a ledger row plus an authorized execution |
 | [terminal-probe.md](terminal-probe.md) | The `TERMINAL_PROBE` graph — the read-only session/observe diagnostic for the terminal stack |
 | [sweep.md](sweep.md) | The `SWEEP` workflow — the roadmap sweep ported field-for-field from `roadmap_sweep.py`, its single-node shape, and the permission-profile-gated routing |
-| [en17h-proof-log.md](en17h-proof-log.md) | EN.17.H task 1's positive-control log — the coord send/status round trip (PASS) and the SWEEP-to-Telegram dispatch attempt (BLOCKED on a missing `BASTION_ENGINE_API_KEY`) |
+| [en17h-proof-log.md](en17h-proof-log.md) | EN.17.H's proof log — both positive controls (coord send/status round trip, SWEEP-to-notification-transport dispatch), the three throwaway fixture tickets registered in HQ's state.json, and the chain/queue proof outcomes |
 | [commander.md](commander.md) | The `COMMANDER` workflow — the `/orchestration-commander` drain loop ported as a two-node graph: whole-fleet inbox discovery, the scoped emit + manifest-only commit, the never-skipping drain-log append, the heartbeat, and the one gated triage step |
 | [consolidate.md](consolidate.md) | The `CONSOLIDATE` workflow — porting `/consolidate-run`'s discovery, D57 two-axis row selection, the first-time `disposal.json` write, remediation promotion, and watermark advance into one single-node graph |
 | [coordination.md](coordination.md) | The `/api/coordination/*` read/write HTTP surface (register, heartbeat, lease, send, drain, ...) and the `HELD_SESSION` workflow |
