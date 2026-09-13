@@ -14,6 +14,52 @@ related: [status, context]
 
 *Append-only working log. One dated entry per session. Newest entries at the top.*
 
+## [run: 2026-09-12]
+
+### `EN.17.E` — FAIL: feature ships fully inert, no task wires the production dispatch path
+
+- **What:** Ran `/sdlc-flow` on branch `EN.17.E-flow`, tasks 1-6, all six passed their own
+  implement/fix/test loop with a confirmed `workAssertionPassed`. Task 1 added the four
+  inbox-triage policy knobs to `OrchestrationPolicy`. Task 2 added the `inbox_triage` module
+  (`InboxVerdict`, the deterministic EDGE_RELEASED re-check, the judged FINDING/QUERY path, reply
+  and escalation composition) with 9 unit tests, wired nowhere yet. Task 3 routed all five
+  message kinds through a NEW entry point, `integrate_chain_with_inbox_triage`, while leaving the
+  production wrapper `integrate_chain_with_preflight` — the only one `graph.rs`'s
+  `OrchestrationRunNode::process` actually calls — hard-coded to `inbox_triage_enabled: false`.
+  Task 4 added a 12-case integration suite over the new entry point plus two `hq_orchestration_policy`
+  tests, one of which stops at policy resolution rather than a real chain run, its own comment
+  noting the `graph.rs` wiring is "out of this task's scope." Task 5 added D64 fixture evidence via
+  `check_messages.py` (exit 0). Task 6 documented the mechanism and flipped HQ's real
+  `planning/harness.json` `orchestration.policy.inbox_triage_enabled` to `true`; the full gate
+  (fmt, clippy, nextest workspace, release build, hang-test, micro-spec, fleet-build tests) passed
+  clean. The consolidated review returned **FAIL**: no task in this spec's 6-task breakdown ever
+  wires `graph.rs`'s production dispatch onto the new inbox-triage path, so setting HQ's harness
+  switch to `true` governs nothing — a real unattended chain still silently drops
+  EDGE_RELEASED/FINDING/QUERY exactly as it did before this block. This needed re-planning to add
+  the missing `graph.rs` wiring task, not a targeted fix, so the run bailed rather than looping a
+  fix attempt against work that was already correct on its own declared scope.
+- **Why:** The spec's own block record (`EN.17.E`) named `graph.rs`'s "JudgmentNode seam wiring,
+  and one `put_result` of `inbox_report`" as a file to modify, but the 6-task breakdown never
+  assigned that change to any task — each task individually did exactly what it was scoped to do.
+- **Refs:** `planning/EN.17.E/sdlc/sdlc-flow-state.json`, `planning/blocks/EN.17.E.json` (Amendment
+  Log), commits `e75faf7`..`09b96a6` on `EN.17.E-flow`.
+
+```
+09b96a6 feat: implement EN.17.E-task6
+2151162 feat: implement EN.17.E-task5
+f05428b feat: implement EN.17.E-task4
+37f62c8 feat: implement EN.17.E-task3
+26c0c99 feat: implement EN.17.E-task2
+e75faf7 feat: implement EN.17.E-task1
+fa10788 docs: log pluggable-code-agent-transport lane close (EN.16.D/E/C shipped)
+4dce1fa docs: note SDLC_FLOW's own sdlc.policy/profiles agent_backend wiring in README.md
+```
+
+Next: re-plan `EN.17.E` to add the missing `graph.rs` production-dispatch wiring task (route a real
+`OrchestrationRunNode` chain through `integrate_chain_with_inbox_triage`, or fold its behavior into
+`integrate_chain_with_preflight`), then re-run `/sdlc-flow` before the HQ harness switch means
+anything.
+
 ## [2026-09-12]
 
 ### `pluggable-code-agent-transport` lane CLOSED — EN.16.D/EN.16.E/EN.16.C shipped; `target/` cleaned
