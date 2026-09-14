@@ -63,10 +63,10 @@
 
 use serde::{Deserialize, Serialize};
 
-pub use crate::policy::tier::{LocalConfig, ModelTier};
+pub use crate::policy::tier::{LocalConfig, ModelTier, PiConfig};
 pub use crate::policy::AgentBackend;
-pub use crate::policy::PartialLocalConfig;
 use crate::policy::{merge_opt, Overlay};
+pub use crate::policy::{PartialLocalConfig, PartialPiConfig};
 use crate::workflows::sdlc_flow::policy::SdlcPolicy;
 pub use crate::workflows::sdlc_flow::policy::{
     OutputVerbosity, PartialRetryFeedback, PartialTransportRetry, RetryFeedback, TestDepth,
@@ -249,6 +249,14 @@ pub struct SdlcTaskPolicy {
     pub max_turns: SdlcTaskTurnCeilings,
     /// Configuration for the `local` model tier, when any stage uses it.
     pub local: LocalConfig,
+    /// `AgentBackend::Pi`'s own dedicated knobs
+    /// (`--no-context-files`/`--no-session`/`--tools`), resolved through
+    /// this workflow's own four layers exactly like every other knob here.
+    /// Read by `ImplementTaskNode`'s `PiTransport` dispatch only when
+    /// `agent_backend == Pi` — see `PiConfig`'s doc comment for what each
+    /// field does and the verified 2026-09-14 finding behind
+    /// `no_context_files`'s default.
+    pub pi: PiConfig,
     /// Enables `TriageTaskNode`'s model-triage branch — same semantics as
     /// `sdlc_flow::policy::SdlcPolicy::llm_triage`.
     pub llm_triage: bool,
@@ -303,6 +311,7 @@ impl Default for SdlcTaskPolicy {
             timeouts: SdlcTaskCallTimeouts::default(),
             max_turns: SdlcTaskTurnCeilings::default(),
             local: LocalConfig::default(),
+            pi: PiConfig::default(),
             llm_triage: false,
             max_attempts: 3,
             retry_feedback: RetryFeedback::default(),
@@ -365,6 +374,7 @@ impl SdlcTaskPolicy {
                 docs: fallback.max_turns.docs,
             },
             local: self.local.clone(),
+            pi: self.pi.clone(),
             llm_triage: self.llm_triage,
             max_attempts: self.max_attempts,
             max_review_attempts: fallback.max_review_attempts,
@@ -409,6 +419,7 @@ pub struct PartialSdlcTaskPolicy {
     pub timeouts: Option<PartialSdlcTaskCallTimeouts>,
     pub max_turns: Option<PartialSdlcTaskTurnCeilings>,
     pub local: Option<PartialLocalConfig>,
+    pub pi: Option<PartialPiConfig>,
     pub llm_triage: Option<bool>,
     pub max_attempts: Option<u32>,
     pub retry_feedback: Option<PartialRetryFeedback>,
@@ -472,6 +483,10 @@ impl crate::policy::Policy for SdlcTaskPolicy {
             local: match &over.local {
                 Some(l) => base.local.overlay(l),
                 None => base.local,
+            },
+            pi: match &over.pi {
+                Some(p) => base.pi.overlay(p),
+                None => base.pi,
             },
             llm_triage: merge_opt(base.llm_triage, over.llm_triage),
             max_attempts: merge_opt(base.max_attempts, over.max_attempts),
@@ -750,6 +765,16 @@ mod tests {
                 generate: None,
             }),
             local: Some(PartialLocalConfig::default()),
+            pi: Some(PartialPiConfig {
+                no_context_files: Some(true),
+                no_session: Some(true),
+                tools: Some(
+                    crate::policy::DEFAULT_PI_TOOLS
+                        .iter()
+                        .map(|s| (*s).to_string())
+                        .collect(),
+                ),
+            }),
             llm_triage: Some(false),
             max_attempts: Some(3),
             retry_feedback: Some(PartialRetryFeedback {
@@ -952,6 +977,17 @@ mod tests {
         assert_ne!(
             p.to_sdlc_policy().agent_backend,
             default_projection.agent_backend
+        );
+
+        let mut p = default.clone();
+        p.pi.no_context_files = !default.pi.no_context_files;
+        assert_eq!(
+            p.to_sdlc_policy().pi.no_context_files,
+            p.pi.no_context_files
+        );
+        assert_ne!(
+            p.to_sdlc_policy().pi.no_context_files,
+            default_projection.pi.no_context_files
         );
     }
 

@@ -27,7 +27,7 @@ use engine_core::nodes::{
     aider_meta_transport, pi_meta_transport, translate_agent_outcome, AgentOutcome, CostEstimate,
 };
 use engine_core::policy::telemetry::{harvest as harvest_telemetry, RunTelemetryInputs};
-use engine_core::policy::{AgentBackend, LocalConfig, Policy, RESOLVED_POLICY_IDENTITY};
+use engine_core::policy::{AgentBackend, LocalConfig, PiConfig, Policy, RESOLVED_POLICY_IDENTITY};
 use engine_core::sessions;
 use engine_core::workflows::sdlc_flow::graph::{
     registry_for_policy as sdlc_flow_registry_for_policy,
@@ -77,6 +77,10 @@ fn write_fake_pi_binary(body: &str) -> (tempfile::TempDir, std::path::PathBuf) {
 
 fn local_config() -> LocalConfig {
     LocalConfig::default()
+}
+
+fn pi_config() -> PiConfig {
+    PiConfig::default()
 }
 
 /// Minimal `ctx` `ImplementTaskNode::process` needs when dispatched through
@@ -453,7 +457,7 @@ printf '{"type":"message_end","message":{"role":"assistant","content":[{"type":"
         ..Config::default()
     };
 
-    let transport = pi_meta_transport(local_config(), None);
+    let transport = pi_meta_transport(local_config(), pi_config(), None);
     let result = transport(config, "prompt".to_string()).await;
 
     unsafe {
@@ -497,7 +501,7 @@ touch "$DONE"
         ..Config::default()
     };
 
-    let transport = pi_meta_transport(local_config(), None);
+    let transport = pi_meta_transport(local_config(), pi_config(), None);
     let result = transport(config, "prompt".to_string()).await;
 
     unsafe {
@@ -548,7 +552,7 @@ touch "$DONE"
         ..Config::default()
     };
 
-    let transport = pi_meta_transport(local_config(), Some(token.clone()));
+    let transport = pi_meta_transport(local_config(), pi_config(), Some(token.clone()));
     let call = transport(config, "prompt".to_string());
 
     let cancel_token = token.clone();
@@ -587,7 +591,7 @@ async fn agent_backend_missing_pi_binary_returns_node_error() {
         std::env::set_var("PI_BINARY", "/definitely/not/a/real/pi/binary/xyz");
     }
 
-    let transport = pi_meta_transport(local_config(), None);
+    let transport = pi_meta_transport(local_config(), pi_config(), None);
     let result = transport(Config::default(), "hello".to_string()).await;
 
     unsafe {
@@ -632,7 +636,7 @@ async fn agent_backend_pi_parses_real_capture_fixture() {
         std::env::set_var("PI_BINARY", &script);
     }
 
-    let transport = pi_meta_transport(local_config(), None);
+    let transport = pi_meta_transport(local_config(), pi_config(), None);
     let result = transport(Config::default(), "prompt".to_string()).await;
 
     unsafe {
@@ -672,7 +676,7 @@ exit 3
     unsafe {
         std::env::set_var("PI_BINARY", &script_3);
     }
-    let transport = pi_meta_transport(local_config(), None);
+    let transport = pi_meta_transport(local_config(), pi_config(), None);
     let (exit_3_outcome, _) = transport(Config::default(), "prompt".to_string())
         .await
         .expect("exit 3 still parses and returns a failed Outcome, not a transport Err");
@@ -689,7 +693,7 @@ exit 1
     unsafe {
         std::env::set_var("PI_BINARY", &script_1);
     }
-    let transport = pi_meta_transport(local_config(), None);
+    let transport = pi_meta_transport(local_config(), pi_config(), None);
     let (exit_1_outcome, _) = transport(Config::default(), "prompt".to_string())
         .await
         .expect("exit 1 also parses and returns a failed Outcome");

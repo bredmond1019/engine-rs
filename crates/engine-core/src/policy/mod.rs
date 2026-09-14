@@ -27,7 +27,7 @@ pub mod tier;
 pub use agent_backend::AgentBackend;
 pub use aggregate::{aggregate, aggregate_state_files, extract_policy_telemetry, PolicyAggregate};
 pub use emit_state::{CommandOutputLike, EmitStateNode, Runner as EmitStateRunner};
-pub use overlay::{merge_local, Overlay, PartialLocalConfig};
+pub use overlay::{merge_local, merge_pi_config, Overlay, PartialLocalConfig, PartialPiConfig};
 pub use permission::{
     decide, resolve_permission_profile, resolve_permission_profile_from_config, Decision,
     GatedAction, PermissionProfile, ProfileResolutionError, DEFAULT_PROFILE,
@@ -44,7 +44,9 @@ pub use shaping::{
 pub use telemetry::{
     harvest as harvest_telemetry, observed_model_tiers, RunTelemetry, RunTelemetryInputs,
 };
-pub use tier::{model_tier_to_model_string, LocalConfig, ModelTier, OutputVerbosity};
+pub use tier::{
+    model_tier_to_model_string, LocalConfig, ModelTier, OutputVerbosity, PiConfig, DEFAULT_PI_TOOLS,
+};
 
 /// Test-only helpers shared by this crate's policy-golden unit tests.
 ///

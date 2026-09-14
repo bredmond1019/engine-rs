@@ -360,7 +360,10 @@ pub fn registry_for_policy_with_cancellation(
         let mut node =
             ImplementTaskNode::new().with_config(agentic_write_config("claude-sonnet-4-5"));
         if pi_backend {
-            node = node.with_meta_transport(pi_meta_transport_live(policy.local.clone()));
+            node = node.with_meta_transport(pi_meta_transport_live(
+                policy.local.clone(),
+                policy.pi.clone(),
+            ));
         } else if aider_backend {
             node = node.with_meta_transport(aider_meta_transport_live(policy.local.clone()));
         }

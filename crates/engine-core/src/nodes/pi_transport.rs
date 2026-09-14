@@ -90,7 +90,7 @@ use serde::Deserialize;
 use tokio::process::Command;
 
 use crate::cancellation::CancellationToken;
-use crate::policy::LocalConfig;
+use crate::policy::{LocalConfig, PiConfig};
 
 use super::agent_code_step::{MetaTransport, TransportInfo};
 use super::agent_outcome::{translate, AgentOutcome, CostEstimate};
@@ -123,16 +123,20 @@ const PI_EXIT_TOOL_APPROVAL_UNAVAILABLE: i32 = 3;
 /// supplied (in addition to whatever cancellation the calling node's own
 /// `with_cancellation_token` races the whole future against — this transport
 /// checks it too so a cancellation is distinguishable, in the returned
-/// error's text, from a timeout).
+/// error's text, from a timeout). `pi` carries `AgentBackend::Pi`'s own
+/// dedicated knobs (`--no-context-files`/`--no-session`/`--tools`) —
+/// standing rule 6, resolved the same four-layer way as `local`.
 #[must_use]
 pub fn pi_meta_transport(
     local: LocalConfig,
+    pi: PiConfig,
     cancellation: Option<CancellationToken>,
 ) -> MetaTransport {
     Arc::new(move |config: Config, prompt: String| {
         let local = local.clone();
+        let pi = pi.clone();
         let cancellation = cancellation.clone();
-        Box::pin(run_pi(config, prompt, local, cancellation))
+        Box::pin(run_pi(config, prompt, local, pi, cancellation))
             as BoxFuture<'static, ClaudeResult<(Outcome, TransportInfo)>>
     })
 }
@@ -142,8 +146,8 @@ pub fn pi_meta_transport(
 /// race (whose drop-on-cancel still kills the child via `kill_on_drop`, just
 /// without this transport's own distinguishing error text).
 #[must_use]
-pub fn pi_meta_transport_live(local: LocalConfig) -> MetaTransport {
-    pi_meta_transport(local, None)
+pub fn pi_meta_transport_live(local: LocalConfig, pi: PiConfig) -> MetaTransport {
+    pi_meta_transport(local, pi, None)
 }
 
 /// What the whole-call race resolved to, before the `Output` (or lack of
@@ -157,6 +161,7 @@ async fn run_pi(
     config: Config,
     prompt: String,
     local: LocalConfig,
+    pi: PiConfig,
     cancellation: Option<CancellationToken>,
 ) -> ClaudeResult<(Outcome, TransportInfo)> {
     let binary = std::env::var(PI_BINARY_ENV).unwrap_or_else(|_| PI_BINARY.to_string());
@@ -170,7 +175,25 @@ async fn run_pi(
         .arg("--provider")
         .arg("ollama")
         .arg("--model")
-        .arg(&local.model)
+        .arg(&local.model);
+
+    // `AgentBackend::Pi`'s own knobs (standing rule 6) — see `PiConfig`'s
+    // doc comment for the verified leak (`no_context_files`) and the
+    // honestly-reported non-finding (`no_session`) each default fixes/guards
+    // against, and `DEFAULT_PI_TOOLS`'s doc comment for why each dropped
+    // tool is dropped. Applied here, before `-p`/`prompt`, which — per this
+    // module's doc comment — MUST stay the last two arguments.
+    if pi.no_context_files {
+        command.arg("--no-context-files");
+    }
+    if pi.no_session {
+        command.arg("--no-session");
+    }
+    if !pi.tools.is_empty() {
+        command.arg("--tools").arg(pi.tools.join(","));
+    }
+
+    command
         .arg("-p")
         .arg(&prompt)
         .stdin(Stdio::null())
@@ -232,7 +255,20 @@ async fn run_pi(
 
     let agent_outcome = build_agent_outcome(parsed, exit_code, &stderr);
 
-    Ok(translate(agent_outcome, "pi"))
+    let (outcome, mut info) = translate(agent_outcome, "pi");
+    // Standing rule 6's telemetry-stamp requirement: record the resolved
+    // `PiConfig` knobs that actually governed this call's command line, not
+    // just the fact that `pi` ran — visible at
+    // `ctx.nodes[name]["transport"]["extra"]`.
+    info.extra.insert(
+        "pi_no_context_files".to_string(),
+        pi.no_context_files.to_string(),
+    );
+    info.extra
+        .insert("pi_no_session".to_string(), pi.no_session.to_string());
+    info.extra
+        .insert("pi_tools".to_string(), pi.tools.join(","));
+    Ok((outcome, info))
 }
 
 /// `Error::Spawn` naming the binary and its install command, for a spawn
@@ -517,6 +553,10 @@ mod tests {
         }
     }
 
+    fn test_pi_config() -> PiConfig {
+        PiConfig::default()
+    }
+
     #[cfg(unix)]
     fn write_fake_binary(body: &str) -> (tempfile::TempDir, std::path::PathBuf) {
         let dir = tempfile::tempdir().expect("temp dir");
@@ -559,7 +599,7 @@ mod tests {
             std::env::set_var(PI_BINARY_ENV, "/definitely/not/a/real/pi/binary/xyz");
         }
 
-        let transport = pi_meta_transport(test_local_config(), None);
+        let transport = pi_meta_transport(test_local_config(), test_pi_config(), None);
         let result = transport(Config::default(), "hello".to_string()).await;
 
         unsafe {
@@ -694,7 +734,7 @@ printf '{"type":"message_end","message":{"role":"assistant","content":[{"type":"
             ..Config::default()
         };
 
-        let transport = pi_meta_transport(test_local_config(), None);
+        let transport = pi_meta_transport(test_local_config(), test_pi_config(), None);
         let result = transport(config, "prompt".to_string()).await;
         clear_pi_binary();
 
@@ -705,6 +745,165 @@ printf '{"type":"message_end","message":{"role":"assistant","content":[{"type":"
             expected_cwd.display(),
             outcome.text
         );
+    }
+
+    // -- `PiConfig` flag construction (`no_context_files`/`no_session`/
+    // `tools`) --
+
+    /// A fake `pi` script that dumps its received argv (one per line, via
+    /// `printf '%s\n' "$@"`) to `argv_file`, then emits a minimal valid
+    /// `--mode json` stream so the transport call still succeeds.
+    #[cfg(unix)]
+    fn write_argv_capturing_fake_binary(
+        argv_file: &std::path::Path,
+    ) -> (tempfile::TempDir, std::path::PathBuf) {
+        write_fake_binary(&format!(
+            r#"printf '%s\n' "$@" > "{}"
+printf '{{"type":"agent_end","messages":[{{"role":"assistant","content":[{{"type":"text","text":"ok"}}]}}]}}\n'
+printf '{{"type":"message_end","message":{{"role":"assistant","content":[{{"type":"text","text":"done"}}],"usage":{{"totalTokens":1}}}}}}\n'
+"#,
+            argv_file.display()
+        ))
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn default_pi_config_constructs_no_context_files_no_session_and_scoped_tools() {
+        let _guard = PI_BINARY_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        let marker_dir = tempfile::tempdir().expect("marker temp dir");
+        let argv_file = marker_dir.path().join("argv.txt");
+        let (_script_dir, script) = write_argv_capturing_fake_binary(&argv_file);
+        set_pi_binary(&script);
+
+        let transport = pi_meta_transport(test_local_config(), test_pi_config(), None);
+        let result = transport(Config::default(), "prompt".to_string()).await;
+        clear_pi_binary();
+        result.expect("fake pi script run must succeed");
+
+        let argv = std::fs::read_to_string(&argv_file).expect("read captured argv");
+        let args: Vec<&str> = argv.lines().collect();
+
+        assert!(
+            args.contains(&"--no-context-files"),
+            "default PiConfig must pass --no-context-files: {args:?}"
+        );
+        assert!(
+            args.contains(&"--no-session"),
+            "default PiConfig must pass --no-session: {args:?}"
+        );
+        let tools_idx = args
+            .iter()
+            .position(|a| *a == "--tools")
+            .expect("--tools flag must be present");
+        assert_eq!(
+            args[tools_idx + 1],
+            crate::policy::DEFAULT_PI_TOOLS.join(","),
+            "default PiConfig must pass the scoped-down tool list: {args:?}"
+        );
+        // `-p`/`prompt` must still be the last two arguments (this module's
+        // doc comment — the stray-positional-argument regression).
+        assert_eq!(args[args.len() - 2], "-p");
+        assert_eq!(args[args.len() - 1], "prompt");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pi_config_with_flags_disabled_omits_no_context_files_no_session_and_tools() {
+        let _guard = PI_BINARY_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        let marker_dir = tempfile::tempdir().expect("marker temp dir");
+        let argv_file = marker_dir.path().join("argv.txt");
+        let (_script_dir, script) = write_argv_capturing_fake_binary(&argv_file);
+        set_pi_binary(&script);
+
+        let pi_config = PiConfig {
+            no_context_files: false,
+            no_session: false,
+            tools: Vec::new(),
+        };
+        let transport = pi_meta_transport(test_local_config(), pi_config, None);
+        let result = transport(Config::default(), "prompt".to_string()).await;
+        clear_pi_binary();
+        result.expect("fake pi script run must succeed");
+
+        let argv = std::fs::read_to_string(&argv_file).expect("read captured argv");
+        let args: Vec<&str> = argv.lines().collect();
+
+        assert!(
+            !args.contains(&"--no-context-files"),
+            "no_context_files: false must omit the flag entirely: {args:?}"
+        );
+        assert!(
+            !args.contains(&"--no-session"),
+            "no_session: false must omit the flag entirely: {args:?}"
+        );
+        assert!(
+            !args.contains(&"--tools"),
+            "an empty tools list must omit --tools entirely (pi's own default applies): {args:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pi_config_custom_tools_list_is_comma_joined_verbatim() {
+        let _guard = PI_BINARY_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        let marker_dir = tempfile::tempdir().expect("marker temp dir");
+        let argv_file = marker_dir.path().join("argv.txt");
+        let (_script_dir, script) = write_argv_capturing_fake_binary(&argv_file);
+        set_pi_binary(&script);
+
+        let pi_config = PiConfig {
+            no_context_files: true,
+            no_session: true,
+            tools: vec!["read".to_string(), "bash".to_string()],
+        };
+        let transport = pi_meta_transport(test_local_config(), pi_config, None);
+        let result = transport(Config::default(), "prompt".to_string()).await;
+        clear_pi_binary();
+        result.expect("fake pi script run must succeed");
+
+        let argv = std::fs::read_to_string(&argv_file).expect("read captured argv");
+        let args: Vec<&str> = argv.lines().collect();
+        let tools_idx = args
+            .iter()
+            .position(|a| *a == "--tools")
+            .expect("--tools flag must be present");
+        assert_eq!(args[tools_idx + 1], "read,bash");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn successful_pi_call_stamps_resolved_pi_config_into_transport_info_extra() {
+        let _guard = PI_BINARY_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        let (_script_dir, script) = write_fake_binary(
+            r#"printf '{"type":"agent_end","messages":[{"role":"assistant","content":[{"type":"text","text":"ok"}]}]}\n'
+printf '{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"done"}],"usage":{"totalTokens":1}}}\n'
+"#,
+        );
+        set_pi_binary(&script);
+
+        let pi_config = PiConfig {
+            no_context_files: true,
+            no_session: false,
+            tools: vec!["read".to_string()],
+        };
+        let transport = pi_meta_transport(test_local_config(), pi_config, None);
+        let result = transport(Config::default(), "prompt".to_string()).await;
+        clear_pi_binary();
+
+        let (_outcome, info) = result.expect("fake pi script run must succeed");
+        assert_eq!(
+            info.extra.get("pi_no_context_files").map(String::as_str),
+            Some("true")
+        );
+        assert_eq!(
+            info.extra.get("pi_no_session").map(String::as_str),
+            Some("false")
+        );
+        assert_eq!(info.extra.get("pi_tools").map(String::as_str), Some("read"));
     }
 
     #[cfg(unix)]
@@ -740,7 +939,7 @@ touch "$DONE"
             ..Config::default()
         };
 
-        let transport = pi_meta_transport(test_local_config(), None);
+        let transport = pi_meta_transport(test_local_config(), test_pi_config(), None);
         let result = transport(config, "prompt".to_string()).await;
         clear_pi_binary();
 
@@ -786,7 +985,8 @@ touch "$DONE"
             ..Config::default()
         };
 
-        let transport = pi_meta_transport(test_local_config(), Some(token.clone()));
+        let transport =
+            pi_meta_transport(test_local_config(), test_pi_config(), Some(token.clone()));
         let call = transport(config, "prompt".to_string());
 
         let cancel_token = token.clone();

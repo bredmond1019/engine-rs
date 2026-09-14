@@ -8,6 +8,7 @@
 //! `TaskContext`, await the SDK's `execute()`, and stamp the result onto the
 //! node's own `TaskContext::nodes` entry and `NodeRun.usage`.
 
+use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
@@ -245,6 +246,15 @@ pub struct TransportInfo {
     /// `true` unconditionally, since every one of them bills through the
     /// `claude` CLI today. No writer reads this yet.
     pub cost_known: bool,
+    /// Free-form backend-specific facts about the call that actually ran,
+    /// stamped verbatim into `ctx.nodes[name]["transport"]["extra"]`
+    /// (standing rule 6's telemetry-stamp requirement) — e.g. `PiTransport`
+    /// records its resolved `no_context_files`/`no_session`/`tools` knobs
+    /// here so a run's `ctx.nodes` shows what actually governed the call,
+    /// not just the fact that `pi` ran. Empty for every transport that has
+    /// nothing backend-specific to add — this field is additive, not a
+    /// replacement for `tier`/`model`/`endpoint`/`backend`/`cost_known`.
+    pub extra: BTreeMap<String, String>,
 }
 
 /// The injectable transport signature for transports that know their own
@@ -519,6 +529,7 @@ impl Node for AgentCodeStep {
                     endpoint: None,
                     backend: "claude_cli".to_string(),
                     cost_known: true,
+                    extra: BTreeMap::new(),
                 };
                 (outcome, info)
             }
@@ -544,6 +555,11 @@ impl Node for AgentCodeStep {
                 // wholesale by `carry_forward_billing`'s `"transport"` key,
                 // so this survives every SDLC wrapper's overwrite for free.
                 "backend": transport_info.backend,
+                // Additive, backend-specific facts (standing rule 6's
+                // telemetry-stamp requirement) — e.g. `PiTransport`'s
+                // resolved `no_context_files`/`no_session`/`tools`. Empty
+                // object for every transport with nothing to add.
+                "extra": transport_info.extra,
             },
             // Additive, non-contract channels (`EN.ticket.token-usage-drops-cache-channels`
             // task 1): `engine_contract::Usage` only carries uncached input/output
@@ -798,6 +814,7 @@ mod tests {
                             endpoint: Some("http://localhost:11434".to_string()),
                             backend: "claude_cli".to_string(),
                             cost_known: true,
+                            extra: BTreeMap::new(),
                         },
                     ))
                 })
@@ -834,6 +851,7 @@ mod tests {
                             endpoint: None,
                             backend: "pi".to_string(),
                             cost_known: true,
+                            extra: BTreeMap::new(),
                         },
                     ))
                 })
@@ -875,6 +893,7 @@ mod tests {
                             endpoint: None,
                             backend: "pi".to_string(),
                             cost_known: false,
+                            extra: BTreeMap::new(),
                         },
                     ))
                 })
@@ -916,6 +935,7 @@ mod tests {
                             endpoint: None,
                             backend: "claude_cli".to_string(),
                             cost_known: true,
+                            extra: BTreeMap::new(),
                         },
                     ))
                 })

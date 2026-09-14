@@ -107,6 +107,7 @@ mod tests {
                 endpoint: None,
                 backend: "claude_cli".to_string(),
                 cost_known: true,
+                extra: std::collections::BTreeMap::new(),
             };
             Box::pin(async move { Ok((outcome, info)) })
                 as BoxFuture<'static, claude_code_rs::Result<(Outcome, TransportInfo)>>

@@ -123,6 +123,7 @@ pub fn translate(outcome: AgentOutcome, backend: &str) -> (Outcome, TransportInf
         endpoint: None,
         backend: backend.to_string(),
         cost_known,
+        extra: BTreeMap::new(),
     };
 
     (claude_outcome, info)

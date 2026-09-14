@@ -64,6 +64,18 @@ pub fn baseline() -> PartialSdlcTaskPolicy {
             generate: d.max_turns.generate,
         }),
         local: Some(crate::policy::PartialLocalConfig::default()),
+        // Restates the built-in default verbatim — baseline's no-op
+        // contract, matching `local` immediately above. `EN.16.B`'s
+        // pi-flag-hardening follow-on: the fixed-leak/fixed-waste defaults
+        // (`no_context_files`/`no_session`: `true`) and the scoped-down
+        // tool allowlist apply on every profile alike — there is no
+        // cost/latency/quality reason for `AgentBackend::Pi`'s own CLI
+        // flags to vary by profile, unlike `model_tiers`/`timeouts`/etc.
+        pi: Some(crate::policy::PartialPiConfig {
+            no_context_files: Some(d.pi.no_context_files),
+            no_session: Some(d.pi.no_session),
+            tools: Some(d.pi.tools.clone()),
+        }),
         llm_triage: Some(d.llm_triage),
         max_attempts: Some(d.max_attempts),
         retry_feedback: Some(super::policy::PartialRetryFeedback {
@@ -126,6 +138,19 @@ pub fn cheap_fast() -> PartialSdlcTaskPolicy {
             generate: Some(20),
         }),
         local: Some(crate::policy::PartialLocalConfig::default()),
+        // No cost/latency reason for `AgentBackend::Pi`'s own flags to vary
+        // by profile (see `baseline`'s longer note) — same scoped-down
+        // default as every other profile.
+        pi: Some(crate::policy::PartialPiConfig {
+            no_context_files: Some(true),
+            no_session: Some(true),
+            tools: Some(
+                crate::policy::DEFAULT_PI_TOOLS
+                    .iter()
+                    .map(|s| (*s).to_string())
+                    .collect(),
+            ),
+        }),
         llm_triage: Some(false),
         max_attempts: Some(2),
         retry_feedback: Some(super::policy::PartialRetryFeedback {
@@ -193,6 +218,19 @@ pub fn thorough() -> PartialSdlcTaskPolicy {
             generate: Some(80),
         }),
         local: Some(crate::policy::PartialLocalConfig::default()),
+        // No cost/latency reason for `AgentBackend::Pi`'s own flags to vary
+        // by profile (see `baseline`'s longer note) — same scoped-down
+        // default as every other profile.
+        pi: Some(crate::policy::PartialPiConfig {
+            no_context_files: Some(true),
+            no_session: Some(true),
+            tools: Some(
+                crate::policy::DEFAULT_PI_TOOLS
+                    .iter()
+                    .map(|s| (*s).to_string())
+                    .collect(),
+            ),
+        }),
         llm_triage: Some(true),
         max_attempts: Some(5),
         retry_feedback: Some(super::policy::PartialRetryFeedback {

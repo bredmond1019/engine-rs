@@ -26,10 +26,10 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
-pub use crate::policy::tier::{LocalConfig, ModelTier, OutputVerbosity};
+pub use crate::policy::tier::{LocalConfig, ModelTier, OutputVerbosity, PiConfig};
 pub use crate::policy::AgentBackend;
-pub use crate::policy::PartialLocalConfig;
 use crate::policy::{merge_opt, Overlay};
+pub use crate::policy::{PartialLocalConfig, PartialPiConfig};
 
 /// How the review gate is applied across a run's tasks (lever #3a).
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -307,6 +307,15 @@ pub struct SdlcPolicy {
     pub max_turns: StageTurnCeilings,
     /// Configuration for the `local` model tier, when any stage uses it.
     pub local: LocalConfig,
+    /// `AgentBackend::Pi`'s own dedicated CLI-flag knobs
+    /// (`--no-context-files`/`--no-session`/`--tools`). Mergeable via the
+    /// same `Overlay` seam as `local` (`EN.16.B` pi-flag-hardening
+    /// follow-on), so a stage that resolves `AgentBackend::Pi` directly
+    /// through SDLC_FLOW's own layers (not projected from SDLC_TASK) still
+    /// gets a resolved value. See `PiConfig`'s doc comment for what each
+    /// field does and the verified 2026-09-14 finding behind
+    /// `no_context_files`'s default.
+    pub pi: PiConfig,
     // `simple_task_max_files` was the selector for a simple-task path
     // (paired with `ModelTiers::implement_simple`) that was never built —
     // deleted 2026-08-21 (EN.ticket.sdlc-flow-dead-policy-knobs task 4)
@@ -438,6 +447,7 @@ impl Default for SdlcPolicy {
             timeouts: CallTimeouts::default(),
             max_turns: StageTurnCeilings::default(),
             local: LocalConfig::default(),
+            pi: PiConfig::default(),
             llm_triage: false,
             max_attempts: 3,
             // Matching JS's MAX_REVIEW_ATTEMPTS — see the field's doc
@@ -481,6 +491,7 @@ pub struct PartialPolicy {
     pub timeouts: Option<PartialCallTimeouts>,
     pub max_turns: Option<PartialStageTurnCeilings>,
     pub local: Option<PartialLocalConfig>,
+    pub pi: Option<PartialPiConfig>,
     pub llm_triage: Option<bool>,
     pub agent_backend: Option<AgentBackend>,
     pub isolated: Option<bool>,
@@ -672,6 +683,10 @@ impl crate::policy::Policy for SdlcPolicy {
             local: match &over.local {
                 Some(l) => base.local.overlay(l),
                 None => base.local,
+            },
+            pi: match &over.pi {
+                Some(p) => base.pi.overlay(p),
+                None => base.pi,
             },
             llm_triage: merge_opt(base.llm_triage, over.llm_triage),
             max_attempts: merge_opt(base.max_attempts, over.max_attempts),
@@ -1838,6 +1853,10 @@ mod tests {
             "local",
             "task_loop.rs::apply_model_tier (local model string), graph.rs (openai_compat_meta_transport_live)",
         ),
+        (
+            "pi",
+            "graph.rs (pi_meta_transport_live, gated on agent_backend == Pi), nodes::pi_transport::run_pi (--no-context-files/--no-session/--tools construction)",
+        ),
         ("llm_triage", "task_loop.rs::TriageTaskNode (resolved_policy fallback)"),
         (
             "max_attempts",
@@ -1897,6 +1916,7 @@ mod tests {
             timeouts,
             max_turns,
             local,
+            pi,
             llm_triage,
             max_attempts,
             max_review_attempts,

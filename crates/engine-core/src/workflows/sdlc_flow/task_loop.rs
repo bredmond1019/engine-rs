@@ -11609,6 +11609,7 @@ pub(crate) mod tests {
                 endpoint: None,
                 backend: backend.to_string(),
                 cost_known: false,
+                extra: std::collections::BTreeMap::new(),
             };
             Box::pin(async move { Ok((outcome, info)) })
         })

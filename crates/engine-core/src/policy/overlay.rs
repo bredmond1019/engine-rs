@@ -10,7 +10,7 @@
 //! four-layer `builtin < harness < profile < event` precedence in
 //! `policy::resolve`, which is unchanged and out of scope here.
 
-use crate::policy::tier::LocalConfig;
+use crate::policy::tier::{LocalConfig, PiConfig};
 use serde::{Deserialize, Serialize};
 
 /// A type with an all-optional `Partial` mirror that can be merged onto a
@@ -78,6 +78,41 @@ impl Overlay for LocalConfig {
     }
 }
 
+/// All-optional mirror of [`PiConfig`], used by the `pi` override layer in
+/// any workflow's policy that resolves `AgentBackend::Pi`'s own knobs.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PartialPiConfig {
+    pub no_context_files: Option<bool>,
+    pub no_session: Option<bool>,
+    pub tools: Option<Vec<String>>,
+}
+
+/// Merge a `PartialPiConfig` override onto a base [`PiConfig`],
+/// field-by-field. Free-function sibling of [`Overlay::overlay`], mirroring
+/// [`merge_local`].
+#[must_use]
+pub fn merge_pi_config(mut base: PiConfig, over: &PartialPiConfig) -> PiConfig {
+    if let Some(v) = over.no_context_files {
+        base.no_context_files = v;
+    }
+    if let Some(v) = over.no_session {
+        base.no_session = v;
+    }
+    if let Some(v) = &over.tools {
+        base.tools = v.clone();
+    }
+    base
+}
+
+impl Overlay for PiConfig {
+    type Partial = PartialPiConfig;
+
+    fn overlay(self, over: &Self::Partial) -> Self {
+        merge_pi_config(self, over)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -132,6 +167,47 @@ mod tests {
         };
 
         let via_free_fn = merge_local(base.clone(), &over);
+        let via_trait = base.overlay(&over);
+
+        assert_eq!(via_free_fn, via_trait);
+    }
+
+    #[test]
+    fn pi_config_overlay_merges_field_by_field_without_clobbering_untouched_fields() {
+        let base = PiConfig::default();
+        let over = PartialPiConfig {
+            no_context_files: Some(false),
+            no_session: None,
+            tools: Some(vec!["read".to_string(), "bash".to_string()]),
+        };
+
+        let merged = base.clone().overlay(&over);
+
+        assert!(!merged.no_context_files);
+        // Untouched field falls through to the base.
+        assert_eq!(merged.no_session, base.no_session);
+        assert_eq!(merged.tools, vec!["read".to_string(), "bash".to_string()]);
+    }
+
+    #[test]
+    fn pi_config_overlay_with_all_none_partial_is_a_no_op() {
+        let base = PiConfig::default();
+        let over = PartialPiConfig::default();
+
+        let merged = base.clone().overlay(&over);
+
+        assert_eq!(merged, base);
+    }
+
+    #[test]
+    fn merge_pi_config_free_function_matches_overlay_trait_impl() {
+        let base = PiConfig::default();
+        let over = PartialPiConfig {
+            no_session: Some(false),
+            ..Default::default()
+        };
+
+        let via_free_fn = merge_pi_config(base.clone(), &over);
         let via_trait = base.overlay(&over);
 
         assert_eq!(via_free_fn, via_trait);

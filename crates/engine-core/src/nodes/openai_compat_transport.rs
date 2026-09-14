@@ -321,6 +321,7 @@ pub fn openai_compat_meta_transport(
                         endpoint: Some(local.endpoint.clone()),
                         backend: "claude_cli".to_string(),
                         cost_known: true,
+                        extra: BTreeMap::new(),
                     };
                     Ok((outcome, info))
                 }
@@ -333,6 +334,7 @@ pub fn openai_compat_meta_transport(
                         endpoint: None,
                         backend: "claude_cli".to_string(),
                         cost_known: true,
+                        extra: BTreeMap::new(),
                     };
                     Ok((outcome, info))
                 }

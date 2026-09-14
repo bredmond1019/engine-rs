@@ -21,6 +21,24 @@
   },
   "node_invocation_payload_cap_bytes": 65536,
   "output_verbosity": "normal",
+  "pi": {
+    "no_context_files": true,
+    "no_session": true,
+    "tools": [
+      "read",
+      "write",
+      "edit",
+      "hashline_edit",
+      "bash",
+      "grep",
+      "find",
+      "ls",
+      "ast_grep",
+      "ast_edit",
+      "lsp",
+      "todo"
+    ]
+  },
   "prompt_cache": false,
   "retry_feedback": {
     "enabled": true,

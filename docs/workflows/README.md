@@ -265,6 +265,22 @@ directory, `~/.cargo`, the HQ vault behind the worktree's `planning/` symlink), 
 description or a cloud-hosted model without revisiting this boundary. See `pi_transport.rs`'s module
 doc for the same statement kept next to the code.
 
+**`pi`'s own dedicated knobs — `PiConfig` (`no_context_files`/`no_session`/`tools`).** Resolved
+through `SdlcTaskPolicy.pi`/`SdlcPolicy.pi` the same four-layer way as `local`, and read only when
+`agent_backend: pi`. All three are documented in `planning/harness.json`'s `sdlc_task.policy`/
+`sdlc_task.profiles` sections (`_comment_pi`) alongside `local`/`agent_backend`.
+
+| Field | Default | Why |
+|---|---|---|
+| `no_context_files` | `true` | Passes `pi --no-context-files`, suppressing `pi`'s own ancestor-directory `AGENTS.md`/`CLAUDE.md` auto-discovery. **Verified real leakage** (2026-09-14): from a scratch directory nested three levels under a probe `AGENTS.md`, a real `pi --verbose --no-tools -p "say ok"` call (`qwen2.5-coder:7b-ctx16384` over `ollama`) replied `"Ok" -- Level A Agent` — following an ancestor directory's unrelated sign-off instruction it was never asked to read. The identical call with `--no-context-files` replied plain `OK`. This fleet's `AGENTS.md`/`CLAUDE.md` chains cascade several directories deep (a worktree under `core/engine-rs/trees/sdlc/<slug>` sits under this repo's, the tier's, and HQ's own), so every un-flagged `-p` call was leaking ambient fleet-governance prose into the local model's system prompt uninvited. Default `true` FIXES this rather than reproducing it — nobody chose today's leak on purpose, so it is not a "behavior-stable" default to preserve. |
+| `no_session` | `true` | Passes `pi --no-session`, skipping `pi`'s session JSONL persistence. **Could not reproduce actual waste**: a dozen trial `-p` calls against the installed `pi` v0.5.1 (`--mode json` and `--mode text`, with and without `--no-session`, with and without an explicit `--session <path>`) left `~/.pi/agent/sessions/` empty every time. Kept anyway as a zero-downside hygiene default matching `pi --help`'s own documented purpose ("ephemeral" one-shot runs) — `ImplementTaskNode`'s dispatch is exactly that shape and never reads a session back — and as a guard against a future `pi` version re-enabling persistence for `-p` mode. Reported honestly as a no-op on the currently-installed binary, not a fix. |
+| `tools` | [`DEFAULT_PI_TOOLS`](../../crates/engine-core/src/policy/tier.rs) — `read,write,edit,hashline_edit,bash,grep,find,ls,ast_grep,ast_edit,lsp,todo` | Passed verbatim as `pi --tools <comma-joined>`. Scopes down `pi`'s wider built-in default (`read,bash,edit,write,grep,find,ls,hashline_edit,web_search,ast_grep,ast_edit,lsp,debug,ask,todo,submit_plan,jobs,hub,current_time`), dropping `web_search`/`hub` (network egress + cost, and part of the safety boundary above), `ask` (blocks on a human a headless run has no way to answer), `submit_plan` (only meaningful under `--plan-mode`, never set here), `jobs` (background-job spawning this transport neither needs nor reaps), and `debug`/`current_time` (no known SDLC use). An empty list omits `--tools` entirely, falling back to `pi`'s own built-in default. |
+
+Resolved values are stamped into `ctx.nodes[name]["transport"]["extra"]` (`pi_no_context_files`/
+`pi_no_session`/`pi_tools`) alongside the existing `tier`/`model`/`endpoint`/`backend`/`cost_known`
+fields, via the new `TransportInfo.extra: BTreeMap<String, String>` bag — additive, empty for every
+transport with nothing backend-specific to add.
+
 **Pitfalls for local backends** (all measured 2026-09-14; the full list with fixes is in
 [local-model-bench.md](../local-model-bench.md)):
 

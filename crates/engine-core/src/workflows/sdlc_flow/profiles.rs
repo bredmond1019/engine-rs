@@ -328,6 +328,11 @@ pub fn thorough() -> PartialPolicy {
         // left unset here to fall through rather than restating the
         // default explicitly ahead of EN.16.D task 5's harness.json wiring.
         agent_backend: None,
+        // Same reasoning as `agent_backend` immediately above — this bundle
+        // never resolves to `AgentBackend::Pi`, so its own dedicated flags
+        // are left unset here to fall through to the built-in default
+        // (`EN.16.B` pi-flag-hardening follow-on).
+        pi: None,
         // The quality ceiling still isolates every call — see
         // `SdlcPolicy::isolated`'s doc comment. Set explicitly per this
         // bundle's own "every field explicit" contract.
