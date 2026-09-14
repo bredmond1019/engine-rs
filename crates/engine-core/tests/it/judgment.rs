@@ -19,6 +19,7 @@ use claude_code_rs::{Config, Outcome};
 use engine_contract::TaskContext;
 use engine_core::nodes::{InputSlice, JudgmentError, JudgmentNode, JudgmentSpec};
 use engine_core::policy::ModelTier;
+use engine_core::workflows::llm_node::TransportSlotted;
 use engine_core::workflows::ModelTransport;
 use futures::future::BoxFuture;
 use futures::FutureExt;
@@ -387,4 +388,54 @@ async fn judgment_live_single_turn_yields_a_recorded_judgment_error() {
         .await
         .expect_err("a one-turn budget on a multi-step prompt should exhaust without a verdict");
     println!("judgment_live_single_turn_yields_a_recorded_judgment_error: {err:?}");
+}
+
+/// Live smoke for Phase 3 of `EN.ticket.transport-slot-consolidation`:
+/// `JudgmentNode`'s trait-provided `with_meta_transport` (via
+/// `llm_node::TransportSlotted`, no longer a hand-written inherent method)
+/// dispatches a real call through `resolve_meta_transport`'s
+/// `ClaudeCli + Local` branch to a real local Ollama endpoint end to end —
+/// the exact path `InboxTriageRunner`/`PreflightRunner` would use if either
+/// were ever wired to `ModelTier::Local` (neither is, in production, today
+/// — see this phase's report). Requires `ollama serve` reachable at
+/// `localhost:11434` with `qwen2.5-coder:7b-ctx16384` pulled (confirmed via
+/// `curl localhost:11434/api/tags` before this test was authored).
+///
+/// Run by hand: `cargo nextest run -p engine-core --run-ignored ignored-only \
+/// judgment_live_local_meta_transport_dispatches_to_real_ollama`
+#[tokio::test]
+#[ignore = "requires a live local Ollama endpoint"]
+async fn judgment_live_local_meta_transport_dispatches_to_real_ollama() {
+    use engine_core::policy::{AgentBackend, LocalConfig, PiConfig};
+    use engine_core::workflows::llm_node::resolve_meta_transport;
+
+    let local = LocalConfig {
+        endpoint: "http://localhost:11434".to_string(),
+        model: "qwen2.5-coder:7b-ctx16384".to_string(),
+        constrained_json: false,
+    };
+    let transport = resolve_meta_transport(
+        ModelTier::Local,
+        AgentBackend::ClaudeCli,
+        &local,
+        &PiConfig::default(),
+    )
+    .expect("ClaudeCli + Local must resolve to Some(transport)");
+
+    let node: JudgmentNode<TestVerdict> = JudgmentNode::new().with_meta_transport(transport);
+    let spec = JudgmentSpec {
+        identity: "JudgmentLiveLocalTest".to_string(),
+        json_schema: test_json_schema(),
+        stable_prompt: "Reply with strict JSON matching the schema: is 2 + 2 equal to 4? \
+                        Set \"verdict\" to true if so.",
+        slices: vec![],
+        tier: ModelTier::Local,
+        max_turns: Some(4),
+    };
+
+    let result = node
+        .judge(&empty_ctx(), spec)
+        .await
+        .expect("a real local Ollama call should produce a schema-valid verdict — is `ollama serve` running on :11434?");
+    assert!(result.verdict.verdict);
 }
