@@ -383,4 +383,51 @@ mod tests {
         );
         assert!(wired.token.is_some());
     }
+
+    /// Live smoke, `#[ignore]`d — same convention `engine-store`'s
+    /// Postgres-gated tests use for a dependency this hermetic suite must
+    /// not require by default. Proves `resolve_meta_transport`'s
+    /// `ClaudeCli + Local` branch produces a [`MetaTransport`] that
+    /// actually dispatches to a real local Ollama endpoint end to end
+    /// (not a stub) — the transport every migrated node now reaches
+    /// through `wire`/`TransportSlotted::with_meta_transport`. The
+    /// wiring mechanics themselves (does the node's own `TransportSlot`
+    /// correctly install and forward whatever transport it's given) are
+    /// already proven hermetically by this module's other tests; this one
+    /// is the "the resolved transport really talks to a local model" half.
+    ///
+    /// Run explicitly: `cargo nextest run -p engine-core \
+    /// llm_node::tests::live_resolve_meta_transport_local_dispatches_to_real_ollama \
+    /// --run-ignored ignored-only`, with a local Ollama serving a real
+    /// model at `http://localhost:11434` (confirmed reachable via
+    /// `curl localhost:11434/api/tags` before this run).
+    #[tokio::test]
+    #[ignore = "requires a live local Ollama endpoint"]
+    async fn live_resolve_meta_transport_local_dispatches_to_real_ollama() {
+        let local = LocalConfig {
+            endpoint: "http://localhost:11434".to_string(),
+            model: "qwen2.5-coder:7b-ctx16384".to_string(),
+            constrained_json: false,
+        };
+        let transport = resolve_meta_transport(
+            ModelTier::Local,
+            AgentBackend::ClaudeCli,
+            &local,
+            &PiConfig::default(),
+        )
+        .expect("ClaudeCli + Local must resolve to Some(transport)");
+
+        let config = Config::default();
+        let (outcome, info) = transport(config, "Reply with exactly one word: ack".to_string())
+            .await
+            .expect("live Ollama call must succeed — is `ollama serve` running on :11434?");
+
+        assert_eq!(info.tier, "local");
+        assert_eq!(info.backend, "claude_cli");
+        assert!(
+            !outcome.text.trim().is_empty(),
+            "expected a non-empty real completion, got: {:?}",
+            outcome.text
+        );
+    }
 }
