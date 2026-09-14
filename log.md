@@ -5,7 +5,7 @@ description: Chronological log of work completed for engine-rs.
 doc_id: log
 layer: [factory]
 status: active
-timestamp: "2026-09-13T21:58:00Z"
+timestamp: "2026-09-14T01:19:00Z"
 keywords: [work log, session history, development log]
 related: [status, context]
 ---
@@ -15,6 +15,36 @@ related: [status, context]
 *Append-only working log. One dated entry per session. Newest entries at the top.*
 
 ## [2026-09-13]
+
+### Local-model orchestration bench built and proven $0-cost; every model fails easy-tier task 1
+- **What:** Root-caused and fixed `orchestration-inbox-drain-never-fires-even-at-the-correct-coord-lane-path`
+  (was a stale local `bastion serve` binary, not a same-host defect — evidence at
+  `planning/orchestration-inbox-drain-verify/evidence/run.md`; carryover CLEARED). Built
+  `scripts/bench_local_models.sh` to dispatch a real, $0-cost `ORCHESTRATION`-driven `SDLC_FLOW`
+  run against local Ollama models, with three fixed difficulty tiers
+  (`planning/local-model-bench/tiers/{easy,medium,hard}/`) so a model comparison is never
+  confounded by varying tasks. Found and fixed two real engine gotchas along the way: an
+  unregistered `ORCHESTRATION` block_id is a silent skip (not an error) that still reports
+  overall `"succeeded"`; `sdlc-flow-state.json`'s `tasks` field is a dict keyed by string task
+  id, not an array. Also found and fixed a real, unrelated defect: `MICRO_SMALL_*`/`MICRO_LARGE_*`
+  marker litter checked into `main` by a past real dispatch was poisoning every future
+  `micro-spec-small`/`micro-spec-large` re-run via `LoadTaskStateNode`'s `git log` reconciliation.
+  Also caught and fixed a real $1.38 mistake mid-session: `child_sdlc_flow_policy` on an
+  `ORCHESTRATION` event must nest under `data.policy`, not sit as a top-level sibling of
+  `blocks`/`lane` — a misplaced field there is silently ignored (no `deny_unknown_fields`) and
+  the run falls back to real-Claude defaults instead of local models. Parallel dispatch (light
+  models pooled, heavy sequential) was prototyped and proven working, then cut back to
+  sequential-only per operator request, to prioritize getting real data over wall-clock speed.
+  Switched the script's default `agent_backend` to `aider` (operator: better results than `pi`
+  previously) and verified it end to end. **Every real model tried (qwen2.5:3b, qwen2.5-coder:7b,
+  on both `pi` and `aider`) failed the easy tier's trivial task 1 across all 3 attempts** — filed
+  as carryover `local-model-bench-easy-tier-task-1-always-fails`, unrooted, blocking trust in any
+  comparison data from this system until resolved.
+- **Why:** Operator wants to compare local Ollama models against each other (and eventually
+  against Sonnet/Opus) on identical, difficulty-tiered tasks, driven by a script rather than an
+  agent, so the comparison itself costs nothing.
+- **Refs:** `planning/handoff.md`, `scripts/bench_local_models.sh`,
+  `planning/local-model-bench/index.md`
 
 ### OAuth isolation fix pushed, deployed, verified live; ticket merged; heal-on-expiry fix designed
 - **What:** Pushed Session 4's isolation-as-policy-knob fix to `main`, deployed to the Mac Mini
