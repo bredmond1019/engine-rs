@@ -13,15 +13,23 @@
 //! [`resolve_meta_transport`] + [`wire`] collapse the graph-side half to one
 //! call per stage.
 //!
-//! **Scope of this pass (`EN.ticket.transport-slot-consolidation` Phase
-//! 1):** only `TriageTaskNode`, `GenerateTasksNode`, `ImplementTaskNode`
-//! (all three registered by `SDLC_TASK`) are migrated onto these traits.
-//! Every other node still using the pre-existing hand-rolled
-//! `TransportSlot` field + inherent builder pair (`ConsolidatedReviewNode`,
-//! `EndReviewNode`, `content_pipeline`'s four nodes, `proposal_generator`'s
-//! three, `diagnostic_intake::IntakeExtractNode`, etc. — see the pre-plan
-//! note's file list) is UNCHANGED by this module and keeps working exactly
-//! as before; migrating them is later-phase work.
+//! **Migrated so far (`EN.ticket.transport-slot-consolidation`):**
+//! Phase 1 — `TriageTaskNode`, `GenerateTasksNode`, `ImplementTaskNode`
+//! (`SDLC_TASK`). Phase 2 — `ConsolidatedReviewNode`, `EndReviewNode`,
+//! `PatchDocsNode` (`SDLC_FLOW`). Phase 3 (narrowed to
+//! orchestration/sdlc_flow/sdlc_task per operator direction) —
+//! `nodes::judgment::JudgmentNode<T>`, the shared primitive
+//! `orchestration::inbox_triage::InboxTriageRunner` and
+//! `orchestration::preflight::PreflightRunner` both delegate to (those two
+//! wrapper structs are not graph `Node`s and hold no `TransportSlot` of
+//! their own — see each module's doc comment). Every other node still
+//! using the pre-existing hand-rolled `TransportSlot` field + inherent
+//! builder pair (`content_pipeline`'s four nodes, `proposal_generator`'s
+//! three, `diagnostic_intake::IntakeExtractNode`,
+//! `claim_reaffirm::judge::JudgeClaimNode`, `linkedin_post`'s node — see
+//! the pre-plan note's file list) is UNCHANGED by this module and keeps
+//! working exactly as before; migrating them is later-phase work,
+//! deliberately deferred by the operator for now.
 
 use std::sync::Arc;
 

@@ -29,13 +29,17 @@ use serde_json::Value;
 use claude_code_rs::Config;
 use engine_contract::TaskContext;
 
+use crate::cancellation::CancellationToken;
 use crate::node::Node;
-use crate::nodes::agent_code_step::{AgentCodeStep, MetaTransport};
+use crate::nodes::agent_code_step::AgentCodeStep;
 use crate::policy::{LocalConfig, ModelTier};
 use crate::sessions::ClaudeSession;
+use crate::workflows::llm_node::{
+    Cancellable as LlmCancellable, TransportSlotted as LlmTransportSlotted,
+};
 use crate::workflows::sdlc_flow::policy::TransportRetry;
 use crate::workflows::{
-    parse_structured_or_fenced, session_baseline, sessions_since, ModelTransport, TransportSlot,
+    parse_structured_or_fenced, session_baseline, sessions_since, TransportSlot,
 };
 
 /// `JudgmentNode` makes exactly one bounded transport attempt per call — no
@@ -204,8 +208,16 @@ fn build_prompt(
 
 /// A bounded, schema-constrained `claude` call over byte-capped input
 /// slices. See the module doc comment for the full shape and rationale.
+///
+/// `transport`/`cancellation_token` are the same two fields every
+/// `llm_node::TransportSlotted`/`llm_node::Cancellable` implementor holds —
+/// see those traits' doc comments in `workflows/llm_node.rs` for
+/// `with_meta_transport`/`with_transport`/`with_cancellation_token`'s
+/// default-method bodies. `None` (the default `new()` sets for the token)
+/// is behavior-stable: no token, no cancellation check.
 pub struct JudgmentNode<T> {
     transport: TransportSlot,
+    cancellation_token: Option<CancellationToken>,
     _marker: std::marker::PhantomData<T>,
 }
 
@@ -216,24 +228,9 @@ impl<T: DeserializeOwned> JudgmentNode<T> {
     pub fn new() -> Self {
         Self {
             transport: TransportSlot::default(),
+            cancellation_token: None,
             _marker: std::marker::PhantomData,
         }
-    }
-
-    /// Override the transport used by the composed `AgentCodeStep`. Tests
-    /// inject a stub so the gated suite never spawns a real subprocess.
-    #[must_use]
-    pub fn with_transport(mut self, transport: ModelTransport) -> Self {
-        self.transport.set_plain(transport);
-        self
-    }
-
-    /// Override the transport with a tier-aware `MetaTransport`. Takes
-    /// precedence over [`Self::with_transport`] when both are set.
-    #[must_use]
-    pub fn with_meta_transport(mut self, transport: MetaTransport) -> Self {
-        self.transport.set_meta(transport);
-        self
     }
 
     /// Run one bounded, schema-constrained `claude` call per `spec`,
@@ -267,10 +264,13 @@ impl<T: DeserializeOwned> JudgmentNode<T> {
         };
         config = crate::policy::apply_model_tier(config, spec.tier, &local_model);
 
-        let step = self
+        let mut step = self
             .transport
             .apply(AgentCodeStep::new(spec.identity.clone(), config, prompt))
             .with_retry_policy(NO_RETRY);
+        if let Some(token) = self.cancellation_token.clone() {
+            step = step.with_cancellation_token(token);
+        }
 
         let call_ctx = ctx.clone();
         let baseline = session_baseline(&call_ctx);
@@ -331,6 +331,22 @@ impl<T: DeserializeOwned> JudgmentNode<T> {
 impl<T: DeserializeOwned> Default for JudgmentNode<T> {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// See `llm_node::TransportSlotted`'s doc comment — `with_meta_transport`/
+/// `with_transport` are default methods over this one field.
+impl<T: DeserializeOwned> LlmTransportSlotted for JudgmentNode<T> {
+    fn transport_slot_mut(&mut self) -> &mut TransportSlot {
+        &mut self.transport
+    }
+}
+
+/// See `llm_node::Cancellable`'s doc comment — `with_cancellation_token` is
+/// a default method over this one field.
+impl<T: DeserializeOwned> LlmCancellable for JudgmentNode<T> {
+    fn cancellation_token_mut(&mut self) -> &mut Option<CancellationToken> {
+        &mut self.cancellation_token
     }
 }
 
