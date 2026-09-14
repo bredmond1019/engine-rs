@@ -20,6 +20,7 @@ use std::sync::{Arc, Mutex};
 use engine_contract::TaskContext;
 use engine_core::node::Node;
 use engine_core::routing::Router;
+use engine_core::workflows::llm_node::TransportSlotted as LlmTransportSlotted;
 use engine_core::workflows::sdlc_flow::schema::{SDLCState, SDLCTask};
 use engine_core::workflows::sdlc_flow::setup::{CommandOutput, CommandRunner};
 use engine_core::workflows::sdlc_flow::task_loop::{
