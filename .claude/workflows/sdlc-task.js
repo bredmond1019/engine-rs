@@ -419,26 +419,93 @@ function renderCommitSafetyGuard(gitCmd = 'git') {
 // it. This is the complement: it runs AFTER the task's own work commit (never before — HEAD~1 must exist), reads
 // tasksJsonPath itself at RUN TIME (never a JS-side static file list — the engine never parses tasks.json's
 // `files[]`, only the agent does) to get task `taskNum`'s declared files[], then aborts when ANY of:
-//   (1) the commit's diff (git diff --name-status HEAD~1 HEAD) is EMPTY;
-//   (2) NO changed path matches any declared file — condition (2);
-//   (3) the commit DELETES ("D" status) a path that is NOT a declared file — the EN.11.O shape, condition (3).
+//   (1) the commit range's diff (git diff --name-status <prevSha or HEAD~1> HEAD) is EMPTY, UNLESS the task's
+//       own tasks.json entry declares `expect_no_diff: true` — a task whose correct outcome IS no diff (a
+//       read-back/verification task, or one whose ACs were already satisfied by an earlier task) then PASSES
+//       instead of aborting (BT.ticket.work-assertion-cannot-express-a-correct-empty-intersection);
+//   (2) NO changed path matches a declared file, a sync-manifest SIBLING of a declared file (read from
+//       scripts/skill_sync_manifest.json / scripts/engine_docs_sync_manifest.json's `skill_md`/`docs_md`
+//       fields — a SKILL.md replication guide or docs/workflows/*.md page the engines themselves require to
+//       be re-stamped when the file it mirrors changes), or a declared DIRECTORY entry (one ending in "/",
+//       or matched as a path prefix) as a prefix of the changed path — condition (2);
+//   (3) the commit DELETES ("D" status) a path that is NOT a declared file (nor a sibling/prefix match) —
+//       the EN.11.O shape, condition (3).
 // Deletion is not itself the signal: a task that deletes a file it DECLARED passes condition (3) cleanly, since
-// that path is matched in WA_DECLARED. Diagnostic names the task and the failing condition, plus both path sets.
+// that path is matched. Diagnostic names the task and the failing condition, plus both path sets.
+// COMMIT-RANGE BOUNDARY: the range's start is `prevSha` — the PREVIOUS task's recorded commit (or the run's
+// base_sha for task 1), persisted in state.tasks/state.base_sha and therefore identical whether the engine is
+// running fresh or resuming — never a literal `HEAD~1`, which silently re-points at whatever commit happens to
+// be immediately before HEAD (a resume-time reconcile/wrap-up commit landing on top changes what `HEAD~1`
+// means without changing the underlying work). Callers with no persisted prevSha fall back to `HEAD~1` so any
+// other caller of this shared block stays unaffected by this bug's fix.
 // EXEMPT (by simply never being called at their commit sites, same idiom renderCommitSafetyGuard already uses
 // for the worktree-init commit): the worktree-init commit, the D16 `chore: derive tasks.json ...` fallback
 // commits, and the vault commit (step 7b) — the vault commits into a DIFFERENT repo where HEAD is the vault's
 // own and files[] entries are `planning/`-prefixed; comparing that commit's diff would need a second, foreign
-// HEAD~1 that may not exist yet in a freshly-adopted vault checkout and that other concurrent lanes also write
+// prevSha that may not exist yet in a freshly-adopted vault checkout and that other concurrent lanes also write
 // to, so a false WORK_ASSERTION_ABORT there would block an honest vault commit on a shared repo it does not
 // fully control. Exempted outright rather than compared.
 // <<shared:renderWorkAssertion>>
-function renderWorkAssertion(gitCmd = 'git', taskNum, tasksJsonPath) {
-  return `NAME_STATUS=$(${gitCmd} diff --name-status HEAD~1 HEAD); if [ -z "$NAME_STATUS" ]; then echo "WORK_ASSERTION_ABORT: task ${taskNum} commit diff is EMPTY (condition 1) - no work was committed"; exit 1; fi; WA_DECLARED=$(python3 -c "
+function renderWorkAssertion(gitCmd = 'git', taskNum, tasksJsonPath, prevSha) {
+  const range = prevSha ? prevSha : 'HEAD~1'
+  return `NAME_STATUS=$(${gitCmd} diff --name-status ${range} HEAD); WA_EXPECT_NO_DIFF=$(python3 -c "
+import json
+d = json.load(open('${tasksJsonPath}'))
+t = [x for x in d if x.get('task_id') == ${taskNum}]
+print('1' if (t and t[0].get('expect_no_diff')) else '0')
+"); if [ -z "$NAME_STATUS" ]; then if [ "$WA_EXPECT_NO_DIFF" = "1" ]; then exit 0; fi; echo "WORK_ASSERTION_ABORT: task ${taskNum} commit diff is EMPTY (condition 1) - no work was committed"; exit 1; fi; WA_RESULT=$(printf '%s' "$NAME_STATUS" | python3 -c "
+import sys, json
+name_status = sys.stdin.read()
+d = json.load(open('${tasksJsonPath}'))
+t = [x for x in d if x.get('task_id') == ${taskNum}]
+declared = t[0].get('files', []) if t else []
+def load_manifest(path):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except Exception:
+        return {}
+siblings = set()
+for manifest_path in ('scripts/skill_sync_manifest.json', 'scripts/engine_docs_sync_manifest.json'):
+    manifest = load_manifest(manifest_path)
+    for key, entry in manifest.items():
+        prefix = key.split('::', 1)[0]
+        if prefix in declared and isinstance(entry, dict):
+            for field in ('skill_md', 'docs_md'):
+                val = entry.get(field)
+                if val:
+                    siblings.add(val)
+def is_allowed(path):
+    if path in declared or path in siblings:
+        return True
+    for entry in declared:
+        if entry.endswith('/') and path.startswith(entry):
+            return True
+        if not entry.endswith('/') and path.startswith(entry + '/'):
+            return True
+    return False
+match = False
+bad_del = ''
+for line in name_status.splitlines():
+    if not line.strip():
+        continue
+    parts = line.split(chr(9))
+    status = parts[0]
+    chk = parts[-1]
+    if is_allowed(chk):
+        match = True
+    elif status.startswith('D'):
+        bad_del = chk
+if not declared:
+    match = True
+print('MATCH=' + ('1' if match else '0'))
+print('BADDEL=' + bad_del)
+"); WA_MATCH=$(printf '%s\n' "$WA_RESULT" | sed -n 's/^MATCH=//p'); WA_BADDEL=$(printf '%s\n' "$WA_RESULT" | sed -n 's/^BADDEL=//p'); WA_DECLARED=$(python3 -c "
 import json
 d = json.load(open('${tasksJsonPath}'))
 t = [x for x in d if x.get('task_id') == ${taskNum}]
 print(chr(10).join(t[0].get('files', []) if t else []))
-"); WA_MATCH=0; WA_BADDEL=""; while IFS=$'\t' read -r WA_ST WA_P1 WA_P2; do WA_CHK="$WA_P1"; case "$WA_ST" in R*) WA_CHK="$WA_P2" ;; esac; if printf '%s\n' "$WA_DECLARED" | grep -qFx "$WA_CHK"; then WA_MATCH=1; else case "$WA_ST" in D*) WA_BADDEL="$WA_CHK" ;; esac; fi; done <<< "$NAME_STATUS"; if [ -z "$WA_DECLARED" ]; then WA_MATCH=1; fi; if [ "$WA_MATCH" -eq 0 ]; then echo "WORK_ASSERTION_ABORT: task ${taskNum} commit's changed paths do not intersect declared files[] (condition 2) - declared: [$WA_DECLARED] - changed: [$NAME_STATUS]"; exit 1; fi; if [ -n "$WA_BADDEL" ]; then echo "WORK_ASSERTION_ABORT: task ${taskNum} commit deletes undeclared file '$WA_BADDEL' not present in files[] (condition 3) - declared: [$WA_DECLARED]"; exit 1; fi`
+"); if [ "$WA_MATCH" != "1" ]; then echo "WORK_ASSERTION_ABORT: task ${taskNum} commit's changed paths do not intersect declared files[] (condition 2) - declared: [$WA_DECLARED] - changed: [$NAME_STATUS]"; exit 1; fi; if [ -n "$WA_BADDEL" ]; then echo "WORK_ASSERTION_ABORT: task ${taskNum} commit deletes undeclared file '$WA_BADDEL' not present in files[] (condition 3) - declared: [$WA_DECLARED]"; exit 1; fi`
 }
 // <</shared:renderWorkAssertion>>
 
@@ -895,7 +962,7 @@ their output; empty when allPassed)${stateWrittenNote}.`
 //   runRootLabel       what to call the run directory in prose.
 //   extraReturnFields  StructuredOutput fields this engine wants that the other does not
 //                      (/sdlc-flow's reportFile). Empty string in the lean engine.
-function renderImplementPrompt({ roleIntro, runRootLabel, runRoot, extraReturnFields, isFix, taskNum, attempt, stem, blockId, specFile, specDesc, tasksJsonFile, breakdownFile, prevFailBlob, vault, GIT, renderCommitSafetyGuard, renderWorkAssertion }) {
+function renderImplementPrompt({ roleIntro, runRootLabel, runRoot, extraReturnFields, isFix, taskNum, attempt, stem, blockId, specFile, specDesc, tasksJsonFile, breakdownFile, prevFailBlob, vault, GIT, renderCommitSafetyGuard, renderWorkAssertion, prevSha }) {
   return `${roleIntro}
 
 Target:
@@ -950,6 +1017,11 @@ Target:
    this one. Load the \`write-okf-markdown\` skill for the full procedure, including the cross-repo
    \`<scope>:<doc_id>\` prefix form a target outside this file's own scope needs.
 
+3c. READ WITH THE READ TOOL, NOT WITH BASH. Open source files with Read (use offset/limit on a large
+   file) and search with Grep/Glob. Do not read or search source through Bash (\`cat\`, \`sed -n\`,
+   \`head\`, \`grep\`, \`rg\`): every Bash result stays in context for the rest of this task and is
+   re-sent on every later turn. Bash is for running commands, not for reading files.
+
 4. Follow every CLAUDE.md standing rule; add/update tests for new code/logic; verify any model ids /
    package names via the claude-api skill — never from memory.
 
@@ -961,7 +1033,11 @@ Target:
      cd ${runRoot} && grep -nE 'todo!\\(|unimplemented!\\(|unreachable!\\(|NotImplementedError|not implemented|FIXME' <those paths> 2>/dev/null
    If something required is incomplete, finish it now — do not commit a partial task.
 
-6. Run the spec's "## Validation Commands" for Task ${taskNum} to confirm correctness.
+6. Confirm correctness with the NARROWEST commands that exercise this task's own change: the tests
+   for the files and modules Task ${taskNum} touched (one test file, one module, or one test-name
+   filter), plus the build/typecheck those files need. Do NOT run the project's whole test suite or
+   the full gating set here. The test stage runs every gating check right after you commit, so a
+   full run here pays for the same suite twice on every attempt.
 
 7. Commit on the branch. Never use git add -A or git add . — stage files explicitly by name.
    Run: cd ${runRoot} && ${GIT} status
@@ -973,8 +1049,16 @@ EOF
    Run: cd ${runRoot} && ${GIT} log --oneline -1   (capture the short hash)
 
 7a. Post-commit work assertion (D81 lift condition 2) — prove this commit actually contains Task
-   ${taskNum}'s declared work, not the absence of it:
-   Run: cd ${runRoot} && ${renderWorkAssertion('git', taskNum, tasksJsonFile)}
+   ${taskNum}'s declared work, not the absence of it. The check's range runs from this task's own
+   start point (the previous task's recorded commit, or the run's base_sha for task 1 — never a
+   literal "one commit back") through HEAD, so a wrap-up or resume commit landing on top does not
+   change the verdict. It PASSES when the changed paths intersect declared files[] (a directory
+   entry in files[] matches as a prefix), OR when the diff lands only in a declared file's
+   sync-manifest sibling (a SKILL.md replication guide or docs/workflows/*.md page), OR when this
+   task's tasks.json entry declares \`expect_no_diff: true\` and the diff is genuinely empty (the
+   task's correct outcome IS no diff — say so via that field rather than leaving an empty diff to
+   be read as work-not-done):
+   Run: cd ${runRoot} && ${renderWorkAssertion('git', taskNum, tasksJsonFile, prevSha)}
    If this prints WORK_ASSERTION_ABORT, the commit failed the check — treat this as a task failure
    (investigate, fix, and re-commit) before proceeding; do NOT report success with a failing assertion.
    Capture the outcome as a STRUCTURED field, not only prose: this command's FINAL run this attempt
@@ -1294,6 +1378,7 @@ const MODEL = {
   triage:      'sonnet',   // classifies a failure RETRYABLE vs MAJOR — light judgment
   stateWriter: 'haiku',    // stamps timestamps, writes state.json, commits when asked
   bookkeep:    'haiku',    // lean close-out: mark tasks.md done, flip status.md + state.json block status, emit-state — a fixed procedure (mirrors /start-block)
+  harnessConfig: 'sonnet', // copies planning/harness.json into a nested StructuredOutput — haiku fails that schema after 2 nudges (9cbca7b); the real fix is a deterministic loader, not a cheaper model (BT.ticket.prepare-run-replaces-setup-agents)
 }
 
 // Final per-task fix pass before the loop gives up runs on a stronger model. The common path
@@ -1475,7 +1560,7 @@ STEP 2 — Decide:
     belong to the other engine). Preserve kind-specific fields verbatim; ignore any other fields.
 
 Return your findings using the StructuredOutput tool.
-`, { label: 'harness-config', schema: HARNESS_CONFIG_SCHEMA, model: 'sonnet' })
+`, { label: 'harness-config', schema: HARNESS_CONFIG_SCHEMA, model: MODEL.harnessConfig })
 
   // "__HARNESS_ABSENT__" or present-but-invalid-JSON both come back as present=false (STEP 2 above)
   // — both degrade to the spec's `## Validation Commands`, never a bail (D5 / standing rule 1: the
@@ -2824,6 +2909,14 @@ for (const taskNum of taskList) {
   state.tasks[String(taskNum)] = state.tasks[String(taskNum)] || { status: 'running', attempts: 0, summary: '', issues: [], fixes: [], decisions: [], files_changed: [], commit: '', validated: '' }
   const t = state.tasks[String(taskNum)]
 
+  // Work-assertion commit-range boundary (BT.ticket.work-assertion-cannot-express-a-correct-empty-
+  // intersection, task 3): the range's start is the PREVIOUS task's own recorded commit, or the
+  // run's base_sha for task 1 — both already persisted in state.tasks/state.base_sha, so this value
+  // is identical whether the engine is running fresh or resuming (a literal `HEAD~1`, by contrast,
+  // silently re-points at whatever commit is immediately before HEAD, which a resume-time wrap-up
+  // commit changes without changing the underlying work).
+  const prevSha = state.tasks[String(taskNum - 1)]?.commit || state.base_sha
+
   let taskPassed = false
   let prevFailBlob = null
   let taskStateWritten = false
@@ -2840,7 +2933,7 @@ for (const taskNum of taskList) {
     the branch (sequential — earlier tasks in this spec are already committed on this branch). Work ONLY on
     Task ${taskNum} of this spec.`
     const stageResult = await tracedAgent(`${W}
-${renderImplementPrompt({ roleIntro, runRootLabel: 'run root', runRoot: runDir, extraReturnFields: '', isFix, taskNum, attempt, stem, blockId, specFile, specDesc, tasksJsonFile, breakdownFile, prevFailBlob, vault, GIT, renderCommitSafetyGuard, renderWorkAssertion })}
+${renderImplementPrompt({ roleIntro, runRootLabel: 'run root', runRoot: runDir, extraReturnFields: '', isFix, taskNum, attempt, stem, blockId, specFile, specDesc, tasksJsonFile, breakdownFile, prevFailBlob, vault, GIT, renderCommitSafetyGuard, renderWorkAssertion, prevSha })}
 `, withModel({ label: `${isFix ? 'fix' : 'implement'}-${taskNum}-${attempt}`, schema: STAGE_SCHEMA, phase: 'Tasks' }, isFix ? fixModel : MODEL.implement))
     recordFilesRead(stageResult)
 

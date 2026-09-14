@@ -1,0 +1,79 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agentic-portfolio/base-template/meta.schema.json",
+  "title": "Run Meta Record",
+  "description": "A versioned record of one thing an SDLC engine run observed about itself, recovered or captured outside the normal state-file lifecycle. First consumer: work-assertion bails recovered from historical runs and replayed as fixtures (BT.ticket.work-assertion-cannot-express-a-correct-empty-intersection) — extracted by scripts/extract_bail_meta_fixtures.py into scripts/fixtures/bail_meta/work_assertion/, and read by both engines' own fixture suite plus engine-rs's EN.ticket.verify-claimed-writes-matches-the-js-work-assertion. `kind` is a closed enum on purpose — only 'bail' is defined yet. A future kind is added by extending the enum and adding its own sibling object next to `bail` (e.g. a `retry` object), never by loosening `bail` itself or by building a generic kind registry ahead of a second real consumer.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "kind", "bail"],
+  "properties": {
+    "schema_version": {
+      "type": "integer",
+      "description": "Format version of this record shape. Starts at 1; bump on any breaking change to the `bail` object below (a field renamed or its type changed — an additive optional field does not require a bump).",
+      "minimum": 1
+    },
+    "kind": {
+      "type": "string",
+      "description": "Which sibling object on this record is populated. Only 'bail' is defined yet — do not add other enum values speculatively; add one only when a second real record shape exists to populate it.",
+      "enum": ["bail"]
+    },
+    "bail": {
+      "type": "object",
+      "description": "Populated when kind is 'bail'. One recorded work-assertion bail (or a synthetic fixture built to the same shape), holding exactly what scripts/extract_bail_meta_fixtures.py can recover deterministically from a source state file and this repo's git history — never an invented or interpolated value.",
+      "additionalProperties": false,
+      "required": ["repo", "engine", "task_id", "name_status", "declared_files", "task_kind", "source"],
+      "properties": {
+        "repo": {
+          "type": "string",
+          "description": "Repo slug the bailed run executed in, as registered in brain.toml (e.g. 'base-template')."
+        },
+        "engine": {
+          "type": "string",
+          "description": "Which engine produced this bail.",
+          "enum": ["task", "flow"]
+        },
+        "task_id": {
+          "type": ["string", "integer"],
+          "description": "The task_id (sdlc-task) or task number (sdlc-flow) that bailed, exactly as recorded on the source state file."
+        },
+        "commit_range": {
+          "type": "string",
+          "description": "OPTIONAL. The commit range the work assertion evaluated for this bail (e.g. 'HEAD~1..HEAD' or '<prevSha>..HEAD'), when the source state file records enough to reconstruct it. Absent when unrecoverable — recovery must not guess this value.",
+          "minLength": 1
+        },
+        "name_status": {
+          "type": "array",
+          "description": "The literal `git diff --name-status` lines for this bail's commit range, one line per array entry. Empty array is a valid, meaningful value (an empty-diff bail) — it is never used as a stand-in for 'unrecoverable'.",
+          "items": { "type": "string" }
+        },
+        "declared_files": {
+          "type": "array",
+          "description": "The bailed task's own files[] at bail time, read from the source state file's recorded task-spec snapshot.",
+          "items": { "type": "string" }
+        },
+        "task_kind": {
+          "type": "string",
+          "description": "Coarse classification of what the task was trying to do, used to interpret an empty diff. 'validate-only' when the task's declared files[] was empty; 'code-change' otherwise.",
+          "enum": ["validate-only", "code-change"]
+        },
+        "validation_exit_codes": {
+          "type": "object",
+          "description": "OPTIONAL. Maps each validation command string the source state file recorded for this bail to its observed exit code. Empty object when the source recorded none — never fabricated.",
+          "additionalProperties": { "type": "integer" }
+        },
+        "primary_class": {
+          "type": "string",
+          "description": "OPTIONAL. Carried through verbatim from the source bail-classification record's own primary_class field, for traceability back to the classification this fixture was recovered from."
+        },
+        "specific_rule": {
+          "type": "string",
+          "description": "OPTIONAL. Carried through verbatim from the source bail-classification record's own specific_rule field."
+        },
+        "source": {
+          "type": "string",
+          "description": "Repo-relative or HQ-vault-relative path to the sdlc-task-state.json / sdlc-flow-state.json (or bail-classification record) this fixture was extracted from — the provenance trail back to the original evidence."
+        }
+      }
+    }
+  }
+}

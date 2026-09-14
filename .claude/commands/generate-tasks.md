@@ -188,6 +188,13 @@ $ARGUMENTS — one of two input modes:
      an altered trait/interface signature, and every call site each one touches — do **not** split
      it across tasks. Put the whole change in **one** task instead. This applies unconditionally:
      both engines are sequential, so there is no parallel-merge model to weigh it against.
+     **Named case: a task changes what a function returns or emits** (a return literal, an output
+     shape, an error message, a constant's value). Before fixing task boundaries, grep the whole test
+     tree for the OLD value. Every assertion still expecting it is fixed **in the same task** as the
+     behaviour change, never deferred to a later task, because any intermediate task whose gate
+     re-runs that test file inherits a red it cannot fix. Measured on `FE.7.D`: task 2 changed
+     `get_api_key_identity()` to return `"api-key"`, the stale `decided_by == "test-secret-key"`
+     assertion was scoped to task 7, and task 3 bailed on it.
    - Foundational steps come first; the final step is always Validate.
    - **Write the task list as `tasks.json`, not markdown headings.** Every SDLC engine reads
      `planning/<spec-slug>/tasks.json` directly — a **bare array** of `{task_id, title, description,
@@ -298,6 +305,11 @@ $ARGUMENTS — one of two input modes:
      [D63](../../planning/decisions/D63-per-task-validation-commands-augment-gating.md) the engine
      runs every `gates: true` check's `fastCommand` (or `command` where none is defined) alongside
      the task's own `validation_commands`, so a gating check left red still fails the task.
+     **When merging would bundle unrelated work, the other lever is harness-side:** a check marked
+     `perTask: false` in `planning/harness.json` is skipped by the per-task tripwire and runs only in
+     the run's final authoritative pass (the terminal reconcile under `/sdlc-task`). Use it for an
+     expensive or narrowly-scoped check, and say so in the spec's notes. Never use it to hide a check
+     a task genuinely breaks.
    - **No task's `files[]` names a path under `planning/` — can fail.** `planning/` is a symlink
      into the private HQ vault, excluded from this repo's git by `base-template/.gitignore:20` (the
      bare rule `/planning`). Code that references such a path — an `include_str!`, a fixture path,
@@ -690,9 +702,12 @@ available at authoring time for a docs/config/fixture-only task — a docs task 
 can otherwise cost minutes per attempt to validate a paragraph — but under `/sdlc-task` that saving
 comes from skipping the expensive `command` form, not the gating checks themselves. Example:
 `"validation_commands": ["test -f docs/thing.md", "grep -q '^type:' docs/thing.md", "grep -q 'thing.md' docs/index.md"]`
-`max_attempts` — defaults to 3, only set per-task to override. `files` — every task but the final
-Validate task needs ≥1 entry. `dependsOn` — ids that must complete first; the final Validate task
-depends on every other id.
+`max_attempts` and `dependsOn` are **informational under both SDLC engines**. Each runs tasks in
+array order with a fixed 3-attempt cap (`MAX_TASK_ATTEMPTS`) and reads neither field, so order tasks
+by position and do not rely on a per-task attempt override. Keep writing both for the task-list
+schema's consumers: `max_attempts` 3, and `dependsOn` the ids that must complete first, with the
+final Validate task depending on every other id. `files` — every task but the final Validate task
+needs ≥1 entry.
 
 **`expect_red`** — optional; omit it entirely for the ordinary case, which is unaffected: a task with
 no `expect_red` behaves exactly as it always has, no new ceremony required. Set it only for a task

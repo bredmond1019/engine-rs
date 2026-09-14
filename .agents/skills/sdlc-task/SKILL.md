@@ -444,9 +444,11 @@ For each `taskNum` in `taskList` (skip any already in the resume skip-set, loggi
      `<breakdownFile>` exists, use its `### Step <taskNum>:` sub-steps as a finer execution guide
      (`tasks.json` stays authoritative for scope). Run the D8 completeness self-check (no
      `todo!()`/`unimplemented!()`/`NotImplementedError`/`not implemented`/`FIXME` on any in-scope
-     path). Run the spec's validation commands for this task to confirm correctness locally — the
-     `## Validation Commands` section in prose (`tasks-md` source), or the `validation_commands`
-     field in the JSON block record (`block-record` source).
+     path). Read source with a file-reading tool, not `cat`/`sed`/`grep` through a shell, because
+     shell output stays in context for the rest of the task. Confirm correctness with the NARROWEST
+     commands that exercise this task's own change (the tests for the files and modules it touched,
+     plus the build/typecheck they need), never the whole suite or full gating set: the test stage
+     runs every gating check right after the commit. The spec's validation commands (the `## Validation Commands` section in prose for a `tasks-md` source, or the `validation_commands` field in the JSON block record for a `block-record` source) are the source to scope down from.
    - **Commit** (never `git add -A`/`git add .` — stage files explicitly by name). Run the
      COMMIT-SAFETY GUARD `&&`-joined with the commit itself, in the SAME shell call:
      ```
