@@ -15,14 +15,19 @@ use engine_contract::TaskContext;
 use serde::Deserialize;
 use serde_json::json;
 
+use crate::cancellation::CancellationToken;
 use crate::node::{Node, NodeError};
-use crate::nodes::{AgentCodeStep, MetaTransport};
+use crate::nodes::AgentCodeStep;
+#[cfg(test)]
+use crate::nodes::MetaTransport;
+use crate::workflows::llm_node::{
+    Cancellable as LlmCancellable, TransportSlotted as LlmTransportSlotted,
+};
 
 use super::task_loop::{apply_policy_config, resolved_policy, worktree_path, Stage};
-use super::{
-    parse_model_verdict, session_baseline, sessions_since, ModelTransport, ModelVerdict,
-    TransportSlot,
-};
+#[cfg(test)]
+use super::ModelTransport;
+use super::{parse_model_verdict, session_baseline, sessions_since, ModelVerdict, TransportSlot};
 
 /// Model output shape `PatchDocsNode` expects (strict JSON reply).
 #[derive(Debug, Deserialize)]
@@ -119,6 +124,14 @@ pub(super) const DOCS_STABLE_PROMPT: &str = include_str!("prompts/docs.md");
 pub struct PatchDocsNode {
     config: Config,
     transport: TransportSlot,
+    /// Taken through this node's OWN builder, never inferred from context —
+    /// mirrors `ConsolidatedReviewNode::with_cancellation_token`. `None`
+    /// (the default) is behavior-stable: no token, no cancellation check.
+    /// Added alongside the `llm_node` trait migration — this node had no
+    /// cancellation support at all before (a scope gap in its original
+    /// onboarding, not a deliberate omission; see `Cancellable`'s doc
+    /// comment).
+    cancellation_token: Option<CancellationToken>,
 }
 
 impl PatchDocsNode {
@@ -131,30 +144,8 @@ impl PatchDocsNode {
         Self {
             config: Config::default(),
             transport: TransportSlot::default(),
+            cancellation_token: None,
         }
-    }
-
-    /// Override the transport used by the composed `AgentCodeStep`. Tests
-    /// use this to stub a real subprocess call with a canned `Outcome`, so
-    /// the gated suite never spawns a real `claude`.
-    #[must_use]
-    pub fn with_transport(mut self, transport: ModelTransport) -> Self {
-        self.transport.set_plain(transport);
-        self
-    }
-
-    /// Override the transport with a tier-aware [`MetaTransport`] that
-    /// reports the [`TransportInfo`] of whichever call actually executed,
-    /// taking precedence over a plain transport set via
-    /// [`Self::with_transport`] — mirrors `TriageTaskNode::with_meta_transport`.
-    /// This is what lets `graph.rs::registry_for_policy` route this node
-    /// through a local model when `policy.model_tiers.docs == ModelTier::Local`.
-    ///
-    /// [`TransportInfo`]: crate::nodes::TransportInfo
-    #[must_use]
-    pub fn with_meta_transport(mut self, transport: MetaTransport) -> Self {
-        self.transport.set_meta(transport);
-        self
     }
 
     /// Override the base `Config` entirely (model/tool-permission/etc.
@@ -193,6 +184,24 @@ impl PatchDocsNode {
 impl Default for PatchDocsNode {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// See `llm_node::TransportSlotted`'s doc comment — `with_meta_transport`/
+/// `with_transport` are default methods over this one field. This is what
+/// lets `graph.rs::registry_for_policy` route this node through a local
+/// model when `policy.model_tiers.docs == ModelTier::Local`.
+impl LlmTransportSlotted for PatchDocsNode {
+    fn transport_slot_mut(&mut self) -> &mut TransportSlot {
+        &mut self.transport
+    }
+}
+
+/// See `llm_node::Cancellable`'s doc comment — `with_cancellation_token` is
+/// a default method over this one field.
+impl LlmCancellable for PatchDocsNode {
+    fn cancellation_token_mut(&mut self) -> &mut Option<CancellationToken> {
+        &mut self.cancellation_token
     }
 }
 
@@ -245,6 +254,9 @@ impl Node for PatchDocsNode {
         )
         .with_retry_policy(policy.transport_retry);
         step = self.transport.apply(step);
+        if let Some(token) = self.cancellation_token.clone() {
+            step = step.with_cancellation_token(token);
+        }
 
         let baseline = session_baseline(&ctx);
         let mut ctx = step.process(ctx).await?;

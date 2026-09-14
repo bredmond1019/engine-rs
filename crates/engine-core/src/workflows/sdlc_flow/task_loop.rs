@@ -27,7 +27,9 @@ use serde_json::json;
 use crate::cancellation::CancellationToken;
 use crate::coord::heavy_work::{HeavyWorkConfig, HeavyWorkQueue, HeavyWorkSpec};
 use crate::node::{Node, NodeError};
-use crate::nodes::{AgentCodeStep, MetaTransport};
+use crate::nodes::AgentCodeStep;
+#[cfg(test)]
+use crate::nodes::MetaTransport;
 use crate::routing::Router;
 use crate::suspend::{self, SuspendReason};
 use crate::workflows::llm_node::{
@@ -43,10 +45,11 @@ use super::policy::{
 };
 use super::schema::{RunMeta, SDLCState, SDLCTask, SDLCTaskStatus};
 use super::setup::baseline_snapshot_path;
+#[cfg(test)]
+use super::ModelTransport;
 use super::{
     carry_forward_billing, get_result, parse_model_verdict, parse_structured_or_fenced, put_result,
-    session_baseline, sessions_since, CommandOutput, CommandRunner, ModelTransport, ModelVerdict,
-    TransportSlot,
+    session_baseline, sessions_since, CommandOutput, CommandRunner, ModelVerdict, TransportSlot,
 };
 #[cfg(test)]
 use crate::policy::RESOLVED_POLICY_IDENTITY;
@@ -3499,34 +3502,6 @@ impl ConsolidatedReviewNode {
         }
     }
 
-    /// Override the transport used by the composed `AgentCodeStep`.
-    #[must_use]
-    pub fn with_transport(mut self, transport: ModelTransport) -> Self {
-        self.transport.set_plain(transport);
-        self
-    }
-
-    /// Attach a `CancellationToken`, raced against the composed
-    /// `AgentCodeStep`'s in-flight review model call so an abort issued
-    /// mid-call interrupts this node instead of only taking effect at the
-    /// next node boundary. With no token attached (the default), behavior
-    /// is unchanged from before this builder existed.
-    #[must_use]
-    pub fn with_cancellation_token(mut self, token: CancellationToken) -> Self {
-        self.cancellation_token = Some(token);
-        self
-    }
-
-    /// Override the transport with a tier-aware [`MetaTransport`] that
-    /// reports the [`TransportInfo`] of whichever call actually executed
-    /// (e.g. local vs. cloud fallback), taking precedence over a plain
-    /// transport set via [`Self::with_transport`].
-    #[must_use]
-    pub fn with_meta_transport(mut self, transport: MetaTransport) -> Self {
-        self.transport.set_meta(transport);
-        self
-    }
-
     /// Override the command runner used for the `git diff` invocation.
     #[must_use]
     pub fn with_runner(mut self, runner: CommandRunner) -> Self {
@@ -3547,6 +3522,24 @@ impl ConsolidatedReviewNode {
 impl Default for ConsolidatedReviewNode {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// See `llm_node::TransportSlotted`'s doc comment — `with_meta_transport`/
+/// `with_transport` are default methods over this one field.
+impl LlmTransportSlotted for ConsolidatedReviewNode {
+    fn transport_slot_mut(&mut self) -> &mut TransportSlot {
+        &mut self.transport
+    }
+}
+
+/// See `llm_node::Cancellable`'s doc comment — `with_cancellation_token` is
+/// a default method over this one field. `None` (the default `new()` sets)
+/// is behavior-stable: no token, no cancellation check, identical to before
+/// this trait existed.
+impl LlmCancellable for ConsolidatedReviewNode {
+    fn cancellation_token_mut(&mut self) -> &mut Option<CancellationToken> {
+        &mut self.cancellation_token
     }
 }
 
@@ -9754,6 +9747,66 @@ pub(crate) mod tests {
             json!({ "worktree_path": "." }),
         );
         ctx
+    }
+
+    /// Live smoke, `#[ignore]`d (same convention as `llm_node.rs`'s
+    /// `live_resolve_meta_transport_local_dispatches_to_real_ollama`) —
+    /// proves `resolve_meta_transport`'s `ClaudeCli + Local` branch
+    /// dispatches a REAL local Ollama call all the way through the
+    /// newly-migrated `ConsolidatedReviewNode`'s own `TransportSlotted`
+    /// wiring via `wire()`, not just the free function `llm_node.rs`
+    /// already proves hermetically (Phase 2 of `EN.ticket.transport-slot-
+    /// consolidation`). Run explicitly: `cargo nextest run -p engine-core \
+    /// task_loop::tests::live_consolidated_review_node_dispatches_to_real_ollama \
+    /// --run-ignored ignored-only`, with a local Ollama serving a real
+    /// model at `http://localhost:11434` (confirmed reachable via
+    /// `curl localhost:11434/api/tags` before this run).
+    #[tokio::test]
+    #[ignore = "requires a live local Ollama endpoint"]
+    async fn live_consolidated_review_node_dispatches_to_real_ollama() {
+        use crate::policy::PiConfig;
+        use crate::workflows::llm_node::{resolve_meta_transport, wire};
+        use crate::workflows::sdlc_flow::policy::LocalConfig;
+
+        let local = LocalConfig {
+            endpoint: "http://localhost:11434".to_string(),
+            model: "qwen2.5-coder:7b-ctx16384".to_string(),
+            constrained_json: false,
+        };
+        let transport = resolve_meta_transport(
+            ModelTier::Local,
+            AgentBackend::ClaudeCli,
+            &local,
+            &PiConfig::default(),
+        );
+
+        let runner: CommandRunner = Arc::new(|_program, _args, _cwd| {
+            Ok(CommandOutput {
+                status: 0,
+                stdout: "diff --git a b".to_string(),
+                stderr: String::new(),
+            })
+        });
+        let node = wire(
+            ConsolidatedReviewNode::new().with_runner(runner),
+            transport,
+            None,
+        );
+
+        let task = SDLCTask::new(1, "One", "d1");
+        let state = state_with_tasks(vec![task.clone()]);
+        let ctx = ctx_for_review(&state, &task);
+
+        let out = node
+            .process(ctx)
+            .await
+            .expect("live Ollama call must succeed — is `ollama serve` running on :11434?");
+
+        assert_eq!(
+            out.nodes["ConsolidatedReviewNode"]["transport"]["tier"], "local",
+            "resolve_meta_transport's Local branch, forwarded through wire()/TransportSlotted, \
+             must dispatch via the real local transport, not fall back to cloud"
+        );
     }
 
     #[tokio::test]

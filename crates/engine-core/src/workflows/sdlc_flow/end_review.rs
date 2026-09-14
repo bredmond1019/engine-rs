@@ -42,18 +42,24 @@ use claude_code_rs::Config;
 use engine_contract::TaskContext;
 use serde_json::json;
 
+use crate::cancellation::CancellationToken;
 use crate::node::{Node, NodeError};
-use crate::nodes::{AgentCodeStep, MetaTransport};
+use crate::nodes::AgentCodeStep;
 use crate::routing::Router;
+use crate::workflows::llm_node::{
+    Cancellable as LlmCancellable, TransportSlotted as LlmTransportSlotted,
+};
 
 use super::policy::ReviewMode;
 use super::task_loop::{
     apply_policy, bound_review_diff, latest_state, resolved_policy, review_output_schema,
     stage_untracked_intent, worktree_path, ReviewOutput, Stage, REVIEW_STABLE_PROMPT,
 };
+#[cfg(test)]
+use super::ModelTransport;
 use super::{
     carry_forward_billing, get_result, parse_model_verdict, put_result, session_baseline,
-    sessions_since, CommandRunner, ModelTransport, ModelVerdict, TransportSlot,
+    sessions_since, CommandRunner, ModelVerdict, TransportSlot,
 };
 
 /// The result-node name [`EndReviewNode`] stamps under, and the name
@@ -97,6 +103,14 @@ pub struct EndReviewNode {
     config: Config,
     transport: TransportSlot,
     runner: CommandRunner,
+    /// Taken through this node's OWN builder, never inferred from context —
+    /// mirrors `ConsolidatedReviewNode::with_cancellation_token`. `None`
+    /// (the default) is behavior-stable: no token, no cancellation check.
+    /// Added alongside the `llm_node` trait migration — this node had no
+    /// cancellation support at all before (a scope gap in its original
+    /// onboarding, not a deliberate omission; see `Cancellable`'s doc
+    /// comment).
+    cancellation_token: Option<CancellationToken>,
 }
 
 impl EndReviewNode {
@@ -109,23 +123,8 @@ impl EndReviewNode {
             },
             transport: TransportSlot::default(),
             runner: super::default_command_runner(),
+            cancellation_token: None,
         }
-    }
-
-    /// Override the transport used by the composed `AgentCodeStep`.
-    #[must_use]
-    pub fn with_transport(mut self, transport: ModelTransport) -> Self {
-        self.transport.set_plain(transport);
-        self
-    }
-
-    /// Override the transport with a tier-aware [`MetaTransport`], taking
-    /// precedence over a plain transport set via [`Self::with_transport`] —
-    /// same precedence as `ConsolidatedReviewNode::with_meta_transport`.
-    #[must_use]
-    pub fn with_meta_transport(mut self, transport: MetaTransport) -> Self {
-        self.transport.set_meta(transport);
-        self
     }
 
     /// Override the command runner used for the `git diff` invocation.
@@ -149,6 +148,22 @@ impl EndReviewNode {
 impl Default for EndReviewNode {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// See `llm_node::TransportSlotted`'s doc comment — `with_meta_transport`/
+/// `with_transport` are default methods over this one field.
+impl LlmTransportSlotted for EndReviewNode {
+    fn transport_slot_mut(&mut self) -> &mut TransportSlot {
+        &mut self.transport
+    }
+}
+
+/// See `llm_node::Cancellable`'s doc comment — `with_cancellation_token` is
+/// a default method over this one field.
+impl LlmCancellable for EndReviewNode {
+    fn cancellation_token_mut(&mut self) -> &mut Option<CancellationToken> {
+        &mut self.cancellation_token
     }
 }
 
@@ -211,9 +226,12 @@ impl Node for EndReviewNode {
         config.cwd = Some(std::path::PathBuf::from(&worktree));
         config.json_schema = Some(review_output_schema());
 
-        let step = self.transport.apply(
+        let mut step = self.transport.apply(
             AgentCodeStep::new(NODE_NAME, config, prompt).with_retry_policy(policy.transport_retry),
         );
+        if let Some(token) = self.cancellation_token.clone() {
+            step = step.with_cancellation_token(token);
+        }
 
         let baseline = session_baseline(&ctx);
         let mut ctx = step.process(ctx).await?;
