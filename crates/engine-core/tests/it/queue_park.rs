@@ -62,6 +62,7 @@ use engine_core::repo_registry::RepoRegistry;
 use engine_core::schema::{NodeConfig, WorkflowSchema};
 use engine_core::suspend::{self, SuspendReason};
 use engine_core::workflow::{OnProgress, Workflow, WorkflowError};
+use engine_core::workflows::llm_node::TransportSlotted as LlmTransportSlotted;
 use engine_core::workflows::orchestration::execute::{
     default_flow_runner_with_heavy_work, execute_step, DiskHeavyJobLookup, EngineKind,
     FlowInvocation,

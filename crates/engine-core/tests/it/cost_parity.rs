@@ -43,6 +43,7 @@ use engine_core::policy::PolicyConfigSource;
 use engine_core::repo_registry::RepoRegistry;
 use engine_core::sessions::{ClaudeSession, SESSIONS_METADATA_KEY};
 use engine_core::workflow::Workflow;
+use engine_core::workflows::llm_node::TransportSlotted as LlmTransportSlotted;
 use engine_core::workflows::orchestration::chain::ChainStep;
 use engine_core::workflows::orchestration::execute::{
     execute_step, EngineKind, FlowInvocation, FlowRunner,

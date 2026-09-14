@@ -35,6 +35,7 @@ use claude_code_rs::Outcome;
 use engine_contract::TaskContext;
 use engine_core::node::{Node, NodeError, NodeRegistry};
 use engine_core::workflow::Workflow;
+use engine_core::workflows::llm_node::TransportSlotted as LlmTransportSlotted;
 use engine_core::workflows::sdlc_flow::close_block::CloseBlockNode;
 use engine_core::workflows::sdlc_flow::docs::PatchDocsNode;
 use engine_core::workflows::sdlc_flow::emit_state::EmitStateNode;

@@ -57,6 +57,7 @@ use engine_core::workflows::sdlc_task::DEFAULT_STATE_FILENAME;
 // chain — a different subsystem from the rest of this file (which drives
 // the assembled SDLC_TASK graph in isolation), pulled in only for the
 // handful of tests at the bottom of this file per the task's file scope.
+use engine_core::workflows::llm_node::TransportSlotted as LlmTransportSlotted;
 use engine_core::workflows::orchestration::execute::{EngineKind, FlowInvocation, FlowRunner};
 use engine_core::workflows::orchestration::graph::{
     OrchestrationRunNode, NODE_NAME as ORCH_NODE_NAME,

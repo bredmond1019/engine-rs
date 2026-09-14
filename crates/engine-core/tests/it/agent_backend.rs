@@ -31,6 +31,7 @@ use engine_core::nodes::{
 use engine_core::policy::telemetry::{harvest as harvest_telemetry, RunTelemetryInputs};
 use engine_core::policy::{AgentBackend, LocalConfig, PiConfig, Policy, RESOLVED_POLICY_IDENTITY};
 use engine_core::sessions;
+use engine_core::workflows::llm_node::TransportSlotted as LlmTransportSlotted;
 use engine_core::workflows::sdlc_flow::graph::{
     registry_for_policy as sdlc_flow_registry_for_policy,
     registry_for_policy_with_cancellation as sdlc_flow_registry_for_policy_with_cancellation,

@@ -34,6 +34,7 @@ use claude_code_rs::Outcome;
 use engine_contract::{NodeRunStatus, TaskContext};
 use engine_core::node::{Node, NodeError, NodeRegistry};
 use engine_core::workflow::Workflow;
+use engine_core::workflows::llm_node::TransportSlotted as LlmTransportSlotted;
 use engine_core::workflows::sdlc_flow::docs::PatchDocsNode;
 use engine_core::workflows::sdlc_flow::end_review::{EndReviewNode, EndReviewRouterNode};
 use engine_core::workflows::sdlc_flow::final_validation::FinalValidationNode;
