@@ -52,8 +52,8 @@ use super::task_loop::{
     stage_untracked_intent, worktree_path, ReviewOutput, Stage, REVIEW_STABLE_PROMPT,
 };
 use super::{
-    carry_forward_billing, get_result, parse_structured_or_fenced, put_result, CommandRunner,
-    ModelTransport, TransportSlot,
+    carry_forward_billing, get_result, parse_model_verdict, put_result, CommandRunner,
+    ModelTransport, ModelVerdict, TransportSlot,
 };
 
 /// The result-node name [`EndReviewNode`] stamps under, and the name
@@ -66,24 +66,6 @@ pub const NODE_NAME: &str = "EndReviewNode";
 /// `harness.json`: that block is not read anywhere in this workflow today,
 /// which is its own parity gap and out of this ticket's scope.
 const FALLBACK_DIFF_BASE: &str = "main";
-
-/// Cap on `raw_output_preview`'s length when a review reply is genuinely
-/// unparseable (see [`EndReviewNode::process`]'s `UNPARSEABLE` branch) — a
-/// diagnostics aid for the operator reading the committed state, not a value
-/// any Rust branch parses, so it stays generous but bounded rather than
-/// risking a multi-KB local-model ramble bloating `sdlc-flow-state.json`.
-const RAW_OUTPUT_PREVIEW_MAX_CHARS: usize = 2000;
-
-/// Truncate `text` to at most [`RAW_OUTPUT_PREVIEW_MAX_CHARS`] chars (not
-/// bytes — char-boundary-safe on any UTF-8 input), appending a visible marker
-/// when truncated so the preview never silently looks complete.
-fn truncate_for_diagnostics(text: &str) -> String {
-    if text.chars().count() <= RAW_OUTPUT_PREVIEW_MAX_CHARS {
-        return text.to_string();
-    }
-    let truncated: String = text.chars().take(RAW_OUTPUT_PREVIEW_MAX_CHARS).collect();
-    format!("{truncated}... [truncated]")
-}
 
 /// Render every task's `acceptance_criteria` in the run's committed state
 /// into one "## Acceptance Criteria" block, numbered by task so the model
@@ -267,43 +249,50 @@ impl Node for EndReviewNode {
         // NOT silently claim PASS: `"UNPARSEABLE"` is not in
         // `EndReviewRouterNode::route`'s `PASS` arm, so the router still
         // sends this to `WrapUpNode`, not `PatchDocsNode`.
-        let parsed: Result<ReviewOutput, serde_json::Error> =
-            parse_structured_or_fenced(&ctx, NODE_NAME, &content);
-        let (normalized_verdict, mut result) = match parsed {
-            Ok(parsed) => {
-                let normalized_verdict = parsed.verdict.trim().to_uppercase();
-                let result = json!({
-                    "verdict": normalized_verdict,
-                    "summary": parsed.summary,
-                    "issues": parsed.issues,
-                    // See `ReviewOutput::localized` — stamped for the operator
-                    // and `/fix` routing; no Rust branch reads it, so this is
-                    // behavior-stable.
-                    "localized": parsed.localized,
-                    "review_diff_max_chars": diff_budget,
-                    "review_diff_truncated": diff_truncated,
-                });
-                (normalized_verdict, result)
-            }
-            Err(err) => {
-                let verdict = "UNPARSEABLE".to_string();
-                let result = json!({
-                    "verdict": verdict,
-                    "summary": format!(
-                        "End-of-run review output could not be parsed as JSON: {err}"
-                    ),
-                    "issues": Vec::<String>::new(),
-                    "localized": false,
-                    "review_diff_max_chars": diff_budget,
-                    "review_diff_truncated": diff_truncated,
-                    // Bounded, never the full reply — this is diagnostics for
-                    // an operator reading the committed state, not something
-                    // any Rust branch parses.
-                    "raw_output_preview": truncate_for_diagnostics(&content),
-                });
-                (verdict, result)
-            }
-        };
+        //
+        // This is the reference implementation `ModelVerdict` (`workflows/
+        // mod.rs`) generalizes for other nodes — see its doc comment for the
+        // full 24-site audit and which other nodes now share this shape
+        // (`TriageTaskNode`/`ConsolidatedReviewNode`, `task_loop.rs`).
+        let (normalized_verdict, mut result) =
+            match parse_model_verdict::<ReviewOutput>(&ctx, NODE_NAME, &content) {
+                ModelVerdict::Parsed(parsed) => {
+                    let normalized_verdict = parsed.verdict.trim().to_uppercase();
+                    let result = json!({
+                        "verdict": normalized_verdict,
+                        "summary": parsed.summary,
+                        "issues": parsed.issues,
+                        // See `ReviewOutput::localized` — stamped for the
+                        // operator and `/fix` routing; no Rust branch reads
+                        // it, so this is behavior-stable.
+                        "localized": parsed.localized,
+                        "review_diff_max_chars": diff_budget,
+                        "review_diff_truncated": diff_truncated,
+                    });
+                    (normalized_verdict, result)
+                }
+                ModelVerdict::Unparseable {
+                    raw_preview,
+                    reason,
+                } => {
+                    let verdict = "UNPARSEABLE".to_string();
+                    let result = json!({
+                        "verdict": verdict,
+                        "summary": format!(
+                            "End-of-run review output could not be parsed as JSON: {reason}"
+                        ),
+                        "issues": Vec::<String>::new(),
+                        "localized": false,
+                        "review_diff_max_chars": diff_budget,
+                        "review_diff_truncated": diff_truncated,
+                        // Bounded, never the full reply — this is diagnostics
+                        // for an operator reading the committed state, not
+                        // something any Rust branch parses.
+                        "raw_output_preview": raw_preview,
+                    });
+                    (verdict, result)
+                }
+            };
         if !matches!(normalized_verdict.as_str(), "PASS" | "FAIL" | "PARTIAL") {
             result["unrecognized_verdict"] = json!(normalized_verdict);
         }

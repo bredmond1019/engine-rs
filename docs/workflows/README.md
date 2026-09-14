@@ -155,6 +155,24 @@ interpolating `format!`s) stays in Rust, per CLAUDE.md standing rule 6. A regres
 `crates/engine-core/tests/it/prompt_externalization.rs`, fails the suite if a new stable-prompt
 `const` is ever written as an inline literal instead of `include_str!`.
 
+## Handling unparseable model output
+
+Every node that asks a model for strict JSON (via `parse_structured_or_fenced`, `workflows/mod.rs`)
+must decide what to do when a reply survives fence-stripping and balanced-JSON extraction and is
+STILL not valid JSON — small local models do this routinely. That decision is node-specific: use
+[`workflows::mod::ModelVerdict`](../../crates/engine-core/src/workflows/mod.rs) and
+`parse_model_verdict` (its doc comment carries the full audit and the fatal-vs-degrade rule of
+thumb) instead of propagating `parse_structured_or_fenced`'s `Err` as a fatal `NodeError` by hand.
+
+**The short version:** if the parsed value IS the node's entire output with no sensible degraded
+fallback (a drafted document, a generated task list, an extracted brief), a fatal `NodeError` is
+still correct — leave it alone. If the node's output is already a verdict/enum shape with an
+established non-fatal path for an out-of-enum *value* (the `unrecognized_verdict` convention in
+`sdlc_flow/task_loop.rs`), a parse failure is the same failure mode one level earlier and should
+degrade to a named `"UNPARSEABLE"` verdict the same way, via `ModelVerdict`. `EndReviewNode`
+(`sdlc_flow/end_review.rs`) is the reference implementation; `TriageTaskNode` and
+`ConsolidatedReviewNode` (`sdlc_flow/task_loop.rs`) are migrated onto the same shared helper.
+
 ## Tuning a workflow: profiles and local models
 
 Most workflows expose a **policy** — the knobs that trade cost, speed and quality (which model tier

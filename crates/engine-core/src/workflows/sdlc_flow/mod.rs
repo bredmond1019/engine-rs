@@ -42,6 +42,13 @@
 // import site elsewhere in the crate must keep resolving unchanged.
 #[allow(unused_imports)]
 pub(crate) use super::{get_result, parse_structured_or_fenced, put_result, strip_json_fence};
+// `ModelVerdict`/`parse_model_verdict` (`EN.ticket.model-verdict-shared-
+// abstraction`) — the fatal-vs-degrade decision layered on top of
+// `parse_structured_or_fenced`; see `workflows::mod::ModelVerdict`'s doc
+// comment for the full audit of which nodes should use this vs. propagate a
+// fatal `NodeError`. `end_review.rs` and `task_loop.rs` are the callers here.
+#[allow(unused_imports)]
+pub(crate) use super::{parse_model_verdict, ModelVerdict};
 // `session_baseline`/`sessions_since` (EN.14.C task 1) — the ledger-delta
 // helper pair a wrapper reads before its inner `AgentCodeStep` call and
 // attaches to any `NodeError` it constructs after that call, so a billed

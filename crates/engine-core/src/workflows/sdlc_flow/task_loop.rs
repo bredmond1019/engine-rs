@@ -41,8 +41,9 @@ use super::policy::{
 use super::schema::{RunMeta, SDLCState, SDLCTask, SDLCTaskStatus};
 use super::setup::baseline_snapshot_path;
 use super::{
-    carry_forward_billing, get_result, parse_structured_or_fenced, put_result, session_baseline,
-    sessions_since, CommandOutput, CommandRunner, ModelTransport, TransportSlot,
+    carry_forward_billing, get_result, parse_model_verdict, parse_structured_or_fenced, put_result,
+    session_baseline, sessions_since, CommandOutput, CommandRunner, ModelTransport, ModelVerdict,
+    TransportSlot,
 };
 #[cfg(test)]
 use crate::policy::RESOLVED_POLICY_IDENTITY;
@@ -3245,13 +3246,38 @@ impl Node for TriageTaskNode {
                     .with_sessions(sessions_since(&ctx, baseline))
             })?
             .to_string();
-        let parsed: TriageOutput = parse_structured_or_fenced(&ctx, "TriageTaskNode", &content)
-            .map_err(|err| {
-                NodeError::new(format!(
-                    "TriageTaskNode: failed to parse model output as JSON: {err}"
-                ))
-                .with_sessions(sessions_since(&ctx, baseline))
-            })?;
+        // A parse failure here is the same failure mode `EndReviewNode` fixed
+        // (`EN.ticket.review-mode-endonly-reviews-nothing`), one level
+        // earlier: a small local model's triage reply that survives
+        // `parse_structured_or_fenced`'s hardening and is still not valid
+        // JSON must not kill the whole run when the underlying test failure
+        // classification is a routine, recoverable event. `TriageTaskNode`
+        // already has the exact non-fatal shape for this — the
+        // `unrecognized_verdict` convention a few lines below, for an
+        // out-of-enum *value* — so an unparseable reply degrades to the same
+        // named `"UNPARSEABLE"` verdict `EndReviewNode` uses, via the shared
+        // [`super::ModelVerdict`] abstraction, instead of a fatal `NodeError`.
+        // `TriageRouterNode`'s catch-all arm already sends any unrecognized
+        // verdict to `WrapUpNode` — no router change needed.
+        let (parsed, raw_output_preview): (TriageOutput, Option<String>) =
+            match parse_model_verdict(&ctx, "TriageTaskNode", &content) {
+                ModelVerdict::Parsed(parsed) => (parsed, None),
+                ModelVerdict::Unparseable {
+                    raw_preview,
+                    reason,
+                } => (
+                    TriageOutput {
+                        verdict: "UNPARSEABLE".to_string(),
+                        reason: format!(
+                            "TriageTaskNode: model output could not be parsed as JSON: {reason}"
+                        ),
+                        evidence: String::new(),
+                        base_state_checked: false,
+                        same_failure_as_before: false,
+                    },
+                    Some(raw_preview),
+                ),
+            };
 
         let normalized_verdict = parsed.verdict.trim().to_uppercase();
         let mut result = json!({
@@ -3276,6 +3302,11 @@ impl Node for TriageTaskNode {
             "PASS" | "RETRYABLE" | "MAJOR_BAIL"
         ) {
             result["unrecognized_verdict"] = json!(normalized_verdict);
+        }
+        if let Some(raw_output_preview) = raw_output_preview {
+            // Bounded, never the full reply — diagnostics for an operator
+            // reading committed state, not something any Rust branch parses.
+            result["raw_output_preview"] = json!(raw_output_preview);
         }
         // Carried forward below: `put_result` replaces this node's whole
         // `ctx.nodes` entry, which would otherwise silently drop what
@@ -3629,15 +3660,33 @@ impl Node for ConsolidatedReviewNode {
                     .with_sessions(sessions_since(&ctx, baseline))
             })?
             .to_string();
-        let parsed: ReviewOutput =
-            parse_structured_or_fenced(&ctx, "ConsolidatedReviewNode", &content).map_err(
-                |err| {
-                    NodeError::new(format!(
-                        "ConsolidatedReviewNode: failed to parse model output as JSON: {err}"
-                    ))
-                    .with_sessions(sessions_since(&ctx, baseline))
-                },
-            )?;
+        // Same treatment as `TriageTaskNode` and the `EndReviewNode` fix it
+        // mirrors: this node is `EndReviewNode`'s exact per-task sibling
+        // (identical `ReviewOutput{verdict}` shape, same `ReviewRouterNode`/
+        // `unrecognized_verdict` convention), so a reply that survives
+        // `parse_structured_or_fenced`'s hardening and is still not valid
+        // JSON degrades to a named `"UNPARSEABLE"` verdict via
+        // [`super::ModelVerdict`] instead of a fatal `NodeError`.
+        // `ReviewRouterNode`'s catch-all arm already sends any unrecognized
+        // verdict to `WrapUpNode` — no router change needed.
+        let (parsed, raw_output_preview): (ReviewOutput, Option<String>) =
+            match parse_model_verdict(&ctx, "ConsolidatedReviewNode", &content) {
+                ModelVerdict::Parsed(parsed) => (parsed, None),
+                ModelVerdict::Unparseable {
+                    raw_preview,
+                    reason,
+                } => (
+                    ReviewOutput {
+                        verdict: "UNPARSEABLE".to_string(),
+                        summary: format!(
+                            "ConsolidatedReviewNode: model output could not be parsed as JSON: {reason}"
+                        ),
+                        issues: Vec::new(),
+                        localized: false,
+                    },
+                    Some(raw_preview),
+                ),
+            };
 
         let normalized_verdict = parsed.verdict.trim().to_uppercase();
         let mut result = json!({
@@ -3664,6 +3713,11 @@ impl Node for ConsolidatedReviewNode {
         });
         if !matches!(normalized_verdict.as_str(), "PASS" | "FAIL" | "PARTIAL") {
             result["unrecognized_verdict"] = json!(normalized_verdict);
+        }
+        if let Some(raw_output_preview) = raw_output_preview {
+            // Bounded, never the full reply — diagnostics for an operator
+            // reading committed state, not something any Rust branch parses.
+            result["raw_output_preview"] = json!(raw_output_preview);
         }
         // The retry bound's counter: charged to THIS task, and only when the
         // verdict is one that can send the run back around the loop. A PASS
@@ -11785,52 +11839,65 @@ pub(crate) mod tests {
             .expect("TriageTaskNode should succeed")
     }
 
-    /// EN.14.C task 3 — REALISM requirement: drive the actual
-    /// `TriageTaskNode` (not a synthetic stand-in) with a fake transport that
-    /// bills the API (`billing_outcome`, a real `cost_usd`/`session_id`) and
-    /// then returns content `TriageOutput` cannot parse, so the wrapper
-    /// fails AFTER the billed call — exactly the measured case named in the
-    /// block's `why`. Asserts on the returned `NodeError` directly (this
-    /// module has no access to the private `node_context`; the generic
-    /// `node_context`-level tests in `workflow.rs` cover that once a
-    /// `NodeError` carries a session via `.with_sessions(..)`, `node_context`
-    /// retains it across the discard — this test proves the real wrapper
-    /// populates that field in the first place).
+    /// EN.14.C task 3 (billing) + `EN.ticket.model-verdict-shared-abstraction`
+    /// (the fatal-vs-degrade fix): drive the actual `TriageTaskNode` (not a
+    /// synthetic stand-in) with a fake transport that bills the API
+    /// (`billing_outcome`, a real `cost_usd`/`session_id`) and then returns
+    /// content `TriageOutput` cannot parse. Since the migration onto
+    /// `ModelVerdict`, this is no longer a fatal wrapper failure — it degrades
+    /// to a named `"UNPARSEABLE"` verdict, the same house convention
+    /// `EndReviewNode` uses, and the billed call's session must still be
+    /// visible on the successful `ctx` (via `metadata.claude_sessions`, not a
+    /// discarded `NodeError`, since there is no error to discard here).
     #[tokio::test]
-    async fn triage_task_node_preserves_billed_session_on_post_billed_call_parse_failure() {
+    async fn triage_task_node_degrades_unparseable_output_to_a_labeled_verdict_preserving_billing()
+    {
         let task = SDLCTask::new(1, "One", "d1");
         let transport: ModelTransport = Arc::new(|_config, _prompt| {
             // Billed (real cost + a session id), but the text is neither
-            // valid `TriageOutput` JSON nor a parseable fenced block — the
-            // parse-failure branch this block targets.
+            // valid `TriageOutput` JSON nor a parseable fenced block.
             Box::pin(async { Ok(billing_outcome("not parseable as TriageOutput at all")) })
         });
         let node = TriageTaskNode::new().with_transport(transport);
         let mut ctx = ctx_with_test_result(false, &task);
         ctx.event = json!({ "spec_slug": "my-spec", "llm_triage": true });
 
-        let err = node
+        let out = node
             .process(ctx)
             .await
-            .expect_err("unparseable model output must fail the wrapper");
+            .expect("a parse failure must not be a fatal NodeError");
 
+        let result = &out.nodes["TriageTaskNode"];
+        assert_eq!(result["verdict"], json!("UNPARSEABLE"));
+        assert_eq!(result["unrecognized_verdict"], json!("UNPARSEABLE"));
         assert!(
-            err.message.contains("failed to parse model output"),
-            "err: {}",
-            err.message
+            result["reason"]
+                .as_str()
+                .unwrap()
+                .contains("could not be parsed as JSON"),
+            "reason must name the parse failure: {result:?}"
         );
-        assert_eq!(
-            err.sessions.len(),
-            1,
-            "the billed call's session must be carried on the wrapper's \
-             failure, not dropped: {:?}",
-            err.sessions
+        assert!(
+            result["raw_output_preview"]
+                .as_str()
+                .unwrap()
+                .contains("not parseable as TriageOutput"),
+            "raw_output_preview must carry the model's actual reply for diagnosis"
         );
+
+        // The billed call's session must still be recorded — no error was
+        // discarded, so it lives on `ctx.metadata` directly.
+        let sessions = out.metadata["claude_sessions"].as_array().unwrap();
+        assert_eq!(sessions.len(), 1);
         assert_eq!(
-            err.sessions[0].session_id.as_deref(),
+            sessions[0]["session_id"].as_str(),
             Some("sess-billing-test")
         );
-        assert_eq!(err.sessions[0].cost_usd, 1.25);
+        assert_eq!(sessions[0]["cost_usd"], json!(1.25));
+
+        // The router must send this to WrapUpNode, not silently retry/pass.
+        let router = TriageRouterNode;
+        assert_eq!(router.route(&out), Some("WrapUpNode".to_string()));
     }
 
     pub(crate) async fn drive_consolidated_review_node_for_billing() -> TaskContext {
@@ -11863,6 +11930,75 @@ pub(crate) mod tests {
         node.process(ctx)
             .await
             .expect("ConsolidatedReviewNode should succeed")
+    }
+
+    /// `EN.ticket.model-verdict-shared-abstraction`: `ConsolidatedReviewNode`
+    /// is `EndReviewNode`'s exact per-task sibling — same `ReviewOutput`
+    /// shape, same router convention. A reply that survives
+    /// `parse_structured_or_fenced`'s hardening and is still not valid JSON
+    /// must degrade to a named `"UNPARSEABLE"` verdict instead of a fatal
+    /// `NodeError`, exactly like `EndReviewNode`'s fix.
+    #[tokio::test]
+    async fn consolidated_review_node_degrades_unparseable_output_to_a_labeled_verdict() {
+        let task = SDLCTask::new(1, "One", "d1");
+        let state = state_with_tasks(vec![task.clone()]);
+        let mut ctx = ctx_with_current_task(&state, &task);
+        ctx.nodes.insert(
+            "SetupWorktreeNode".to_string(),
+            json!({ "worktree_path": "." }),
+        );
+
+        let runner: CommandRunner = Arc::new(|_program, _args, _cwd| {
+            Ok(CommandOutput {
+                status: 0,
+                stdout: "diff --git a b".to_string(),
+                stderr: String::new(),
+            })
+        });
+        let transport: ModelTransport = Arc::new(|_config, _prompt| {
+            Box::pin(async {
+                Ok(billing_outcome(
+                    "not parseable as ReviewOutput at all, single-quoted: {'verdict': 'PASS'}",
+                ))
+            })
+        });
+        let node = ConsolidatedReviewNode::new()
+            .with_runner(runner)
+            .with_transport(transport);
+
+        let out = node
+            .process(ctx)
+            .await
+            .expect("a parse failure must not be a fatal NodeError");
+
+        let result = &out.nodes["ConsolidatedReviewNode"];
+        assert_eq!(result["verdict"], json!("UNPARSEABLE"));
+        assert_eq!(result["unrecognized_verdict"], json!("UNPARSEABLE"));
+        assert!(
+            result["summary"]
+                .as_str()
+                .unwrap()
+                .contains("could not be parsed as JSON"),
+            "summary must name the parse failure: {result:?}"
+        );
+        assert!(
+            result["raw_output_preview"]
+                .as_str()
+                .unwrap()
+                .contains("not parseable as ReviewOutput"),
+            "raw_output_preview must carry the model's actual reply for diagnosis"
+        );
+
+        // An unrecognized verdict (including this node's own "UNPARSEABLE")
+        // is routed through the SAME bounded-retry path as a minor
+        // FAIL/PARTIAL, not straight to WrapUpNode — see
+        // `bounded_review_retry_route`. On this task's first review attempt
+        // (`review_attempt_count` bumped from 0 to 1, under the default
+        // `max_review_attempts: 3`), that means one more implement attempt,
+        // not an immediate bail — the bounded retry only falls through to
+        // `WrapUpNode` once the cap is exhausted.
+        let router = ReviewRouterNode;
+        assert_eq!(router.route(&out), Some("IncrementAttemptNode".to_string()));
     }
 
     /// Counter for a unique scratch worktree per call — `GenerateTasksNode`

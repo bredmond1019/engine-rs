@@ -310,6 +310,218 @@ pub(crate) fn parse_structured_or_fenced<T: serde::de::DeserializeOwned>(
     }
 }
 
+/// Cap on a diagnostics preview of a model's raw reply when it turns out to
+/// be unparseable — shared by every [`ModelVerdict::Unparseable`] site so the
+/// whole workspace has one convention instead of each node picking its own
+/// cap. Established by `EndReviewNode`'s original fix
+/// (`EN.ticket.review-mode-endonly-reviews-nothing` /
+/// local-model-bench-motivated `UNPARSEABLE` verdict); hoisted here when the
+/// pattern was generalized to other nodes (`EN.ticket.model-verdict-shared-
+/// abstraction`). Generous but bounded: a diagnostics aid for an operator
+/// reading committed state, not a value any Rust branch parses, so it should
+/// never risk a multi-KB local-model ramble bloating a run's persisted state.
+pub(crate) const RAW_OUTPUT_PREVIEW_MAX_CHARS: usize = 2000;
+
+/// Truncate `text` to at most [`RAW_OUTPUT_PREVIEW_MAX_CHARS`] chars (not
+/// bytes — char-boundary-safe on any UTF-8 input), appending a visible marker
+/// when truncated so the preview never silently looks complete.
+pub(crate) fn truncate_for_diagnostics(text: &str) -> String {
+    if text.chars().count() <= RAW_OUTPUT_PREVIEW_MAX_CHARS {
+        return text.to_string();
+    }
+    let truncated: String = text.chars().take(RAW_OUTPUT_PREVIEW_MAX_CHARS).collect();
+    format!("{truncated}... [truncated]")
+}
+
+/// The result of attempting to parse a model's reply into `T` via
+/// [`parse_structured_or_fenced`], as a typed value a **node** pattern-matches
+/// on to decide fatal-vs-degrade for itself — rather than the parsing layer
+/// making that call unilaterally by returning a bare `Result`.
+///
+/// ## Why this exists
+///
+/// `EndReviewNode` (`sdlc_flow/end_review.rs`) used to map any JSON-parse
+/// failure straight to a fatal `NodeError`, killing the whole `SDLC_FLOW` run
+/// even when the underlying work was correct and a small local model had just
+/// wrapped its verdict in prose. The fix replaced that with a named
+/// `"UNPARSEABLE"` verdict routed through the existing
+/// `TriageTaskNode`/`ConsolidatedReviewNode` `unrecognized_verdict` house
+/// convention (stamp the out-of-enum string; let the router's catch-all arm
+/// send the walk to a safe terminal state) instead of a hard crash.
+///
+/// An audit of every one of `parse_structured_or_fenced`'s ~24 call sites
+/// (`EN.ticket.model-verdict-shared-abstraction`) found the same fix does
+/// **not** generalize to all of them — most are correctly fatal on a parse
+/// failure, because parsing structured data IS the node's entire job with no
+/// sensible degraded fallback (a translation, a drafted document, an
+/// extracted brief, a generated task list). Forcing every call site onto one
+/// non-fatal shape would silently turn "this node produced nothing" into "the
+/// run continued with garbage" for nodes whose whole contract is the
+/// structured output itself. The audit's three buckets:
+///
+/// - **`FATAL_CORRECT`** (the majority): `content_pipeline::{translate,
+///   summarize,revise}`, `linkedin_post::{revise,draft,graph}`,
+///   `sdlc_flow::setup::GenerateTasksNode`, `proposal_generator::{
+///   opportunity_identifier,revise,writer,company_research}`,
+///   `diagnostic_intake::extract::ExtractNode`,
+///   `research_agent::{prospecting,company_research}`. The parsed value IS
+///   the node's entire output; there is no meaningful degraded fallback, so a
+///   fatal `NodeError` on parse failure is the right, honest outcome. Left
+///   unchanged.
+/// - **`ALREADY_GRACEFUL`**: `nodes::judgment::JudgmentNode` (a typed
+///   `JudgmentError::NoStructuredResult` variant callers already switch on),
+///   `sdlc_flow::task_loop::ImplementTaskNode` (falls back to the raw text as
+///   the summary and derives `modified_files` from git status instead of
+///   trusting the parse). Left unchanged — already does the right thing.
+/// - **`FATAL_SHOULD_DEGRADE`**: nodes whose output is already a
+///   verdict/enum shape with an established non-fatal path for an
+///   *out-of-enum* value (the `unrecognized_verdict` convention), where a
+///   parse failure is really the same failure mode one level earlier and
+///   deserves the same treatment. `sdlc_flow::task_loop::TriageTaskNode` and
+///   `ConsolidatedReviewNode` are migrated onto [`ModelVerdict`] here — they
+///   are `EndReviewNode`'s exact siblings (same verdict shape, same router
+///   convention, and `EndReviewNode`'s own comment already cited them as the
+///   precedent). `content_pipeline::self_critic`/`linkedin_post::brand_critic`
+///   (`CriticEvaluation{verdict}`), `claim_reaffirm::judge`
+///   (`JudgeOutput{action}`, which already forces a structural
+///   `NeedsHuman` fallback for empty evidence — an unparseable reply fits the
+///   same shape), `sdlc_flow::docs::PatchDocsNode` (already has a
+///   `flagged: Vec<String>` non-fatal routing path), and
+///   `proposal_generator::review::ProposalReviewNode`
+///   (`Verdict::from_model_text`) are left as fatal for now: each has its own
+///   distinct verdict shape and prompt contract that a one-shot migration
+///   would need to design and test individually rather than reuse verbatim.
+///   Flagged here as good candidates for a follow-up ticket, not migrated
+///   in this pass to keep this change reviewable.
+///
+/// ## How to use it
+///
+/// Call [`parse_model_verdict`] instead of `parse_structured_or_fenced(..)?`.
+/// On [`ModelVerdict::Unparseable`], build your node's own result shape with
+/// whatever verdict string means "unusable model output" in your node's enum
+/// (follow `EndReviewNode`'s `"UNPARSEABLE"` convention unless a different
+/// out-of-enum string already exists for your node), and let your router's
+/// existing catch-all arm carry it to a safe terminal state — the same shape
+/// the `unrecognized_verdict` convention already uses for an out-of-enum
+/// *value*. Do not invent a second preview-length or naming convention
+/// alongside this one.
+#[derive(Debug)]
+pub(crate) enum ModelVerdict<T> {
+    /// The reply parsed cleanly (structured field, bare JSON, or recovered
+    /// via [`extract_balanced_json`]).
+    Parsed(T),
+    /// The reply survived every parse attempt and still was not valid JSON.
+    /// `raw_preview` is [`truncate_for_diagnostics`]'s bounded rendering of
+    /// the model's actual raw content; `reason` is the underlying
+    /// `serde_json::Error` rendered to a string.
+    Unparseable { raw_preview: String, reason: String },
+}
+
+/// Parse a model's reply into `T` via [`parse_structured_or_fenced`] and
+/// return the outcome as a [`ModelVerdict`] instead of a `Result` — the
+/// classification decision (fatal vs. degrade) is left to the caller. See
+/// [`ModelVerdict`]'s doc comment for when to reach for this instead of
+/// propagating `parse_structured_or_fenced`'s `Err` as a fatal `NodeError`.
+pub(crate) fn parse_model_verdict<T: serde::de::DeserializeOwned>(
+    ctx: &TaskContext,
+    node_name: &str,
+    content: &str,
+) -> ModelVerdict<T> {
+    match parse_structured_or_fenced(ctx, node_name, content) {
+        Ok(value) => ModelVerdict::Parsed(value),
+        Err(err) => ModelVerdict::Unparseable {
+            raw_preview: truncate_for_diagnostics(content),
+            reason: err.to_string(),
+        },
+    }
+}
+
+#[cfg(test)]
+mod model_verdict_tests {
+    use super::{parse_model_verdict, ModelVerdict};
+    use engine_contract::TaskContext;
+    use serde::Deserialize;
+
+    #[derive(Debug, Deserialize, PartialEq)]
+    struct Verdict {
+        verdict: String,
+    }
+
+    fn ctx_without_structured() -> TaskContext {
+        TaskContext {
+            event: serde_json::json!({}),
+            nodes: Default::default(),
+            metadata: serde_json::json!({}),
+            node_runs: Default::default(),
+        }
+    }
+
+    #[test]
+    fn happy_path_parses_directly() {
+        let ctx = ctx_without_structured();
+        let outcome: ModelVerdict<Verdict> =
+            parse_model_verdict(&ctx, "SomeNode", r#"{"verdict":"PASS"}"#);
+        match outcome {
+            ModelVerdict::Parsed(v) => assert_eq!(v.verdict, "PASS"),
+            ModelVerdict::Unparseable { .. } => panic!("expected Parsed"),
+        }
+    }
+
+    #[test]
+    fn prose_wrapped_reply_recovers_via_balanced_extraction() {
+        let ctx = ctx_without_structured();
+        let content = "Here is my review: {\"verdict\":\"PASS\"}\nHope that helps!";
+        let outcome: ModelVerdict<Verdict> = parse_model_verdict(&ctx, "SomeNode", content);
+        match outcome {
+            ModelVerdict::Parsed(v) => assert_eq!(v.verdict, "PASS"),
+            ModelVerdict::Unparseable { .. } => {
+                panic!("expected recovery via extract_balanced_json")
+            }
+        }
+    }
+
+    #[test]
+    fn genuinely_unparseable_reply_is_labeled_not_a_result_err() {
+        let ctx = ctx_without_structured();
+        let content = "I could not complete this due to an internal error.";
+        let outcome: ModelVerdict<Verdict> = parse_model_verdict(&ctx, "SomeNode", content);
+        match outcome {
+            ModelVerdict::Parsed(_) => panic!("expected Unparseable"),
+            ModelVerdict::Unparseable {
+                raw_preview,
+                reason,
+            } => {
+                assert_eq!(raw_preview, content);
+                assert!(!reason.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn unparseable_preview_is_truncated_and_bounded() {
+        let ctx = ctx_without_structured();
+        let huge = "x".repeat(super::RAW_OUTPUT_PREVIEW_MAX_CHARS + 500);
+        let outcome: ModelVerdict<Verdict> = parse_model_verdict(&ctx, "SomeNode", &huge);
+        match outcome {
+            ModelVerdict::Parsed(_) => panic!("expected Unparseable"),
+            ModelVerdict::Unparseable { raw_preview, .. } => {
+                assert!(raw_preview.len() < huge.len());
+                assert!(raw_preview.ends_with("... [truncated]"));
+            }
+        }
+    }
+
+    #[test]
+    fn single_quoted_keys_are_unparseable_never_silently_repaired() {
+        // Conservative-by-design: must never coerce genuinely malformed JSON
+        // into a claimed verdict.
+        let ctx = ctx_without_structured();
+        let outcome: ModelVerdict<Verdict> =
+            parse_model_verdict(&ctx, "SomeNode", "{'verdict': 'PASS'}");
+        assert!(matches!(outcome, ModelVerdict::Unparseable { .. }));
+    }
+}
+
 #[cfg(test)]
 mod json_extraction_tests {
     use super::{extract_balanced_json, parse_structured_or_fenced, strip_json_fence};
