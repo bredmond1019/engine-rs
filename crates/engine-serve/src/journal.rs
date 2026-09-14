@@ -30,8 +30,10 @@ use claude_code_rs::Config;
 use engine_contract::{JournalDecisionKind, JournalRow, TaskContext};
 use engine_core::policy::profiles::read_harness_policy_defaults;
 use engine_core::policy::resolve::{resolve, Policy};
-use engine_core::policy::tier::{model_tier_to_model_string, ModelTier};
+use engine_core::policy::tier::{model_tier_to_model_string, LocalConfig, ModelTier, PiConfig};
+use engine_core::policy::{AgentBackend, Overlay, PartialLocalConfig, PartialPiConfig};
 use engine_core::repo_registry::RepoRegistry;
+use engine_core::workflows::llm_node::resolve_meta_transport;
 use engine_core::workflows::orchestration::chain::ChainStep;
 use engine_core::workflows::orchestration::debrief::JournalReader;
 use engine_core::workflows::orchestration::execute::{EngineKind, ExecutionOutcome, FlowRunner};
@@ -423,22 +425,34 @@ const LEDGER_COMPOSER_NODE_NAME: &str = "VerificationLedgerComposer";
 /// the field in `planning/harness.json` alongside the existing no-op defaults.
 const ORCHESTRATION_HARNESS_KEY: &str = "orchestration";
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct LedgerComposerPolicy {
     ledger_composer_model_tier: ModelTier,
+    /// `Local`-tier routing config, mirroring every other stage's `local`/`pi` knobs
+    /// (`OrchestrationPolicy`'s own fields, `crates/engine-core/src/workflows/orchestration/graph.rs`).
+    /// Added alongside the `Local` arm below — previously this composer had no meaning for
+    /// `Local` at all (no transport was ever wired), a real gap found auditing every
+    /// model-tier-resolving knob reachable from an `ORCHESTRATION` chain for a genuine
+    /// zero-cloud-calls guarantee.
+    local: LocalConfig,
+    pi: PiConfig,
 }
 
 impl Default for LedgerComposerPolicy {
     fn default() -> Self {
         Self {
             ledger_composer_model_tier: ModelTier::Sonnet,
+            local: LocalConfig::default(),
+            pi: PiConfig::default(),
         }
     }
 }
 
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct PartialLedgerComposerPolicy {
     ledger_composer_model_tier: Option<ModelTier>,
+    local: Option<PartialLocalConfig>,
+    pi: Option<PartialPiConfig>,
 }
 
 impl Policy for LedgerComposerPolicy {
@@ -449,17 +463,26 @@ impl Policy for LedgerComposerPolicy {
             ledger_composer_model_tier: over
                 .ledger_composer_model_tier
                 .unwrap_or(self.ledger_composer_model_tier),
+            local: match &over.local {
+                Some(l) => self.local.overlay(l),
+                None => self.local,
+            },
+            pi: match &over.pi {
+                Some(p) => self.pi.overlay(p),
+                None => self.pi,
+            },
         }
     }
 }
 
-/// Resolve the composer's model tier: `harness.json`'s `orchestration.policy` (read from the
-/// just-integrated block's own repo checkout, `repo_path`) over the built-in `Sonnet` default.
-/// Only two of the four policy layers apply here — there is no per-run `profile`/`event`
+/// Resolve the composer's full policy — model tier plus `local`/`pi` routing config — from
+/// `harness.json`'s `orchestration.policy` (read from the just-integrated block's own repo
+/// checkout, `repo_path`) over the built-in `Sonnet`/default-`LocalConfig`/default-`PiConfig`
+/// base. Only two of the four policy layers apply here — there is no per-run `profile`/`event`
 /// override reachable from a bare [`ExecutionOutcome`], so this deliberately resolves the
 /// same two layers [`crate::workflows::content_pipeline`] and friends fall back to when no
 /// profile was selected, rather than silently inventing a profile identity.
-fn resolve_ledger_composer_model_tier(repo_path: &Path) -> ModelTier {
+fn resolve_ledger_composer_policy(repo_path: &Path) -> LedgerComposerPolicy {
     let harness_defaults = read_harness_policy_defaults::<PartialLedgerComposerPolicy>(
         repo_path,
         ORCHESTRATION_HARNESS_KEY,
@@ -472,7 +495,6 @@ fn resolve_ledger_composer_model_tier(repo_path: &Path) -> ModelTier {
         None,
         None,
     )
-    .ledger_composer_model_tier
 }
 
 fn ledger_status_from_wire(value: &str) -> LedgerStatus {
@@ -644,18 +666,29 @@ fn compose_ledger_entries_via_agent(
     let ctx_nodes = serde_json::to_value(&outcome.ctx.nodes).unwrap_or(Value::Null);
 
     Box::pin(async move {
-        let model_tier = resolve_ledger_composer_model_tier(&repo_path);
-        // `Local` has no meaning for this composer (no OpenAI-compatible transport is wired
-        // here) — `model_tier_to_model_string`'s `local_model` fallback is a placeholder that
-        // is never actually reached because `harness.json`'s built-in default is `Sonnet` and
-        // nothing sets this knob to `local` today; documented rather than silently supported.
-        let model = model_tier_to_model_string(model_tier, "unset-local-model");
+        let policy = resolve_ledger_composer_policy(&repo_path);
+        let model_tier = policy.ledger_composer_model_tier;
+        let model = model_tier_to_model_string(model_tier, &policy.local.model);
         let config = Config {
             model: Some(model),
             ..Config::default()
         };
         let prompt = build_compose_prompt(&repo, &block_id, engine, &ctx_nodes);
-        let step = AgentCodeStep::new(LEDGER_COMPOSER_NODE_NAME, config, prompt);
+        let mut step = AgentCodeStep::new(LEDGER_COMPOSER_NODE_NAME, config, prompt);
+        // `Local` now has real meaning: routes through the same OpenAI-compatible transport
+        // every other `llm_node`-migrated stage uses (`resolve_meta_transport`,
+        // `crates/engine-core/src/workflows/llm_node.rs`), so this composer no longer makes a
+        // real Claude call regardless of every other stage's tier. `AgentBackend::ClaudeCli` is
+        // hardcoded here (not `policy.agent_backend`) because this composer has no notion of an
+        // editing backend — Pi/Aider only make sense for a node that edits files.
+        if let Some(meta) = resolve_meta_transport(
+            model_tier,
+            AgentBackend::ClaudeCli,
+            &policy.local,
+            &policy.pi,
+        ) {
+            step = step.with_meta_transport(move |config, prompt| (meta)(config, prompt));
+        }
 
         let ctx = TaskContext {
             event: Value::Object(serde_json::Map::new()),
@@ -904,10 +937,77 @@ mod tests {
 
     use actix_web::{test, web, App};
     use engine_core::dispatch::Dispatcher;
+    use engine_core::workflows::orchestration::engine_kind::EngineKind;
     use uuid::Uuid;
 
     use crate::http::{configure, AppState};
     use crate::live_state::LiveStateStore;
+
+    /// `EN.ticket.transport-slot-consolidation` follow-up: the ledger composer's
+    /// `composer_model_tier: local` path, proven against a REAL local Ollama endpoint —
+    /// not just that the policy resolves, but that `compose_ledger_entries_via_agent`
+    /// actually dispatches through `resolve_meta_transport`/`with_meta_transport` instead
+    /// of silently falling back to a real Claude call. `#[ignore]`d like this repo's other
+    /// live-Ollama smokes (e.g. `llm_node`'s), since it needs a real local Ollama running.
+    ///
+    /// Requires `ollama serve` reachable at `http://localhost:11434` with `qwen2.5:7b-instruct`
+    /// pulled (this repo's `LocalConfig::default()`). Run explicitly:
+    /// `cargo nextest run -p engine-serve journal::tests::compose_ledger_entries_local_tier_dispatches_to_real_ollama --run-ignored all`
+    #[tokio::test]
+    #[ignore = "needs a real local Ollama endpoint"]
+    async fn compose_ledger_entries_local_tier_dispatches_to_real_ollama() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let planning_dir = tmp.path().join("planning");
+        std::fs::create_dir_all(&planning_dir).expect("create planning dir");
+        std::fs::write(
+            planning_dir.join("harness.json"),
+            serde_json::json!({
+                "orchestration": {
+                    "policy": {
+                        "composer_model_tier": "local"
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .expect("write harness.json");
+
+        let outcome = engine_core::workflows::orchestration::execute::ExecutionOutcome {
+            repo: "engine-rs".to_string(),
+            repo_path: tmp.path().to_path_buf(),
+            block_id: "TEST.ledger-composer-local-smoke".to_string(),
+            engine: EngineKind::Task,
+            ctx: engine_contract::TaskContext {
+                event: serde_json::json!({}),
+                nodes: std::collections::HashMap::new(),
+                metadata: serde_json::json!({}),
+                node_runs: std::collections::HashMap::new(),
+            },
+            use_worktree: false,
+            auto_pr: false,
+            campaign_id: Uuid::new_v4(),
+            cost_usd: None,
+            total_tokens: 0,
+        };
+
+        let result = super::compose_ledger_entries_via_agent(&outcome).await;
+
+        // A real Ollama call either parses cleanly (Ok) or fails with a composer-output
+        // parse error (the model didn't return the expected JSON shape) -- both prove the
+        // call actually reached Ollama. A transport-level failure (connection refused, CLI
+        // not found, or a Claude-auth error) proves the OPPOSITE -- that this still silently
+        // fell back to a real cloud call or hit no endpoint at all -- and must fail the test.
+        match result {
+            Ok(_) => {}
+            Err(err) => {
+                assert!(
+                    err.contains("composer output"),
+                    "expected a real-Ollama parse-shape error, got a transport-level failure \
+                     instead (this means the local route was NOT actually taken): {err}"
+                );
+            }
+        }
+    }
 
     fn test_app_state() -> AppState {
         AppState::builder(
