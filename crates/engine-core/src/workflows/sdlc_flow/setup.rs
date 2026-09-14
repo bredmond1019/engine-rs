@@ -5726,4 +5726,61 @@ repo_path = "beta"
 
         std::fs::remove_dir_all(&worktree).ok();
     }
+
+    /// Live smoke, `#[ignore]`d, costs real money (`ollama` is free — this
+    /// is the deliberate exception): drives `GenerateTasksNode::process`
+    /// with NEITHER `with_transport` nor `with_meta_transport` set, so it
+    /// falls all the way through `TransportSlot::apply`'s no-op path to its
+    /// true default — a real `claude` CLI call — proving the
+    /// `LlmNode`-trait migration (`EN.ticket.transport-slot-
+    /// consolidation`) left the default ClaudeCli/Cloud path byte-for-byte
+    /// unaffected, not just the local-tier path the other live smoke
+    /// covers. `model_tiers.generate: Haiku` and a near-empty context cap
+    /// keep the call as cheap as a single real call can be.
+    ///
+    /// Run explicitly: `cargo nextest run -p engine-core \
+    /// sdlc_flow::setup::tests::live_generate_tasks_node_default_path_calls_real_claude \
+    /// --run-ignored ignored-only`, with a `claude` CLI on `PATH` and
+    /// already authenticated (confirmed via `claude --version` before this
+    /// run).
+    #[tokio::test]
+    #[ignore = "costs real money against the live claude CLI"]
+    async fn live_generate_tasks_node_default_path_calls_real_claude() {
+        let worktree = temp_dir();
+        let spec_dir = worktree.join("planning").join("live-smoke-spec");
+        std::fs::create_dir_all(&spec_dir).unwrap();
+        std::fs::write(
+            spec_dir.join("context.md"),
+            "One-line spec: do nothing, this is a wiring smoke test.",
+        )
+        .unwrap();
+
+        let policy = SdlcPolicy {
+            model_tiers: ModelTiers {
+                generate: ModelTier::Haiku,
+                ..ModelTiers::default()
+            },
+            generate_context_max_bytes: Some(512),
+            ..SdlcPolicy::default()
+        };
+        let ctx = ctx_with_worktree_and_policy("live-smoke-spec", &worktree, &policy);
+
+        // No with_transport/with_meta_transport: TransportSlot::apply's
+        // neither-set branch leaves the composed AgentCodeStep on its own
+        // default transport (claude_code_rs::execute), the real CLI.
+        let node = GenerateTasksNode::new();
+        let out = node
+            .process(ctx)
+            .await
+            .expect("a real claude call must succeed — is `claude` on PATH and authenticated?");
+
+        let transport = &out.nodes["GenerateTasksNode"]["transport"];
+        assert_eq!(
+            transport["tier"], "cloud",
+            "the default (no override) path stamps the generic cloud tier, matching \
+             pre-consolidation behavior exactly"
+        );
+
+        std::fs::remove_dir_all(&worktree).ok();
+    }
 }
