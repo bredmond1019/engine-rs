@@ -73,13 +73,11 @@ use std::sync::Arc;
 use crate::cancellation::CancellationToken;
 use crate::coord::heavy_work::{HeavyWorkConfig, HeavyWorkQueue};
 use crate::node::NodeRegistry;
-use crate::nodes::aider_meta_transport_live;
-use crate::nodes::openai_compat_transport::openai_compat_meta_transport_live;
-use crate::nodes::pi_meta_transport_live;
 use crate::schema::{NodeConfig, WorkflowSchema};
 use crate::workflow::Workflow;
 
 use crate::policy::{AgentBackend, PolicyConfigSource};
+use crate::workflows::llm_node::{resolve_meta_transport, wire};
 use crate::workflows::sdlc_flow::close_block::CloseBlockNode;
 use crate::workflows::sdlc_flow::final_validation::{FinalValidationNode, ValidationScope};
 use crate::workflows::sdlc_flow::graph::agentic_write_config;
@@ -96,7 +94,7 @@ use super::lean_bookkeep::LeanBookkeepNode;
 use super::policy::SdlcTaskPolicy;
 use super::profiles::resolve_policy_for_run_from;
 use super::task_triage_router::TaskTriageRouterNode;
-use super::{default_command_runner, ModelTransport, DEFAULT_STATE_FILENAME};
+use super::{default_command_runner, DEFAULT_STATE_FILENAME};
 
 /// The `SDLC_TASK` workflow's declared identity/type name, used both to
 /// register the workflow (`EN.11.P`, ORCHESTRATION dispatch — out of scope
@@ -219,9 +217,9 @@ pub fn schema() -> WorkflowSchema {
 /// `/sdlc-task` run rather than only inside this crate's own hand-built
 /// integration tests (`EN.ticket.test-task-node-queue-park-has-no-
 /// production-graph-wiring`). Duplicated rather than shared with
-/// `sdlc_flow::graph`'s identical helper — this crate's own convention
-/// (see `real_cloud_transport`'s doc comment in this file) is to duplicate
-/// a small one-liner rather than force a cross-module import for it.
+/// `sdlc_flow::graph`'s identical helper — this crate's own convention is
+/// to duplicate a small one-liner rather than force a cross-module import
+/// for it.
 ///
 /// Resolution failure (no `ENGINE_BRAIN_ROOT` and no `brain.toml` walking
 /// up from cwd, or an invalid override) degrades open to a disabled queue —
@@ -283,16 +281,6 @@ pub fn registry() -> NodeRegistry {
     registry
 }
 
-/// The real `claude_code_rs::execute` transport — mirrors
-/// `sdlc_flow::graph::real_cloud_transport` (kept private there, so this is
-/// a duplicate rather than a shared import; both are one-line delegations
-/// to the same free function).
-fn real_cloud_transport() -> ModelTransport {
-    Arc::new(|config, prompt| {
-        Box::pin(async move { claude_code_rs::execute(&config, &prompt).await })
-    })
-}
-
 /// Build a `NodeRegistry` like [`registry`], but with `TriageTaskNode`'s
 /// `llm_triage` model branch wired to route through
 /// [`openai_compat_meta_transport_live`] whenever `policy`'s resolved tier
@@ -313,25 +301,29 @@ pub fn registry_for_policy(policy: &SdlcTaskPolicy) -> NodeRegistry {
 }
 
 /// Like [`registry_for_policy`], but additionally wires `token` — when
-/// given — into `ImplementTaskNode` and `TriageTaskNode` via their
-/// `with_cancellation_token` builder (`EN.ticket.abort-must-interrupt-an-
-/// in-flight-agent-node`), mirroring
+/// given — into every node via their `with_cancellation_token` builder
+/// (`EN.ticket.abort-must-interrupt-an-in-flight-agent-node`), mirroring
 /// `sdlc_flow::graph::registry_for_policy_with_cancellation`. `SDLC_TASK`
 /// registers no `ConsolidatedReviewNode`, so there is no third node here.
 /// `token: None` reproduces [`registry_for_policy`] exactly.
 ///
-/// **`ImplementTaskNode` re-registration is gated on `policy.agent_backend`
-/// being [`AgentBackend::Pi`], OR on `token` being given — not on `token`
-/// alone (`EN.16.B` task 8).** The base [`registry`] this function starts
-/// from always registers the `claude_cli` `ImplementTaskNode` (no meta
-/// transport); the real production call site
-/// (`orchestration::execute::EngineKind::Task`) goes through
-/// [`registry_for_policy`], i.e. `token: None`. Gating the re-registration
-/// on `token.is_some()` alone — the shape this had before task 8 — meant
-/// `agent_backend: pi` with no cancellation token silently kept the base
-/// registry's billed `claude_cli` node: the knob had no effect on the one
-/// path that actually runs in production. Mirrors the `triage_local ||
-/// token.is_some()` shape already used for `TriageTaskNode` above.
+/// **Consolidated onto `llm_node::{resolve_meta_transport, wire}`**
+/// (`EN.ticket.transport-slot-consolidation` Phase 1). Every node is now
+/// registered unconditionally through [`wire`] rather than behind a
+/// hand-written `if X_local || token.is_some() { .. }` guard: `wire` with
+/// both `transport: None` and `token: None` is a true no-op — the returned
+/// node is indistinguishable from one built by `Node::new()` alone — so the
+/// guards that existed only to keep the default-policy path byte-identical
+/// to [`registry`] are no longer needed. [`resolve_meta_transport`]
+/// reproduces the exact backend/tier branching each node had by hand:
+/// `TriageTaskNode`/`GenerateTasksNode` pass `AgentBackend::ClaudeCli`
+/// (neither has ever supported `Pi`/`Aider`, only the `Local` tier);
+/// `ImplementTaskNode` passes `policy.agent_backend` (the local tier is
+/// scoped to single-shot judgment calls, never the agentic implement
+/// stage — same rationale as `sdlc_flow`, so `ImplementTaskNode`'s own
+/// `tier` argument is always [`ModelTier::Sonnet`], never
+/// `policy.model_tiers`-derived, matching the old code never checking a
+/// tier for this node at all).
 #[must_use]
 pub fn registry_for_policy_with_cancellation(
     policy: &SdlcTaskPolicy,
@@ -339,48 +331,38 @@ pub fn registry_for_policy_with_cancellation(
 ) -> NodeRegistry {
     let mut registry = registry();
 
-    let triage_local = policy.model_tiers.triage == ModelTier::Local;
-    if triage_local || token.is_some() {
-        let mut node = TriageTaskNode::new();
-        if triage_local {
-            node = node.with_meta_transport(openai_compat_meta_transport_live(
-                policy.local.clone(),
-                real_cloud_transport(),
-            ));
-        }
-        if let Some(t) = token.clone() {
-            node = node.with_cancellation_token(t);
-        }
-        registry.register(Box::new(node));
-    }
+    registry.register(Box::new(wire(
+        TriageTaskNode::new(),
+        resolve_meta_transport(
+            policy.model_tiers.triage,
+            AgentBackend::ClaudeCli,
+            &policy.local,
+            &policy.pi,
+        ),
+        token.clone(),
+    )));
 
-    let generate_local = policy.model_tiers.generate == ModelTier::Local;
-    if generate_local {
-        let node = GenerateTasksNode::new().with_meta_transport(openai_compat_meta_transport_live(
-            policy.local.clone(),
-            real_cloud_transport(),
-        ));
-        registry.register(Box::new(node));
-    }
+    registry.register(Box::new(wire(
+        GenerateTasksNode::new(),
+        resolve_meta_transport(
+            policy.model_tiers.generate,
+            AgentBackend::ClaudeCli,
+            &policy.local,
+            &policy.pi,
+        ),
+        token.clone(),
+    )));
 
-    let pi_backend = policy.agent_backend == AgentBackend::Pi;
-    let aider_backend = policy.agent_backend == AgentBackend::Aider;
-    if pi_backend || aider_backend || token.is_some() {
-        let mut node =
-            ImplementTaskNode::new().with_config(agentic_write_config("claude-sonnet-4-5"));
-        if pi_backend {
-            node = node.with_meta_transport(pi_meta_transport_live(
-                policy.local.clone(),
-                policy.pi.clone(),
-            ));
-        } else if aider_backend {
-            node = node.with_meta_transport(aider_meta_transport_live(policy.local.clone()));
-        }
-        if let Some(t) = token {
-            node = node.with_cancellation_token(t);
-        }
-        registry.register(Box::new(node));
-    }
+    registry.register(Box::new(wire(
+        ImplementTaskNode::new().with_config(agentic_write_config("claude-sonnet-4-5")),
+        resolve_meta_transport(
+            ModelTier::Sonnet,
+            policy.agent_backend,
+            &policy.local,
+            &policy.pi,
+        ),
+        token,
+    )));
 
     registry
 }
