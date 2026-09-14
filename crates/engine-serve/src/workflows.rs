@@ -56,7 +56,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, OnceLock, RwLock};
 
 use engine_contract::TaskContext;
-use engine_core::policy::{PolicyConfigSource, RESOLVED_POLICY_IDENTITY};
+use engine_core::policy::{AgentBackend, PolicyConfigSource, RESOLVED_POLICY_IDENTITY};
 use engine_core::repo_registry::RepoRegistry;
 use engine_core::workflows::orchestration::integrate::StepProgress;
 use engine_core::workflows::sdlc_flow::setup::SetupWorktreeNode;
@@ -1213,7 +1213,22 @@ fn build_preflight_seam(
         return Arc::new(|_repo: &str, _block_id: &str| PreflightOutcome::Disabled);
     }
 
-    let runner = Arc::new(PreflightRunner::new(PreflightConfig::from(policy)));
+    let mut runner = PreflightRunner::new(PreflightConfig::from(policy));
+    // `EN.ticket.wire-local-model-tier-into-preflight-and-inbox-triage`: the
+    // four-layer `preflight_model_tier` knob has always resolved correctly,
+    // but no production call site ever forwarded it into a real transport
+    // override, so setting it to `ModelTier::Local` silently did nothing.
+    // `JudgmentNode` only ever composes a `claude`-style call (never an
+    // editing agent), so `AgentBackend::ClaudeCli` is passed unconditionally.
+    if let Some(transport) = engine_core::workflows::llm_node::resolve_meta_transport(
+        policy.preflight_model_tier,
+        AgentBackend::ClaudeCli,
+        &policy.local,
+        &policy.pi,
+    ) {
+        runner = runner.with_meta_transport(transport);
+    }
+    let runner = Arc::new(runner);
     Arc::new(move |repo: &str, block_id: &str| {
         let runner = runner.clone();
         let registry = registry.clone();
@@ -1278,9 +1293,19 @@ fn build_inbox_triage_runner(
         return None;
     }
 
-    Some(Arc::new(InboxTriageRunner::new(InboxTriageConfig::from(
-        policy,
-    ))))
+    let mut runner = InboxTriageRunner::new(InboxTriageConfig::from(policy));
+    // Same gap-fix as `build_preflight_seam` above: `inbox_triage_model_tier`
+    // already resolved through all four policy layers, but this call site
+    // never forwarded it into a real transport override.
+    if let Some(transport) = engine_core::workflows::llm_node::resolve_meta_transport(
+        policy.inbox_triage_model_tier,
+        AgentBackend::ClaudeCli,
+        &policy.local,
+        &policy.pi,
+    ) {
+        runner = runner.with_meta_transport(transport);
+    }
+    Some(Arc::new(runner))
 }
 
 /// The registry-nickname identity a Rust-driven chain registers,
@@ -4519,6 +4544,121 @@ mod tests {
         assert!(
             !message.contains("needs either `blocks` or `roadmap`+`lane`"),
             "must not fall through to the pre-CONDUCTOR hard refusal, got: {message}"
+        );
+    }
+
+    // --- preflight/inbox-triage local-tier wiring
+    // (EN.ticket.wire-local-model-tier-into-preflight-and-inbox-triage) ---
+
+    /// Regression safety for the fix: `preflight_enabled: false` (the
+    /// built-in default, the common case for a served run) must still
+    /// short-circuit to `PreflightOutcome::Disabled` before a `PreflightRunner`
+    /// is ever constructed — even with `preflight_model_tier: Local` set,
+    /// which would previously have been silently ignored anyway but must
+    /// now ALSO not flip the disabled guard. The real proof that the
+    /// `Local` tier dispatches end to end through this exact function is
+    /// the live-Ollama integration test in this same module (ignored by
+    /// default — needs a real local endpoint).
+    #[test]
+    fn build_preflight_seam_disabled_short_circuits_regardless_of_tier() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("brain.toml"),
+            "[[repos]]\nslug = \"repo-a\"\nrepo_path = \"repo-a\"\n",
+        )
+        .expect("write brain.toml");
+        let registry =
+            Arc::new(RepoRegistry::from_brain_root(dir.path()).expect("registry should build"));
+        let policy = engine_core::workflows::orchestration::graph::OrchestrationPolicy {
+            preflight_enabled: false,
+            preflight_model_tier: engine_core::policy::ModelTier::Local,
+            ..Default::default()
+        };
+
+        let seam = build_preflight_seam(registry, &policy);
+        let outcome = seam("repo-a", "A.1");
+
+        assert!(
+            matches!(
+                outcome,
+                engine_core::workflows::orchestration::preflight::PreflightOutcome::Disabled
+            ),
+            "preflight_enabled: false must still short-circuit even with tier: local set, \
+             got {outcome:?}"
+        );
+    }
+
+    /// Same regression safety as above, for inbox-triage's construction site.
+    #[test]
+    fn build_inbox_triage_runner_disabled_returns_none_regardless_of_tier() {
+        let policy = engine_core::workflows::orchestration::graph::OrchestrationPolicy {
+            inbox_triage_enabled: false,
+            inbox_triage_model_tier: engine_core::policy::ModelTier::Local,
+            ..Default::default()
+        };
+
+        let runner = build_inbox_triage_runner(&policy);
+
+        assert!(
+            runner.is_none(),
+            "inbox_triage_enabled: false must still return None even with tier: local set"
+        );
+    }
+
+    /// Live end-to-end proof (ignored by default — needs a real local Ollama
+    /// endpoint on `localhost:11434`) that `preflight_model_tier: Local`
+    /// now actually dispatches through `build_preflight_seam`'s real
+    /// construction path, not just through `resolve_meta_transport`/
+    /// `JudgmentNode` in isolation (already proven by Phase 1-3's own live
+    /// smokes). Run manually: `cargo nextest run -p engine-serve
+    /// preflight_seam_local_tier_dispatches_to_real_ollama -- --ignored`.
+    #[test]
+    #[ignore = "needs a real local Ollama endpoint at localhost:11434"]
+    fn preflight_seam_local_tier_dispatches_to_real_ollama() {
+        // `PreflightRunner::run_for_block` reads `planning/blocks/<id>.json`
+        // (`repo_registry::read_block_record`), NOT `state.json`'s
+        // `tracks[].blocks[]` — an earlier draft of this test wrote only
+        // `state.json` and got a trivially-passing `SkippedNoRecord`
+        // outcome (no real call ever made) in ~11ms. Fixed by writing the
+        // real block-record file the seam actually reads.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo_dir = dir.path().join("repo-a");
+        let blocks_dir = repo_dir.join("planning").join("blocks");
+        std::fs::create_dir_all(&blocks_dir).expect("mkdir repo-a/planning/blocks");
+        std::fs::write(
+            blocks_dir.join("A.1.json"),
+            r#"{
+    "id": "A.1",
+    "what": "Add a doc comment to a private helper function.",
+    "files": ["src/lib.rs"],
+    "acceptance_criteria": ["nothing load-bearing — this is a live-wiring smoke test"]
+}"#,
+        )
+        .expect("write planning/blocks/A.1.json");
+        std::fs::write(
+            dir.path().join("brain.toml"),
+            "[[repos]]\nslug = \"repo-a\"\nrepo_path = \"repo-a\"\n",
+        )
+        .expect("write brain.toml");
+
+        let registry =
+            Arc::new(RepoRegistry::from_brain_root(dir.path()).expect("registry should build"));
+        let policy = engine_core::workflows::orchestration::graph::OrchestrationPolicy {
+            preflight_enabled: true,
+            preflight_model_tier: engine_core::policy::ModelTier::Local,
+            ..Default::default()
+        };
+
+        let seam = build_preflight_seam(registry, &policy);
+        let outcome = seam("repo-a", "A.1");
+
+        assert!(
+            matches!(
+                outcome,
+                engine_core::workflows::orchestration::preflight::PreflightOutcome::Judged { .. }
+            ),
+            "preflight_model_tier: local via the real build_preflight_seam construction path \
+             must produce a real Judged outcome from Ollama, got {outcome:?}"
         );
     }
 }

@@ -506,6 +506,15 @@ HQ-set `orchestration.policy.preflight_enabled` still governs a run naming eithe
 same name, so a profile that *did* set these knobs would silently drop every other built-in knob in
 it.
 
+**`preflight_model_tier: local` now actually dispatches locally**
+(`EN.ticket.wire-local-model-tier-into-preflight-and-inbox-triage`). `OrchestrationPolicy` also
+carries `local: LocalConfig`/`pi: PiConfig` (the same pair `sdlc_flow`/`sdlc_task` policies already
+carry, defaulting to Ollama at `localhost:11434`), and `engine-serve`'s `build_preflight_seam`
+resolves `llm_node::resolve_meta_transport(preflight_model_tier, AgentBackend::ClaudeCli, &local,
+&pi)` before constructing the real `PreflightRunner` — closing a gap where the tier knob resolved
+correctly through all four policy layers but no production call site ever forwarded it into a real
+transport override, so `local` silently did nothing.
+
 **THE EFFECTIVE SWITCH LIVES IN HQ'S OWN `harness.json`, not this repo's** — the same reasoning as
 `on_bail`/`bail_channel` above: `OrchestrationRunNode` resolves policy from
 `PolicyConfigSource::Worktree(event.brain_root)`, and the engine-mounted `bastion serve` that drives
@@ -610,6 +619,10 @@ explicit no-op); `cheap-fast` and `thorough` leave all four unset, so an HQ-set
 `orchestration.policy.inbox_triage_enabled` still governs a run naming either profile —
 `resolve_profile_from` returns a named bundle whole, with no merge onto the built-in bundle of the
 same name.
+
+`inbox_triage_model_tier: local` is wired the same way as `preflight_model_tier` above — see that
+section's note. `build_inbox_triage_runner` resolves the same `local`/`pi` pair before constructing
+the real `InboxTriageRunner`.
 
 **THE EFFECTIVE SWITCH LIVES IN HQ'S OWN `harness.json`, not this repo's** — the same
 `PolicyConfigSource::Worktree(event.brain_root)` reasoning as `on_bail`/`bail_channel`/

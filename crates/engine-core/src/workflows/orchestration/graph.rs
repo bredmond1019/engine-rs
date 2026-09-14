@@ -110,7 +110,8 @@ use crate::nodes::terminal::HeldSessionNode;
 use crate::operator::transport::OperatorTransport;
 use crate::policy::permission::resolve_permission_profile;
 use crate::policy::{
-    read_harness_policy_defaults_from, resolve_profile_from, ModelTier, PolicyConfigSource,
+    read_harness_policy_defaults_from, resolve_profile_from, LocalConfig, ModelTier, Overlay,
+    PartialLocalConfig, PartialPiConfig, PiConfig, PolicyConfigSource,
 };
 use crate::repo_registry::RepoRegistry;
 use crate::schema::{NodeConfig, WorkflowSchema};
@@ -390,6 +391,28 @@ pub struct OrchestrationPolicy {
     /// the judgment call. `4_000` (the built-in default) matches
     /// `preflight_slice_max_bytes`.
     pub inbox_triage_slice_max_bytes: usize,
+    /// The OpenAI-compatible local-model endpoint `preflight`/`inbox_triage`'s
+    /// `JudgmentNode` calls resolve through when their tier is
+    /// [`ModelTier::Local`] — the gap this field closes:
+    /// `preflight_model_tier`/`inbox_triage_model_tier` already existed and
+    /// resolved through all four policy layers, but neither production
+    /// construction site (`engine-serve`'s `build_preflight_seam`/
+    /// `build_inbox_triage_runner`) ever called
+    /// `llm_node::resolve_meta_transport` with it, so setting either tier
+    /// to `Local` silently did nothing. `LocalConfig::default()` (the
+    /// built-in default) is behavior-stable per CLAUDE.md standing rule 6 —
+    /// both tiers already default to `Haiku`, so this field is inert
+    /// unless a caller also opts a tier into `Local`.
+    pub local: LocalConfig,
+    /// Unused by `preflight`/`inbox_triage` today — both are `JudgmentNode`
+    /// calls, never an editing agent, so [`AgentBackend::ClaudeCli`] is
+    /// passed at both call sites unconditionally. Carried here only so
+    /// [`local`](Self::local) and `pi` merge through the same
+    /// [`Overlay`]-based four-layer shape every other workflow's
+    /// `local`/`pi` pair already uses (`sdlc_flow::policy::SdlcPolicy`,
+    /// `sdlc_task::policy::SdlcTaskPolicy`) — keeps this policy's shape
+    /// consistent rather than a one-off partial pair.
+    pub pi: PiConfig,
 }
 
 impl Default for OrchestrationPolicy {
@@ -426,6 +449,8 @@ impl Default for OrchestrationPolicy {
             inbox_triage_model_tier: ModelTier::Haiku,
             inbox_triage_max_turns: None,
             inbox_triage_slice_max_bytes: 4_000,
+            local: LocalConfig::default(),
+            pi: PiConfig::default(),
         }
     }
 }
@@ -466,6 +491,8 @@ pub struct PartialOrchestrationPolicy {
     pub inbox_triage_model_tier: Option<ModelTier>,
     pub inbox_triage_max_turns: Option<Option<u32>>,
     pub inbox_triage_slice_max_bytes: Option<usize>,
+    pub local: Option<PartialLocalConfig>,
+    pub pi: Option<PartialPiConfig>,
 }
 
 impl crate::policy::Policy for OrchestrationPolicy {
@@ -560,6 +587,14 @@ impl crate::policy::Policy for OrchestrationPolicy {
                 self.inbox_triage_slice_max_bytes,
                 over.inbox_triage_slice_max_bytes,
             ),
+            local: match &over.local {
+                Some(l) => self.local.overlay(l),
+                None => self.local,
+            },
+            pi: match &over.pi {
+                Some(p) => self.pi.overlay(p),
+                None => self.pi,
+            },
         }
     }
 }
@@ -615,6 +650,11 @@ pub fn baseline() -> PartialOrchestrationPolicy {
         inbox_triage_model_tier: Some(ModelTier::Haiku),
         inbox_triage_max_turns: Some(None),
         inbox_triage_slice_max_bytes: Some(4_000),
+        // Restates the built-in default verbatim — baseline's no-op
+        // contract extends to the local-transport config the gap fix above
+        // introduced.
+        local: Some(PartialLocalConfig::default()),
+        pi: Some(PartialPiConfig::default()),
     }
 }
 
