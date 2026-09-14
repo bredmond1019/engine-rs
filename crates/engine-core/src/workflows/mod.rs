@@ -349,7 +349,7 @@ pub(crate) fn truncate_for_diagnostics(text: &str) -> String {
 /// convention (stamp the out-of-enum string; let the router's catch-all arm
 /// send the walk to a safe terminal state) instead of a hard crash.
 ///
-/// An audit of every one of `parse_structured_or_fenced`'s ~24 call sites
+/// An audit of every one of `parse_structured_or_fenced`'s call sites
 /// (`EN.ticket.model-verdict-shared-abstraction`) found the same fix does
 /// **not** generalize to all of them — most are correctly fatal on a parse
 /// failure, because parsing structured data IS the node's entire job with no
@@ -377,22 +377,37 @@ pub(crate) fn truncate_for_diagnostics(text: &str) -> String {
 ///   verdict/enum shape with an established non-fatal path for an
 ///   *out-of-enum* value (the `unrecognized_verdict` convention), where a
 ///   parse failure is really the same failure mode one level earlier and
-///   deserves the same treatment. `sdlc_flow::task_loop::TriageTaskNode` and
-///   `ConsolidatedReviewNode` are migrated onto [`ModelVerdict`] here — they
-///   are `EndReviewNode`'s exact siblings (same verdict shape, same router
-///   convention, and `EndReviewNode`'s own comment already cited them as the
-///   precedent). `content_pipeline::self_critic`/`linkedin_post::brand_critic`
-///   (`CriticEvaluation{verdict}`), `claim_reaffirm::judge`
-///   (`JudgeOutput{action}`, which already forces a structural
-///   `NeedsHuman` fallback for empty evidence — an unparseable reply fits the
-///   same shape), `sdlc_flow::docs::PatchDocsNode` (already has a
-///   `flagged: Vec<String>` non-fatal routing path), and
-///   `proposal_generator::review::ProposalReviewNode`
-///   (`Verdict::from_model_text`) are left as fatal for now: each has its own
-///   distinct verdict shape and prompt contract that a one-shot migration
-///   would need to design and test individually rather than reuse verbatim.
-///   Flagged here as good candidates for a follow-up ticket, not migrated
-///   in this pass to keep this change reviewable.
+///   deserves the same treatment. All 5 identified call sites are now
+///   migrated onto [`ModelVerdict`] (a follow-up recount against
+///   `parse_structured_or_fenced`'s call sites found 5, not the original
+///   audit's "6" — one per file, no call site was ever double-counted):
+///   - `sdlc_flow::task_loop::TriageTaskNode` and `ConsolidatedReviewNode` —
+///     `EndReviewNode`'s exact siblings (same verdict shape, same router
+///     convention, and `EndReviewNode`'s own comment already cited them as
+///     the precedent).
+///   - `content_pipeline::self_critic::SelfCriticNode` and
+///     `linkedin_post::brand_critic::BrandCriticNode` (`CriticEvaluation
+///     {verdict}`) — degrade to `CriticVerdict::Revise` with `confidence:
+///     0.0` and a diagnostic `issues[]` entry naming the parse failure,
+///     reusing `verdict_from_model_text`'s own fail-closed convention for an
+///     ambiguous verdict *value*.
+///   - `claim_reaffirm::judge::JudgeClaimNode` (`JudgeOutput{action}`) —
+///     degrades straight to `VerdictAction::NeedsHuman`, the same fallback
+///     this node already forces structurally when evidence is empty (OR.K3)
+///     — an unparseable reply is the same "cannot trust the model's
+///     judgment" case one level earlier.
+///   - `sdlc_flow::docs::PatchDocsNode` — degrades onto its own
+///     `flagged: Vec<String>` non-fatal routing path, flagging the
+///     `modified_files` that triggered the pass (the docs-patch outcome is
+///     unknown, so the whole batch goes to human review) instead of
+///     `files_patched`.
+///   - `proposal_generator::review::ProposalReviewNode`
+///     (`Verdict::from_model_text`) — degrades to `Verdict::Revise`, the
+///     same fail-closed default that function already applies to an
+///     ambiguous verdict *value*.
+///
+///   Every migration stamps a bounded `raw_output_preview` onto its result
+///   for operator diagnostics, matching `EndReviewNode`'s convention.
 ///
 /// ## How to use it
 ///

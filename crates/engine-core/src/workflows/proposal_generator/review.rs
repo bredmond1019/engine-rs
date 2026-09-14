@@ -25,7 +25,7 @@ use serde_json::json;
 use crate::node::{Node, NodeError};
 use crate::nodes::{AgentCodeStep, MetaTransport};
 use crate::workflows::{
-    get_result, parse_structured_or_fenced, put_result, ModelTransport, TransportSlot,
+    get_result, parse_model_verdict, put_result, ModelTransport, ModelVerdict, TransportSlot,
 };
 
 use super::policy::{ProposalGeneratorPolicy, ReviewMode};
@@ -223,21 +223,42 @@ impl Node for ProposalReviewNode {
             .and_then(|value| value.get("transport"))
             .cloned();
 
-        let parsed: ReviewOutput =
-            parse_structured_or_fenced(&ctx, NODE_NAME, &content).map_err(|err| {
-                NodeError::new(format!(
-                    "{NODE_NAME}: failed to parse a review verdict from the model's reply: {err}"
-                ))
-            })?;
-
-        let verdict = Verdict::from_model_text(&parsed.verdict);
+        // A review reply that survives `parse_structured_or_fenced`'s
+        // fence-stripping + balanced-extraction hardening and is STILL not
+        // valid JSON is the same failure mode `Verdict::from_model_text`
+        // already handles one level later (an ambiguous/malformed verdict
+        // *value*, fail-closed to `Revise`) — degrade the same way via the
+        // shared `ModelVerdict` abstraction (`workflows/mod.rs`) instead of
+        // a fatal `NodeError` that would halt the whole proposal-generator
+        // run over a small local model's stray prose.
+        let (verdict, notes, raw_output_preview) =
+            match parse_model_verdict::<ReviewOutput>(&ctx, NODE_NAME, &content) {
+                ModelVerdict::Parsed(parsed) => (
+                    Verdict::from_model_text(&parsed.verdict),
+                    parsed.notes,
+                    None,
+                ),
+                ModelVerdict::Unparseable {
+                    raw_preview,
+                    reason,
+                } => (
+                    Verdict::Revise,
+                    format!("{NODE_NAME}: model reply could not be parsed as JSON: {reason}"),
+                    Some(raw_preview),
+                ),
+            };
 
         let mut result = json!({
             "verdict": verdict.as_str(),
-            "notes": parsed.notes,
+            "notes": notes,
         });
         if let Some(transport) = transport_stamp {
             result["transport"] = transport;
+        }
+        if let Some(raw_output_preview) = raw_output_preview {
+            // Bounded, never the full reply — diagnostics for an operator
+            // reading committed state, not something any Rust branch parses.
+            result["raw_output_preview"] = json!(raw_output_preview);
         }
         put_result(&mut ctx, NODE_NAME, result);
 
@@ -483,6 +504,55 @@ mod tests {
 
         let (_config, prompt) = captured.lock().unwrap().take().expect("transport called");
         assert!(prompt.contains("Loja da Ana"));
+    }
+
+    fn stub_unparseable_transport() -> ModelTransport {
+        std::sync::Arc::new(move |_config: Config, _prompt: String| {
+            async move {
+                Ok(Outcome {
+                    text: "I could not complete this review due to an internal error.".to_string(),
+                    cost_usd: 0.01,
+                    usage: SdkUsage {
+                        input_tokens: 50,
+                        output_tokens: 20,
+                        cache_creation_input_tokens: 0,
+                        cache_read_input_tokens: 0,
+                    },
+                    model_usage: BTreeMap::new(),
+                    session_id: None,
+                    structured_output: None,
+                    is_error: false,
+                    api_error_status: None,
+                })
+            }
+            .boxed()
+        })
+    }
+
+    #[tokio::test]
+    async fn process_degrades_genuinely_unparseable_reply_to_revise_instead_of_fatal_error() {
+        let node = ProposalReviewNode::new().with_transport(stub_unparseable_transport());
+        let ctx = empty_ctx(base_event());
+
+        let ctx = node
+            .process(ctx)
+            .await
+            .expect("an unparseable review reply must degrade, not fail the whole run");
+
+        let result = &ctx.nodes[NODE_NAME];
+        assert_eq!(
+            result["verdict"],
+            json!("revise"),
+            "an unusable model signal must fail closed, mirroring an ambiguous verdict value"
+        );
+        assert!(result["notes"]
+            .as_str()
+            .unwrap()
+            .contains("could not be parsed as JSON"));
+        assert!(
+            result["raw_output_preview"].as_str().is_some(),
+            "the raw reply preview must be stamped for an operator to diagnose"
+        );
     }
 
     #[tokio::test]

@@ -58,7 +58,7 @@ use crate::node::{InputBinding, Node, NodeError};
 use crate::nodes::AgentCodeStep;
 use crate::workflows::content_pipeline::increment_critic_iteration;
 use crate::workflows::content_pipeline::schema::{CriticEvaluation, CriticVerdict};
-use crate::workflows::{get_result, parse_structured_or_fenced, put_result, ModelTransport};
+use crate::workflows::{get_result, parse_model_verdict, put_result, ModelTransport, ModelVerdict};
 
 use super::policy::LinkedInPostPolicy;
 use super::{draft, revise};
@@ -351,7 +351,7 @@ impl Node for BrandCriticNode {
 
         let scan_findings = deterministic_scan(&draft);
 
-        let (evaluation, mut ctx) = if !scan_findings.is_empty() {
+        let (evaluation, mut ctx, raw_output_preview) = if !scan_findings.is_empty() {
             // A mechanical violation was found — never even call the
             // model; the draft is caught on the deterministic layer alone.
             let evaluation = CriticEvaluation {
@@ -360,7 +360,7 @@ impl Node for BrandCriticNode {
                 issues: scan_findings.into_iter().map(|f| f.issue).collect(),
                 iteration,
             };
-            (evaluation, ctx)
+            (evaluation, ctx, None)
         } else {
             let mut config = self.config.clone();
             config = crate::policy::apply_model_tier(
@@ -385,22 +385,40 @@ impl Node for BrandCriticNode {
                 .unwrap_or_default()
                 .to_string();
 
-            let parsed: CriticOutput = parse_structured_or_fenced(&inner_ctx, NODE_NAME, &content)
-                .map_err(|err| {
-                    NodeError::new(format!(
-                        "{NODE_NAME}: failed to parse a CriticEvaluation from the model's reply: \
-                         {err}"
-                    ))
-                })?;
-
-            let verdict = verdict_from_model_text(&parsed.verdict);
+            // Same fail-closed reasoning as `content_pipeline::self_critic`
+            // (its exact shape sibling): a reply that survives
+            // `parse_structured_or_fenced`'s hardening and is still not
+            // valid JSON is the same "unusable model signal" failure mode
+            // one level earlier than an ambiguous verdict *value* — degrade
+            // to `Revise` via the shared `ModelVerdict` abstraction
+            // (`workflows/mod.rs`) rather than a fatal `NodeError`.
+            let (verdict, confidence, issues, raw_output_preview) =
+                match parse_model_verdict::<CriticOutput>(&inner_ctx, NODE_NAME, &content) {
+                    ModelVerdict::Parsed(parsed) => (
+                        verdict_from_model_text(&parsed.verdict),
+                        parsed.confidence,
+                        parsed.issues,
+                        None,
+                    ),
+                    ModelVerdict::Unparseable {
+                        raw_preview,
+                        reason,
+                    } => (
+                        CriticVerdict::Revise,
+                        0.0,
+                        vec![format!(
+                            "{NODE_NAME}: model reply could not be parsed as JSON: {reason}"
+                        )],
+                        Some(raw_preview),
+                    ),
+                };
             let evaluation = CriticEvaluation {
                 verdict,
-                confidence: parsed.confidence,
-                issues: parsed.issues,
+                confidence,
+                issues,
                 iteration,
             };
-            (evaluation, inner_ctx)
+            (evaluation, inner_ctx, raw_output_preview)
         };
 
         // This pass's 1-based ordinal — mirrors
@@ -415,6 +433,11 @@ impl Node for BrandCriticNode {
             NodeError::new(format!("failed to serialize CriticEvaluation: {err}"))
         })?;
         result["capped"] = json!(capped);
+        if let Some(raw_output_preview) = raw_output_preview {
+            // Bounded, never the full reply — diagnostics for an operator
+            // reading committed state, not something any Rust branch parses.
+            result["raw_output_preview"] = json!(raw_output_preview);
+        }
         put_result(&mut ctx, NODE_NAME, result);
 
         Ok(ctx)
@@ -629,6 +652,59 @@ mod tests {
         let ctx = node.process(ctx).await.expect("process should succeed");
         let evaluation = evaluation_of(&ctx);
         assert_eq!(evaluation.verdict, CriticVerdict::Revise);
+    }
+
+    fn stub_unparseable_transport() -> ModelTransport {
+        std::sync::Arc::new(move |_config: Config, _prompt: String| {
+            async move {
+                Ok(Outcome {
+                    text: "I could not complete this critique due to an internal error."
+                        .to_string(),
+                    cost_usd: 0.01,
+                    usage: SdkUsage {
+                        input_tokens: 10,
+                        output_tokens: 5,
+                        cache_creation_input_tokens: 0,
+                        cache_read_input_tokens: 0,
+                    },
+                    model_usage: BTreeMap::new(),
+                    session_id: None,
+                    structured_output: None,
+                    is_error: false,
+                    api_error_status: None,
+                })
+            }
+            .boxed()
+        })
+    }
+
+    #[tokio::test]
+    async fn process_degrades_genuinely_unparseable_reply_to_revise_instead_of_fatal_error() {
+        let node = BrandCriticNode::new().with_transport(stub_unparseable_transport());
+        let ctx = ctx_with_draft(draft::NODE_NAME, "A clean, plainly stated draft.");
+
+        let ctx = node
+            .process(ctx)
+            .await
+            .expect("an unparseable critic reply must degrade, not fail the whole run");
+        let evaluation = evaluation_of(&ctx);
+
+        assert_eq!(evaluation.verdict, CriticVerdict::Revise);
+        assert!((evaluation.confidence - 0.0).abs() < f64::EPSILON);
+        assert!(
+            evaluation
+                .issues
+                .iter()
+                .any(|i| i.contains("could not be parsed as JSON")),
+            "issues should name the parse failure, got: {:?}",
+            evaluation.issues
+        );
+        assert!(
+            ctx.nodes[NODE_NAME]["raw_output_preview"]
+                .as_str()
+                .is_some(),
+            "the raw reply preview must be stamped for an operator to diagnose"
+        );
     }
 
     #[tokio::test]

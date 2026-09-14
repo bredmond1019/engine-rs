@@ -170,8 +170,14 @@ still correct — leave it alone. If the node's output is already a verdict/enum
 established non-fatal path for an out-of-enum *value* (the `unrecognized_verdict` convention in
 `sdlc_flow/task_loop.rs`), a parse failure is the same failure mode one level earlier and should
 degrade to a named `"UNPARSEABLE"` verdict the same way, via `ModelVerdict`. `EndReviewNode`
-(`sdlc_flow/end_review.rs`) is the reference implementation; `TriageTaskNode` and
-`ConsolidatedReviewNode` (`sdlc_flow/task_loop.rs`) are migrated onto the same shared helper.
+(`sdlc_flow/end_review.rs`) is the reference implementation, and every other node in the
+`FATAL_SHOULD_DEGRADE` bucket is now migrated onto the same shared helper: `TriageTaskNode` and
+`ConsolidatedReviewNode` (`sdlc_flow/task_loop.rs`) share `EndReviewNode`'s exact verdict/router
+shape, while `SelfCriticNode` (`content_pipeline/self_critic.rs`), `BrandCriticNode`
+(`linkedin_post/brand_critic.rs`), `JudgeClaimNode` (`claim_reaffirm/judge.rs`), `PatchDocsNode`
+(`sdlc_flow/docs.rs`), and `ProposalReviewNode` (`proposal_generator/review.rs`) each degrade onto
+their own node-appropriate non-fatal shape instead of reusing `EndReviewNode`'s exact
+`"UNPARSEABLE"` string; see `ModelVerdict`'s doc comment for which shape each one picked and why.
 
 ## Tuning a workflow: profiles and local models
 

@@ -19,7 +19,7 @@ use crate::node::{Node, NodeError};
 use crate::nodes::AgentCodeStep;
 
 use super::task_loop::{apply_policy_config, resolved_policy, worktree_path, Stage};
-use super::{parse_structured_or_fenced, ModelTransport};
+use super::{parse_model_verdict, ModelTransport, ModelVerdict};
 
 /// Model output shape `PatchDocsNode` expects (strict JSON reply).
 #[derive(Debug, Deserialize)]
@@ -241,32 +241,57 @@ impl Node for PatchDocsNode {
             .ok_or_else(|| NodeError::new("PatchDocsNode: model returned no content"))?
             .to_string();
 
-        let parsed: PatchDocsOutput = parse_structured_or_fenced(&ctx, "PatchDocsNode", &content)
-            .map_err(|err| {
-            NodeError::new(format!(
-                "PatchDocsNode: failed to parse model output as JSON: {err}"
-            ))
-        })?;
+        // A docs-patch reply that survives `parse_structured_or_fenced`'s
+        // fence-stripping + balanced-extraction hardening and is STILL not
+        // valid JSON already has a safe non-fatal home: the `flagged`
+        // field's whole job is "the model did not resolve this, a human
+        // must look" (`/close-out` routes it to a ticket/carryover). An
+        // unparseable reply is exactly that same "the model did not
+        // resolve this" outcome one level earlier — we cannot know which
+        // docs got patched, so the modified files that triggered this pass
+        // are flagged wholesale for review, via the shared `ModelVerdict`
+        // abstraction (`workflows/mod.rs`), instead of a fatal `NodeError`
+        // that would halt the whole SDLC_FLOW run over a docs-stage reply.
+        let (parsed, raw_output_preview) =
+            match parse_model_verdict::<PatchDocsOutput>(&ctx, "PatchDocsNode", &content) {
+                ModelVerdict::Parsed(parsed) => (parsed, None),
+                ModelVerdict::Unparseable {
+                    raw_preview,
+                    reason,
+                } => (
+                    PatchDocsOutput {
+                        summary: format!(
+                            "PatchDocsNode: model reply could not be parsed as JSON: {reason}"
+                        ),
+                        files_patched: Vec::new(),
+                        created: Vec::new(),
+                        flagged: Self::collect_modified_files(&ctx),
+                    },
+                    Some(raw_preview),
+                ),
+            };
 
-        super::put_result(
-            &mut ctx,
-            "PatchDocsNode",
-            json!({
-                "summary": parsed.summary,
-                "files_patched": parsed.files_patched,
-                // Bootstrap creations and NEEDS_REVIEW flags, stamped so
-                // `/close-out` can route a flagged rewrite to a ticket or a
-                // carryover instead of it dying in the model's reply.
-                "created": parsed.created,
-                "flagged": parsed.flagged,
-                // Stamp the resolved knob values so `RunTelemetry` /
-                // `PolicyAggregate` can attribute this stage's observed cost
-                // to the settings that caused it (standing rule 6).
-                "model_tier": policy.model_tiers.docs,
-                "call_timeout_secs": policy.timeouts.docs,
-                "max_turns": policy.max_turns.docs,
-            }),
-        );
+        let mut result = json!({
+            "summary": parsed.summary,
+            "files_patched": parsed.files_patched,
+            // Bootstrap creations and NEEDS_REVIEW flags, stamped so
+            // `/close-out` can route a flagged rewrite to a ticket or a
+            // carryover instead of it dying in the model's reply.
+            "created": parsed.created,
+            "flagged": parsed.flagged,
+            // Stamp the resolved knob values so `RunTelemetry` /
+            // `PolicyAggregate` can attribute this stage's observed cost
+            // to the settings that caused it (standing rule 6).
+            "model_tier": policy.model_tiers.docs,
+            "call_timeout_secs": policy.timeouts.docs,
+            "max_turns": policy.max_turns.docs,
+        });
+        if let Some(raw_output_preview) = raw_output_preview {
+            // Bounded, never the full reply — diagnostics for an operator
+            // reading committed state, not something any Rust branch parses.
+            result["raw_output_preview"] = json!(raw_output_preview);
+        }
+        super::put_result(&mut ctx, "PatchDocsNode", result);
 
         Ok(ctx)
     }
@@ -801,9 +826,21 @@ mod tests {
         assert_eq!(result["max_turns"], json!(9));
     }
 
+    /// A genuinely-unparseable reply (e.g. a small local model giving up on
+    /// the task) must degrade to the node's own non-fatal `flagged` path —
+    /// the same routing convention already used for a model's own
+    /// NEEDS_REVIEW flags — rather than fail the whole SDLC_FLOW run.
     #[tokio::test]
-    async fn errors_on_non_json_model_reply() {
-        let ctx = ctx_with_policy(&SdlcPolicy::default());
+    async fn degrades_genuinely_unparseable_reply_to_flagged_instead_of_fatal_error() {
+        let mut ctx = ctx_with_policy(&SdlcPolicy::default());
+        ctx.nodes.insert(
+            "ImplementTaskNode".to_string(),
+            json!({
+                "summary": "did the thing",
+                "modified_files": ["src/foo.rs", "src/bar.rs"],
+                "tests_added": [],
+            }),
+        );
         let node = PatchDocsNode::new().with_transport(Arc::new(|_config, _prompt| {
             let outcome = Outcome {
                 cost_usd: 0.0,
@@ -814,7 +851,7 @@ mod tests {
                     cache_read_input_tokens: 0,
                 },
                 model_usage: std::collections::BTreeMap::new(),
-                text: "not json".to_string(),
+                text: "I could not complete this due to an internal error.".to_string(),
                 is_error: false,
                 api_error_status: None,
                 session_id: None,
@@ -823,8 +860,25 @@ mod tests {
             Box::pin(async move { Ok(outcome) })
         }));
 
-        let result = node.process(ctx).await;
-        assert!(result.is_err());
+        let out = node
+            .process(ctx)
+            .await
+            .expect("an unparseable docs reply must degrade, not fail the whole run");
+        let result = out.nodes.get("PatchDocsNode").expect("output present");
+        assert_eq!(
+            result["flagged"],
+            json!(["src/foo.rs", "src/bar.rs"]),
+            "the modified files that triggered this pass must be flagged for human review"
+        );
+        assert_eq!(result["files_patched"], json!([]));
+        assert!(result["summary"]
+            .as_str()
+            .unwrap()
+            .contains("could not be parsed as JSON"));
+        assert!(
+            result["raw_output_preview"].as_str().is_some(),
+            "the raw reply preview must be stamped for an operator to diagnose"
+        );
     }
 
     /// `EN.ticket.sdlc-flow-dead-policy-knobs` task 3: a non-default

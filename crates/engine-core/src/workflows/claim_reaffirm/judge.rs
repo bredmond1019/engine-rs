@@ -45,8 +45,8 @@ use crate::nodes::{
 };
 use crate::policy::LocalConfig;
 use crate::workflows::{
-    get_result, parse_structured_or_fenced, put_result, session_baseline, sessions_since,
-    ModelTransport, TransportSlot,
+    get_result, parse_model_verdict, put_result, session_baseline, sessions_since, ModelTransport,
+    ModelVerdict, TransportSlot,
 };
 
 use super::queue_router;
@@ -462,15 +462,33 @@ impl Node for JudgeClaimNode {
             .and_then(|value| value.get("transport"))
             .cloned();
 
-        let parsed: JudgeOutput = parse_structured_or_fenced(&ctx, JUDGE_NODE_NAME, &content)
-            .map_err(|err| {
-                NodeError::new(format!(
-                    "{JUDGE_NODE_NAME}: failed to parse a verdict from the model's reply: {err}"
-                ))
-                .with_sessions(sessions_since(&ctx, baseline))
-            })?;
-
-        let mut action = verdict_action_from_model_text(&parsed.action);
+        // A judge reply that survives `parse_structured_or_fenced`'s
+        // fence-stripping + balanced-extraction hardening and is STILL not
+        // valid JSON is the same failure mode `JudgeOutput` already has a
+        // structural fallback for one level later: this node forces
+        // `VerdictAction::NeedsHuman` whenever it cannot trust the model's
+        // judgment (today, empty evidence — see the OR.K3 guard below). An
+        // unparseable reply is exactly that same "cannot trust the model's
+        // judgment" case, so it degrades straight to `NeedsHuman` via the
+        // shared `ModelVerdict` abstraction (`workflows/mod.rs`) rather than
+        // a fatal `NodeError` that would halt the whole claim-reaffirm drain
+        // over one claim's unusable reply.
+        let (mut action, reasoning, raw_output_preview) =
+            match parse_model_verdict::<JudgeOutput>(&ctx, JUDGE_NODE_NAME, &content) {
+                ModelVerdict::Parsed(parsed) => (
+                    verdict_action_from_model_text(&parsed.action),
+                    parsed.reasoning,
+                    None,
+                ),
+                ModelVerdict::Unparseable {
+                    raw_preview,
+                    reason,
+                } => (
+                    VerdictAction::NeedsHuman,
+                    format!("{JUDGE_NODE_NAME}: model reply could not be parsed as JSON: {reason}"),
+                    Some(raw_preview),
+                ),
+            };
         // Structural OR.K3 guard: empty evidence can never yield
         // BumpFreshness/Supersede, regardless of what the model returned.
         if results.is_empty()
@@ -510,7 +528,7 @@ impl Node for JudgeClaimNode {
         let verdict = Verdict {
             action,
             evidence,
-            reasoning: parsed.reasoning,
+            reasoning,
             transport,
         };
 
@@ -519,6 +537,11 @@ impl Node for JudgeClaimNode {
                 .with_sessions(sessions_since(&ctx, baseline))
         })?;
         result["skipped"] = json!(false);
+        if let Some(raw_output_preview) = raw_output_preview {
+            // Bounded, never the full reply — diagnostics for an operator
+            // reading committed state, not something any Rust branch parses.
+            result["raw_output_preview"] = json!(raw_output_preview);
+        }
         put_result(&mut ctx, JUDGE_NODE_NAME, result);
         let _ = &dispatched.claim_id; // identity carried by ClaimQueueRouterNode's own stamp
 
@@ -743,6 +766,61 @@ mod tests {
         let verdict: Verdict =
             serde_json::from_value(ctx.nodes[JUDGE_NODE_NAME].clone()).expect("valid Verdict");
         assert_eq!(verdict.action, VerdictAction::Archive);
+    }
+
+    fn stub_unparseable_transport() -> ModelTransport {
+        Arc::new(move |_config: Config, _prompt: String| {
+            async move {
+                Ok(Outcome {
+                    text: "I could not complete this judgment due to an internal error."
+                        .to_string(),
+                    cost_usd: 0.01,
+                    usage: SdkUsage {
+                        input_tokens: 80,
+                        output_tokens: 30,
+                        cache_creation_input_tokens: 0,
+                        cache_read_input_tokens: 0,
+                    },
+                    model_usage: BTreeMap::new(),
+                    session_id: None,
+                    structured_output: None,
+                    is_error: false,
+                    api_error_status: None,
+                })
+            }
+            .boxed()
+        })
+    }
+
+    #[tokio::test]
+    async fn judge_degrades_genuinely_unparseable_reply_to_needs_human_instead_of_fatal_error() {
+        let mut ctx = ctx_with_dispatched_claim("Claim text", "planning/status.md");
+        put_recall_result(
+            &mut ctx,
+            false,
+            vec![evidence_hit("planning/status.md", "still true today")],
+        );
+        let node = JudgeClaimNode::new().with_transport(stub_unparseable_transport());
+
+        let ctx = node
+            .process(ctx)
+            .await
+            .expect("an unparseable judge reply must degrade, not fail the whole drain");
+        let verdict: Verdict =
+            serde_json::from_value(ctx.nodes[JUDGE_NODE_NAME].clone()).expect("valid Verdict");
+
+        assert_eq!(
+            verdict.action,
+            VerdictAction::NeedsHuman,
+            "an unusable model signal must route to a human, mirroring the OR.K3 fallback"
+        );
+        assert!(verdict.reasoning.contains("could not be parsed as JSON"));
+        assert!(
+            ctx.nodes[JUDGE_NODE_NAME]["raw_output_preview"]
+                .as_str()
+                .is_some(),
+            "the raw reply preview must be stamped for an operator to diagnose"
+        );
     }
 
     #[tokio::test]

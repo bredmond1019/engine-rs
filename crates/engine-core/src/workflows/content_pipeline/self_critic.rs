@@ -31,8 +31,8 @@ use serde_json::json;
 use crate::node::{InputBinding, Node, NodeError};
 use crate::nodes::{AgentCodeStep, MetaTransport};
 use crate::workflows::{
-    get_result, parse_structured_or_fenced, put_result, session_baseline, sessions_since,
-    ModelTransport, TransportSlot,
+    get_result, parse_model_verdict, put_result, session_baseline, sessions_since, ModelTransport,
+    ModelVerdict, TransportSlot,
 };
 
 use super::policy::ContentPipelinePolicy;
@@ -281,20 +281,42 @@ impl Node for SelfCriticNode {
             .and_then(|value| value.get("transport"))
             .cloned();
 
-        let parsed: CriticOutput =
-            parse_structured_or_fenced(&ctx, NODE_NAME, &content).map_err(|err| {
-                NodeError::new(format!(
-                    "{NODE_NAME}: failed to parse a CriticEvaluation from the model's reply: {err}"
-                ))
-                .with_sessions(sessions_since(&ctx, baseline))
-            })?;
-
-        let verdict = verdict_from_model_text(&parsed.verdict);
+        // A critic reply that survives `parse_structured_or_fenced`'s
+        // fence-stripping + balanced-extraction hardening and is STILL not
+        // valid JSON is the same failure mode `verdict_from_model_text`
+        // already handles one level later (an ambiguous/malformed verdict
+        // *value*) — fail closed onto `Revise` rather than a fatal
+        // `NodeError`, via the shared `ModelVerdict` abstraction
+        // (`workflows/mod.rs`). This is NOT the node's `FATAL_CORRECT`
+        // sibling shape: `SelfCriticNode`'s whole contract already has a
+        // safe non-fatal fallback for an unusable model signal, so treating
+        // a parse failure as anything other than that same fallback would
+        // kill a content-pipeline run over a small local model's stray prose.
+        let (verdict, confidence, issues, raw_output_preview) =
+            match parse_model_verdict::<CriticOutput>(&ctx, NODE_NAME, &content) {
+                ModelVerdict::Parsed(parsed) => (
+                    verdict_from_model_text(&parsed.verdict),
+                    parsed.confidence,
+                    parsed.issues,
+                    None,
+                ),
+                ModelVerdict::Unparseable {
+                    raw_preview,
+                    reason,
+                } => (
+                    CriticVerdict::Revise,
+                    0.0,
+                    vec![format!(
+                        "{NODE_NAME}: model reply could not be parsed as JSON: {reason}"
+                    )],
+                    Some(raw_preview),
+                ),
+            };
 
         let evaluation = CriticEvaluation {
             verdict,
-            confidence: parsed.confidence,
-            issues: parsed.issues,
+            confidence,
+            issues,
             iteration,
         };
 
@@ -304,6 +326,11 @@ impl Node for SelfCriticNode {
         })?;
         if let Some(transport) = transport_stamp {
             result["transport"] = transport;
+        }
+        if let Some(raw_output_preview) = raw_output_preview {
+            // Bounded, never the full reply — diagnostics for an operator
+            // reading committed state, not something any Rust branch parses.
+            result["raw_output_preview"] = json!(raw_output_preview);
         }
         put_result(&mut ctx, NODE_NAME, result);
 
@@ -567,6 +594,67 @@ mod tests {
         assert_eq!(config.model.as_deref(), Some("claude-opus-4-8"));
         assert_eq!(config.system_prompt.as_deref(), Some(STABLE_SYSTEM_PROMPT));
         assert!(prompt.contains("Be terse"));
+    }
+
+    /// Stubs raw, non-JSON prose as the transport's `text` with no
+    /// `structured_output` fallback, so `parse_structured_or_fenced` has
+    /// nothing to recover from.
+    fn stub_unparseable_transport() -> ModelTransport {
+        std::sync::Arc::new(move |_config: Config, _prompt: String| {
+            async move {
+                Ok(Outcome {
+                    text: "I could not complete this critique due to an internal error."
+                        .to_string(),
+                    cost_usd: 0.01,
+                    usage: SdkUsage {
+                        input_tokens: 80,
+                        output_tokens: 30,
+                        cache_creation_input_tokens: 0,
+                        cache_read_input_tokens: 0,
+                    },
+                    model_usage: BTreeMap::new(),
+                    session_id: None,
+                    structured_output: None,
+                    is_error: false,
+                    api_error_status: None,
+                })
+            }
+            .boxed()
+        })
+    }
+
+    #[tokio::test]
+    async fn process_degrades_genuinely_unparseable_reply_to_revise_instead_of_fatal_error() {
+        let node = SelfCriticNode::new().with_transport(stub_unparseable_transport());
+        let ctx = ctx_with_summary(summarize::NODE_NAME, "A concise summary.");
+
+        let ctx = node
+            .process(ctx)
+            .await
+            .expect("an unparseable critic reply must degrade, not fail the whole run");
+
+        let evaluation: CriticEvaluation =
+            serde_json::from_value(ctx.nodes[NODE_NAME].clone()).expect("valid CriticEvaluation");
+        assert_eq!(
+            evaluation.verdict,
+            CriticVerdict::Revise,
+            "an unusable model signal must fail closed, mirroring an ambiguous verdict value"
+        );
+        assert!((evaluation.confidence - 0.0).abs() < f64::EPSILON);
+        assert!(
+            evaluation
+                .issues
+                .iter()
+                .any(|i| i.contains("could not be parsed as JSON")),
+            "issues should name the parse failure, got: {:?}",
+            evaluation.issues
+        );
+        assert!(
+            ctx.nodes[NODE_NAME]["raw_output_preview"]
+                .as_str()
+                .is_some(),
+            "the raw reply preview must be stamped for an operator to diagnose"
+        );
     }
 
     #[tokio::test]
