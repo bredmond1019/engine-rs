@@ -303,6 +303,7 @@ Engine code the bench depends on:
 | `crates/engine-core/src/nodes/pi_transport.rs` | The pi command line |
 | `crates/engine-core/src/workflows/sdlc_flow/graph.rs` | `registry_for_policy_with_cancellation` — local transports per stage |
 | `crates/engine-core/src/workflows/sdlc_flow/setup.rs` | Worktrees from `origin/main`; resume by commit title |
+| `crates/engine-core/src/workflows/llm_node.rs` | The shared `TransportSlotted`/`Cancellable` traits + `resolve_meta_transport`/`wire` every stage above's local-tier rewire now goes through (`EN.ticket.transport-slot-consolidation`, 2026-09-14) — same observable behavior as before, different internal mechanism. See its own doc comment for exactly which nodes are migrated |
 
 ## Engine defects still open
 
@@ -316,6 +317,18 @@ Filed as `carryover[]` in the private `planning/state.json`. `heavy-work-queue-p
 
 Two more are fixed **outside this repo**, in the local `core/pi_agent_rust` clone (not yet filed
 upstream) — see pitfalls 17/18 above and the callout on the patched `pi` binary requirement.
+
+## Opportunity not yet explored: ORCHESTRATION's preflight/inbox-triage stages
+
+As of `65f102e` (2026-09-14), `OrchestrationPolicy.preflight_model_tier`/`inbox_triage_model_tier:
+local` actually dispatch to a local model — before, the tier resolved through policy but no
+production call site forwarded it, so `local` silently did nothing (see [orchestration.md
+§ preflight_model_tier](orchestration.md), [policy-and-profiles.md](policy-and-profiles.md)). **This
+bench script does not exercise either stage** — every job here dispatches `SDLC_FLOW` only, and
+`ORCHESTRATION`'s preflight/inbox-triage runs are a separate workflow this bench has no job type
+for. No result in this runbook's leaderboards says anything about local-model quality on either
+stage; that would need a new job type dispatching `ORCHESTRATION`, not a config change to an
+existing one. Filed as a real gap, not yet a backlog ticket.
 
 ## Opportunity not yet explored: completion-only models elsewhere in the engine
 
