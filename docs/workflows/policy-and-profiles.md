@@ -145,6 +145,16 @@ Anything else is a manual rewire: set that stage's tier to `local` and supply a 
 through `harness.json` or a per-run `policy` override. Check the workflow's own doc for its stage
 names before writing the override.
 
+**`ORCHESTRATION`'s `preflight_model_tier`/`inbox_triage_model_tier` are also live now** —
+`OrchestrationPolicy` gained its own `local`/`pi` fields so setting either to `local` actually
+dispatches, where before the tier resolved through policy but had nowhere to route to. See
+[orchestration.md](orchestration.md) for both knobs. The node-side mechanism behind every one of
+these local-tier rewires (`TriageTaskNode`, `ConsolidatedReviewNode`, `EndReviewNode`,
+`PatchDocsNode`, `GenerateTasksNode`, `ImplementTaskNode`, `JudgmentNode` — the shared primitive
+behind `PreflightRunner`/`InboxTriageRunner`) is now the `TransportSlotted`/`Cancellable` traits in
+`crates/engine-core/src/workflows/llm_node.rs`; `content_pipeline`/`proposal_generator`/
+`diagnostic_intake`/`linkedin_post` still route local the pre-existing way (unmigrated, not broken).
+
 ## Which workflows have a policy section
 
 These keys exist in `engine-rs/planning/harness.json` today:

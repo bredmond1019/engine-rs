@@ -401,6 +401,20 @@ micro-workflow. The operator-facing half that *drives* those pending records —
 decision in the approval ledger, and executes only a matched-digest approval — is documented in
 [approve-and-run-workflow.md](workflows/approve-and-run.md).
 
+**The node-side transport-selection shape is a shared trait, not a fourth injectable seam.**
+`crates/engine-core/src/workflows/llm_node.rs`'s `TransportSlotted`/`Cancellable` traits (plus
+`resolve_meta_transport`/`wire`) are the single home every LLM-calling node in `sdlc_task`,
+`sdlc_flow`, and `orchestration` (via `nodes::judgment::JudgmentNode<T>`) implements for the local-
+model-tier override + cancellation-token plumbing, replacing what used to be a hand-duplicated
+field/builder pair per node and a hand-written `if tier == Local` conditional per graph-side
+registration call. See that module's own doc comment for exactly which nodes are migrated so far —
+`content_pipeline`, `proposal_generator`, `diagnostic_intake`, `linkedin_post`, and
+`claim_reaffirm::judge` still use the pre-existing hand-rolled `TransportSlot` field directly
+(unmigrated, not broken — local routing still works for them the old way). This is distinct from
+the seams table above: those three wrap an *external* dependency (HTTP, a channel, the Brain
+corpus); `llm_node.rs` is a capability every model-calling node shares regardless of what it talks
+to.
+
 **Materialize -\> harvest ordering guarantee.** In `CONTENT_PIPELINE`, `MaterializeDocNode` always
 runs upstream of `PersistToBrainNode` in the declared graph, and the harvest gate never changes
 that order or `MaterializeDocNode`'s own behavior: the materialized `.md` is written identically

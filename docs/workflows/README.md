@@ -260,9 +260,10 @@ HTTP 404.
 `registry_for_policy_with_cancellation`; `PatchDocsNode`/`GenerateTasksNode` had no
 `with_meta_transport` builder at all, so `model_tiers.docs`/`model_tiers.generate: local` was a
 silent no-op — the docs-patch and task-generation stages kept billing the real `claude` CLI
-regardless of the policy. Both nodes now carry the same `TransportSlot`/`with_meta_transport` shape
-as `TriageTaskNode`, wired in `graph.rs` (`SDLC_FLOW`, both stages) and `sdlc_task/graph.rs`
-(`SDLC_TASK`, `generate` only — `SDLC_TASK` has no `PatchDocsNode`). Any tool driving a full
+regardless of the policy. Both nodes now implement the shared `TransportSlotted`/`Cancellable`
+traits (`crates/engine-core/src/workflows/llm_node.rs`) the same as `TriageTaskNode`, wired via
+`llm_node::wire` in `graph.rs` (`SDLC_FLOW`, both stages) and `sdlc_task/graph.rs` (`SDLC_TASK`,
+`generate` only — `SDLC_TASK` has no `PatchDocsNode`). Any tool driving a full
 SDLC_FLOW/SDLC_TASK run entirely on a local model must set all four tiers
 (`triage`/`review`/`docs`/`generate`), not just `triage`/`review`.
 

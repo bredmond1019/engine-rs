@@ -277,11 +277,13 @@ endpoint (schema-shaped hint gated by `local.constrained_json`, off by default).
 Setting `model_tiers.triage` and/or `model_tiers.review` to `local` routes that stage's calls
 through `openai_compat_meta_transport_live` (a `MetaTransport`, `openai_compat_transport.rs`) to
 an OpenAI-compatible endpoint (e.g. a local Ollama server) instead of the Claude CLI — for cheap,
-zero-cost judgment calls on cheap hardware. Both `TriageTaskNode` and `ConsolidatedReviewNode` hold
-a `TransportSlot` (`workflows/transport_slot.rs`) so this meta-reporting override, not just a plain
-`ModelTransport`, is what `registry_for_policy` wires in (`EN.ticket.wire-meta-transport-telemetry`
-task 2) — see [Observed vs. intended tier](#telemetry-runoutcomes) below for why that distinction
-matters to `model_tier_used`.
+zero-cost judgment calls on cheap hardware. Both `TriageTaskNode` and `ConsolidatedReviewNode`
+implement `TransportSlotted` (`crates/engine-core/src/workflows/llm_node.rs`, wrapping the same
+`TransportSlot`, `workflows/transport_slot.rs`) so this meta-reporting override, not just a plain
+`ModelTransport`, is what `registry_for_policy` wires in via `llm_node::wire`
+(`EN.ticket.wire-meta-transport-telemetry` task 2; consolidated onto the shared trait by
+`EN.ticket.transport-slot-consolidation`) — see [Observed vs. intended tier](#telemetry-runoutcomes)
+below for why that distinction matters to `model_tier_used`.
 
 - **Scoped to single-shot judgment stages only** — `TriageTaskNode`'s LLM-triage branch and
   `ConsolidatedReviewNode`. `ImplementTaskNode` (the agentic implement stage) is **never** rewired
