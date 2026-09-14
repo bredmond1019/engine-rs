@@ -233,6 +233,66 @@ has the full table; in short: `no_context_files`/`no_session` default `true` (co
 `AGENTS.md`/`CLAUDE.md` leakage into every local-model prompt otherwise, and a zero-downside hygiene
 default), `tools` scopes `pi`'s own 19-tool default down to 12 for a headless coding task.
 
+## Running jobs concurrently, and exercising ORCHESTRATION (2026-09-14)
+
+Two additive modes, both default-off so existing invocations are unchanged:
+
+**`--parallel N`** (default `1`) — runs N worker slots concurrently against `--dispatch direct`
+(the default dispatch mode, unchanged otherwise). Each slot gets its own `--spec-slug` suffix
+(`-slot1`, `-slot2`, ...) and therefore its own worktree, so concurrent jobs never stomp each
+other's `tasks.json`/`harness.json`. Verified 2026-09-14: two jobs dispatched at the same second
+against the real dev `bastion serve` (port 4317), confirmed running concurrently via overlapping
+`status: running` polls, completing independently (one failed fast, the other passed ~105s later).
+Safe at any `--parallel` value — direct dispatch carries no `block_id`, so it has no merge/push/
+close side effects to race on.
+
+**`--dispatch orchestration`** — fires the real `ORCHESTRATION` workflow (not a direct
+`SDLC_FLOW`/`SDLC_TASK` POST) against a disposable, repeatedly-reopened block
+(`EN.ticket.local-model-bench-orchestration-slot`), so a bench run also exercises real chain
+mechanics (`SetupWorktreeNode` → `SpecExistsRouterNode` → the full `SDLC_TASK` graph → close).
+**Sandbox-only, hard-guarded** (`assert_sandbox_target`): refuses to run without an explicit
+`--sandbox-root`, refuses a root that is or contains the real HQ vault
+(`/Users/brandon/Dev/agentic-portfolio`), and refuses `BASTION_SERVE_ADDR` port `4317` (the real
+dev instance). This is not optional hardening — `docs/workflows/orchestration.md`'s own "Pitfall"
+section documents that a passing orchestration step merges its branch into `main`, pushes it, and
+closes the block (a fleet-wide `mev emit-state --write`); pointed at the real HQ vault, a bench
+sweep would rewrite real state and push real branches. **Sequential only** — `--parallel > 1` is
+rejected for this mode, because that merge-and-push happens in the repo's *primary* checkout, which
+races across concurrent dispatches even for different blocks.
+
+**Known gap, not fixed by this mode: not zero-cloud-cost.** A PASSING orchestration job still
+triggers `ORCHESTRATION`'s own ledger-composer step
+(`crates/engine-serve/src/journal.rs::compose_ledger_entries_via_agent`), which has **no local
+transport wired at all** — confirmed in source: `"Local` has no meaning for this composer (no
+OpenAI-compatible transport is wired here) ... nothing sets this knob to `local` today."` Every
+passing job makes one real sonnet-tier Claude call regardless of how local the child run's own
+tiers are. A **failing** job never reaches that step (`CloseBlockNode` only runs on a real close),
+so a task-failed/timeout job is genuinely free. Verified 2026-09-14: a real end-to-end dispatch
+(real `qwen2.5-coder:7b` + `aider` against a sandbox instance) ran the full chain in 180s, made real
+file changes, and failed at the engine's own final-check classification
+(`engine_rejected_correct_work` — a real bench finding, not a plumbing bug) *before* reaching the
+composer, so that specific verification run made zero Claude calls. A pass-through run would not be
+free. Fixing the composer's local routing is out of scope here — same shape as the `llm_node.rs`
+trait work elsewhere in this repo, but its own task.
+
+**Setup, once per sandbox instance:** `ensure_sandbox_bench_block` idempotently creates the
+disposable block and a `planning/roadmaps/local-model-bench/` directory (an explicit `blocks` list
+still needs a `roadmap_slug` to resolve a lane-log directory) on first use — nothing to do by hand.
+
+Auto-monitor (`system_monitor.py`, both modes): launched automatically alongside any run, logged to
+`<run>/system_monitor.jsonl`, terminated on completion or interrupt. `--no-monitor` opts out.
+
+```bash
+# Real model parallelism against the real dev bastion serve (safe, default target)
+python3 scripts/bench_local_models.py --parallel 3 --models all --tiers easy --agent-backends aider
+
+# Exercise ORCHESTRATION for real, sandbox only
+export BASTION_SERVE_ADDR=http://localhost:18090   # the sandbox's own engine port
+python3 scripts/bench_local_models.py --dispatch orchestration \
+  --sandbox-root /Users/brandon/Dev/engine-rs-sandbox-engrs1 \
+  --models qwen2.5-coder:7b --tiers easy --agent-backends aider
+```
+
 ## Pitfalls (every one of these happened)
 
 Each was measured on 2026-09-14 while getting the first clean run. The fix column says where the
