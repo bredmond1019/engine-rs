@@ -497,6 +497,16 @@ pub fn registry_for_policy_with_cancellation(
         registry.register(Box::new(node));
     }
 
+    // `review_mode: end_only` reviews through `EndReviewNode`, which must
+    // honour the local tier exactly as `ConsolidatedReviewNode` does — left on
+    // the base registry it sent the local model name to the claude CLI and
+    // failed with HTTP 404 (measured 2026-09-14).
+    if review_local {
+        registry.register(Box::new(EndReviewNode::new().with_meta_transport(
+            openai_compat_meta_transport_live(policy.local.clone(), real_cloud_transport()),
+        )));
+    }
+
     let pi_backend = policy.agent_backend == AgentBackend::Pi;
     let aider_backend = policy.agent_backend == AgentBackend::Aider;
     if pi_backend || aider_backend || token.is_some() {

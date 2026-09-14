@@ -296,6 +296,24 @@ fn build_workflow(
     consolidated_review_transport: ModelTransport,
     end_review_transport: ModelTransport,
 ) -> Workflow {
+    build_workflow_with_end_review(
+        worktree,
+        policy,
+        runner,
+        consolidated_review_transport,
+        Some(end_review_transport),
+    )
+}
+
+/// `end_review_transport: None` keeps whatever `registry_for_policy` wired
+/// `EndReviewNode` to, so a test can observe the production wiring itself.
+fn build_workflow_with_end_review(
+    worktree: &Path,
+    policy: &SdlcPolicy,
+    runner: CommandRunner,
+    consolidated_review_transport: ModelTransport,
+    end_review_transport: Option<ModelTransport>,
+) -> Workflow {
     let mut registry: NodeRegistry = graph::registry_for_policy(policy);
 
     registry.register(Box::new(FixtureSetupNode {
@@ -324,11 +342,13 @@ fn build_workflow(
     registry.register(Box::new(
         FinalValidationNode::new().with_runner(runner.clone()),
     ));
-    registry.register(Box::new(
-        EndReviewNode::new()
-            .with_runner(runner.clone())
-            .with_transport(end_review_transport),
-    ));
+    if let Some(end_review_transport) = end_review_transport {
+        registry.register(Box::new(
+            EndReviewNode::new()
+                .with_runner(runner.clone())
+                .with_transport(end_review_transport),
+        ));
+    }
     registry.register(Box::new(EndReviewRouterNode));
     registry.register(Box::new(
         PatchDocsNode::new().with_transport(patch_docs_transport()),
@@ -448,6 +468,96 @@ async fn end_only_full_run_makes_exactly_one_review_call_with_full_ac_and_multi_
     let state = read_state(&worktree);
     assert_eq!(state["status"], json!("done"));
     assert_eq!(state["review"]["verdict"], json!("PASS"));
+
+    let _ = std::fs::remove_dir_all(&worktree);
+}
+
+/// A loopback OpenAI-compat stub returning `content`, counting requests.
+async fn spawn_local_http_stub(content: &str) -> (String, Arc<AtomicUsize>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("stub server should bind a loopback port");
+    let addr = listener.local_addr().expect("bound listener address");
+    let calls = Arc::new(AtomicUsize::new(0));
+    let calls_for_task = Arc::clone(&calls);
+    let body = json!({
+        "choices": [{ "message": { "content": content } }],
+        "usage": { "prompt_tokens": 3, "completion_tokens": 4 },
+    })
+    .to_string();
+
+    tokio::spawn(async move {
+        while let Ok((mut socket, _)) = listener.accept().await {
+            calls_for_task.fetch_add(1, Ordering::SeqCst);
+            let body = body.clone();
+            tokio::spawn(async move {
+                let mut buf = [0u8; 65536];
+                let _ = socket.read(&mut buf).await;
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+                let _ = socket.shutdown().await;
+            });
+        }
+    });
+
+    (format!("http://{addr}"), calls)
+}
+
+/// `review: local` under `EndOnly` must send the end review to the local
+/// endpoint. Before the fix `registry_for_policy` left `EndReviewNode` on the
+/// claude CLI transport, which 404'd on the local model name (measured
+/// 2026-09-14, local-model-bench smoke).
+#[tokio::test]
+async fn end_only_local_review_tier_routes_end_review_to_the_local_endpoint() {
+    use engine_core::policy::{LocalConfig, ModelTier};
+    use engine_core::workflows::sdlc_flow::policy::ModelTiers;
+
+    let worktree = temp_worktree("end-only-local");
+    write_fixture_files(&worktree, 3);
+    let (endpoint, http_calls) = spawn_local_http_stub(
+        &json!({ "verdict": "PASS", "summary": "ok", "issues": [] }).to_string(),
+    )
+    .await;
+
+    let policy = SdlcPolicy {
+        review_mode: ReviewMode::EndOnly,
+        model_tiers: ModelTiers {
+            review: ModelTier::Local,
+            ..ModelTiers::default()
+        },
+        local: LocalConfig {
+            endpoint,
+            model: "stub-local-model".to_string(),
+            constrained_json: false,
+        },
+        ..SdlcPolicy::default()
+    };
+
+    let workflow = build_workflow_with_end_review(
+        &worktree,
+        &policy,
+        make_runner(MULTI_TASK_DIFF, NON_TRIVIAL_NUMSTAT),
+        panicking_transport(),
+        None,
+    );
+    let final_ctx = workflow
+        .run(run_event(), Box::new(|_ctx: &TaskContext| {}))
+        .await
+        .expect("workflow run should not error");
+
+    assert_eq!(http_calls.load(Ordering::SeqCst), 1);
+    let end_review = &final_ctx.node_runs["EndReviewNode"];
+    assert_eq!(end_review.status, NodeRunStatus::Success);
+    assert_eq!(
+        end_review.usage.as_ref().expect("usage stamped").model,
+        "local/stub-local-model"
+    );
 
     let _ = std::fs::remove_dir_all(&worktree);
 }

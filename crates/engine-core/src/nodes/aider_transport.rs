@@ -87,6 +87,26 @@ const AIDER_BINARY: &str = "aider";
 /// instead of a real `aider` install.
 const AIDER_BINARY_ENV: &str = "AIDER_BINARY";
 
+/// `Config.env` key a caller uses to hand this transport the task's declared
+/// files (newline-separated). It is consumed here, never exported to the
+/// child: each safe path becomes a positional `aider` file argument, so the
+/// file is in the chat under its real name before the model replies.
+/// `MetaTransport` carries only `(Config, prompt)`, hence the env channel.
+pub const AIDER_FILES_ENV: &str = "ENGINE_AIDER_FILES";
+
+/// A declared file is passed to `aider` only when it is a non-empty relative
+/// path with no `..` component and no leading `-` (which aider would parse as
+/// a flag).
+fn is_safe_task_path(path: &str) -> bool {
+    let candidate = std::path::Path::new(path);
+    !path.is_empty()
+        && !path.starts_with('-')
+        && candidate.is_relative()
+        && !candidate
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+}
+
 /// Whole-call wall-clock ceiling applied when `Config.timeout` carries no
 /// override — same value and same rationale as `pi_transport::DEFAULT_PI_TIMEOUT`
 /// (a shared local Ollama server can queue concurrent lanes).
@@ -150,6 +170,15 @@ async fn run_aider(
         .stderr(Stdio::piped())
         .kill_on_drop(true);
 
+    let task_files: Vec<&str> = config
+        .env
+        .iter()
+        .filter(|(k, _)| k == AIDER_FILES_ENV)
+        .flat_map(|(_, v)| v.lines().map(str::trim))
+        .filter(|path| is_safe_task_path(path))
+        .collect();
+    command.args(&task_files);
+
     if let Some(cwd) = &config.cwd {
         command.current_dir(cwd);
     }
@@ -158,9 +187,13 @@ async fn run_aider(
     // distinct from `pi`'s `OLLAMA_HOST` (see module doc).
     command.env("OLLAMA_API_BASE", &local.endpoint);
 
-    if !config.env.is_empty() {
-        command.envs(config.env.iter().map(|(k, v)| (k.as_str(), v.as_str())));
-    }
+    command.envs(
+        config
+            .env
+            .iter()
+            .filter(|(k, _)| k != AIDER_FILES_ENV)
+            .map(|(k, v)| (k.as_str(), v.as_str())),
+    );
 
     let child = match command.spawn() {
         Ok(child) => child,
@@ -552,6 +585,47 @@ printf 'Applied edit to hello.txt\n'
             expected_cwd.display(),
             outcome.text
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn declared_files_become_positional_args_and_never_reach_the_child_env() {
+        let _guard = AIDER_BINARY_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        let (_script_dir, script) = write_fake_binary(
+            r#"for a in "$@"; do printf 'arg:%s\n' "$a"; done
+printf 'files_env:%s\n' "${ENGINE_AIDER_FILES:-unset}"
+printf 'other_env:%s\n' "${OTHER:-unset}"
+"#,
+        );
+        set_aider_binary(&script);
+
+        let config = Config {
+            env: vec![
+                (
+                    AIDER_FILES_ENV.to_string(),
+                    "LOCAL_ORCH_1.md\nsrc/lib.rs\n../escape.md\n/abs/path.md\n-rf\n".to_string(),
+                ),
+                ("OTHER".to_string(), "kept".to_string()),
+            ],
+            ..Config::default()
+        };
+
+        let transport = aider_meta_transport(test_local_config(), None);
+        let result = transport(config, "prompt".to_string()).await;
+        clear_aider_binary();
+
+        let (outcome, _info) = result.expect("fake aider script run must succeed");
+        let text = outcome.text;
+        assert!(text.contains("arg:LOCAL_ORCH_1.md"), "{text}");
+        assert!(text.contains("arg:src/lib.rs"), "{text}");
+        assert!(!text.contains("arg:../escape.md"), "{text}");
+        assert!(!text.contains("arg:/abs/path.md"), "{text}");
+        assert!(!text.contains("arg:-rf"), "{text}");
+        assert!(text.contains("files_env:unset"), "{text}");
+        assert!(text.contains("other_env:kept"), "{text}");
     }
 
     #[cfg(unix)]

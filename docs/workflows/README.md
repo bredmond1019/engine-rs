@@ -207,6 +207,29 @@ non-`claude_cli` backend, `modified_files` is read from the worktree's git state
 model's self-report. The existing guard against a run that did nothing is unchanged: a task
 declaring `expects_writes` still fails write-verification if the worktree is untouched.
 
+**Local backends get an act-now prompt, not the JSON contract** (2026-09-14, found by
+`scripts/bench_local_models.py`). Asked to "respond with strict JSON", small local models under
+`aider` applied that JSON as a whole-file overwrite of `CLAUDE.md`, and under `pi` replied with a JSON
+claim of having written the file without ever calling the write tool. `ImplementTaskNode` therefore
+tells `aider` to apply the edit directly and `pi` to use its file tools, and — for any non-`claude_cli`
+backend — names the task's declared `files[]` verbatim in the prompt, because small models otherwise
+copy their tool's example path (`path/to/LOCAL_ORCH_1.md`). `aider` also receives those files as
+positional arguments (via the `ENGINE_AIDER_FILES` config-env channel, consumed by the transport and
+never exported), so they are in its chat under their real names. `claude_cli`'s prompt is unchanged.
+
+**`aider` write-verification diffs against the task's first-attempt `HEAD`.** `aider` commits during
+the call, so `git status` is always clean afterward. `ImplementTaskNode` stamps `task_base_sha` (the
+`HEAD` before the task's first attempt, kept across its retries) and `TestTaskNode` diffs against it.
+A per-call diff would read a retry whose earlier attempt already committed the work as a no-op and
+fail every remaining attempt. The same base is used by `ConsolidatedReviewNode`'s review diff and by
+`TriageTaskNode`'s trivial-task classification: against `HEAD` both see an empty diff after aider's
+commit, and a local reviewer failed correct work as "file does not exist" (measured 2026-09-14).
+
+**`review: local` covers `EndReviewNode` too.** `registry_for_policy` wires the local OpenAI-compat
+transport into `EndReviewNode` exactly as into `ConsolidatedReviewNode`; before, `review_mode:
+end_only` with a local review tier sent the local model name to the `claude` CLI and failed with
+HTTP 404.
+
 **Safety boundary — named, accepted for a local model on the operator's own machine, not closed.**
 `PiTransport` shells to `pi` with `--approval-mode yolo`, which lets the model's own output run
 shell, file and network actions with no per-tool gate — `policy/command_floor.rs` cannot reach it

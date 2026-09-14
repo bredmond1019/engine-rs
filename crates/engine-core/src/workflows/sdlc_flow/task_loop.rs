@@ -183,6 +183,18 @@ pub(super) fn stage_turn_ceiling(policy: &SdlcPolicy, stage: Stage) -> Option<u3
 /// injectable [`CommandRunner`] seam: one line per changed file,
 /// `<added>\t<deleted>\t<path>`.
 ///
+/// The ref a task's working-tree diff is taken against: `HEAD`, except when
+/// `ImplementTaskNode` stamped a `task_base_sha` (Aider, which commits during
+/// the call). There `HEAD` already contains the task's work, so `git diff
+/// HEAD` is empty and a reviewer sees nothing — measured 2026-09-14, a local
+/// reviewer failed a correct aider task with "bench_greet.py does not exist".
+fn task_diff_base(ctx: &TaskContext) -> String {
+    get_result(ctx, "ImplementTaskNode")
+        .and_then(|value| value.get("task_base_sha"))
+        .and_then(|value| value.as_str())
+        .map_or_else(|| "HEAD".to_string(), str::to_string)
+}
+
 /// This used to diff the COMMIT range `<base_sha>..HEAD`. Since nothing in
 /// the run ever committed code, that range was always empty, so every task
 /// classified as trivial (0 files / 0 lines) and `ReviewMode::TrivialSkip`
@@ -199,7 +211,8 @@ fn classify_trivial(ctx: &TaskContext, runner: &CommandRunner, policy: &SdlcPoli
         return false;
     };
     stage_untracked_intent(runner, Path::new(&worktree));
-    let Ok(output) = runner("git", &["diff", "--numstat", "HEAD"], Path::new(&worktree)) else {
+    let base = task_diff_base(ctx);
+    let Ok(output) = runner("git", &["diff", "--numstat", &base], Path::new(&worktree)) else {
         return false;
     };
 
@@ -327,6 +340,61 @@ fn git_files_changed_since(
         .map(str::trim)
         .filter(|line| !line.is_empty())
         .map(str::to_string)
+        .collect()
+}
+
+/// Same as [`git_files_changed_since`], but paired with each path's status
+/// letter — the `Aider`-aware counterpart to [`TestTaskNode`]'s
+/// `changed_files_with_status`, needed because that method's plain `git
+/// status --porcelain` always reports a clean tree after `Aider`'s mid-call
+/// auto-commit (see `verify_claimed_writes`'s doc comment). Parses `git diff
+/// --name-status <sha> HEAD`, whose lines are `STATUS\tPATH` (`M`, `A`, `D`)
+/// or, for a rename/copy, `R100\tOLD\tNEW` (score digits vary; only the
+/// leading letter is kept as the status, matching `changed_files_with_status`'s
+/// "a rename's status is always `R`, never `D`" invariant) — the destination
+/// path is the LAST tab-separated field. Degrades to an empty list, never
+/// panics, on a missing `pre_call_sha` or a failed `git diff` invocation,
+/// mirroring every other helper in this file.
+fn git_files_changed_since_with_status(
+    runner: &CommandRunner,
+    worktree: &Path,
+    pre_call_sha: Option<&str>,
+) -> Vec<(String, String)> {
+    let Some(pre_call_sha) = pre_call_sha else {
+        return Vec::new();
+    };
+    let output = runner(
+        "git",
+        &["diff", "--name-status", pre_call_sha, "HEAD"],
+        worktree,
+    )
+    .unwrap_or(CommandOutput {
+        status: -1,
+        stdout: String::new(),
+        stderr: String::new(),
+    });
+
+    output
+        .stdout
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split('\t');
+            let raw_status = fields.next()?.trim();
+            if raw_status.is_empty() {
+                return None;
+            }
+            let status = raw_status
+                .chars()
+                .next()
+                .map(|c| c.to_string())
+                .unwrap_or_default();
+            let path = fields.next_back()?.trim();
+            if path.is_empty() {
+                None
+            } else {
+                Some((status, path.to_string()))
+            }
+        })
         .collect()
 }
 
@@ -1354,6 +1422,7 @@ impl Node for ImplementTaskNode {
         // knob is read here and the same `policy` is threaded into
         // `apply_policy` below (no second resolve).
         let policy = resolved_policy(&ctx)?;
+        let task_state = current_task_state(&ctx, "ImplementTaskNode")?;
 
         // Charge this attempt BEFORE the call, whatever it goes on to
         // conclude — see this node's doc comment for why the count lives
@@ -1385,11 +1454,62 @@ impl Node for ImplementTaskNode {
                  --show-toplevel` must resolve there before you write.\n\n"
             ));
         }
+        // `Aider` applies a model's reply as a literal file edit against
+        // whichever file is already in its chat context (auto-added because
+        // IMPLEMENT_STANDARDS_PREAMBLE tells the model to read CLAUDE.md) —
+        // it does not treat a reply as a status report the way `ClaudeCli`/
+        // `Pi` do. Asking Aider's model for the same "respond with strict
+        // JSON" contract makes it apply that JSON blob as a whole-file
+        // replacement for CLAUDE.md instead of creating the task's real
+        // target file (measured 2026-09-14, local-model-bench: `LOCAL_ORCH_1
+        // .md` never created, `CLAUDE.md` overwritten with the model's JSON
+        // reply, on 100% of attempts). `modified_files` for `Aider` is
+        // already derived from a pre/post-call git diff (see `pre_call_sha`
+        // below), never from parsing this reply, so dropping the JSON ask
+        // for this backend costs nothing downstream.
+        // `Pi` has the same failure in a different shape: asked for a JSON
+        // reply, small local models emit a JSON claim of having written the
+        // file and never call the write tool (measured 2026-09-14,
+        // `qwen2.5:7b-instruct`/`qwen2.5-coder:7b`/`llama3.2:3b`/`qwen3:8b`,
+        // exit 0, no file). Its `modified_files` also comes from git, so the
+        // JSON ask buys nothing there either.
+        let response_contract = match policy.agent_backend {
+            AgentBackend::Aider => {
+                "Implement the following SDLC task by making the actual file/code changes in this \
+                 repository now. Do not reply with a JSON summary or any other description of the \
+                 change — apply the edit directly; it will be committed automatically afterward."
+            }
+            AgentBackend::Pi => {
+                "Implement the following SDLC task by calling your file-writing and editing tools \
+                 to make the actual changes in this repository now. A reply that only describes \
+                 or summarizes a change does nothing — only tool calls that write files count, and \
+                 the repository is checked afterward."
+            }
+            _ => {
+                "Implement the following SDLC task. Respond with strict JSON of the shape \
+                 {\"summary\": str, \"modified_files\": [str], \"tests_added\": [str]}."
+            }
+        };
+        // Local backends only: small models echo their tool's example paths
+        // (aider's edit-format prompt uses `path/to/filename`) instead of the
+        // task's real target — measured 2026-09-14, `qwen2.5:7b-instruct` wrote
+        // `path/to/LOCAL_ORCH_1.md`. `ClaudeCli` keeps JS prompt parity.
+        let files_directive =
+            if policy.agent_backend != AgentBackend::ClaudeCli && !task_state.files.is_empty() {
+                format!(
+                    " Files to create or edit, as exact paths relative to the repository root — \
+                     use these names verbatim, never a placeholder directory such as path/to/: {}.",
+                    task_state.files.join(", ")
+                )
+            } else {
+                String::new()
+            };
         prompt.push_str(&format!(
-            "Implement the following SDLC task. Respond with strict JSON of \
-             the shape {{\"summary\": str, \"modified_files\": [str], \
-             \"tests_added\": [str]}}.\n\nTitle: {title}\nDescription: \
-             {description}\nAcceptance criteria: {acceptance_criteria}"
+            "{response_contract} When an acceptance criterion specifies exact literal text or \
+             content, reproduce it byte for byte — no paraphrasing, no placeholder or translated \
+             text, and add nothing else to the file beyond what is asked.{files_directive}\n\n\
+             Title: {title}\nDescription: {description}\nAcceptance criteria: \
+             {acceptance_criteria}"
         ));
 
         // On a retry, tell the model what the previous attempt broke.
@@ -1408,7 +1528,6 @@ impl Node for ImplementTaskNode {
         // is `attempt_count + 1` (`attempt_count` counts RETRIES, not
         // attempts — see [`bump_task_attempt`]'s doc comment), so this is
         // final when that equals `max_attempts`.
-        let task_state = current_task_state(&ctx, "ImplementTaskNode")?;
         let is_final_attempt =
             u64::from(task_state.attempt_count) + 1 >= u64::from(task_state.max_attempts);
         let mut effective_policy = policy.clone();
@@ -1436,6 +1555,14 @@ impl Node for ImplementTaskNode {
         }
 
         config.json_schema = Some(implement_output_schema());
+        // Putting the declared files in aider's chat is what makes a small
+        // model write to the real path rather than one it invented.
+        if policy.agent_backend == AgentBackend::Aider && !task_state.files.is_empty() {
+            config.env.push((
+                crate::nodes::aider_transport::AIDER_FILES_ENV.to_string(),
+                task_state.files.join("\n"),
+            ));
+        }
 
         let mut step = AgentCodeStep::new("ImplementTaskNode", config, prompt)
             .with_retry_policy(policy.transport_retry);
@@ -1454,6 +1581,24 @@ impl Node for ImplementTaskNode {
             worktree
                 .as_deref()
                 .and_then(|worktree| git_worktree_head_sha(&self.runner, Path::new(worktree)))
+        } else {
+            None
+        };
+        // A retry of a task whose earlier attempt already auto-committed has
+        // nothing new to commit, so a per-call diff is empty even when the
+        // task's work is present. Write-verification diffs against the HEAD
+        // captured on this task's FIRST attempt instead — the Aider analogue
+        // of `git status` still showing an earlier attempt's uncommitted work.
+        let task_base_sha = if policy.agent_backend == AgentBackend::Aider {
+            get_result(&ctx, "ImplementTaskNode")
+                .filter(|prior| {
+                    prior.get("task_id").and_then(|v| v.as_u64())
+                        == Some(u64::from(task_state.task_id))
+                })
+                .and_then(|prior| prior.get("task_base_sha"))
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+                .or_else(|| pre_call_sha.clone())
         } else {
             None
         };
@@ -1523,6 +1668,17 @@ impl Node for ImplementTaskNode {
             // attribute this call's cost to the setting that caused it
             // (standing rule 6) — mirrors `docs.rs`'s `"model_tier"` stamp.
             "model_tier": model_tier_used,
+            // `Aider`-only: the `HEAD` sha captured before this call, so
+            // `TestTaskNode::verify_claimed_writes` (a LATER node) can diff
+            // against it too, instead of `git status --porcelain` — which,
+            // same as this node's own `modified_files` derivation above,
+            // sees a clean tree after Aider's mid-call auto-commit and would
+            // otherwise fail write-verification on every successful Aider
+            // attempt. `null` for every other backend (no-op there).
+            "pre_call_sha": pre_call_sha,
+            "task_id": task_state.task_id,
+            // `Aider`-only (`null` otherwise): see `task_base_sha` above.
+            "task_base_sha": task_base_sha,
         });
         // Nested under `"state"`, not instead of the payload above: this
         // result is also what the write-verification guard reads
@@ -2152,7 +2308,37 @@ impl TestTaskNode {
             return None;
         }
 
-        let changed_with_status = self.changed_files_with_status(worktree);
+        // `Aider` auto-commits its own edits DURING `ImplementTaskNode`'s
+        // call (see that node's `modified_files` derivation, a few hundred
+        // lines up), so by the time this LATER node runs, `git status
+        // --porcelain` always reports a clean tree — even after a fully
+        // correct edit. Left as `changed_files_with_status(worktree)`
+        // unconditionally, this guard failed EVERY successful `Aider`
+        // attempt with "the worktree shows no changes at all", regardless
+        // of backend, model, or task correctness — confirmed 2026-09-14 via
+        // `local-model-bench`'s `bench-easy` fixture: task 1's file was
+        // objectively correct on attempt 1 (right filename, right content,
+        // real commit) and still failed this guard, burning all 3 attempts.
+        // `ImplementTaskNode` stamps a `pre_call_sha` (Aider-only, `null`
+        // otherwise) into its own result specifically so this node can diff
+        // against it instead — a git-verified fact, not the model's own
+        // claim, so this does not weaken condition (1)'s "never trust the
+        // self-report" principle below.
+        // Prefer the task's first-attempt base (see `ImplementTaskNode`'s
+        // `task_base_sha`) so a retry whose earlier attempt already committed
+        // the work is not misread as a no-op.
+        let implement_result = get_result(ctx, "ImplementTaskNode");
+        let pre_call_sha = ["task_base_sha", "pre_call_sha"].iter().find_map(|key| {
+            implement_result
+                .and_then(|value| value.get(*key))
+                .and_then(|value| value.as_str())
+                .map(str::to_string)
+        });
+        let changed_with_status = if pre_call_sha.is_some() {
+            git_files_changed_since_with_status(&self.runner, worktree, pre_call_sha.as_deref())
+        } else {
+            self.changed_files_with_status(worktree)
+        };
         let changed: Vec<String> = changed_with_status
             .iter()
             .map(|(_, path)| path.clone())
@@ -2176,6 +2362,11 @@ impl TestTaskNode {
             } else {
                 format!("ImplementTaskNode claimed modified_files {modified_files:?}")
             };
+            let evidence_source = if pre_call_sha.is_some() {
+                "git diff --name-status against the pre-call HEAD"
+            } else {
+                "git status --porcelain"
+            };
 
             return Some(CheckResult {
                 name: "write-verification".to_string(),
@@ -2183,8 +2374,8 @@ impl TestTaskNode {
                 passed: false,
                 output: String::new(),
                 message: format!(
-                    "{claim} and the worktree shows no changes at all (git status \
-                     --porcelain reported nothing) — task {} is expected to write, so an \
+                    "{claim} and the worktree shows no changes at all ({evidence_source} \
+                     reported nothing) — task {} is expected to write, so an \
                      unchanged worktree means the implement work never reached this tree. \
                      Harness checks passing against an untouched checkout say nothing about \
                      this task. If this task is genuinely investigation-only, declare \
@@ -3347,7 +3538,8 @@ impl Node for ConsolidatedReviewNode {
         // every run, which is why every past review verdict was a rubber
         // stamp. Intent-to-add first so brand-new files appear with content.
         stage_untracked_intent(&self.runner, Path::new(&worktree));
-        let diff = (self.runner)("git", &["diff", "HEAD"], Path::new(&worktree))
+        let base = task_diff_base(&ctx);
+        let diff = (self.runner)("git", &["diff", &base], Path::new(&worktree))
             .map(|output| output.stdout)
             .unwrap_or_default();
 
@@ -7164,6 +7356,186 @@ pub(crate) mod tests {
         assert!(results.is_empty());
     }
 
+    /// `ImplementTaskNode`'s `Aider`-only `pre_call_sha` stamp, plus the
+    /// worktree's actual `git diff --name-status` against it.
+    fn ctx_with_aider_implement_claim(
+        worktree: &Path,
+        modified_files: &[&str],
+        pre_call_sha: &str,
+    ) -> TaskContext {
+        let mut ctx = ctx_for_worktree(worktree);
+        ctx.nodes.insert(
+            "ImplementTaskNode".to_string(),
+            json!({
+                "summary": "did the thing",
+                "modified_files": modified_files,
+                "tests_added": [],
+                "pre_call_sha": pre_call_sha,
+            }),
+        );
+        ctx
+    }
+
+    /// `git status --porcelain` ALWAYS reports the given (typically empty)
+    /// output — simulating `Aider`'s mid-call auto-commit, which leaves the
+    /// worktree clean regardless of what the attempt actually did. `git
+    /// diff --name-status <sha> HEAD` returns `diff_name_status_lines`.
+    fn aider_diff_runner(diff_name_status_lines: &'static str) -> CommandRunner {
+        Arc::new(move |program, args, _cwd| {
+            if program == "git" && args.first() == Some(&"status") {
+                Ok(CommandOutput {
+                    status: 0,
+                    stdout: String::new(),
+                    stderr: String::new(),
+                })
+            } else if program == "git" && args.first() == Some(&"diff") {
+                Ok(CommandOutput {
+                    status: 0,
+                    stdout: diff_name_status_lines.to_string(),
+                    stderr: String::new(),
+                })
+            } else {
+                Ok(CommandOutput {
+                    status: 0,
+                    stdout: String::new(),
+                    stderr: String::new(),
+                })
+            }
+        })
+    }
+
+    /// REGRESSION for the 2026-09-14 defect found via `local-model-bench`'s
+    /// `bench-easy` fixture: a real `agent_backend: aider` dispatch produced
+    /// an objectively correct attempt-1 result (right filename, right
+    /// content, a real commit — confirmed by hand against the actual
+    /// worktree) and this guard STILL failed it with "the worktree shows no
+    /// changes at all", because `Aider` had already auto-committed mid-call,
+    /// leaving `git status --porcelain` clean by the time this node ran. The
+    /// run then burned all 3 attempts and bailed despite doing nothing
+    /// wrong. With `pre_call_sha` present, the guard must diff against it
+    /// instead and pass.
+    #[tokio::test]
+    async fn write_verification_passes_for_aider_via_pre_call_sha_diff_when_worktree_is_clean() {
+        let worktree = temp_worktree();
+        write_harness(&worktree, json!([]));
+        let ctx = ctx_with_aider_implement_claim(&worktree, &["LOCAL_ORCH_1.md"], "deadbeef");
+
+        let node = TestTaskNode::new().with_runner(aider_diff_runner("A\tLOCAL_ORCH_1.md\n"));
+        let out = node.process(ctx).await.expect("process should succeed");
+
+        assert_eq!(
+            out.nodes["TestTaskNode"]["all_passed"], true,
+            "a real Aider commit visible only via pre_call_sha diff must pass: {:?}",
+            out.nodes["TestTaskNode"]
+        );
+    }
+
+    /// Positive control for the fix above: `pre_call_sha` changes WHICH
+    /// evidence source the guard reads, not whether a genuinely empty diff
+    /// still trips condition (1). A no-op retry (or a run that truly never
+    /// touched the tree) must still fail even when `pre_call_sha` is present.
+    #[tokio::test]
+    async fn write_verification_still_fails_for_aider_when_diff_since_pre_call_sha_is_empty() {
+        let worktree = temp_worktree();
+        write_harness(&worktree, json!([]));
+        let ctx = ctx_with_aider_implement_claim(&worktree, &["LOCAL_ORCH_1.md"], "deadbeef");
+
+        let node = TestTaskNode::new().with_runner(aider_diff_runner(""));
+        let out = node.process(ctx).await.expect("process should succeed");
+
+        assert_eq!(out.nodes["TestTaskNode"]["all_passed"], false);
+        let results = out.nodes["TestTaskNode"]["check_results"]
+            .as_array()
+            .unwrap();
+        assert_eq!(results[0]["kind"], "write-verification");
+    }
+
+    /// A deletion visible only via the `pre_call_sha` diff (not `git status
+    /// --porcelain`, which Aider always leaves clean) must still be caught
+    /// by condition (3) when undeclared.
+    #[tokio::test]
+    async fn write_verification_fails_on_aider_deletion_of_undeclared_path_via_pre_call_sha() {
+        let worktree = temp_worktree();
+        write_harness(&worktree, json!([]));
+        let ctx = ctx_with_aider_implement_claim(&worktree, &["kept.rs"], "deadbeef");
+
+        let node =
+            TestTaskNode::new().with_runner(aider_diff_runner("D\tundeclared.rs\nA\tkept.rs\n"));
+        let out = node.process(ctx).await.expect("process should succeed");
+
+        assert_eq!(out.nodes["TestTaskNode"]["all_passed"], false);
+        let results = out.nodes["TestTaskNode"]["check_results"]
+            .as_array()
+            .unwrap();
+        assert_eq!(results[0]["kind"], "write-verification");
+        assert!(results[0]["message"]
+            .as_str()
+            .unwrap()
+            .contains("undeclared.rs"));
+    }
+
+    /// A rename visible only via the `pre_call_sha` diff
+    /// (`R100\told.rs\tnew.rs`) must not be misread as a deletion — mirrors
+    /// `write_verification_rename_not_misread_as_deletion` for the
+    /// `git status --porcelain` path.
+    #[tokio::test]
+    async fn write_verification_aider_rename_not_misread_as_deletion() {
+        let worktree = temp_worktree();
+        write_harness(&worktree, json!([]));
+        let ctx = ctx_with_aider_implement_claim(&worktree, &["new.rs"], "deadbeef");
+
+        let node = TestTaskNode::new().with_runner(aider_diff_runner("R100\told.rs\tnew.rs\n"));
+        let out = node.process(ctx).await.expect("process should succeed");
+
+        assert_eq!(out.nodes["TestTaskNode"]["all_passed"], true);
+    }
+
+    /// `git diff` against `base_sha` reports one added file; against any
+    /// other sha it reports nothing — a retry whose earlier attempt already
+    /// auto-committed the task's work.
+    fn aider_base_vs_call_runner() -> CommandRunner {
+        Arc::new(move |program, args, _cwd| {
+            let stdout = if program == "git"
+                && args.first() == Some(&"diff")
+                && args.contains(&"base_sha")
+            {
+                "A\tLOCAL_ORCH_2.md\n".to_string()
+            } else {
+                String::new()
+            };
+            Ok(CommandOutput {
+                status: 0,
+                stdout,
+                stderr: String::new(),
+            })
+        })
+    }
+
+    /// A retry of a task whose first attempt already committed correct work
+    /// (its gate failed for another reason) makes no new commit, so the
+    /// per-call diff is empty. Diffing against `task_base_sha` must still see
+    /// the task's work; the control shows the per-call sha alone fails.
+    #[tokio::test]
+    async fn write_verification_aider_retry_diffs_against_task_base_sha() {
+        let worktree = temp_worktree();
+        write_harness(&worktree, json!([]));
+
+        let mut ctx = ctx_with_aider_implement_claim(&worktree, &[], "call_sha");
+        ctx.nodes.get_mut("ImplementTaskNode").unwrap()["task_base_sha"] = json!("base_sha");
+        let node = TestTaskNode::new().with_runner(aider_base_vs_call_runner());
+        let out = node.process(ctx).await.expect("process should succeed");
+        assert_eq!(
+            out.nodes["TestTaskNode"]["all_passed"], true,
+            "{:?}",
+            out.nodes["TestTaskNode"]
+        );
+
+        let control = ctx_with_aider_implement_claim(&worktree, &[], "call_sha");
+        let node = TestTaskNode::new().with_runner(aider_base_vs_call_runner());
+        let out = node.process(control).await.expect("process should succeed");
+        assert_eq!(out.nodes["TestTaskNode"]["all_passed"], false);
+    }
+
     #[tokio::test]
     async fn forbidden_pattern_scan_fails_on_unallowlisted_match() {
         let worktree = temp_worktree();
@@ -7789,6 +8161,73 @@ pub(crate) mod tests {
         let out = node.process(ctx).await.expect("process should succeed");
         assert!(*diff_called.lock().unwrap());
         assert_eq!(out.nodes["ConsolidatedReviewNode"]["verdict"], "PASS");
+    }
+
+    /// Aider commits during the call, so `HEAD` already holds the task's work:
+    /// with a `task_base_sha` stamped, the review diff and the trivial
+    /// classification must both diff against it, or the reviewer sees an empty
+    /// diff and fails correct work.
+    #[tokio::test]
+    async fn review_and_trivial_classification_diff_against_task_base_sha_when_stamped() {
+        let task = SDLCTask::new(1, "One", "d1");
+        let state = state_with_tasks(vec![task.clone()]);
+        let mut ctx = ctx_with_current_task(&state, &task);
+        ctx.nodes.insert(
+            "SetupWorktreeNode".to_string(),
+            json!({ "worktree_path": "." }),
+        );
+        ctx.nodes.insert(
+            "ImplementTaskNode".to_string(),
+            json!({ "task_id": 1, "task_base_sha": "base123" }),
+        );
+
+        let calls: Arc<Mutex<Vec<Vec<String>>>> = Arc::new(Mutex::new(Vec::new()));
+        let calls_clone = calls.clone();
+        let runner: CommandRunner = Arc::new(move |_program, args, _cwd| {
+            calls_clone
+                .lock()
+                .unwrap()
+                .push(args.iter().map(|s| (*s).to_string()).collect());
+            Ok(CommandOutput {
+                status: 0,
+                stdout: "diff --git a b".to_string(),
+                stderr: String::new(),
+            })
+        });
+
+        let _ = classify_trivial(&ctx, &runner, &SdlcPolicy::default());
+        let canned =
+            json!({ "verdict": "PASS", "summary": "looks good", "issues": [] }).to_string();
+        let transport: ModelTransport = Arc::new(move |_config, _prompt| {
+            let outcome = canned_outcome(canned.clone());
+            Box::pin(async move { Ok(outcome) })
+        });
+        ConsolidatedReviewNode::new()
+            .with_runner(runner)
+            .with_transport(transport)
+            .process(ctx)
+            .await
+            .expect("process should succeed");
+
+        let recorded = calls.lock().unwrap();
+        assert!(
+            recorded.contains(&vec![
+                "diff".to_string(),
+                "--numstat".to_string(),
+                "base123".to_string()
+            ]),
+            "{recorded:?}"
+        );
+        assert!(
+            recorded.contains(&vec!["diff".to_string(), "base123".to_string()]),
+            "{recorded:?}"
+        );
+        assert!(
+            !recorded
+                .iter()
+                .any(|args| args.last().map(String::as_str) == Some("HEAD")),
+            "{recorded:?}"
+        );
     }
 
     /// The review diff is the WORKING TREE against `HEAD`, taken after an
@@ -8618,7 +9057,10 @@ pub(crate) mod tests {
     /// **Updated deliberately** by the JS prompt port
     /// (`EN.ticket.prompt-parity-with-the-js-engines`) to admit
     /// [`IMPLEMENT_STANDARDS_PREAMBLE`] between the path-discipline block and
-    /// the request. Updating the pin is the intended way to make a prompt
+    /// the request, and again (2026-09-14) to append a literal-content
+    /// precision clause after the response contract — see the
+    /// `response_contract` comment at the `ImplementTaskNode::process` call
+    /// site for why. Updating the pin is the intended way to make a prompt
     /// change visible in review; deleting it is not.
     #[tokio::test]
     async fn implement_node_first_attempt_prompt_is_byte_identical() {
@@ -8637,10 +9079,163 @@ pub(crate) mod tests {
             format!(
                 "{PATH_DISCIPLINE_PREAMBLE}{IMPLEMENT_STANDARDS_PREAMBLE}Implement the \
                  following SDLC task. Respond with strict JSON of the shape {{\"summary\": \
-                 str, \"modified_files\": [str], \"tests_added\": [str]}}.\n\nTitle: \
-                 One\nDescription: d1\nAcceptance criteria: []"
+                 str, \"modified_files\": [str], \"tests_added\": [str]}}. When an acceptance \
+                 criterion specifies exact literal text or content, reproduce it byte for byte \
+                 — no paraphrasing, no placeholder or translated text, and add nothing else to \
+                 the file beyond what is asked.\n\nTitle: One\nDescription: d1\nAcceptance \
+                 criteria: []"
             )
         );
+    }
+
+    /// Regression guard for the 2026-09-14 local-model-bench defect: with
+    /// `agent_backend: Aider`, the prompt must NEVER ask the model to
+    /// "Respond with strict JSON" — Aider applies a reply as a literal file
+    /// edit against whichever file is already in its chat (auto-added
+    /// because `IMPLEMENT_STANDARDS_PREAMBLE` tells the model to read
+    /// `CLAUDE.md`), so that instruction previously made every Aider
+    /// dispatch overwrite `CLAUDE.md` with the model's JSON reply instead of
+    /// creating the task's real target file, 100% of attempts, regardless of
+    /// model. The literal-content precision clause must still be present —
+    /// it is not backend-specific.
+    #[tokio::test]
+    async fn implement_node_aider_backend_prompt_never_asks_for_a_json_reply() {
+        let task = SDLCTask::new(1, "One", "d1");
+        let state = state_with_tasks(vec![task.clone()]);
+        let ctx = ctx_with_current_task(&state, &task);
+        let policy = SdlcPolicy {
+            agent_backend: AgentBackend::Aider,
+            ..SdlcPolicy::default()
+        };
+        let ctx = ctx_with_policy(ctx, &policy);
+
+        let (seen, transport) = prompt_recording_transport();
+        let node = ImplementTaskNode::new().with_transport(transport);
+        node.process(ctx).await.expect("process should succeed");
+
+        let prompts = seen.lock().unwrap().clone();
+        let prompt = &prompts[0];
+        assert!(
+            !prompt.contains("Respond with strict JSON"),
+            "Aider must never be asked for a JSON reply — it applies the \
+             reply as a literal file edit: {prompt}"
+        );
+        assert!(
+            prompt.contains("making the actual file/code changes in this repository now"),
+            "Aider must be told to make the edit directly instead: {prompt}"
+        );
+        assert!(
+            prompt.contains("reproduce it byte for byte"),
+            "the literal-content precision clause is not backend-specific: {prompt}"
+        );
+    }
+
+    /// Pi models asked for a JSON reply emit a JSON claim and never call the
+    /// write tool; the Pi contract must ask for tool calls instead.
+    #[tokio::test]
+    async fn implement_node_pi_backend_prompt_asks_for_tool_calls_not_json() {
+        let task = SDLCTask::new(1, "One", "d1");
+        let state = state_with_tasks(vec![task.clone()]);
+        let ctx = ctx_with_current_task(&state, &task);
+        let policy = SdlcPolicy {
+            agent_backend: AgentBackend::Pi,
+            ..SdlcPolicy::default()
+        };
+        let ctx = ctx_with_policy(ctx, &policy);
+
+        let (seen, transport) = prompt_recording_transport();
+        let node = ImplementTaskNode::new().with_transport(transport);
+        node.process(ctx).await.expect("process should succeed");
+
+        let prompt = seen.lock().unwrap()[0].clone();
+        assert!(!prompt.contains("Respond with strict JSON"), "{prompt}");
+        assert!(
+            prompt.contains("only tool calls that write files count"),
+            "{prompt}"
+        );
+    }
+
+    fn head_sha_runner(sha: &'static str) -> CommandRunner {
+        Arc::new(move |program, args, _cwd| {
+            let stdout = if program == "git" && args.first() == Some(&"rev-parse") {
+                format!("{sha}\n")
+            } else {
+                String::new()
+            };
+            Ok(CommandOutput {
+                status: 0,
+                stdout,
+                stderr: String::new(),
+            })
+        })
+    }
+
+    /// Runs `ImplementTaskNode` once under `agent_backend: Aider` with a
+    /// declared file, optionally seeding a prior `ImplementTaskNode` result,
+    /// and returns `(result, prompt, config.env)`.
+    async fn run_aider_implement(
+        prior: Option<serde_json::Value>,
+    ) -> (serde_json::Value, String, Vec<(String, String)>) {
+        let worktree = temp_worktree();
+        let mut task = SDLCTask::new(1, "One", "d1");
+        task.files = vec!["LOCAL_ORCH_1.md".to_string()];
+        let state = state_with_tasks(vec![task.clone()]);
+        let mut ctx = ctx_with_current_task_and_worktree(&state, &task, &worktree);
+        let policy = SdlcPolicy {
+            agent_backend: AgentBackend::Aider,
+            ..SdlcPolicy::default()
+        };
+        ctx = ctx_with_policy(ctx, &policy);
+        if let Some(prior) = prior {
+            ctx.nodes.insert("ImplementTaskNode".to_string(), prior);
+        }
+
+        type RecordedCalls = Arc<Mutex<Vec<(String, Vec<(String, String)>)>>>;
+        let seen: RecordedCalls = Arc::default();
+        let seen_clone = seen.clone();
+        let transport: ModelTransport = Arc::new(move |config: Config, prompt| {
+            seen_clone
+                .lock()
+                .unwrap()
+                .push((prompt, config.env.clone()));
+            let outcome = canned_outcome(json!({ "summary": "done" }).to_string());
+            Box::pin(async move { Ok(outcome) })
+        });
+        let node = ImplementTaskNode::new()
+            .with_transport(transport)
+            .with_runner(head_sha_runner("head_now"));
+        let out = node.process(ctx).await.expect("process should succeed");
+        let (prompt, env) = seen.lock().unwrap()[0].clone();
+        (out.nodes["ImplementTaskNode"].clone(), prompt, env)
+    }
+
+    #[tokio::test]
+    async fn implement_node_aider_hands_declared_files_to_the_transport_and_prompt() {
+        let (_result, prompt, env) = run_aider_implement(None).await;
+        assert!(
+            env.iter()
+                .any(|(k, v)| k == crate::nodes::aider_transport::AIDER_FILES_ENV
+                    && v == "LOCAL_ORCH_1.md"),
+            "{env:?}"
+        );
+        assert!(prompt.contains("use these names verbatim"), "{prompt}");
+        assert!(prompt.contains("LOCAL_ORCH_1.md"), "{prompt}");
+    }
+
+    #[tokio::test]
+    async fn implement_node_aider_task_base_sha_is_kept_across_retries_of_the_same_task() {
+        let (first, _, _) = run_aider_implement(None).await;
+        assert_eq!(first["task_base_sha"], "head_now");
+        assert_eq!(first["task_id"], 1);
+
+        let same_task = json!({ "task_id": 1, "task_base_sha": "first_attempt_head" });
+        let (retry, _, _) = run_aider_implement(Some(same_task)).await;
+        assert_eq!(retry["task_base_sha"], "first_attempt_head");
+        assert_eq!(retry["pre_call_sha"], "head_now");
+
+        let other_task = json!({ "task_id": 2, "task_base_sha": "other_task_head" });
+        let (fresh, _, _) = run_aider_implement(Some(other_task)).await;
+        assert_eq!(fresh["task_base_sha"], "head_now");
     }
 
     /// The headline behavior: a ctx carrying a failed `TestTaskNode` result
@@ -8711,8 +9306,11 @@ pub(crate) mod tests {
             format!(
                 "{PATH_DISCIPLINE_PREAMBLE}{IMPLEMENT_STANDARDS_PREAMBLE}Implement the \
                  following SDLC task. Respond with strict JSON of the shape {{\"summary\": \
-                 str, \"modified_files\": [str], \"tests_added\": [str]}}.\n\nTitle: \
-                 One\nDescription: d1\nAcceptance criteria: []"
+                 str, \"modified_files\": [str], \"tests_added\": [str]}}. When an acceptance \
+                 criterion specifies exact literal text or content, reproduce it byte for byte \
+                 — no paraphrasing, no placeholder or translated text, and add nothing else to \
+                 the file beyond what is asked.\n\nTitle: One\nDescription: d1\nAcceptance \
+                 criteria: []"
             )
         );
     }
