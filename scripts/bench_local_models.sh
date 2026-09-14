@@ -6,7 +6,9 @@
 # local Ollama model (and per repeat), and harvest structured pass/fail data
 # for each -- so the comparison is of the MODEL, not of varying tasks. Pure
 # bash + curl + python3: no Claude agent drives this, so running it costs
-# nothing beyond local compute.
+# nothing beyond local compute. SEQUENTIAL ONLY (deliberately, for now --
+# parallel dispatch is possible but was cut here to keep this script simple
+# and reliable; see "Known follow-ups" below if reviving it).
 #
 # THREE FIXED DIFFICULTY TIERS (planning/local-model-bench/tiers/<tier>/),
 # never combined into one run: easy (a floor check -- capable models should
@@ -16,23 +18,17 @@
 # per tier) for a full sweep. This is deliberate, not a limitation: a single
 # run's pass/fail must be attributable to ONE difficulty level.
 #
-# EVERY (model, rep) JOB GETS ITS OWN THROWAWAY SPEC DIRECTORY AND WORKTREE
-# (planning/bench-<tier>-<model-slug>-r<rep>/, trees/sdlc/<same>). This is
-# what makes parallel dispatch safe: SetupWorktreeNode keys a worktree and
-# its shared sdlc-flow-state.json by block_id/spec_slug, so two concurrent
-# dispatches sharing one block_id would race on the same state file. Giving
-# every job a unique block_id sidesteps that entirely -- confirmed safe to
-# dispatch WITHOUT a planning/state.json block registration (ORCHESTRATION
-# only needs planning/<block_id>/tasks.json to exist on disk; verified
-# 2026-09-14 with an unregistered probe block that dispatched and completed
-# normally).
-#
-# LIGHT MODELS RUN IN PARALLEL, HEAVY MODELS RUN ONE AT A TIME. A model is
-# "light" when its `ollama list` SIZE is <= --light-max-gb (default 6GB) --
-# small/fast enough that running several at once is unlikely to starve the
-# machine. Anything larger runs strictly sequentially, and the whole light
-# pool is drained before any heavy model starts, so a heavy model never
-# competes with a light one for RAM.
+# A REGISTERED BLOCK IS REQUIRED -- an unregistered block_id is not an
+# error, it is a SILENT SKIP that still reports overall "succeeded" having
+# run nothing at all (BlockPresence::NotInTracks in
+# crates/engine-core/src/workflows/orchestration/integrate.rs; measured
+# 2026-09-14, cost a full debugging cycle). This script registers ONE block
+# per tier (bench-<tier>), once, via `mev create-block --write` -- reused
+# across every model/rep, exactly like scripts/run_micro_spec.sh's own
+# clean-before-each-dispatch pattern. Only planning/bench-<tier>/tasks.json
+# is rewritten per job (it never changes -- it's a straight copy of the
+# canonical tier fixture every time); the block record itself is written
+# once and never touched again.
 #
 # WHY child_sdlc_flow_policy MUST NEST UNDER data.policy: OrchestrationEventSchema
 # has no top-level child_sdlc_flow_policy field -- only `policy:
@@ -43,6 +39,15 @@
 # whatever real-Claude defaults the brain_root's own planning/harness.json
 # configures. Measured 2026-09-13: a misplaced field here cost $1.38 in real
 # Sonnet/Opus sessions on what was meant to be a free local-model smoke test.
+#
+# THE tasks FIELD IN sdlc-flow-state.json IS A JSON OBJECT KEYED BY STRING
+# TASK ID (`{"1": {...}, "2": {...}}`), NOT AN ARRAY. Iterating it as a list
+# silently produces an empty per-task summary (measured 2026-09-14) -- this
+# script's harvest_run reads it as a dict. Also: a bailed task's `status`
+# stays "pending" forever (TriageRouterNode's MAJOR_BAIL arm bypasses
+# UpdateTaskStatusNode, the only writer of "done"/"failed"), so pass/fail per
+# task is derived from `attempt_count >= max_attempts` alongside `status`,
+# not from `status` alone.
 #
 # Usage:
 #   bench_local_models.sh --tier <easy|medium|hard> --models <m1,m2,...> [options]
@@ -59,7 +64,7 @@
 #                               one for you.
 #
 # Options:
-#   --endpoint <url>       Ollama OpenAI-compatible base URL (default:
+#   --endpoint <url>      Ollama OpenAI-compatible base URL (default:
 #                         http://localhost:11434).
 #   --agent-backend <pi|aider>
 #                         Which local ImplementTaskNode transport to use
@@ -72,16 +77,7 @@
 #                         tier's summary land in (default:
 #                         planning/local-model-bench/results/<tier>).
 #   --repeat <N>          Run each model N times (default: 1) -- separates
-#                         flake from a model's genuine ceiling. Each rep gets
-#                         its own throwaway spec dir, so reps of the SAME
-#                         model are also safe to run in the parallel pool.
-#   --light-max-gb <N>    A model at or under this many GB (from `ollama
-#                         list`'s SIZE column) is dispatched in the parallel
-#                         pool; anything larger runs alone (default: 6).
-#   --max-parallel <N>    Concurrency cap for the light-model pool (default: 3).
-#   --keep-work-dirs      Do not delete each job's throwaway
-#                         planning/bench-.../ directory and worktree after
-#                         harvesting (default: cleaned up immediately).
+#                         flake from a model's genuine ceiling.
 #   --help                 Show this help and exit.
 #
 # Environment (scripts/.env, gitignored, or already-exported):
@@ -95,15 +91,31 @@
 #
 # Per-run output: <out>/<model-slug>-r<rep>-<run-id>.json --
 #   {model, tier, rep, run_id, status, wall_clock_seconds, chain_report,
-#    bail_reason, tasks: [{task_id, title, status, attempt_count}],
-#    backend_used, model_tier_used, total_cost_usd, total_attempts,
-#    review_verdicts}
+#    bail_reason, tasks: [{task_id, title, status, attempt_count,
+#    max_attempts, passed, attempts_exhausted}], backend_used,
+#    model_tier_used, total_cost_usd, total_attempts, review_verdicts}
 #
 # Plus <out>/summary.md (human table) and <out>/summary.json (machine list),
 # REGENERATED (not appended) from every *.json record present in <out> at
 # the end of this run -- so re-running with different models/repeats
 # accumulates one growing comparison for that tier, not a fresh one each
 # time.
+#
+# Known follow-ups (deliberately not done here):
+#   - Parallel dispatch of light/small models was prototyped and worked
+#     (mkdir-based slot locks, one registered block per parallel slot) but
+#     was cut for simplicity -- getting model comparison DATA matters more
+#     right now than wall-clock speed. Revive by giving each concurrent job
+#     its own registered block (bench-<tier>-slot-N) instead of the single
+#     bench-<tier> block this script uses, since two dispatches sharing one
+#     block_id race on the same sdlc-flow-state.json.
+#   - Consider a Python rewrite if this keeps growing -- the JSON
+#     construction/parsing here is already routed entirely through inline
+#     python3 one-liners and heredocs because bash has no native JSON
+#     support; a real script would drop the heredoc-quoting fragility (a
+#     heredoc combined with `<<<` on the same command silently breaks --
+#     hit once already, fixed) and the bash-3.2-on-macOS constraints
+#     (no `declare -A`, no `wait -n`, no `mapfile`).
 #
 # Exit codes:
 #   0   every job reached a terminal status (a fixture task genuinely
@@ -135,9 +147,6 @@ AGENT_BACKEND="pi"
 ROADMAP="coordination-layer-port"
 OUT_DIR=""
 REPEAT=1
-LIGHT_MAX_GB=6
-MAX_PARALLEL=3
-KEEP_WORK_DIRS=0
 
 print_help() {
     sed -n '2,110p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
@@ -152,9 +161,6 @@ while [ $# -gt 0 ]; do
         --roadmap) ROADMAP="${2:-}"; shift 2 ;;
         --out) OUT_DIR="${2:-}"; shift 2 ;;
         --repeat) REPEAT="${2:-}"; shift 2 ;;
-        --light-max-gb) LIGHT_MAX_GB="${2:-}"; shift 2 ;;
-        --max-parallel) MAX_PARALLEL="${2:-}"; shift 2 ;;
-        --keep-work-dirs) KEEP_WORK_DIRS=1; shift ;;
         --help|-h) print_help; exit 0 ;;
         *) echo "error: unrecognized argument: $1" >&2; print_help; exit 3 ;;
     esac
@@ -172,10 +178,6 @@ esac
 
 case "$REPEAT" in
     ''|*[!0-9]*|0) echo "error: --repeat must be a positive integer, got '$REPEAT'" >&2; exit 3 ;;
-esac
-
-case "$MAX_PARALLEL" in
-    ''|*[!0-9]*|0) echo "error: --max-parallel must be a positive integer, got '$MAX_PARALLEL'" >&2; exit 3 ;;
 esac
 
 if [ -z "$MODELS" ]; then
@@ -200,23 +202,64 @@ if [ -z "$OUT_DIR" ]; then
 fi
 mkdir -p "$OUT_DIR"
 
-# ── Model classification: record, never pull ────────────────────────────────
+WORK_ID="bench-${TIER}"
+STATE_FILE="planning/$WORK_ID/sdlc/sdlc-flow-state.json"
 
-model_size_gb() {
-    local model="$1"
-    curl -sf "$ENDPOINT/api/tags" 2>/dev/null | python3 -c "
-import json, sys
-model = sys.argv[1]
-try:
-    tags = json.load(sys.stdin)
-except Exception:
-    sys.exit(1)
-for m in tags.get('models', []):
-    if m.get('name') == model:
-        print(m.get('size', 0) / (1024**3))
-        sys.exit(0)
-sys.exit(1)
-" "$model"
+# ── Block registration (once per tier) ──────────────────────────────────────
+
+block_registered() {
+    local id="$1"
+    python3 -c "
+import json
+d = json.load(open('planning/state.json'))
+ids = {b['id'] for t in d.get('tracks', []) for b in t.get('blocks', [])}
+exit(0 if '$id' in ids else 1)
+" 2>/dev/null
+}
+
+ensure_block_registered() {
+    if block_registered "$WORK_ID"; then
+        return 0
+    fi
+    echo "Registering bench block: $WORK_ID ..." >&2
+    local payload
+    payload=$(mktemp).json
+    python3 -c "
+import json
+json.dump({
+    'id': '$WORK_ID',
+    'title': 'local-model-bench $TIER tier -- reusable dispatch target',
+    'kind': 'chore',
+    'sdlc_workflow': 'flow',
+    'repo': 'engine-rs',
+    'spec_dir': 'planning/$WORK_ID/',
+    'model': 'sonnet',
+    'what': 'A reusable local-model-bench dispatch target -- scripts/bench_local_models.sh overwrites planning/$WORK_ID/tasks.json fresh (from planning/local-model-bench/tiers/$TIER/) before every dispatch. The block record itself never changes.',
+    'why': 'ORCHESTRATION refuses to dispatch a block_id absent from planning/state.json tracks[] (a silent skip, not an error), so a reusable target must be registered once.',
+    'description': 'Infrastructure for the local-model-bench sweep. Never closed/wontfixed -- reused indefinitely as a dispatch target.',
+    'acceptance_criteria': ['N/A -- infrastructure target, not a unit of work with a completion criterion.'],
+    'out_of_scope': ['Any real implementation work -- this block id is never actually implemented, only dispatched through.'],
+    'testing_strategy': 'Each dispatch through this block is its own test, harvested by the calling script.',
+    'forward_looking': False,
+    'epics': ['unattended-runs'],
+}, open('$payload', 'w'), indent=2)
+"
+    mev create-block --write --scope engine-rs --from "$payload" >/dev/null 2>&1 || true
+    rm -f "$payload"
+    if ! block_registered "$WORK_ID"; then
+        echo "error: failed to register block $WORK_ID -- run \`mev create-block --write --scope engine-rs --from <payload>\` by hand to see the real error" >&2
+        exit 1
+    fi
+}
+
+# ── Clean helper: reset the block's worktree/branch/state (same trap
+# run_micro_spec.sh guards against -- a leftover sdlc-flow-state.json makes
+# the NEXT dispatch resume a run already marked done) ───────────────────────
+
+clean_block() {
+    git worktree remove --force "trees/sdlc/$WORK_ID" >/dev/null 2>&1 || true
+    git branch -D "sdlc/$WORK_ID" >/dev/null 2>&1 || true
+    rm -rf "planning/$WORK_ID/sdlc"
 }
 
 # ── Poll one run to a terminal status; echoes "<status> <elapsed_seconds>" ──
@@ -241,7 +284,7 @@ poll_run() {
         status=$(echo "$response" | python3 -c "import json,sys; print(json.load(sys.stdin).get('status','unknown'))" 2>/dev/null || echo "unknown")
 
         if [ "$status" != "$last_status" ]; then
-            echo "$(date '+%H:%M:%S') [$run_id] status: $status" >&2
+            echo "$(date '+%H:%M:%S') status: $status (run $run_id)" >&2
             last_status="$status"
         fi
 
@@ -259,17 +302,10 @@ poll_run() {
 }
 
 # ── Harvest: combine the child SDLC_FLOW state + the ORCHESTRATION chain
-# report into one structured per-run record. `tasks` in sdlc-flow-state.json
-# is a JSON OBJECT keyed by string task_id ({"1": {...}, "2": {...}}), not an
-# array -- a real trap hit building this script (2026-09-14): iterating it
-# as a list silently produced an empty per-task summary. Also: a bailed
-# task's status stays "pending" (TriageRouterNode's MAJOR_BAIL arm bypasses
-# UpdateTaskStatusNode, the only writer of "done"/"failed"), so pass/fail
-# per task is read from attempt_count reaching max_attempts, not from status
-# alone. ──────────────────────────────────────────────────────────────────
+# report into one structured per-run record ─────────────────────────────────
 
 harvest_run() {
-    local model="$1" tier="$2" rep="$3" run_id="$4" status="$5" elapsed="$6" state_file="$7"
+    local model="$1" rep="$2" run_id="$3" status="$4" elapsed="$5"
     local slug dest orch_record_file
     slug=$(echo "$model" | tr -c 'A-Za-z0-9._-' '-')
     dest="$OUT_DIR/${slug}-r${rep}-${run_id}.json"
@@ -277,7 +313,7 @@ harvest_run() {
     orch_record_file=$(mktemp)
     curl -sf -H "X-API-Key: $BASTION_ENGINE_API_KEY" "$BASTION_ADDR/events/$run_id" 2>/dev/null > "$orch_record_file" || echo '{}' > "$orch_record_file"
 
-    python3 - "$dest" "$model" "$tier" "$rep" "$run_id" "$status" "$elapsed" "$state_file" "$orch_record_file" <<'PYEOF'
+    python3 - "$dest" "$model" "$TIER" "$rep" "$run_id" "$status" "$elapsed" "$STATE_FILE" "$orch_record_file" <<'PYEOF'
 import json, sys, os
 
 dest, model, tier, rep, run_id, status, elapsed, state_file, orch_record_file = sys.argv[1:10]
@@ -361,25 +397,13 @@ PYEOF
     rm -f "$orch_record_file"
 }
 
-# ── One (model, rep) job: unique throwaway spec dir + worktree, dispatch,
-# poll, harvest, clean up ───────────────────────────────────────────────────
+# ── Dispatch one run; echoes "<run_id>" ─────────────────────────────────────
 
-run_one() {
-    local model="$1" rep="$2"
-    local slug work_id lane event_body trigger run_id state_file
+dispatch_run() {
+    local model="$1" lane="$2"
+    local event_body trigger run_id
 
-    slug=$(echo "$model" | tr -c 'A-Za-z0-9._-' '-')
-    work_id="bench-${TIER}-${slug}-r${rep}"
-    state_file="planning/$work_id/sdlc/sdlc-flow-state.json"
-
-    echo "== [$work_id] preparing =="
-    rm -rf "planning/$work_id"
-    mkdir -p "planning/$work_id"
-    cp "$CANONICAL_DIR/tasks.json" "planning/$work_id/tasks.json"
-    cp "$CANONICAL_DIR/harness.json" "planning/$work_id/harness.json"
-
-    lane="bench-${slug}-r${rep}-$(date +%s)"
-    event_body=$(python3 - "$BRAIN_ROOT" "$ROADMAP" "$lane" "$work_id" "$AGENT_BACKEND" "$ENDPOINT" "$model" <<'PYEOF'
+    event_body=$(python3 - "$BRAIN_ROOT" "$ROADMAP" "$lane" "$WORK_ID" "$AGENT_BACKEND" "$ENDPOINT" "$model" <<'PYEOF'
 import json, sys
 brain_root, roadmap, lane, block_id, agent_backend, endpoint, model = sys.argv[1:8]
 print(json.dumps({
@@ -409,30 +433,10 @@ PYEOF
     run_id=$(echo "$trigger" | python3 -c "import json,sys; print(json.load(sys.stdin).get('run_id',''))" 2>/dev/null)
 
     if [ -z "$run_id" ]; then
-        echo "error: [$work_id] POST /events/ did not return a run_id ($trigger)" >&2
-        [ "$KEEP_WORK_DIRS" -eq 1 ] || rm -rf "planning/$work_id"
+        echo "error: POST /events/ did not return a run_id ($trigger)" >&2
         return 1
     fi
-
-    echo "[$work_id] run_id=$run_id"
-
-    local poll_out poll_rc run_status run_elapsed
-    set +e
-    poll_out=$(poll_run "$run_id")
-    poll_rc=$?
-    set -e
-    run_status=$(echo "$poll_out" | tail -n1 | awk '{print $1}')
-    run_elapsed=$(echo "$poll_out" | tail -n1 | awk '{print $2}')
-
-    harvest_run "$model" "$TIER" "$rep" "$run_id" "$run_status" "$run_elapsed" "$state_file"
-
-    if [ "$KEEP_WORK_DIRS" -eq 0 ]; then
-        git worktree remove --force "trees/sdlc/$work_id" >/dev/null 2>&1 || true
-        git branch -D "sdlc/$work_id" >/dev/null 2>&1 || true
-        rm -rf "planning/$work_id"
-    fi
-
-    return "$poll_rc"
+    echo "$run_id"
 }
 
 # ── Regenerate the comparison summary from every record in OUT_DIR ──────────
@@ -481,68 +485,55 @@ print("\n".join(lines))
 PYEOF
 }
 
-# ── Classify models into light (parallel pool) / heavy (sequential) ────────
+# ── Main sweep: sequential, every model x every rep ─────────────────────────
 
-LIGHT_MODELS=()
-HEAVY_MODELS=()
+ensure_block_registered
+
 IFS=',' read -r -a MODEL_ARRAY <<< "$MODELS"
 OVERALL_RC=0
 
 for model in "${MODEL_ARRAY[@]}"; do
-    size_gb=$(model_size_gb "$model" || true)
-    if [ -z "$size_gb" ]; then
-        echo "SKIPPING $model: not found in \`ollama list\` at $ENDPOINT -- pull it first (\`ollama pull $model\`)" >&2
-        OVERALL_RC=1
-        continue
-    fi
-    is_light=$(python3 -c "print(1 if $size_gb <= $LIGHT_MAX_GB else 0)")
-    if [ "$is_light" -eq 1 ]; then
-        LIGHT_MODELS+=("$model")
-        echo "$model classified LIGHT (${size_gb}GB <= ${LIGHT_MAX_GB}GB) -> parallel pool"
-    else
-        HEAVY_MODELS+=("$model")
-        echo "$model classified HEAVY (${size_gb}GB > ${LIGHT_MAX_GB}GB) -> sequential"
-    fi
-done
-
-# ── Phase 1: light models, parallel pool (bounded by --max-parallel) ────────
-
-PIDS=()
-for model in "${LIGHT_MODELS[@]:-}"; do
-    [ -z "$model" ] && continue
     rep=1
     while [ "$rep" -le "$REPEAT" ]; do
-        while [ "${#PIDS[@]}" -ge "$MAX_PARALLEL" ]; do
-            NEW_PIDS=()
-            for pid in "${PIDS[@]}"; do
-                if kill -0 "$pid" 2>/dev/null; then
-                    NEW_PIDS+=("$pid")
-                fi
-            done
-            PIDS=("${NEW_PIDS[@]:-}")
-            [ "${#PIDS[@]}" -ge "$MAX_PARALLEL" ] && sleep 3
-        done
-        run_one "$model" "$rep" &
-        PIDS+=("$!")
+        echo "== model=$model rep=$rep/$REPEAT =="
+        clean_block
+        mkdir -p "planning/$WORK_ID"
+        cp "$CANONICAL_DIR/tasks.json" "planning/$WORK_ID/tasks.json"
+        cp "$CANONICAL_DIR/harness.json" "planning/$WORK_ID/harness.json"
+
+        lane="bench-$(echo "$model" | tr -c 'A-Za-z0-9._-' '-')-r${rep}-$(date +%s)"
+
+        set +e
+        RUN_ID=$(dispatch_run "$model" "$lane")
+        DISPATCH_RC=$?
+        set -e
+
+        if [ -z "$RUN_ID" ]; then
+            echo "error: model=$model rep=$rep produced no run_id" >&2
+            OVERALL_RC=1
+            rep=$((rep + 1))
+            continue
+        fi
+
+        set +e
+        POLL_OUT=$(poll_run "$RUN_ID")
+        POLL_RC=$?
+        set -e
+
+        RUN_STATUS=$(echo "$POLL_OUT" | tail -n1 | awk '{print $1}')
+        RUN_ELAPSED=$(echo "$POLL_OUT" | tail -n1 | awk '{print $2}')
+
+        harvest_run "$model" "$rep" "$RUN_ID" "$RUN_STATUS" "$RUN_ELAPSED"
+
+        if [ "$DISPATCH_RC" -ne 0 ] || [ "$POLL_RC" -ne 0 ]; then
+            OVERALL_RC=1
+        fi
+
         rep=$((rep + 1))
     done
 done
 
-for pid in "${PIDS[@]:-}"; do
-    [ -z "$pid" ] && continue
-    wait "$pid" || OVERALL_RC=1
-done
-
-# ── Phase 2: heavy models, strictly sequential, after the light pool drains ─
-
-for model in "${HEAVY_MODELS[@]:-}"; do
-    [ -z "$model" ] && continue
-    rep=1
-    while [ "$rep" -le "$REPEAT" ]; do
-        run_one "$model" "$rep" || OVERALL_RC=1
-        rep=$((rep + 1))
-    done
-done
+clean_block
 
 echo ""
 echo "=== Comparison summary: tier=$TIER ($OUT_DIR/summary.md, $OUT_DIR/summary.json) ==="
