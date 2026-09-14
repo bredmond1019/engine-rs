@@ -79,22 +79,35 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import atexit
 import dataclasses
 import json
 import os
+import queue
 import re
 import shutil
+import signal
 import statistics
 import subprocess
 import sys
+import tempfile
+import threading
 import time
 import traceback
 import urllib.error
 import urllib.request
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
+
+# The real HQ vault this bench must NEVER write to via `--dispatch orchestration`
+# (that mode's ORCHESTRATION-driven child run closes a block, which triggers a
+# fleet-wide `mev emit-state --write` against whatever `brain_root` it resolves
+# -- see assert_sandbox_target below, the single guard this depends on).
+REAL_HQ_ROOT = Path("/Users/brandon/Dev/agentic-portfolio").resolve()
+REAL_BASTION_PORT = 4317
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_DIR = SCRIPT_DIR.parent
@@ -493,6 +506,159 @@ def block_id_registered(spec_slug: str) -> bool:
 
 def worktree_dir(work_id: str) -> Path:
     return REPO_DIR / "trees" / "sdlc" / work_id
+
+
+# ── ORCHESTRATION-dispatch mode: sandbox-only guard + disposable block ─────
+#
+# `--dispatch orchestration` fires the real ORCHESTRATION workflow instead of
+# a direct SDLC_FLOW/SDLC_TASK POST. Per docs/workflows/orchestration.md's own
+# "Pitfall" section, a PASSING orchestration step (1) merges its branch into
+# `main` in the repo's primary checkout, (2) runs `git push origin main`
+# itself, and (3) closes the block in `planning/state.json`, which re-runs a
+# FLEET-WIDE `mev emit-state --write` scoped to whatever `brain_root` the
+# dispatched event names. Pointed at the real HQ vault, a bench sweep would
+# rewrite real state/status/lane files and push real branches. This function
+# is the ONE gate standing between this mode and that outcome -- it must run,
+# and pass, before any mev command or HTTP dispatch in orchestration mode.
+
+SANDBOX_BENCH_BLOCK_ID = "EN.ticket.local-model-bench-orchestration-slot"
+# Even an explicit `blocks` list (no `roadmap`/`lane`) still needs a `roadmap_slug`
+# to resolve a lane-log directory (confirmed by hand 2026-09-14: OrchestrationRunNode
+# fails without one, then fails again if the directory doesn't exist on disk).
+ORCHESTRATION_ROADMAP_SLUG = "local-model-bench"
+
+
+def assert_sandbox_target(bastion_addr: str, sandbox_root: Path | None) -> Path:
+    """Refuse to proceed unless every signal says this is a disposable sandbox,
+    never the real HQ vault. Raises SystemExit with a plain-English reason on
+    any failure -- this must fail closed, not warn and continue."""
+    if sandbox_root is None:
+        raise SystemExit(
+            "error: --dispatch orchestration requires --sandbox-root <path> "
+            "(the sandbox instance's own root, e.g. /Users/brandon/Dev/engine-rs-sandbox-engrs1). "
+            "There is no default: a missing value must never silently target the real HQ vault."
+        )
+    root = sandbox_root.resolve()
+    if root == REAL_HQ_ROOT or REAL_HQ_ROOT in root.parents or root in REAL_HQ_ROOT.parents:
+        raise SystemExit(
+            f"error: --sandbox-root {root} is the real HQ vault (or contains/is contained by it, "
+            f"{REAL_HQ_ROOT}). Refusing -- this mode closes blocks and pushes branches for real."
+        )
+    manifest = root / "sandbox.env"
+    if not manifest.is_file():
+        raise SystemExit(
+            f"error: {root} has no sandbox.env manifest -- this does not look like a "
+            "scripts/new-sandbox.sh-provisioned sandbox instance. Refusing."
+        )
+    if "SBX_INSTANCE=" not in manifest.read_text():
+        raise SystemExit(f"error: {manifest} does not declare SBX_INSTANCE -- refusing to trust it as a sandbox.")
+    brain_toml = root / "brain.toml"
+    if not brain_toml.is_file():
+        raise SystemExit(f"error: no brain.toml at sandbox root {root} -- ORCHESTRATION cannot resolve a RepoRegistry.")
+
+    m = re.search(r":(\d+)(?:/|$)", bastion_addr.split("//", 1)[-1])
+    port = int(m.group(1)) if m else None
+    if port == REAL_BASTION_PORT:
+        raise SystemExit(
+            f"error: BASTION_SERVE_ADDR resolves to port {REAL_BASTION_PORT}, the real dev bastion serve. "
+            "--dispatch orchestration must target a sandbox instance's own port (e.g. 18090). Refusing."
+        )
+    return root
+
+
+def sandbox_engine_rs_dir(sandbox_root: Path) -> Path:
+    return sandbox_root / "core" / "engine-rs"
+
+
+def sandbox_worktree_dir(sandbox_root: Path, work_id: str) -> Path:
+    return sandbox_engine_rs_dir(sandbox_root) / "trees" / "sdlc" / work_id
+
+
+def _run_mev(sandbox_root: Path, *args: str) -> subprocess.CompletedProcess:
+    return subprocess.run(["mev", *args, str(sandbox_root)], capture_output=True, text=True, check=False)
+
+
+def ensure_sandbox_bench_block(sandbox_root: Path) -> str:
+    """Idempotently ensure SANDBOX_BENCH_BLOCK_ID exists (as a no-op refusal if
+    already present, per `mev create-block`'s own contract), then reset it to
+    `open` so a prior run's CloseBlockNode close doesn't skip this one."""
+    (sandbox_root / "planning" / "roadmaps" / ORCHESTRATION_ROADMAP_SLUG).mkdir(parents=True, exist_ok=True)
+    payload = {
+        "id": SANDBOX_BENCH_BLOCK_ID,
+        "repo": "engine-rs",
+        "kind": "ticket",
+        "title": "local-model-bench disposable ORCHESTRATION slot",
+        "description": "Disposable, repeatedly-reopened block scripts/bench_local_models.py dispatches "
+        "through ORCHESTRATION in a sandbox instance only, to exercise real chain mechanics "
+        "alongside local-model comparison. Never a real deliverable.",
+        "what": "A bench job's tasks.json/harness.json are (re)written to this block's spec_dir before "
+        "each dispatch; the block's status is reset to open before every run so ORCHESTRATION's "
+        "CloseBlockNode closing it on pass never skips the next job.",
+        "why": "ORCHESTRATION-dispatched runs need a real block_id; a disposable, reusable one avoids "
+        "minting a fresh block per job.",
+        "sdlc_workflow": "task",
+        # block.schema.json's `model` vocabulary is {sonnet, gemini-pro, gemini-flash, either} --
+        # the SDLC-stage {haiku, sonnet, opus} vocabulary does not apply here (E_BLOCK_CREATE_MODEL_ENUM,
+        # confirmed by hand 2026-09-14). This field is metadata only -- the actual per-stage tier the
+        # dispatched child run uses comes from child_sdlc_task_policy below, not from this block.
+        "model": "sonnet",
+        "files": {"planning/local-model-bench-orchestration-slot/tasks.json": "Overwritten per job by the bench script."},
+        "out_of_scope": ["Any real deliverable -- this block exists only to give bench jobs a block_id."],
+        "acceptance_criteria": ["N/A -- disposable bench infrastructure, never reviewed as real work."],
+        "testing_strategy": "N/A -- disposable bench infrastructure, never reviewed as real work.",
+        "epics": ["local-model-bench"],
+        "spec_dir": "planning/local-model-bench-orchestration-slot/",
+        "created": datetime.now().strftime("%Y-%m-%d"),
+        "updated": datetime.now().strftime("%Y-%m-%d"),
+    }
+    with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
+        json.dump(payload, f)
+        payload_path = f.name
+    try:
+        create = _run_mev(sandbox_root, "create-block", "--from", payload_path, "--write")
+        if create.returncode not in (0, 1):
+            raise RuntimeError(f"mev create-block failed unexpectedly:\n{create.stdout}\n{create.stderr}")
+    finally:
+        os.unlink(payload_path)
+    # KEY is `repo:id`, a single positional -- `mev set-block-status --help`.
+    reopen = _run_mev(sandbox_root, "set-block-status", f"engine-rs:{SANDBOX_BENCH_BLOCK_ID}", "open", "--write")
+    if reopen.returncode != 0:
+        raise RuntimeError(f"mev set-block-status (reopen) failed:\n{reopen.stdout}\n{reopen.stderr}")
+    return SANDBOX_BENCH_BLOCK_ID
+
+
+def build_orchestration_event_body(spec: JobSpec, cfg: SweepConfig, sandbox_root: Path, block_id: str) -> dict:
+    """Same child policy shape build_event_body sends direct, nested under
+    ORCHESTRATION's `child_sdlc_task_policy` (forwarded verbatim to the child
+    SDLC_TASK event's own `policy` field, per PartialOrchestrationPolicy)."""
+    sdlc_body = build_event_body(spec, cfg)
+    child_policy = sdlc_body["data"]["policy"]
+    return {
+        "workflow_type": "ORCHESTRATION",
+        "data": {
+            "brain_root": str(sandbox_root),
+            "blocks": [{"repo": "engine-rs", "block_id": block_id}],
+            # Even an explicit block-list chain (no roadmap/lane) still needs a
+            # `roadmap_slug` to resolve a lane-log directory (confirmed by hand
+            # 2026-09-14: OrchestrationRunNode fails "needs `roadmap_slug` (or
+            # `roadmap`) to resolve the lane-log directory" without one). This
+            # roadmap dir lives under the SANDBOX's own planning/, never the
+            # real HQ's.
+            "roadmap_slug": ORCHESTRATION_ROADMAP_SLUG,
+            "policy": {
+                "child_sdlc_task_policy": child_policy,
+                "local": child_policy["local"],
+                # Anything ORCHESTRATION's OWN nodes touch at block boundaries
+                # (the ledger composer's `composer_model_tier`, SWEEP,
+                # COMMANDER, preflight/inbox-triage) is NOT covered by this
+                # mode yet -- see the runbook's "Known gap" note. This block
+                # never exercises depends_on/preflight/inbox-triage (a bare
+                # explicit single-block chain with no lane directives), so
+                # composer_model_tier is the one live exposure: it fires on
+                # this block's own close and is left at its policy default.
+            },
+        },
+    }
 
 
 def clean_block(work_id: str) -> None:
@@ -932,6 +1098,145 @@ def run_one_job(spec: JobSpec, cfg: SweepConfig) -> JobRecord:
     return record
 
 
+# ── ORCHESTRATION dispatch (sandbox-only) ───────────────────────────────────
+#
+# Mirrors run_one_job above, but: (1) writes tasks.json/harness.json into the
+# SANDBOX's own engine-rs checkout, not this repo's REPO_DIR; (2) ensures the
+# reusable disposable block via ensure_sandbox_bench_block before dispatch and
+# after every run, so a pass's CloseBlockNode close never skips the next job;
+# (3) POSTs workflow_type=ORCHESTRATION instead of SDLC_FLOW.
+#
+# KNOWN GAP, not fixed by this mode: a passing dispatch triggers ORCHESTRATION's
+# own ledger-composer step (`journal.rs::compose_ledger_entries_via_agent`),
+# which has NO local-model transport wired at all -- confirmed in source
+# (journal.rs:462-464: "`Local` has no meaning for this composer ... nothing
+# sets this knob to `local` today"). Every PASSING job dispatched this way
+# still makes one real Claude API call (sonnet tier by default) for the
+# composer, regardless of how local the child SDLC_TASK's own model tiers are
+# set. This mode is NOT zero-cloud-cost. See docs/local-model-bench.md.
+ORCHESTRATION_CLOUD_COMPOSER_WARNING = (
+    "NOTE: --dispatch orchestration is not zero-cloud-cost. Every PASSING job triggers "
+    "ORCHESTRATION's ledger-composer step, which has no local-model transport wired "
+    "(journal.rs::compose_ledger_entries_via_agent) and makes one real sonnet-tier Claude "
+    "call regardless of the child run's own local model tiers. See docs/local-model-bench.md "
+    "§ ORCHESTRATION dispatch mode."
+)
+
+
+def run_one_job_orchestration(spec: JobSpec, cfg: SweepConfig, sandbox_root: Path) -> JobRecord:
+    record = JobRecord(
+        model=spec.model, backend=spec.backend, model_info=cfg.model_info.get(spec.model, {}),
+        tier=spec.tier, rep=spec.rep, review_mode=cfg.review_mode, endpoint=cfg.endpoint,
+        started_at=now_iso(),
+    )
+    start = time.monotonic()
+    engine_rs_dir = sandbox_engine_rs_dir(sandbox_root)
+    # A block-driven SDLC_TASK's spec directory is named after the BLOCK id, not an
+    # arbitrary work_id -- confirmed by hand 2026-09-14: SpecExistsRouterNode bailed
+    # ("did not succeed") when tasks.json lived under cfg.work_id instead of the
+    # dispatched block's own id. cfg.work_id (the --spec-slug value) is unused here.
+    worktree = sandbox_worktree_dir(sandbox_root, SANDBOX_BENCH_BLOCK_ID)
+    # Bound before the try so the `finally` cleanup below can always reference it,
+    # even if ensure_sandbox_bench_block (the try block's first call) raises.
+    work_dir = engine_rs_dir / "planning" / SANDBOX_BENCH_BLOCK_ID
+    orch_event: dict = {}
+
+    try:
+        block_id = ensure_sandbox_bench_block(sandbox_root)
+        work_dir.mkdir(parents=True, exist_ok=True)
+        tasks = json.loads((TIERS_DIR / spec.tier / "tasks.json").read_text())
+        (work_dir / "tasks.json").write_text(json.dumps(tasks, indent=2) + "\n")
+        (work_dir / "harness.json").write_text(json.dumps(build_harness_from_tasks(tasks), indent=2) + "\n")
+
+        body = build_orchestration_event_body(spec, cfg, sandbox_root, block_id)
+        trigger = http_post_json(f"{cfg.bastion_addr}/events/", cfg.api_key, body)
+        run_id = trigger.get("run_id")
+        if not run_id:
+            record.outcome = "dispatch_error"
+            record.failure_category = "infra"
+            record.error = f"POST /events/ (ORCHESTRATION) did not return a run_id: {trigger}"
+            return record
+        record.run_id = run_id
+
+        status, _ = poll_run(cfg.bastion_addr, cfg.api_key, run_id, cfg.poll_interval, cfg.timeout_minutes)
+        if status == "timeout":
+            record.timed_out = True
+            log(f"  job exceeded {cfg.timeout_minutes}m, aborting run {run_id}")
+            abort_run(cfg.bastion_addr, cfg.api_key, run_id)
+            status, _ = poll_run(cfg.bastion_addr, cfg.api_key, run_id, cfg.poll_interval, cfg.abort_grace_minutes)
+        record.run_status = status
+        record.wall_clock_seconds = round(time.monotonic() - start, 1)
+
+        if status == "timeout":
+            record.outcome = "infra_error"
+            record.failure_category = "abort_unconfirmed"
+            record.fatal = True
+            record.error = f"run {run_id} still not terminal {cfg.abort_grace_minutes}m after abort"
+            return record
+
+        try:
+            orch_event = http_get_json(f"{cfg.bastion_addr}/events/{run_id}", cfg.api_key)
+        except Exception:  # noqa: BLE001
+            orch_event = {}
+
+        # sdlc_workflow: "task" -> the child's own state file is sdlc-task-state.json,
+        # not sdlc-flow-state.json (see docs/workflows/orchestration.md, "Each engine
+        # writes ... its own state file"). harvest_state's key set (outcomes/tasks/
+        # bail_reason/engine_build_sha) is schema-compatible with both.
+        harvest_state(record, work_dir / "sdlc" / "sdlc-task-state.json")
+        record.final_checks = run_final_checks(tasks, worktree)
+        record.changed_paths = changed_paths(worktree)
+        declared = {f for t in tasks for f in t.get("files") or []}
+        record.undeclared_paths = [p for p in record.changed_paths if p not in declared]
+        record.tasks_total = len(tasks)
+        record.tasks_passed_final = sum(1 for c in record.final_checks if c["passed"])
+        record.failure_category = classify(
+            engine_tasks=record.tasks, final_checks=record.final_checks,
+            changed=record.changed_paths, declared=declared,
+        )
+        if record.timed_out:
+            record.outcome = "timeout"
+        elif record.failure_category == "passed":
+            record.outcome = "passed"
+        else:
+            record.outcome = "task_failed"
+
+    except Exception as e:  # noqa: BLE001 -- a job must never kill the sweep
+        record.outcome = "exception"
+        record.failure_category = "infra"
+        record.error = str(e)
+        record.error_traceback = traceback.format_exc()
+        log(f"  !! orchestration job exception (recorded, continuing): {e}")
+    finally:
+        record.ended_at = now_iso()
+        if not record.wall_clock_seconds:
+            record.wall_clock_seconds = round(time.monotonic() - start, 1)
+        try:
+            dest = cfg.run_dir / "artifacts" / spec.slug
+            record.artifacts_dir = str(
+                capture_evidence(dest, worktree, SANDBOX_BENCH_BLOCK_ID, orch_event, record.final_checks)
+            )
+        except Exception as err:  # noqa: BLE001
+            log(f"  !! evidence capture error (non-fatal): {err}")
+        # Reopen (not delete) the disposable block for the next job -- deleting it
+        # would just make the next ensure_sandbox_bench_block() recreate it, and
+        # reopening is cheaper. Worktree/branch cleanup still happens like direct mode.
+        try:
+            def git(*args: str) -> None:
+                subprocess.run(["git", *args], cwd=engine_rs_dir, capture_output=True, check=False)
+            git("worktree", "remove", "--force", f"trees/sdlc/{SANDBOX_BENCH_BLOCK_ID}")
+            if worktree.exists():
+                shutil.rmtree(worktree, ignore_errors=True)
+            git("worktree", "prune")
+            git("branch", "-D", f"sdlc/{SANDBOX_BENCH_BLOCK_ID}")
+            shutil.rmtree(work_dir / "sdlc", ignore_errors=True)
+            _run_mev(sandbox_root, "set-block-status", f"engine-rs:{SANDBOX_BENCH_BLOCK_ID}", "open", "--write")
+        except Exception as err:  # noqa: BLE001
+            log(f"  !! sandbox cleanup error (non-fatal): {err}")
+
+    return record
+
+
 # ── Reports ─────────────────────────────────────────────────────────────────
 
 
@@ -1209,7 +1514,110 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     p.add_argument("--poll-interval", type=float, default=float(env("BENCH_LOCAL_MODELS_POLL_INTERVAL", "5")), help="Seconds between status polls.")
     p.add_argument("--infra-wait-minutes", type=float, default=float(env("BENCH_LOCAL_MODELS_INFRA_WAIT_MINUTES", "10")), help="How long to wait for bastion serve/Ollama before stopping the sweep.")
     p.add_argument("--dry-run", action="store_true", help="Run preflight and print the job plan without dispatching anything.")
+    p.add_argument("--parallel", type=int, default=int(env("BENCH_LOCAL_MODELS_PARALLEL", "1")), help="Concurrent worker slots for --dispatch direct (default 1 = today's sequential behavior). Each slot gets its own --spec-slug suffix (-slotN) and worktree, so slots never collide. Rejected for --dispatch orchestration -- see that flag's help.")
+    p.add_argument("--dispatch", choices=("direct", "orchestration"), default=env("BENCH_LOCAL_MODELS_DISPATCH", "direct"), help="direct (default): unchanged behavior, POSTs SDLC_FLOW with no block_id. orchestration: POSTs the real ORCHESTRATION workflow against a disposable, repeatedly-reopened block, so the bench also exercises real chain mechanics (gates/integrate/lane-log). SEQUENTIAL ONLY (--parallel is rejected) -- ORCHESTRATION's integrate step merges a passing step's branch into `main` and pushes it in the repo's PRIMARY checkout, which races across concurrent dispatches. Requires --sandbox-root and refuses to run against the real dev bastion serve (port 4317) -- see assert_sandbox_target. NOT zero-cloud-cost: every passing job still makes one real Claude call for ORCHESTRATION's own ledger-composer step (no local transport wired there yet) -- see docs/local-model-bench.md.")
+    p.add_argument("--sandbox-root", type=Path, default=(Path(env("BENCH_LOCAL_MODELS_SANDBOX_ROOT")) if env("BENCH_LOCAL_MODELS_SANDBOX_ROOT") else None), help="Required for --dispatch orchestration: the sandbox instance's own root (its own brain.toml/planning/, isolated from the real HQ vault) -- e.g. /Users/brandon/Dev/engine-rs-sandbox-engrs1. No default; a missing value must never silently target the real HQ vault.")
+    p.add_argument("--no-monitor", action="store_true", help="Do not auto-launch scripts/dev-tooling/system_monitor.py alongside this run (default: launched automatically, logged to <run>/system_monitor.jsonl, terminated when the sweep ends or is interrupted).")
     return p.parse_args(argv)
+
+
+# ── Auto-monitor: launch/terminate system_monitor.py alongside this run ────
+
+
+def start_system_monitor(run_dir: Path) -> subprocess.Popen | None:
+    monitor_script = SCRIPT_DIR / "dev-tooling" / "system_monitor.py"
+    if not monitor_script.is_file():
+        log(f"warning: {monitor_script} not found -- skipping auto-monitor")
+        return None
+    run_dir.mkdir(parents=True, exist_ok=True)
+    log_path = run_dir / "system_monitor.jsonl"
+    proc = subprocess.Popen(
+        [sys.executable, str(monitor_script), "--log", str(log_path)],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    log(f"system_monitor.py started (pid {proc.pid}), logging to {log_path}")
+    return proc
+
+
+def stop_system_monitor(proc: subprocess.Popen | None) -> None:
+    if proc is None or proc.poll() is not None:
+        return
+    try:
+        proc.terminate()
+        proc.wait(timeout=5)
+    except Exception:  # noqa: BLE001
+        try:
+            proc.kill()
+        except Exception:  # noqa: BLE001
+            pass
+    log(f"system_monitor.py (pid {proc.pid}) stopped")
+
+
+# ── Parallel direct-dispatch: N worker slots, each with its OWN spec-slug ──
+#
+# Direct dispatch (no block_id) has no merge/push/close side effects, so
+# concurrent jobs are safe -- BUT the existing convention is one shared
+# --spec-slug -> one shared worktree, which concurrent jobs would stomp
+# (overwriting each other's tasks.json/harness.json mid-run). Each worker
+# slot here gets its own spec-slug suffix (-slotN), hence its own worktree,
+# and runs its share of `pending` strictly sequentially within that slot --
+# only ACROSS slots is anything concurrent.
+
+
+def run_parallel(
+    pending: list[JobSpec], cfg: SweepConfig, run_dir: Path, run_name: str,
+    parallel: int, deadline: datetime | None, stop_requested: threading.Event,
+) -> str | None:
+    job_queue: queue.Queue[JobSpec] = queue.Queue()
+    for job in pending:
+        job_queue.put(job)
+    write_lock = threading.Lock()
+    stopped: list[str | None] = [None]
+    fatal_event = threading.Event()
+    remaining = len(pending)
+    progress_lock = threading.Lock()
+
+    def worker(slot: int) -> None:
+        nonlocal remaining
+        slot_cfg = dataclasses.replace(cfg, work_id=f"{cfg.work_id}-slot{slot}")
+        while True:
+            if fatal_event.is_set() or stop_requested.is_set():
+                return
+            if deadline and datetime.now() >= deadline:
+                with write_lock:
+                    if stopped[0] is None:
+                        stopped[0] = f"deadline reached"
+                return
+            try:
+                spec = job_queue.get_nowait()
+            except queue.Empty:
+                return
+            ok, why = wait_for_infra(slot_cfg.bastion_addr, slot_cfg.endpoint, 10.0)
+            if not ok:
+                with write_lock:
+                    if stopped[0] is None:
+                        stopped[0] = f"infrastructure unavailable: {why}"
+                fatal_event.set()
+                return
+            log(f"== [slot {slot}] {spec.slug} ==")
+            record = run_one_job(spec, slot_cfg)
+            with write_lock:
+                path = spec.record_path(run_dir)
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(json.dumps(record.to_json(), indent=2) + "\n")
+                with progress_lock:
+                    remaining -= 1
+                log(f"  -> [slot {slot}] {record.outcome} / {record.failure_category} in {record.wall_clock_seconds}s ({remaining} left)")
+                render_reports(run_dir, run_name)
+                if record.fatal:
+                    stopped[0] = f"fatal job {spec.slug}: {record.error}"
+                    fatal_event.set()
+
+    with ThreadPoolExecutor(max_workers=parallel) as pool:
+        futures = [pool.submit(worker, slot) for slot in range(1, parallel + 1)]
+        for f in futures:
+            f.result()
+    return stopped[0]
 
 
 def main(argv: list[str]) -> int:
@@ -1267,9 +1675,28 @@ def main(argv: list[str]) -> int:
             print(job.slug)
         return 0
 
-    if block_id_registered(args.spec_slug):
+    if args.parallel < 1:
+        print("error: --parallel must be >= 1", file=sys.stderr)
+        return 3
+
+    sandbox_root = None
+    if args.dispatch == "orchestration":
+        if args.parallel > 1:
+            print(
+                "error: --parallel > 1 is rejected for --dispatch orchestration -- ORCHESTRATION's "
+                "integrate step merges a passing step's branch into `main` and pushes it in the repo's "
+                "PRIMARY checkout, which races across concurrent dispatches. Use --dispatch direct "
+                "(no block_id, safe to parallelize) for real model-level parallelism instead.",
+                file=sys.stderr,
+            )
+            return 3
+        sandbox_root = assert_sandbox_target(bastion_addr, args.sandbox_root)
+        log(f"ORCHESTRATION dispatch mode -- sandbox root {sandbox_root}, bastion {bastion_addr}")
+        log(ORCHESTRATION_CLOUD_COMPOSER_WARNING)
+    elif block_id_registered(args.spec_slug):
         log(f"error: --spec-slug {args.spec_slug} is a registered block id; a passing run would close it")
         return 3
+
     cfg = SweepConfig(
         bastion_addr=bastion_addr, api_key=api_key, endpoint=args.endpoint,
         work_id=args.spec_slug, review_mode=args.review_mode, call_timeout_seconds=args.call_timeout_seconds,
@@ -1278,25 +1705,69 @@ def main(argv: list[str]) -> int:
         test_dispatch=args.test_dispatch,
     )
 
-    stopped = None
-    for index, spec in enumerate(pending, start=1):
-        if deadline and datetime.now() >= deadline:
-            stopped = f"deadline {args.deadline} reached"
-            break
-        ok, why = wait_for_infra(bastion_addr, args.endpoint, args.infra_wait_minutes)
-        if not ok:
-            stopped = f"infrastructure unavailable: {why}"
-            break
-        log(f"== [{index}/{len(pending)}] {spec.slug} ==")
-        record = run_one_job(spec, cfg)
-        path = spec.record_path(run_dir)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(record.to_json(), indent=2) + "\n")
-        log(f"  -> {record.outcome} / {record.failure_category} in {record.wall_clock_seconds}s")
-        render_reports(run_dir, args.run_name)
-        if record.fatal:
-            stopped = f"fatal job {spec.slug}: {record.error}"
-            break
+    monitor_proc = None if args.no_monitor else start_system_monitor(run_dir)
+    stop_requested = threading.Event()
+
+    def _handle_signal(signum: int, frame: Any) -> None:
+        log(f"signal {signum} received -- stopping after the in-flight job(s)")
+        stop_requested.set()
+
+    orig_sigint = signal.signal(signal.SIGINT, _handle_signal)
+    orig_sigterm = signal.signal(signal.SIGTERM, _handle_signal)
+
+    try:
+        stopped = None
+        if args.dispatch == "orchestration":
+            for index, spec in enumerate(pending, start=1):
+                if stop_requested.is_set():
+                    stopped = "interrupted"
+                    break
+                if deadline and datetime.now() >= deadline:
+                    stopped = f"deadline {args.deadline} reached"
+                    break
+                ok, why = wait_for_infra(bastion_addr, args.endpoint, args.infra_wait_minutes)
+                if not ok:
+                    stopped = f"infrastructure unavailable: {why}"
+                    break
+                log(f"== [{index}/{len(pending)}] {spec.slug} (orchestration) ==")
+                record = run_one_job_orchestration(spec, cfg, sandbox_root)
+                path = spec.record_path(run_dir)
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(json.dumps(record.to_json(), indent=2) + "\n")
+                log(f"  -> {record.outcome} / {record.failure_category} in {record.wall_clock_seconds}s")
+                render_reports(run_dir, args.run_name)
+                if record.fatal:
+                    stopped = f"fatal job {spec.slug}: {record.error}"
+                    break
+        elif args.parallel == 1:
+            for index, spec in enumerate(pending, start=1):
+                if stop_requested.is_set():
+                    stopped = "interrupted"
+                    break
+                if deadline and datetime.now() >= deadline:
+                    stopped = f"deadline {args.deadline} reached"
+                    break
+                ok, why = wait_for_infra(bastion_addr, args.endpoint, args.infra_wait_minutes)
+                if not ok:
+                    stopped = f"infrastructure unavailable: {why}"
+                    break
+                log(f"== [{index}/{len(pending)}] {spec.slug} ==")
+                record = run_one_job(spec, cfg)
+                path = spec.record_path(run_dir)
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(json.dumps(record.to_json(), indent=2) + "\n")
+                log(f"  -> {record.outcome} / {record.failure_category} in {record.wall_clock_seconds}s")
+                render_reports(run_dir, args.run_name)
+                if record.fatal:
+                    stopped = f"fatal job {spec.slug}: {record.error}"
+                    break
+        else:
+            log(f"dispatching with {args.parallel} parallel slot(s)")
+            stopped = run_parallel(pending, cfg, run_dir, args.run_name, args.parallel, deadline, stop_requested)
+    finally:
+        signal.signal(signal.SIGINT, orig_sigint)
+        signal.signal(signal.SIGTERM, orig_sigterm)
+        stop_system_monitor(monitor_proc)
 
     render_reports(run_dir, args.run_name)
     if stopped:
