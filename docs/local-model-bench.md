@@ -260,20 +260,24 @@ sweep would rewrite real state and push real branches. **Sequential only** — `
 rejected for this mode, because that merge-and-push happens in the repo's *primary* checkout, which
 races across concurrent dispatches even for different blocks.
 
-**Known gap, not fixed by this mode: not zero-cloud-cost.** A PASSING orchestration job still
-triggers `ORCHESTRATION`'s own ledger-composer step
-(`crates/engine-serve/src/journal.rs::compose_ledger_entries_via_agent`), which has **no local
-transport wired at all** — confirmed in source: `"Local` has no meaning for this composer (no
-OpenAI-compatible transport is wired here) ... nothing sets this knob to `local` today."` Every
-passing job makes one real sonnet-tier Claude call regardless of how local the child run's own
-tiers are. A **failing** job never reaches that step (`CloseBlockNode` only runs on a real close),
-so a task-failed/timeout job is genuinely free. Verified 2026-09-14: a real end-to-end dispatch
-(real `qwen2.5-coder:7b` + `aider` against a sandbox instance) ran the full chain in 180s, made real
-file changes, and failed at the engine's own final-check classification
-(`engine_rejected_correct_work` — a real bench finding, not a plumbing bug) *before* reaching the
-composer, so that specific verification run made zero Claude calls. A pass-through run would not be
-free. Fixing the composer's local routing is out of scope here — same shape as the `llm_node.rs`
-trait work elsewhere in this repo, but its own task.
+**Fixed, with a real configuration step still required.** A PASSING orchestration job used to always
+trigger `ORCHESTRATION`'s own ledger-composer step
+(`crates/engine-serve/src/journal.rs::compose_ledger_entries_via_agent`) with **no local transport
+wired at all**, making one real sonnet-tier Claude call regardless of every other tier. The composer
+now implements the same `resolve_meta_transport`/`with_meta_transport` routing every other
+`llm_node`-migrated stage uses, so `ModelTier::Local` genuinely dispatches to Ollama. **But this
+composer resolves its policy from only two of the four layers** (`harness_defaults` over the
+built-in default — see `docs/workflows/orchestration.md`'s "The D57 verification-ledger seam"
+section) — it does **not** read the per-run event's `policy` field the way `child_sdlc_task_policy`
+does, so setting `"local"` in the bench's own event body (`build_orchestration_event_body`) has no
+effect on the composer. To make a sandbox bench run genuinely zero-cloud through this step, the
+**sandbox's own `planning/harness.json`** (not the real HQ's) needs an explicit
+`orchestration.policy.ledger_composer_model_tier: "local"` (and, if the sandbox's Ollama isn't on
+the built-in default `http://localhost:11434`/`qwen2.5:7b-instruct`, an
+`orchestration.policy.local` override alongside it) — a one-time, per-sandbox config step, not
+something the bench script sets per-run. A **failing** job never reaches this step at all
+(`CloseBlockNode` only runs on a real close), so a task-failed/timeout job was, and remains,
+genuinely free either way.
 
 **Setup, once per sandbox instance:** `ensure_sandbox_bench_block` idempotently creates the
 disposable block and a `planning/roadmaps/local-model-bench/` directory (an explicit `blocks` list

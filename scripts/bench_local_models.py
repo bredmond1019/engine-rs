@@ -649,13 +649,16 @@ def build_orchestration_event_body(spec: JobSpec, cfg: SweepConfig, sandbox_root
                 "child_sdlc_task_policy": child_policy,
                 "local": child_policy["local"],
                 # Anything ORCHESTRATION's OWN nodes touch at block boundaries
-                # (the ledger composer's `composer_model_tier`, SWEEP,
-                # COMMANDER, preflight/inbox-triage) is NOT covered by this
-                # mode yet -- see the runbook's "Known gap" note. This block
-                # never exercises depends_on/preflight/inbox-triage (a bare
-                # explicit single-block chain with no lane directives), so
-                # composer_model_tier is the one live exposure: it fires on
-                # this block's own close and is left at its policy default.
+                # (SWEEP, COMMANDER, preflight/inbox-triage) is NOT covered by
+                # this event body -- this block never exercises
+                # depends_on/preflight/inbox-triage (a bare explicit
+                # single-block chain with no lane directives), so those never
+                # fire here regardless. The ledger composer used to be the one
+                # live exposure on every close; it now supports `local` too,
+                # but resolves it from the SANDBOX's own planning/harness.json
+                # only (never this per-run `policy` object -- see
+                # ORCHESTRATION_CLOUD_COMPOSER_WARNING above) so setting it
+                # here would be a silent no-op, not left out by omission.
             },
         },
     }
@@ -1106,20 +1109,25 @@ def run_one_job(spec: JobSpec, cfg: SweepConfig) -> JobRecord:
 # after every run, so a pass's CloseBlockNode close never skips the next job;
 # (3) POSTs workflow_type=ORCHESTRATION instead of SDLC_FLOW.
 #
-# KNOWN GAP, not fixed by this mode: a passing dispatch triggers ORCHESTRATION's
-# own ledger-composer step (`journal.rs::compose_ledger_entries_via_agent`),
-# which has NO local-model transport wired at all -- confirmed in source
-# (journal.rs:462-464: "`Local` has no meaning for this composer ... nothing
-# sets this knob to `local` today"). Every PASSING job dispatched this way
-# still makes one real Claude API call (sonnet tier by default) for the
-# composer, regardless of how local the child SDLC_TASK's own model tiers are
-# set. This mode is NOT zero-cloud-cost. See docs/local-model-bench.md.
+# FIXED, CONFIG STEP STILL REQUIRED: a passing dispatch triggers ORCHESTRATION's own
+# ledger-composer step (`journal.rs::compose_ledger_entries_via_agent`), which now HAS a
+# local-model transport wired (same resolve_meta_transport/with_meta_transport every other
+# llm_node-migrated stage uses) -- but it only ever resolves `harness.json`'s
+# `orchestration.policy` section (two of the four policy layers), never a per-run event
+# override, so the `"local"` value this script sends in the event body's `policy.local`
+# has NO EFFECT on this specific step. To make a sandbox run genuinely zero-cloud through
+# this step, the SANDBOX's own planning/harness.json needs an explicit
+# `orchestration.policy.ledger_composer_model_tier: "local"` set once, out of band -- see
+# docs/local-model-bench.md and docs/workflows/orchestration.md's "The D57
+# verification-ledger seam" section. Without that, every PASSING job still makes one real
+# sonnet-tier Claude call for this step regardless of how local the child SDLC_TASK's own
+# model tiers are.
 ORCHESTRATION_CLOUD_COMPOSER_WARNING = (
-    "NOTE: --dispatch orchestration is not zero-cloud-cost. Every PASSING job triggers "
-    "ORCHESTRATION's ledger-composer step, which has no local-model transport wired "
-    "(journal.rs::compose_ledger_entries_via_agent) and makes one real sonnet-tier Claude "
-    "call regardless of the child run's own local model tiers. See docs/local-model-bench.md "
-    "§ ORCHESTRATION dispatch mode."
+    "NOTE: --dispatch orchestration is zero-cloud-cost for this step ONLY if the sandbox's "
+    "own planning/harness.json sets orchestration.policy.ledger_composer_model_tier to "
+    "\"local\" -- this script's own event-body policy override does not reach that step "
+    "(journal.rs::compose_ledger_entries_via_agent resolves harness.json only, never a "
+    "per-run event). See docs/local-model-bench.md § ORCHESTRATION dispatch mode."
 )
 
 
@@ -1515,7 +1523,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     p.add_argument("--infra-wait-minutes", type=float, default=float(env("BENCH_LOCAL_MODELS_INFRA_WAIT_MINUTES", "10")), help="How long to wait for bastion serve/Ollama before stopping the sweep.")
     p.add_argument("--dry-run", action="store_true", help="Run preflight and print the job plan without dispatching anything.")
     p.add_argument("--parallel", type=int, default=int(env("BENCH_LOCAL_MODELS_PARALLEL", "1")), help="Concurrent worker slots for --dispatch direct (default 1 = today's sequential behavior). Each slot gets its own --spec-slug suffix (-slotN) and worktree, so slots never collide. Rejected for --dispatch orchestration -- see that flag's help.")
-    p.add_argument("--dispatch", choices=("direct", "orchestration"), default=env("BENCH_LOCAL_MODELS_DISPATCH", "direct"), help="direct (default): unchanged behavior, POSTs SDLC_FLOW with no block_id. orchestration: POSTs the real ORCHESTRATION workflow against a disposable, repeatedly-reopened block, so the bench also exercises real chain mechanics (gates/integrate/lane-log). SEQUENTIAL ONLY (--parallel is rejected) -- ORCHESTRATION's integrate step merges a passing step's branch into `main` and pushes it in the repo's PRIMARY checkout, which races across concurrent dispatches. Requires --sandbox-root and refuses to run against the real dev bastion serve (port 4317) -- see assert_sandbox_target. NOT zero-cloud-cost: every passing job still makes one real Claude call for ORCHESTRATION's own ledger-composer step (no local transport wired there yet) -- see docs/local-model-bench.md.")
+    p.add_argument("--dispatch", choices=("direct", "orchestration"), default=env("BENCH_LOCAL_MODELS_DISPATCH", "direct"), help="direct (default): unchanged behavior, POSTs SDLC_FLOW with no block_id. orchestration: POSTs the real ORCHESTRATION workflow against a disposable, repeatedly-reopened block, so the bench also exercises real chain mechanics (gates/integrate/lane-log). SEQUENTIAL ONLY (--parallel is rejected) -- ORCHESTRATION's integrate step merges a passing step's branch into `main` and pushes it in the repo's PRIMARY checkout, which races across concurrent dispatches. Requires --sandbox-root and refuses to run against the real dev bastion serve (port 4317) -- see assert_sandbox_target. Zero-cloud-cost for ORCHESTRATION's own ledger-composer step ONLY IF the sandbox's planning/harness.json sets orchestration.policy.ledger_composer_model_tier to \"local\" (this script's own event-body policy override does not reach that step) -- see docs/local-model-bench.md.")
     p.add_argument("--sandbox-root", type=Path, default=(Path(env("BENCH_LOCAL_MODELS_SANDBOX_ROOT")) if env("BENCH_LOCAL_MODELS_SANDBOX_ROOT") else None), help="Required for --dispatch orchestration: the sandbox instance's own root (its own brain.toml/planning/, isolated from the real HQ vault) -- e.g. /Users/brandon/Dev/engine-rs-sandbox-engrs1. No default; a missing value must never silently target the real HQ vault.")
     p.add_argument("--no-monitor", action="store_true", help="Do not auto-launch scripts/dev-tooling/system_monitor.py alongside this run (default: launched automatically, logged to <run>/system_monitor.jsonl, terminated when the sweep ends or is interrupted).")
     return p.parse_args(argv)

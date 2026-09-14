@@ -830,6 +830,21 @@ The composer resolves its model tier via `composer_model_tier` (`planning/harnes
 `ExecutionOutcome` carries no per-run `profile`/event identity to resolve a named bundle against;
 only the `harness_defaults` and built-in layers apply.
 
+`composer_model_tier: local` is real and routed (fixed as a follow-up to
+`EN.ticket.transport-slot-consolidation`, which migrated every other stage onto the shared
+`llm_node::{TransportSlotted, Cancellable}` traits but left this composer as a plain function with
+no transport override at all): `compose_ledger_entries_via_agent` now resolves the same standalone
+`Partial` type's `local`/`pi` sibling fields and calls `resolve_meta_transport`/
+`AgentCodeStep::with_meta_transport` exactly like every other `llm_node`-migrated stage, so `Local`
+genuinely dispatches to Ollama instead of silently falling back to a cloud model string. **The
+caveat that made this worth stating explicitly:** because this composer only ever resolves the
+`harness_defaults`/`builtin` layers (see above), setting `"local"` on a per-run event's `policy`
+field — the way `child_sdlc_task_policy` or any other `OrchestrationPolicy` knob would be overridden
+— does nothing here. The only way to route this specific step local is
+`orchestration.policy.ledger_composer_model_tier: "local"` in the *repo's own* `planning/harness.json`
+(the `ExecutionOutcome.repo_path` the composer reads), which is a standing, per-repo configuration
+choice, not a per-run one.
+
 **Known gap, tracked not invented:** no production call site today files a remediation ticket from
 a `BailEntry` — the composer never proposes a `Remediation` object, and `call_site: NONE` is its
 honest answer. This is an open finding in
@@ -1019,7 +1034,7 @@ Resolved through the standard four layers (per-run event override > named profil
 | `conductor_single_repo_only` | `true` | `CONDUCTOR`-only — trims a proposal to its first block's repo. Never varies by profile. |
 | `campaign_max_cost_usd_cents` | `Some(5_000)` | `CONDUCTOR`-only — the campaign cost ceiling in USD cents, wired into `integrate_chain`'s `campaign_budget` and enforced via the `budget_halted` terminal state (`EN.11.F`). |
 | `campaign_max_total_tokens` | `None` | `CONDUCTOR`-only — the same ceiling by token count. Unset on every named profile. |
-| `composer_model_tier` | `sonnet` | The model tier the injected D57 verification-ledger composer seam (see above) runs its `AgentCodeStep` judgment call at. Resolved from a standalone `Partial` type (not `OrchestrationPolicy` itself), read from this same `orchestration.policy`/`orchestration.profiles` section of `planning/harness.json`. |
+| `composer_model_tier` | `sonnet` | The model tier the injected D57 verification-ledger composer seam (see above) runs its `AgentCodeStep` judgment call at. Resolved from a standalone `Partial` type (not `OrchestrationPolicy` itself), read from this same `orchestration.policy`/`orchestration.profiles` section of `planning/harness.json`. `local` is a real, routed option — see "The D57 verification-ledger seam" above for the composer's own `local`/`pi` sibling fields and the caveat that this knob is not reachable from a per-run event override. |
 | `child_sdlc_flow_policy` | `None` | **`EN.17.F`.** A partial `SdlcPolicy` override object, forwarded verbatim as the `"policy"` key on every `flow` step's composed child event — layer 1 of that child's own four-layer resolution. `None` (the built-in default on every named profile, `baseline` included) leaves the composed child event byte-identical to before this knob existed: no `"policy"` key at all. See "Child policy forwarding" below. |
 | `child_sdlc_task_policy` | `None` | **`EN.17.F`.** The same mechanism as `child_sdlc_flow_policy`, but forwarded only into a `task` step's child event — a `flow` step never sees it and vice versa. |
 | `on_bail` | `stop_chain` | **`EN.17.B`.** Whether a bailed step ends the whole chain (`stop_chain`) or skips only its own dependents while independent steps still run (`skip_dependents`). See "A bail skips only its dependents" above. |
