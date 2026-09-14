@@ -208,6 +208,7 @@ protection now lives, so nobody removes it as clutter.
 | 12 | `review_mode: end_only` failed with HTTP 404 | `EndReviewNode` ignored the local review tier | Engine: wired to the local transport |
 | 13 | A manual Pi run hung for 7 min with no output | Pi was waiting on an open stdin | The engine already nulls stdin; only affects hand-run `pi` |
 | 14 | A checker failed correct work | `py_compile` with `cfile=/dev/null` raises on every file | Fixed in the checker; caught by testing it against a correct edit first |
+| 15 | Verifiably correct runs (checks 2/2, real commits) reported as a hard crash under `review_mode: end_only` | `EndReviewNode`'s strict JSON parse rejected `llama3.1:8b`/`llama3.2:3b`/`phi3.5:3.8b`'s prose-wrapped verdicts, and the parse failure returned a fatal `NodeError` instead of a labeled outcome | Engine: `parse_structured_or_fenced` (`workflows/mod.rs`) gained a balanced-JSON-extraction fallback for prose-wrapped replies; a still-unparseable reply now stamps a distinct `UNPARSEABLE` verdict (`EndReviewNode`, `end_review.rs`) that routes to `WrapUpNode` as a legible `blocked` run instead of crashing the whole run |
 
 ## Troubleshooting
 

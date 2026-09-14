@@ -215,23 +215,249 @@ pub(crate) fn strip_json_fence(text: &str) -> &str {
     }
 }
 
+/// Best-effort extraction of the first balanced JSON object or array
+/// embedded anywhere in `text` — the one further normalization needed on top
+/// of [`strip_json_fence`] for a chattier local model, which will still wrap
+/// its verdict in prose even after the fence is stripped (observed live
+/// during the local-model bench, `EN.local-model-bench`: replies of the
+/// shape `Here is my review:\n{...}\nLet me know if you have questions.`).
+///
+/// Conservative by construction: this only narrows the byte range handed to
+/// `serde_json::from_str` by matching `{`/`[` against `}`/`]` (tracking
+/// string literals and `\`-escapes so a brace inside a quoted string never
+/// perturbs the depth count) — it never rewrites a single byte of what falls
+/// inside that range. Genuinely malformed JSON inside the boundaries (a
+/// single-quoted key, a trailing comma) still fails the caller's subsequent
+/// parse; this function's job is finding the substring, not repairing it.
+///
+/// Returns `None` when `text` contains no `{`/`[` at all, or when the one
+/// found never closes (an unbalanced/truncated reply).
+pub(crate) fn extract_balanced_json(text: &str) -> Option<&str> {
+    let bytes = text.as_bytes();
+    let start = text.find(['{', '['])?;
+    let mut depth: i32 = 0;
+    let mut in_string = false;
+    let mut escaped = false;
+    for (i, &b) in bytes.iter().enumerate().skip(start) {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if b == b'\\' {
+                escaped = true;
+            } else if b == b'"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match b {
+            b'"' => in_string = true,
+            b'{' | b'[' => depth += 1,
+            b'}' | b']' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(&text[start..=i]);
+                }
+                if depth < 0 {
+                    // A stray closer before anything opened at `start` — not
+                    // a balanced region; bail rather than report a bogus span.
+                    return None;
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 /// Prefer the pre-parsed `structured` value written by a `AgentCodeStep`
 /// (stamped onto `ctx.nodes[node_name]["structured"]`) when present and
 /// non-null; otherwise fall back to [`strip_json_fence`] +
-/// `serde_json::from_str` on the raw text `content`. Factored out of the
-/// byte-identical copies `ImplementTaskNode`/`TriageTaskNode`/
-/// `ConsolidatedReviewNode` (`task_loop.rs`), `GenerateTasksNode`
-/// (`setup.rs`), and `PatchDocsNode` (`docs.rs`) each carried privately
-/// (EN.4.0 task 4).
+/// `serde_json::from_str` on the raw text `content`, and — only if that
+/// strict parse fails — one further attempt against
+/// [`extract_balanced_json`]'s narrower span (a chattier local model's
+/// prose-wrapped verdict). Factored out of the byte-identical copies
+/// `ImplementTaskNode`/`TriageTaskNode`/`ConsolidatedReviewNode`
+/// (`task_loop.rs`), `GenerateTasksNode` (`setup.rs`), and `PatchDocsNode`
+/// (`docs.rs`) each carried privately (EN.4.0 task 4); `EndReviewNode`
+/// (`end_review.rs`) is the newest caller and the one that motivated the
+/// balanced-extraction fallback (local-model bench false negatives).
+///
+/// On total failure, returns the ORIGINAL strict-parse error (over the
+/// balanced-extraction attempt's, if that also ran and also failed) — it is
+/// the more informative of the two for a caller reporting "why didn't this
+/// parse", since it points at the fence-stripped text as the model actually
+/// sent it rather than an already-narrowed substring.
 pub(crate) fn parse_structured_or_fenced<T: serde::de::DeserializeOwned>(
     ctx: &TaskContext,
     node_name: &str,
     content: &str,
 ) -> Result<T, serde_json::Error> {
     let structured = get_result(ctx, node_name).and_then(|value| value.get("structured").cloned());
-    match structured {
-        Some(value) if !value.is_null() => serde_json::from_value(value),
-        _ => serde_json::from_str(strip_json_fence(content)),
+    if let Some(value) = structured {
+        if !value.is_null() {
+            return serde_json::from_value(value);
+        }
+    }
+    let fence_stripped = strip_json_fence(content);
+    match serde_json::from_str(fence_stripped) {
+        Ok(parsed) => Ok(parsed),
+        Err(strict_err) => match extract_balanced_json(fence_stripped) {
+            Some(candidate) if candidate != fence_stripped => {
+                serde_json::from_str(candidate).or(Err(strict_err))
+            }
+            _ => Err(strict_err),
+        },
+    }
+}
+
+#[cfg(test)]
+mod json_extraction_tests {
+    use super::{extract_balanced_json, parse_structured_or_fenced, strip_json_fence};
+    use engine_contract::TaskContext;
+    use serde::Deserialize;
+
+    #[derive(Debug, Deserialize, PartialEq)]
+    struct Verdict {
+        verdict: String,
+    }
+
+    fn ctx_without_structured() -> TaskContext {
+        TaskContext {
+            event: serde_json::json!({}),
+            nodes: Default::default(),
+            metadata: serde_json::json!({}),
+            node_runs: Default::default(),
+        }
+    }
+
+    // --- extract_balanced_json ------------------------------------------
+
+    #[test]
+    fn extract_balanced_json_finds_bare_object() {
+        let text = r#"{"verdict":"PASS"}"#;
+        assert_eq!(extract_balanced_json(text), Some(text));
+    }
+
+    #[test]
+    fn extract_balanced_json_strips_leading_and_trailing_prose() {
+        let text = "Here is my review: {\"verdict\":\"PASS\"}\nLet me know if you have questions.";
+        assert_eq!(extract_balanced_json(text), Some(r#"{"verdict":"PASS"}"#));
+    }
+
+    #[test]
+    fn extract_balanced_json_ignores_braces_inside_string_values() {
+        let text = r#"blah {"verdict":"PASS","summary":"looks {ok}"} trailing"#;
+        assert_eq!(
+            extract_balanced_json(text),
+            Some(r#"{"verdict":"PASS","summary":"looks {ok}"}"#)
+        );
+    }
+
+    #[test]
+    fn extract_balanced_json_handles_escaped_quotes_inside_strings() {
+        let text = r#"prefix {"summary":"she said \"ok\""} suffix"#;
+        assert_eq!(
+            extract_balanced_json(text),
+            Some(r#"{"summary":"she said \"ok\""}"#)
+        );
+    }
+
+    #[test]
+    fn extract_balanced_json_returns_none_when_unbalanced() {
+        assert_eq!(extract_balanced_json("prose { \"verdict\": \"PASS\""), None);
+    }
+
+    #[test]
+    fn extract_balanced_json_returns_none_with_no_braces() {
+        assert_eq!(extract_balanced_json("no json here at all"), None);
+    }
+
+    #[test]
+    fn extract_balanced_json_finds_array() {
+        let text = "issues: [\"a\", \"b\"] end";
+        assert_eq!(extract_balanced_json(text), Some(r#"["a", "b"]"#));
+    }
+
+    // --- parse_structured_or_fenced --------------------------------------
+
+    #[test]
+    fn happy_path_bare_json_unchanged() {
+        let ctx = ctx_without_structured();
+        let out: Verdict =
+            parse_structured_or_fenced(&ctx, "SomeNode", r#"{"verdict":"PASS"}"#).unwrap();
+        assert_eq!(out.verdict, "PASS");
+    }
+
+    #[test]
+    fn code_fenced_json_parses_via_strip_json_fence() {
+        let ctx = ctx_without_structured();
+        let content = "```json\n{\"verdict\":\"PASS\"}\n```";
+        let out: Verdict = parse_structured_or_fenced(&ctx, "SomeNode", content).unwrap();
+        assert_eq!(out.verdict, "PASS");
+    }
+
+    #[test]
+    fn prose_wrapped_json_parses_via_balanced_extraction_fallback() {
+        let ctx = ctx_without_structured();
+        let content = "Here is my review: {\"verdict\":\"PASS\"}\nHope that helps!";
+        let out: Verdict = parse_structured_or_fenced(&ctx, "SomeNode", content).unwrap();
+        assert_eq!(out.verdict, "PASS");
+    }
+
+    #[test]
+    fn prose_and_fence_wrapped_json_parses_via_both_normalizations() {
+        let ctx = ctx_without_structured();
+        let content =
+            "Sure thing, here you go:\n```json\n{\"verdict\":\"PASS\"}\n```\nLet me know!";
+        let out: Verdict = parse_structured_or_fenced(&ctx, "SomeNode", content).unwrap();
+        assert_eq!(out.verdict, "PASS");
+    }
+
+    #[test]
+    fn single_quoted_keys_remain_a_reported_parse_failure() {
+        // Conservative-by-design: balanced extraction only narrows the byte
+        // range, it never repairs syntax. Single-quoted keys are genuinely
+        // malformed JSON and must still fail — silently coercing them would
+        // risk inventing a verdict the model never actually returned.
+        let ctx = ctx_without_structured();
+        let content = "{'verdict': 'PASS'}";
+        let err = parse_structured_or_fenced::<Verdict>(&ctx, "SomeNode", content).unwrap_err();
+        assert!(
+            !err.to_string().is_empty(),
+            "must surface a real parse error"
+        );
+    }
+
+    #[test]
+    fn trailing_comma_remains_a_reported_parse_failure() {
+        let ctx = ctx_without_structured();
+        let content = r#"{"verdict": "PASS",}"#;
+        assert!(parse_structured_or_fenced::<Verdict>(&ctx, "SomeNode", content).is_err());
+    }
+
+    #[test]
+    fn genuinely_unparseable_output_is_a_reported_parse_failure() {
+        let ctx = ctx_without_structured();
+        let content = "I could not complete the review due to an internal error.";
+        assert!(parse_structured_or_fenced::<Verdict>(&ctx, "SomeNode", content).is_err());
+    }
+
+    #[test]
+    fn structured_field_still_wins_over_raw_content() {
+        let mut ctx = ctx_without_structured();
+        ctx.nodes.insert(
+            "SomeNode".to_string(),
+            serde_json::json!({ "structured": {"verdict": "PASS"} }),
+        );
+        // Raw content is deliberately garbage — the structured field must be
+        // preferred and this must still succeed.
+        let out: Verdict = parse_structured_or_fenced(&ctx, "SomeNode", "not json at all").unwrap();
+        assert_eq!(out.verdict, "PASS");
+    }
+
+    #[test]
+    fn strip_json_fence_still_trims_a_bare_reply() {
+        assert_eq!(strip_json_fence("  {\"a\":1}  "), "{\"a\":1}");
     }
 }
 

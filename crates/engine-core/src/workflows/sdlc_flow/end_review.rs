@@ -67,6 +67,24 @@ pub const NODE_NAME: &str = "EndReviewNode";
 /// which is its own parity gap and out of this ticket's scope.
 const FALLBACK_DIFF_BASE: &str = "main";
 
+/// Cap on `raw_output_preview`'s length when a review reply is genuinely
+/// unparseable (see [`EndReviewNode::process`]'s `UNPARSEABLE` branch) — a
+/// diagnostics aid for the operator reading the committed state, not a value
+/// any Rust branch parses, so it stays generous but bounded rather than
+/// risking a multi-KB local-model ramble bloating `sdlc-flow-state.json`.
+const RAW_OUTPUT_PREVIEW_MAX_CHARS: usize = 2000;
+
+/// Truncate `text` to at most [`RAW_OUTPUT_PREVIEW_MAX_CHARS`] chars (not
+/// bytes — char-boundary-safe on any UTF-8 input), appending a visible marker
+/// when truncated so the preview never silently looks complete.
+fn truncate_for_diagnostics(text: &str) -> String {
+    if text.chars().count() <= RAW_OUTPUT_PREVIEW_MAX_CHARS {
+        return text.to_string();
+    }
+    let truncated: String = text.chars().take(RAW_OUTPUT_PREVIEW_MAX_CHARS).collect();
+    format!("{truncated}... [truncated]")
+}
+
 /// Render every task's `acceptance_criteria` in the run's committed state
 /// into one "## Acceptance Criteria" block, numbered by task so the model
 /// can attribute a criterion back to the work that was supposed to satisfy
@@ -223,25 +241,69 @@ impl Node for EndReviewNode {
             .and_then(|value| value.as_str())
             .ok_or_else(|| NodeError::new(format!("{NODE_NAME}: model returned no content")))?
             .to_string();
-        let parsed: ReviewOutput =
-            parse_structured_or_fenced(&ctx, NODE_NAME, &content).map_err(|err| {
-                NodeError::new(format!(
-                    "{NODE_NAME}: failed to parse model output as JSON: {err}"
-                ))
-            })?;
 
-        let normalized_verdict = parsed.verdict.trim().to_uppercase();
-        let mut result = json!({
-            "verdict": normalized_verdict,
-            "summary": parsed.summary,
-            "issues": parsed.issues,
-            // See `ReviewOutput::localized` — stamped for the operator and
-            // `/fix` routing; no Rust branch reads it, so this is
-            // behavior-stable.
-            "localized": parsed.localized,
-            "review_diff_max_chars": diff_budget,
-            "review_diff_truncated": diff_truncated,
-        });
+        // Design decision (local-model bench false negatives, 2026-09-14):
+        // a review reply that survives `parse_structured_or_fenced`'s
+        // fence-stripping + balanced-extraction hardening (`workflows/mod.rs`)
+        // and is STILL not valid JSON is a known, expected failure mode for
+        // small local models (they will sometimes emit prose the extraction
+        // can't bound, single-quoted keys, a trailing comma, or outright
+        // give up on the task) — it is NOT a system error, and real,
+        // verifiably-correct work (checks green, real commits) must not be
+        // reported as an opaque node crash purely because the REVIEWER's
+        // reply was unusable.
+        //
+        // This follows the exact house convention `TriageRouterNode`/
+        // `ReviewRouterNode`/`EndReviewRouterNode` already use for a
+        // recognized-but-off-list verdict string (stamp `unrecognized_verdict`
+        // on the result; `wrap_up::derive_terminal_signal`'s fallback arm
+        // turns that into a named `MajorBail` instead of a fatal `NodeError`)
+        // — Option A from this ticket, chosen over a hard failure (Option B)
+        // specifically because that convention already exists and already
+        // gives an "unusable model output" run a legible, diagnosable
+        // `blocked` outcome (committed state, real task/check history, a
+        // `bail_reason` naming the parse failure) rather than an
+        // undiagnosable crash with nothing committed. It deliberately does
+        // NOT silently claim PASS: `"UNPARSEABLE"` is not in
+        // `EndReviewRouterNode::route`'s `PASS` arm, so the router still
+        // sends this to `WrapUpNode`, not `PatchDocsNode`.
+        let parsed: Result<ReviewOutput, serde_json::Error> =
+            parse_structured_or_fenced(&ctx, NODE_NAME, &content);
+        let (normalized_verdict, mut result) = match parsed {
+            Ok(parsed) => {
+                let normalized_verdict = parsed.verdict.trim().to_uppercase();
+                let result = json!({
+                    "verdict": normalized_verdict,
+                    "summary": parsed.summary,
+                    "issues": parsed.issues,
+                    // See `ReviewOutput::localized` — stamped for the operator
+                    // and `/fix` routing; no Rust branch reads it, so this is
+                    // behavior-stable.
+                    "localized": parsed.localized,
+                    "review_diff_max_chars": diff_budget,
+                    "review_diff_truncated": diff_truncated,
+                });
+                (normalized_verdict, result)
+            }
+            Err(err) => {
+                let verdict = "UNPARSEABLE".to_string();
+                let result = json!({
+                    "verdict": verdict,
+                    "summary": format!(
+                        "End-of-run review output could not be parsed as JSON: {err}"
+                    ),
+                    "issues": Vec::<String>::new(),
+                    "localized": false,
+                    "review_diff_max_chars": diff_budget,
+                    "review_diff_truncated": diff_truncated,
+                    // Bounded, never the full reply — this is diagnostics for
+                    // an operator reading the committed state, not something
+                    // any Rust branch parses.
+                    "raw_output_preview": truncate_for_diagnostics(&content),
+                });
+                (verdict, result)
+            }
+        };
         if !matches!(normalized_verdict.as_str(), "PASS" | "FAIL" | "PARTIAL") {
             result["unrecognized_verdict"] = json!(normalized_verdict);
         }
@@ -539,6 +601,134 @@ mod tests {
         let result = &out.nodes[NODE_NAME];
         assert_eq!(result["verdict"], json!("PASS"));
         assert_eq!(result["summary"], json!("looks good"));
+    }
+
+    /// Local-model bench false negative, reproduced: a small local model
+    /// wraps its verdict in a markdown code fence AND leading/trailing
+    /// prose. Both `parse_structured_or_fenced` normalizations must fire
+    /// together and the run must still land a clean PASS.
+    #[tokio::test]
+    async fn end_only_mode_parses_a_fenced_and_prose_wrapped_reply() {
+        let state = state_with_tasks(vec![SDLCTask::new(1, "t1", "d1")]);
+        let ctx = ctx_with_policy(ReviewMode::EndOnly, &state);
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let runner = make_runner(calls.clone(), "diff content");
+        let transport = model_transport_returning(
+            "Sure, here is my review:\n```json\n{\"verdict\":\"PASS\",\"summary\":\"looks good\",\
+             \"issues\":[]}\n```\nLet me know if you have any questions!",
+        );
+
+        let node = EndReviewNode::new()
+            .with_runner(runner)
+            .with_transport(transport);
+        let out = node.process(ctx).await.expect("process should succeed");
+
+        let result = &out.nodes[NODE_NAME];
+        assert_eq!(result["verdict"], json!("PASS"));
+        assert_eq!(result["summary"], json!("looks good"));
+        assert!(
+            result.get("unrecognized_verdict").is_none(),
+            "a recovered PASS must not be flagged unrecognized"
+        );
+    }
+
+    /// Local-model bench false negative, reproduced: a bare prose-wrapped
+    /// reply with no code fence at all — the exact shape smaller models
+    /// (`llama3.2:3b`, `phi3.5:3.8b`) were observed returning.
+    #[tokio::test]
+    async fn end_only_mode_parses_a_prose_wrapped_reply_with_no_fence() {
+        let state = state_with_tasks(vec![SDLCTask::new(1, "t1", "d1")]);
+        let ctx = ctx_with_policy(ReviewMode::EndOnly, &state);
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let runner = make_runner(calls.clone(), "diff content");
+        let transport = model_transport_returning(
+            "I have reviewed the diff. {\"verdict\":\"PASS\",\"summary\":\"all good\",\
+             \"issues\":[]} That completes my review.",
+        );
+
+        let node = EndReviewNode::new()
+            .with_runner(runner)
+            .with_transport(transport);
+        let out = node.process(ctx).await.expect("process should succeed");
+
+        let result = &out.nodes[NODE_NAME];
+        assert_eq!(result["verdict"], json!("PASS"));
+        assert_eq!(result["summary"], json!("all good"));
+    }
+
+    /// The genuinely-unparseable case (the bug this ticket fixes): output
+    /// that survives every extraction attempt and is still not valid JSON
+    /// (single-quoted keys — a common small-local-model quirk) must NOT
+    /// return a hard `NodeError` that kills the whole run. It must land as a
+    /// distinct, honestly-labeled `UNPARSEABLE` verdict so
+    /// `EndReviewRouterNode` still routes to `WrapUpNode` (never silently
+    /// PASS) and the run finishes with a legible, diagnosable `blocked`
+    /// state instead of an opaque crash.
+    #[tokio::test]
+    async fn end_only_mode_genuinely_unparseable_output_is_a_labeled_outcome_not_a_node_error() {
+        let state = state_with_tasks(vec![SDLCTask::new(1, "t1", "d1")]);
+        let ctx = ctx_with_policy(ReviewMode::EndOnly, &state);
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let runner = make_runner(calls.clone(), "diff content");
+        // Single-quoted keys: valid-looking-JSON-ish, but genuinely
+        // malformed — must not be silently repaired into a claimed verdict.
+        let transport = model_transport_returning("{'verdict': 'PASS', 'summary': 'looks ok'}");
+
+        let node = EndReviewNode::new()
+            .with_runner(runner)
+            .with_transport(transport);
+        let out = node
+            .process(ctx)
+            .await
+            .expect("a parse failure must not be a hard NodeError");
+
+        let result = &out.nodes[NODE_NAME];
+        assert_eq!(result["verdict"], json!("UNPARSEABLE"));
+        assert_eq!(result["unrecognized_verdict"], json!("UNPARSEABLE"));
+        assert!(
+            result["summary"]
+                .as_str()
+                .unwrap()
+                .contains("could not be parsed as JSON"),
+            "summary must name the parse failure: {result:?}"
+        );
+        assert!(
+            result["raw_output_preview"]
+                .as_str()
+                .unwrap()
+                .contains("verdict"),
+            "raw_output_preview must carry the model's actual reply for diagnosis"
+        );
+
+        // The router must send this to WrapUpNode, not PatchDocsNode — it is
+        // NOT a silent PASS.
+        let router = EndReviewRouterNode;
+        assert_eq!(router.route(&out), Some("WrapUpNode".to_string()));
+    }
+
+    /// A reply the model gave up on entirely (no JSON-shaped content
+    /// anywhere) must also degrade to the same labeled outcome, not a hard
+    /// failure.
+    #[tokio::test]
+    async fn end_only_mode_content_with_no_json_at_all_is_a_labeled_outcome() {
+        let state = state_with_tasks(vec![SDLCTask::new(1, "t1", "d1")]);
+        let ctx = ctx_with_policy(ReviewMode::EndOnly, &state);
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let runner = make_runner(calls.clone(), "diff content");
+        let transport = model_transport_returning(
+            "I was unable to complete this review due to an internal error.",
+        );
+
+        let node = EndReviewNode::new()
+            .with_runner(runner)
+            .with_transport(transport);
+        let out = node
+            .process(ctx)
+            .await
+            .expect("a parse failure must not be a hard NodeError");
+
+        let result = &out.nodes[NODE_NAME];
+        assert_eq!(result["verdict"], json!("UNPARSEABLE"));
     }
 
     /// `EN.ticket.sdlc-flow-dead-policy-knobs` task 3: a non-default
