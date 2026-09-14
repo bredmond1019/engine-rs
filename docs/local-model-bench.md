@@ -47,7 +47,7 @@ python3 scripts/bench_local_models.py --models all --dry-run
 python3 scripts/bench_local_models.py --models all --run-name overnight-1 --deadline 07:30
 
 # 4. Read the result.
-sed -n '/## Leaderboard/,/## Jobs/p' planning/local-model-bench/results/overnight-1/leaderboard.md
+sed -n '/## Leaderboard/,/## Jobs/p' ../../planning/open-work/local-models/local-model-bench/results/overnight-1/leaderboard.md
 ```
 
 **Always pass `--run-name`** for a sweep that may cross midnight. The default name is today's date,
@@ -113,8 +113,13 @@ has the early tiers rather than half the models having everything.
 
 ## The tiers
 
-Fixtures live in the private vault at `planning/local-model-bench/tiers/<tier>/tasks.json` (bare path
-— `planning/` is not in the public repo). A tier's expected files and checks are written once, there.
+Fixtures live in the HQ vault, moved 2026-09-14 from this repo's own `planning/` to
+`planning/open-work/local-models/local-model-bench/tiers/<tier>/tasks.json` (bare path — the
+`agentic-portfolio` company-brain repo, not this public one; two levels up from `core/engine-rs/`).
+A tier's expected files and checks are written once, there. A compat symlink at
+`core/_planning/engine-rs/local-model-bench` (this repo's own vault entry) still points at that same
+directory, which is why every checker command below still reads `planning/local-model-bench/...` —
+that literal string resolves unchanged through a worktree's own `planning/` symlink.
 
 | Tier | Task | Checked by | Tests |
 |---|---|---|---|
@@ -136,7 +141,9 @@ Rust test binary under a 30 s alarm. Model-written code can loop forever.
 
 ## Reading the results
 
-Everything for a run lands in the private vault under `planning/local-model-bench/results/<run-name>/`:
+Everything for a run lands in the HQ vault under
+`planning/open-work/local-models/local-model-bench/results/<run-name>/` (bare `planning/local-model-bench/results/<run-name>/`
+still works too, via the compat symlink noted above):
 
 | File | What it is |
 |---|---|
@@ -188,8 +195,8 @@ Run `python3 scripts/bench_local_models.py --help` for the full list. Every flag
 | `--require-capability` | `auto` | Ollama capability floor, queried live per model via `POST /api/show` (never a hardcoded name list). `auto` resolves to `tools` whenever `--agent-backends` includes `aider`/`pi` (both always send tool definitions; Ollama hard-rejects a tools-incapable model with HTTP 400 before generation starts), else `completion`. `tools`/`completion` force the floor explicitly |
 | `--dry-run` | off | Preflight and plan only. Reports, but does not create, context variants |
 
-Every preflight (dry-run or real) regenerates `planning/local-model-bench/model-capabilities.md`
-and `.json` — every resolved model's Ollama capability set, which models were excluded and why,
+Every preflight (dry-run or real) regenerates
+`planning/open-work/local-models/local-model-bench/model-capabilities.md` and `.json` — every resolved model's Ollama capability set, which models were excluded and why,
 distinct from other preflight warnings.
 
 ## Pitfalls (every one of these happened)
@@ -279,8 +286,8 @@ result** — passing this bench's tool-driven coding tasks says nothing about su
 translation quality, and no such evaluation has been run. Filed as a backlog idea (not committed
 work) in the brain's `planning/backlog.md`,
 `local-model-bench-completion-only-models-for-content-pipeline`. The current capability set for
-every local model is `planning/local-model-bench/model-capabilities.md`, regenerated on every
-preflight.
+every local model is `planning/open-work/local-models/local-model-bench/model-capabilities.md`,
+regenerated on every preflight.
 
 ## See also
 
@@ -288,4 +295,5 @@ preflight.
 - [workflows/orchestration.md](workflows/orchestration.md) — why ORCHESTRATION merges, pushes and closes
 - [heavy-work-queue.md](heavy-work-queue.md) — the queue behind `test_dispatch: queue_park`
 - [workflows/policy-and-profiles.md](workflows/policy-and-profiles.md) — the policy fields the bench sets
-- `planning/local-model-bench/index.md` (private vault) — fixtures, checkers and result runs
+- `planning/open-work/local-models/local-model-bench/index.md` (HQ vault, moved 2026-09-14) —
+  fixtures, checkers and result runs

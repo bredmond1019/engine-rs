@@ -43,7 +43,14 @@ crates/engine-core/src/workflows/sdlc_flow/setup.rs). A tier may only
 reference repo files already pushed; preflight checks this. Checkers that are
 not on origin/main live in planning/local-model-bench/checkers/ and are reached
 through the worktree's planning/ symlink -- which also keeps them out of
-aider's repo map.
+aider's repo map. The bench's own docs/tiers/checkers/results moved 2026-09-14
+to the HQ vault at planning/open-work/local-models/local-model-bench/ (they
+outgrew this repo's own planning/); a compat symlink at
+core/_planning/engine-rs/local-model-bench -> that new location keeps this
+literal "planning/local-model-bench/..." checker path (baked into every tier's
+tasks.json validation_commands, and into missing_fixture_paths()'s preflight
+existence check below) resolving unchanged through the worktree's planning/
+symlink. BENCH_DIR itself now points straight at the new HQ location.
 
 CONFIG-FIRST FIXTURE GENERATION: each tier's harness.json is DERIVED from that
 tier's tasks.json validation_commands at dispatch time (build_harness_from_tasks),
@@ -91,7 +98,14 @@ from typing import Any
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_DIR = SCRIPT_DIR.parent
-BENCH_DIR = REPO_DIR / "planning" / "local-model-bench"
+HQ_ROOT = REPO_DIR.parent.parent  # core/engine-rs -> core -> agentic-portfolio
+# Moved 2026-09-14 out of this repo's own planning/ vault into the HQ-level
+# open-work tree (it outgrew a single-repo home). A compat symlink at
+# core/_planning/engine-rs/local-model-bench -> this same directory keeps the
+# literal "planning/local-model-bench/..." checker paths baked into every
+# tier's tasks.json (and checked by missing_fixture_paths() below) resolving
+# through the worktree's own planning/ symlink -- do not remove that symlink.
+BENCH_DIR = HQ_ROOT / "planning" / "open-work" / "local-models" / "local-model-bench"
 TIERS_DIR = BENCH_DIR / "tiers"
 
 DEFAULT_TIERS = "easy,edit,medium,hard,rust"
@@ -922,6 +936,24 @@ def _cell(text: Any, limit: int = 100) -> str:
     return str(text if text is not None else "-").replace("|", "/").replace("\n", " ")[:limit]
 
 
+# `bail_reason` routinely wraps the actually-useful diagnostic (e.g. a real
+# check's stdout/traceback) behind a fixed, verbose "how to recover" template
+# -- naively truncating from the front (as the Jobs table's Reason column
+# used to) cut the reason off exactly before the useful part on every
+# "max attempts reached" bail. Prefer the tail after a known marker.
+_DIAGNOSTIC_MARKERS = ("Failing check detail:", "check_id:", "reason:")
+
+
+def _diagnostic_reason(text: Any) -> str:
+    """The actionable tail of a bail/error reason, not its boilerplate head."""
+    s = str(text if text is not None else "-")
+    for marker in _DIAGNOSTIC_MARKERS:
+        idx = s.find(marker)
+        if idx != -1:
+            return s[idx:]
+    return s
+
+
 def render_reports(run_dir: Path, run_name: str) -> str:
     records = load_records(run_dir)
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -1016,8 +1048,31 @@ def render_reports(run_dir: Path, run_name: str) -> str:
             f"| {r['tier']} | {r['backend']} | {r['model']} | {r.get('rep')} | {r.get('outcome')} | "
             f"{r.get('failure_category')} | {r.get('tasks_passed_final', 0)}/{r.get('tasks_total', 0)} | "
             f"{_cell(r.get('total_attempts'))} | {_cell(r.get('run_status'))} | {_cell(r.get('wall_clock_seconds'))} | "
-            f"{_cell(reason)} |"
+            f"{_cell(_diagnostic_reason(reason), limit=200)} |"
         )
+
+    # Full, untruncated reason per non-passing job -- the table above is for
+    # scanning; this is for reading. Grouped so the same recurring failure
+    # text (a systemic bug) is visually obvious rather than scattered.
+    failing = [r for r in records if r.get("outcome") != "passed" or r.get("run_status") == "failed"]
+    lines += ["", "## Failure detail (full, untruncated)", ""]
+    if failing:
+        by_reason: dict[str, list[dict]] = {}
+        for r in failing:
+            reason = str(r.get("error") or r.get("bail_reason") or "(no reason recorded)")
+            by_reason.setdefault(reason, []).append(r)
+        # Recurring reasons first -- these are the ones worth investigating
+        # as an engine/tool bug rather than N independent model mistakes.
+        for reason, recs in sorted(by_reason.items(), key=lambda kv: -len(kv[1])):
+            who = ", ".join(f"{r['tier']}/{r['backend']}/{r['model']}r{r.get('rep')}" for r in recs)
+            count_flag = f" **(seen {len(recs)}x -- check for a systemic cause before blaming the model)**" if len(recs) > 1 else ""
+            lines.append(f"### {who}{count_flag}")
+            lines.append("")
+            lines.append(f"```\n{reason}\n```")
+            lines.append("")
+    else:
+        lines.append("None.")
+
     text = "\n".join(lines) + "\n"
     (run_dir / "leaderboard.md").write_text(text)
     return text
