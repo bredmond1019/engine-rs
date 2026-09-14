@@ -68,7 +68,8 @@
 #                         http://localhost:11434).
 #   --agent-backend <pi|aider>
 #                         Which local ImplementTaskNode transport to use
-#                         (default: pi).
+#                         (default: aider -- measured better results than pi
+#                         in prior operator testing).
 #   --roadmap <slug>      An existing planning/roadmaps/<slug>/ directory
 #                         (default: coordination-layer-port) -- ORCHESTRATION
 #                         writes its lane-log/bails/escalations under this
@@ -143,7 +144,7 @@ TIMEOUT_MINUTES="${BENCH_LOCAL_MODELS_TIMEOUT_MINUTES:-15}"
 TIER=""
 MODELS=""
 ENDPOINT="http://localhost:11434"
-AGENT_BACKEND="pi"
+AGENT_BACKEND="aider"
 ROADMAP="coordination-layer-port"
 OUT_DIR=""
 REPEAT=1
