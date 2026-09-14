@@ -34,9 +34,13 @@ use serde_json::{json, Value};
 use engine_contract::TaskContext;
 use okf_core::{CapViolation, MessageKind, MessageRecord};
 
+use crate::cancellation::CancellationToken;
 use crate::coord::write::{self, CoordWriteError};
 use crate::nodes::{InputSlice, JudgmentError, JudgmentNode, JudgmentSpec, MetaTransport};
 use crate::policy::ModelTier;
+use crate::workflows::llm_node::{
+    Cancellable as LlmCancellable, TransportSlotted as LlmTransportSlotted,
+};
 use crate::workflows::ModelTransport;
 
 use super::chain::ChainStep;
@@ -304,6 +308,16 @@ impl InboxTriageRunner {
     #[must_use]
     pub fn with_meta_transport(mut self, transport: MetaTransport) -> Self {
         self.judgment = self.judgment.with_meta_transport(transport);
+        self
+    }
+
+    /// Attach a `CancellationToken`, forwarded to the inner `JudgmentNode`'s
+    /// own `with_cancellation_token` (`llm_node::Cancellable`). `None` (the
+    /// default `new()` sets) is behavior-stable: no token, no cancellation
+    /// check.
+    #[must_use]
+    pub fn with_cancellation_token(mut self, token: CancellationToken) -> Self {
+        self.judgment = self.judgment.with_cancellation_token(token);
         self
     }
 
