@@ -174,7 +174,7 @@ Run `python3 scripts/bench_local_models.py --help` for the full list. Every flag
 
 | Flag | Default | Notes |
 |---|---|---|
-| `--models` | required | Comma-separated, or `all` (every pulled model with completion capability, smallest first; embedding models and `-ctxN` variants skipped) |
+| `--models` | required | Comma-separated, or `all` (every pulled model, smallest first, base variants only; `-ctxN` variants skipped -- see `--require-capability` for capability filtering) |
 | `--tiers` | `easy,edit,medium,hard,rust` | |
 | `--agent-backends` | `aider,pi` | |
 | `--repeat` | `1` | All of rep 1 finishes before rep 2 starts |
@@ -185,7 +185,12 @@ Run `python3 scripts/bench_local_models.py --help` for the full list. Every flag
 | `--review-mode` | `end_only` | One local-model review of the whole run. `per_task`/`trivial_skip` depend on the aider review-diff fix |
 | `--test-dispatch` | `inline` | Never `queue_park` — pitfall 9 |
 | `--spec-slug` | `local-model-bench-run` | Refused if it names a registered block |
+| `--require-capability` | `auto` | Ollama capability floor, queried live per model via `POST /api/show` (never a hardcoded name list). `auto` resolves to `tools` whenever `--agent-backends` includes `aider`/`pi` (both always send tool definitions; Ollama hard-rejects a tools-incapable model with HTTP 400 before generation starts), else `completion`. `tools`/`completion` force the floor explicitly |
 | `--dry-run` | off | Preflight and plan only. Reports, but does not create, context variants |
+
+Every preflight (dry-run or real) regenerates `planning/local-model-bench/model-capabilities.md`
+and `.json` — every resolved model's Ollama capability set, which models were excluded and why,
+distinct from other preflight warnings.
 
 ## Pitfalls (every one of these happened)
 
@@ -209,6 +214,7 @@ protection now lives, so nobody removes it as clutter.
 | 13 | A manual Pi run hung for 7 min with no output | Pi was waiting on an open stdin | The engine already nulls stdin; only affects hand-run `pi` |
 | 14 | A checker failed correct work | `py_compile` with `cfile=/dev/null` raises on every file | Fixed in the checker; caught by testing it against a correct edit first |
 | 15 | Verifiably correct runs (checks 2/2, real commits) reported as a hard crash under `review_mode: end_only` | `EndReviewNode`'s strict JSON parse rejected `llama3.1:8b`/`llama3.2:3b`/`phi3.5:3.8b`'s prose-wrapped verdicts, and the parse failure returned a fatal `NodeError` instead of a labeled outcome | Engine: `parse_structured_or_fenced` (`workflows/mod.rs`) gained a balanced-JSON-extraction fallback for prose-wrapped replies; a still-unparseable reply now stamps a distinct `UNPARSEABLE` verdict (`EndReviewNode`, `end_review.rs`) that routes to `WrapUpNode` as a legible `blocked` run instead of crashing the whole run |
+| 16 | `--models all` dispatched `phi3.5:3.8b`/`codestral:22b` (and their `-ctxN` variants) through aider/pi, which sent tool definitions on every call; Ollama hard-rejected with HTTP 400 before generation started -- instant, uninformative failures with nothing to do with model quality | Model selection checked only `completion` capability, never `tools` | Bench: `--require-capability` (default `auto` = `tools` for aider/pi), queried per model via `POST /api/show`. `/api/tags`'s own `capabilities` array is **not** reliable for this: it reports `deepseek-r1:14b`/`32b` as `[completion, thinking]` (no `tools`), while `/api/show` for the same model returns `[tools, thinking, completion]` -- confirmed 2026-09-14 |
 
 ## Troubleshooting
 
@@ -261,6 +267,20 @@ Filed as `carryover[]` in the private `planning/state.json`:
 - `aider-mention-reflection-discards-pending-edit` — pitfall 11
 - `orchestration-merge-step-pushes-main-directly` — pitfall 6's push bypasses the fleet push script
 - `orchestration-dev-node-invocations-table-missing`
+
+## Opportunity not yet explored: completion-only models elsewhere in the engine
+
+A model excluded here for lacking `tools` (currently `phi3.5:3.8b`, `codestral:22b`) is not
+necessarily bad — it's unusable by aider/pi specifically, which always send tool definitions.
+`content_pipeline`'s `SummarizeNode`/`SelfCriticNode`/`ReviseNode`/`TranslateNode` call a local
+model for plain text generation via `parse_structured_or_fenced`, not a tool-calling loop, so a
+completion-only model is architecturally usable there. **This is an unproven hypothesis, not a
+result** — passing this bench's tool-driven coding tasks says nothing about summarization/critique/
+translation quality, and no such evaluation has been run. Filed as a backlog idea (not committed
+work) in the brain's `planning/backlog.md`,
+`local-model-bench-completion-only-models-for-content-pipeline`. The current capability set for
+every local model is `planning/local-model-bench/model-capabilities.md`, regenerated on every
+preflight.
 
 ## See also
 

@@ -187,6 +187,18 @@ class TestEventBody(unittest.TestCase):
             models = blm.resolve_models("all", "http://x")
         self.assertEqual(models, ["llama3.2:3b", "qwen2.5:7b-instruct"])
 
+    def test_resolve_required_capability_auto_requires_tools_for_coding_agent_backends(self) -> None:
+        self.assertEqual(blm.resolve_required_capability("auto", ["aider", "pi"]), "tools")
+        self.assertEqual(blm.resolve_required_capability("auto", ["pi"]), "tools")
+
+    def test_resolve_required_capability_auto_falls_back_to_completion_for_non_coding_backends(self) -> None:
+        self.assertEqual(blm.resolve_required_capability("auto", []), "completion")
+        self.assertEqual(blm.resolve_required_capability("auto", ["some-future-backend"]), "completion")
+
+    def test_resolve_required_capability_explicit_choice_overrides_auto(self) -> None:
+        self.assertEqual(blm.resolve_required_capability("completion", ["aider", "pi"]), "completion")
+        self.assertEqual(blm.resolve_required_capability("tools", []), "tools")
+
     def test_ctx_variant_names(self) -> None:
         self.assertEqual(blm.ctx_variant_name("qwen2.5:7b-instruct", 16384), "qwen2.5:7b-instruct-ctx16384")
         self.assertEqual(blm.ctx_variant_name("gpt-oss", 8192), "gpt-oss:latest-ctx8192")
@@ -195,6 +207,97 @@ class TestEventBody(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             body = blm.build_event_body(blm.JobSpec("easy", "m", "aider", 1), make_cfg(Path(d)))
         self.assertNotIn("timeouts", body["data"]["policy"])
+
+
+class TestPreflightCapabilityFilter(unittest.TestCase):
+    """The bug this closes: --models all dispatched tools-incapable models
+    (phi3.5:3.8b, codestral:22b) through aider/pi, which always send tool
+    definitions -- Ollama hard-rejects with HTTP 400 before generation starts.
+    Capability must come from a live query, never a hardcoded name list."""
+
+    def _run_preflight(self, *, backends: list[str], require_capability: str, tags: dict, shows: dict):
+        def fake_http_status(url, *_a, **_k):
+            if url.endswith("/health"):
+                return 200
+            if url.endswith("/api/tags"):
+                return 200
+            return 200
+
+        def fake_http_get_json(url, *_a, **_k):
+            if url.endswith("/api/tags"):
+                return tags
+            return {}
+
+        def fake_http_post_json(url, _api_key, payload, *_a, **_k):
+            if url.endswith("/api/show"):
+                return shows[payload["model"]]
+            return {}
+
+        with mock.patch.multiple(
+            blm,
+            http_status=fake_http_status,
+            http_get_json=fake_http_get_json,
+            http_post_json=fake_http_post_json,
+            commit_subject_collisions=mock.MagicMock(return_value=[]),
+            tasks_already_satisfied=mock.MagicMock(return_value=[]),
+            shutil=mock.MagicMock(which=mock.MagicMock(return_value="/usr/bin/fake")),
+        ):
+            return blm.preflight(
+                tiers=[], models_arg="all", backends=backends,
+                endpoint="http://x", bastion_addr="http://y", api_key="k",
+                num_ctx=0, create_variants=False, require_capability=require_capability,
+            )
+
+    def test_tools_incapable_model_excluded_when_backend_requires_tools(self) -> None:
+        tags = {"models": [{"name": "phi3.5:3.8b", "size": 1}, {"name": "qwen3:8b", "size": 2}]}
+        shows = {
+            "phi3.5:3.8b": {"capabilities": ["completion"], "details": {}},
+            "qwen3:8b": {"capabilities": ["completion", "tools"], "details": {}},
+        }
+        problems, warnings, excluded, runnable, info, all_caps = self._run_preflight(
+            backends=["aider", "pi"], require_capability="tools", tags=tags, shows=shows,
+        )
+        self.assertEqual(problems, [])
+        self.assertEqual(runnable, ["qwen3:8b"])
+        excluded_models = {e["model"] for e in excluded}
+        self.assertIn("phi3.5:3.8b", excluded_models)
+        self.assertIn("tools", next(e["reason"] for e in excluded if e["model"] == "phi3.5:3.8b"))
+        self.assertEqual(len(all_caps), 2, "capability record kept for every resolved model, runnable or not")
+
+    def test_same_model_is_runnable_when_only_completion_is_required(self) -> None:
+        tags = {"models": [{"name": "phi3.5:3.8b", "size": 1}]}
+        shows = {"phi3.5:3.8b": {"capabilities": ["completion"], "details": {}}}
+        problems, warnings, excluded, runnable, info, all_caps = self._run_preflight(
+            backends=[], require_capability="completion", tags=tags, shows=shows,
+        )
+        self.assertEqual(excluded, [])
+        self.assertEqual(runnable, ["phi3.5:3.8b"])
+
+    def test_embedding_only_model_excluded_regardless_of_capability_floor(self) -> None:
+        tags = {"models": [{"name": "bge-m3:latest", "size": 1}]}
+        shows = {"bge-m3:latest": {"capabilities": ["embedding"], "details": {}}}
+        _problems, _warnings, excluded, runnable, _info, _all_caps = self._run_preflight(
+            backends=[], require_capability="completion", tags=tags, shows=shows,
+        )
+        self.assertEqual(runnable, [])
+        self.assertEqual(excluded[0]["reason"], "no completion capability ['embedding']")
+
+
+class TestRenderCapabilityReport(unittest.TestCase):
+    def test_separates_tools_capable_from_completion_only_and_lists_exclusions(self) -> None:
+        all_caps = [
+            {"model": "qwen3:8b", "capabilities": ["completion", "tools"], "parameter_size": "8B", "quantization_level": "Q4", "family": "qwen3"},
+            {"model": "phi3.5:3.8b", "capabilities": ["completion"], "parameter_size": "3.8B", "quantization_level": "Q4", "family": "phi3"},
+        ]
+        excluded = [{"model": "phi3.5:3.8b", "capabilities": ["completion"], "reason": "no tools capability"}]
+        with tempfile.TemporaryDirectory() as d:
+            with mock.patch.object(blm, "BENCH_DIR", Path(d)):
+                text = blm.render_capability_report(all_caps, excluded, "tools", ["aider", "pi"])
+                self.assertTrue((Path(d) / "model-capabilities.json").is_file())
+        self.assertIn("qwen3:8b", text.split("## Completion-only")[0])
+        self.assertIn("phi3.5:3.8b", text.split("## Completion-only")[1].split("## Excluded")[0])
+        self.assertIn("no tools capability", text)
+        self.assertIn("SummarizeNode", text)
 
 
 class TestClassify(unittest.TestCase):

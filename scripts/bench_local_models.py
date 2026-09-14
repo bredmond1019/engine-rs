@@ -96,6 +96,13 @@ TIERS_DIR = BENCH_DIR / "tiers"
 
 DEFAULT_TIERS = "easy,edit,medium,hard,rust"
 BACKENDS = ("aider", "pi")
+# Backends that drive a coding agent and therefore always send Ollama tool
+# definitions on every call. Ollama's OpenAI-compat endpoint hard-rejects a
+# tools-incapable model with an instant HTTP 400 before generation starts --
+# a guaranteed, uninformative failure, confirmed 2026-09-14 for phi3.5:3.8b
+# and codestral:22b (see docs/local-model-bench.md pitfall table).
+CODING_AGENT_BACKENDS = frozenset({"aider", "pi"})
+CAPABILITY_CHOICES = ("auto", "tools", "completion")
 REVIEW_MODES = ("per_task", "trivial_skip", "end_only")
 TERMINAL_STATUSES = ("succeeded", "failed", "cancelled", "budget_halted")
 RETRYABLE_OUTCOMES = ("exception", "dispatch_error", "infra_error")
@@ -242,6 +249,15 @@ def wait_for_infra(bastion_addr: str, endpoint: str, wait_minutes: float) -> tup
         time.sleep(15)
 
 
+def resolve_required_capability(choice: str, backends: list[str]) -> str:
+    """Resolve --require-capability's `auto` into a concrete floor: `tools`
+    whenever any selected backend always sends tool definitions (aider, pi),
+    else `completion` (a future non-agentic backend needs no tool-calling)."""
+    if choice != "auto":
+        return choice
+    return "tools" if any(b in CODING_AGENT_BACKENDS for b in backends) else "completion"
+
+
 def resolve_models(models_arg: str, endpoint: str) -> list[str]:
     if models_arg.strip() == "all":
         tags = http_get_json(f"{endpoint}/api/tags", None).get("models", [])
@@ -343,11 +359,17 @@ def ensure_ctx_variant(model: str, num_ctx: int, endpoint: str, create: bool) ->
 
 def preflight(
     *, tiers: list[str], models_arg: str, backends: list[str], endpoint: str, bastion_addr: str, api_key: str,
-    num_ctx: int = 0, create_variants: bool = False,
-) -> tuple[list[str], list[str], list[str], dict]:
-    """Returns (problems, warnings, runnable_models, model_info). Any problem blocks the sweep."""
+    num_ctx: int = 0, create_variants: bool = False, require_capability: str = "completion",
+) -> tuple[list[str], list[str], list[dict], list[str], dict, list[dict]]:
+    """Returns (problems, warnings, excluded, runnable_models, model_info, all_model_caps).
+    Any problem blocks the sweep. `excluded` is models filtered by capability
+    (distinct from `warnings`, which covers other preflight notices); `all_model_caps`
+    is the capability record for every resolved model, runnable or not, for the
+    durable capability report."""
     problems: list[str] = []
     warnings: list[str] = []
+    excluded: list[dict] = []
+    all_model_caps: list[dict] = []
     tier_tasks: dict[str, list[dict]] = {}
     for tier in tiers:
         tasks_path = TIERS_DIR / tier / "tasks.json"
@@ -378,23 +400,47 @@ def preflight(
 
     if http_status(f"{endpoint}/api/tags") != 200:
         problems.append(f"ollama not reachable at {endpoint}")
-        return problems, warnings, [], {}
+        return problems, warnings, excluded, [], {}, all_model_caps
 
     runnable: list[str] = []
     info: dict = {}
     for model in resolve_models(models_arg, endpoint):
         try:
+            # Capability comes from /api/show, NOT the /api/tags list used by
+            # resolve_models(): measured 2026-09-14, /api/tags reports
+            # deepseek-r1:14b/32b as `[completion, thinking]` (no `tools`),
+            # while /api/show for the same model returns `[tools, thinking,
+            # completion]`. /api/tags is unreliable for capability filtering.
             show = http_post_json(f"{endpoint}/api/show", None, {"model": model})
         except Exception as e:  # noqa: BLE001
             problems.append(f"model {model}: not available in ollama ({e})")
             continue
         caps = show.get("capabilities") or []
         details = show.get("details") or {}
+        cap_record = {
+            "model": model,
+            "capabilities": caps,
+            "parameter_size": details.get("parameter_size"),
+            "quantization_level": details.get("quantization_level"),
+            "family": details.get("family"),
+        }
+        all_model_caps.append(cap_record)
         if "completion" not in caps:
-            warnings.append(f"model {model}: skipped, no completion capability {caps}")
+            excluded.append({**cap_record, "reason": f"no completion capability {caps}"})
             continue
-        if "pi" in backends and "tools" not in caps:
-            warnings.append(f"model {model}: no tool-calling capability, pi jobs will likely fail fast")
+        if require_capability == "tools" and "tools" not in caps:
+            excluded.append(
+                {
+                    **cap_record,
+                    "reason": (
+                        f"no tools capability {caps} -- required because backend(s) "
+                        f"{sorted(set(backends) & CODING_AGENT_BACKENDS)} always send tool definitions "
+                        "and Ollama's OpenAI-compat endpoint hard-rejects a tools-incapable model with "
+                        "HTTP 400 before generation starts"
+                    ),
+                }
+            )
+            continue
         ollama_model = model
         if num_ctx:
             try:
@@ -416,7 +462,7 @@ def preflight(
         }
     if not runnable:
         problems.append("no runnable models")
-    return problems, warnings, runnable, info
+    return problems, warnings, excluded, runnable, info, all_model_caps
 
 
 # ── Block registration / cleanup ────────────────────────────────────────────
@@ -977,6 +1023,92 @@ def render_reports(run_dir: Path, run_name: str) -> str:
     return text
 
 
+# ── Model capability report ─────────────────────────────────────────────────
+
+# content_pipeline nodes confirmed 2026-09-14 (crates/engine-core/src/workflows/
+# content_pipeline/{summarize,self_critic,revise,translate}.rs) to parse plain
+# model text via parse_structured_or_fenced rather than driving a tool-calling
+# loop -- so a completion-only model is architecturally usable there, though
+# never benchmarked: passing this bench's tool-driven coding tasks says nothing
+# about summarization/critique/translation quality. See planning/backlog.md.
+COMPLETION_ONLY_CANDIDATE_NODES = (
+    "SummarizeNode",
+    "SelfCriticNode",
+    "ReviseNode",
+    "TranslateNode",
+)
+
+
+def render_capability_report(
+    all_model_caps: list[dict], excluded: list[dict], require_capability: str, backends: list[str]
+) -> str:
+    """Durable record of every resolved model's Ollama capability set, written to
+    planning/local-model-bench/ on every preflight (dry-run or real) so a model
+    pulled next month shows up here with zero code changes. do not hand-edit."""
+    BENCH_DIR.mkdir(parents=True, exist_ok=True)
+    (BENCH_DIR / "model-capabilities.json").write_text(json.dumps(all_model_caps, indent=2) + "\n")
+
+    excluded_models = {e["model"] for e in excluded}
+    tools_capable = sorted(c["model"] for c in all_model_caps if "tools" in (c["capabilities"] or []))
+    completion_only = sorted(
+        c["model"] for c in all_model_caps if "completion" in (c["capabilities"] or []) and "tools" not in (c["capabilities"] or [])
+    )
+
+    lines = [
+        "---",
+        "type: Reference",
+        'title: "local-model-bench model capabilities"',
+        (
+            "description: Ollama capability set (tools vs completion-only) for every model resolved by "
+            "scripts/bench_local_models.py, regenerated on every preflight -- do not hand-edit."
+        ),
+        "doc_id: local-model-bench-model-capabilities",
+        "layer: [engine]",
+        "project: engine-rs",
+        "status: active",
+        "keywords: [local model bench, ollama, capabilities, tools, completion]",
+        "related: [local-model-bench-index]",
+        f"updated: {datetime.now():%Y-%m-%d}",
+        "---",
+        "",
+        "# local-model-bench model capabilities",
+        "",
+        f"Generated by `scripts/bench_local_models.py:render_capability_report`. Current selection floor: "
+        f"`--require-capability {require_capability}` (backends: {', '.join(backends) or '-'}).",
+        "",
+        "## Tools-capable (usable by aider/pi coding-agent backends)",
+        "",
+    ]
+    lines += [f"- `{m}`" for m in tools_capable] or ["None."]
+    lines += ["", "## Completion-only (excluded from aider/pi dispatch; see opportunity note below)", ""]
+    lines += [f"- `{m}`" for m in completion_only] or ["None."]
+    lines += ["", "## Excluded this run", ""]
+    if excluded:
+        lines += [f"- `{e['model']}`: {e['reason']}" for e in excluded]
+    else:
+        lines.append("None.")
+    lines += [
+        "",
+        "## Opportunity: completion-only models for non-coding-agent nodes (not yet evaluated)",
+        "",
+        (
+            "Models with no `tools` capability (e.g. `phi3.5:3.8b`, `codestral:22b`) can never run through "
+            "aider/pi, but several content_pipeline nodes call a local model for plain text generation, not "
+            "tool-calling, and could plausibly use them: "
+            + ", ".join(f"`{n}`" for n in COMPLETION_ONLY_CANDIDATE_NODES)
+            + " (crates/engine-core/src/workflows/content_pipeline/, each parses the reply via "
+            "parse_structured_or_fenced). This is a hypothesis, not a result -- passing this bench's "
+            "tool-driven coding tasks says nothing about summarization/critique/translation quality, and no "
+            "such run has been attempted. Tracked as a backlog idea, not committed work: see "
+            "`planning/backlog.md` (repo:engine-rs, `local-model-bench-completion-only-models-for-content-pipeline`)."
+        ),
+        "",
+    ]
+    text = "\n".join(lines) + "\n"
+    (BENCH_DIR / "model-capabilities.md").write_text(text)
+    return text
+
+
 # ── CLI ──────────────────────────────────────────────────────────────────────
 
 
@@ -985,7 +1117,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description="Dispatch local Ollama models through real SDLC_FLOW runs across fixed tiers.",
     )
-    p.add_argument("--models", required=True, help="Comma-separated Ollama model names, or `all` (every pulled model with completion capability, smallest first).")
+    p.add_argument("--models", required=True, help="Comma-separated Ollama model names, or `all` (every pulled model, smallest first, base variants only -- excluded by --require-capability, see that flag).")
     p.add_argument("--tiers", default=env("BENCH_LOCAL_MODELS_TIERS", DEFAULT_TIERS), help=f"Comma-separated tier directories under planning/local-model-bench/tiers/ (default: {DEFAULT_TIERS}).")
     p.add_argument("--agent-backends", default=env("BENCH_LOCAL_MODELS_AGENT_BACKENDS", "aider,pi"), help="Comma-separated local ImplementTaskNode transports to compare (aider, pi).")
     p.add_argument("--repeat", type=int, default=int(env("BENCH_LOCAL_MODELS_REPEAT", "1")), help="Repeats per (tier, model, backend); all of rep 1 runs before any of rep 2.")
@@ -997,6 +1129,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     p.add_argument("--call-timeout-seconds", type=int, default=int(env("BENCH_LOCAL_MODELS_CALL_TIMEOUT_SECONDS", "0")) or None, help="Optional per-model-call timeout for implement/triage/review (child policy `timeouts`); unset keeps the engine default.")
     p.add_argument("--review-mode", choices=REVIEW_MODES, default=env("BENCH_LOCAL_MODELS_REVIEW_MODE", "end_only"), help="Child SDLC_FLOW review_mode (default end_only: one local-model review of the whole run's diff against its base). per_task/trivial_skip review `git diff HEAD`, which is empty after aider's auto-commit, so the reviewer fails correct aider work (measured 2026-09-14). end_only needs an engine build with EndReviewNode on the local tier.")
     p.add_argument("--ollama-num-ctx", type=int, default=int(env("BENCH_LOCAL_MODELS_OLLAMA_NUM_CTX", "16384")), help="Context window baked into a per-model Ollama variant (<model>-ctx<N>) used by both backends; 0 uses each model as-is. Pi sends no num_ctx, and Ollama's default truncated its ~9k-token engine prompt.")
+    p.add_argument("--require-capability", choices=CAPABILITY_CHOICES, default=env("BENCH_LOCAL_MODELS_REQUIRE_CAPABILITY", "auto"), help="Ollama capability floor for --models all selection, queried live from `POST /api/show` (never a hardcoded model-name list). `tools` excludes any model lacking Ollama's `tools` capability -- coding-agent backends (aider, pi) always send tool definitions, and Ollama's OpenAI-compat endpoint hard-rejects a tools-incapable model with HTTP 400 before generation starts. `completion` allows any completion-capable model. `auto` (default) resolves to `tools` whenever --agent-backends includes aider or pi, else `completion` -- so the aider/pi default is safe with no flag needed.")
     p.add_argument("--test-dispatch",choices=("inline", "queue_park"), default=env("BENCH_LOCAL_MODELS_TEST_DISPATCH", "inline"), help="Child SDLC_FLOW test_dispatch (default inline; see build_event_body).")
     p.add_argument("--endpoint", default=env("BENCH_LOCAL_MODELS_ENDPOINT", "http://localhost:11434"), help="Ollama base URL.")
     p.add_argument("--spec-slug", default=env("BENCH_LOCAL_MODELS_SPEC_SLUG", "local-model-bench-run"), help="planning/<slug>/ spec directory every job reuses; its worktree is trees/sdlc/<slug>. Never a registered block id.")
@@ -1028,14 +1161,19 @@ def main(argv: list[str]) -> int:
         return 1
     bastion_addr = os.environ.get("BASTION_SERVE_ADDR", "http://localhost:4317")
     run_dir = (Path(args.out) if args.out else BENCH_DIR / "results") / args.run_name
+    require_capability = resolve_required_capability(args.require_capability, backends)
 
-    problems, warnings, models, model_info = preflight(
+    problems, warnings, excluded, models, model_info, all_model_caps = preflight(
         tiers=tiers, models_arg=args.models, backends=backends,
         endpoint=args.endpoint, bastion_addr=bastion_addr, api_key=api_key,
         num_ctx=args.ollama_num_ctx, create_variants=not args.dry_run,
+        require_capability=require_capability,
     )
+    render_capability_report(all_model_caps, excluded, require_capability, backends)
     for w in warnings:
         log(f"warning: {w}")
+    for e in excluded:
+        log(f"excluded (capability): {e['model']} -- {e['reason']}")
     for problem in problems:
         log(f"PREFLIGHT FAILED: {problem}")
     if problems:
@@ -1046,7 +1184,12 @@ def main(argv: list[str]) -> int:
     log(f"run {run_dir}: {len(jobs)} jobs planned, {len(jobs) - len(pending)} already recorded, {len(pending)} to run")
     log(f"models: {', '.join(models)}")
     log(f"tiers: {', '.join(tiers)}; backends: {', '.join(backends)}; deadline: {deadline or 'none'}")
+    log(f"require-capability: {require_capability} ({len(excluded)} model(s) excluded, see {BENCH_DIR / 'model-capabilities.md'})")
     if args.dry_run:
+        if excluded:
+            print(f"# excluded (capability floor: {require_capability}):")
+            for e in excluded:
+                print(f"#   {e['model']}: {e['reason']}")
         for job in pending:
             print(job.slug)
         return 0
