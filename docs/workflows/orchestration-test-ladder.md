@@ -23,10 +23,13 @@ two-block chain (both via a live Claude Code session driving it turn by turn).
 loop. **Cost note:** a `block`-kind step always calls a real `SDLC_TASK`/`SDLC_FLOW` child —
 `resolve_explicit_chain` (used by both an explicit `blocks` list and `CONDUCTOR` itself) always
 sets `kind: Block`. There is no literal-$0 tier through the normal trigger path; "cheap" below
-means small and bounded, via the smallest fixture spec you have — reuse `micro-spec-small` /
-`micro-spec-large` (proven 2026-09-02, see
+means small and bounded, via the smallest fixture spec you have — reuse
+`dev-tooling/micro-spec-small` / `dev-tooling/micro-spec-large` (proven 2026-09-02 under their
+pre-move names, see
 [orchestration.md § Status](orchestration.md#status-first-real-repo-chain-has-run-cross-repo-remains-unexercised))
-or `smoke-sdlc-flow` ([sdlc-flow-smoke.md](sdlc-flow-smoke.md)) rather than authoring a new one.
+or `dev-tooling/smoke-sdlc-flow` ([sdlc-flow-smoke.md](sdlc-flow-smoke.md)) rather than authoring a
+new one. These fixtures live under `planning/dev-tooling/` — see
+[`scripts/dev-tooling/README.md`](../../scripts/dev-tooling/README.md).
 
 ## Tier 1 — the HTTP trigger path itself
 

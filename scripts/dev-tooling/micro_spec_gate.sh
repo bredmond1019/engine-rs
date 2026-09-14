@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# scripts/micro_spec_gate.sh
+# scripts/dev-tooling/micro_spec_gate.sh
 #
 # EN.ticket.micro-spec-fixture-for-engine-seam-comparison task 1 — the mechanism
 # that makes ONE task in a micro-spec fail its per-task validation gate on attempt
@@ -16,11 +16,11 @@
 # THE COUNTER FILE MUST NOT LIVE UNDER `planning/`: `.gitignore` line 7 is
 # `/planning`, so a write there is invisible to `git status --porcelain` and
 # defeats `TestTaskNode::verify_claimed_writes` — the exact trap documented in
-# `planning/smoke-sdlc-flow/tasks.md`. Always pass a counter-file path outside
+# `planning/dev-tooling/smoke-sdlc-flow/tasks.md`. Always pass a counter-file path outside
 # `planning/` (the worktree root, or /tmp for ad-hoc testing); the default below
 # is worktree-root-relative and disposable, never committed.
 #
-# Usage: scripts/micro_spec_gate.sh [counter-file-path]
+# Usage: scripts/dev-tooling/micro_spec_gate.sh [counter-file-path]
 #   counter-file-path defaults to .micro-spec-attempt (relative to invoking cwd,
 #   which is the worktree root under /sdlc-flow, per SetupWorktreeNode).
 #

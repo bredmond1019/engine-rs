@@ -7,7 +7,7 @@
 # times against a named engine and profile, HARVESTING each run's flow-state
 # artifact BEFORE the next dispatch begins.
 #
-# Modelled on scripts/sdlc_smoke.sh: same scripts/.env sourcing, same
+# Modelled on scripts/dev-tooling/sdlc_smoke.sh: same scripts/.env sourcing, same
 # BASTION_SERVE_ADDR default (http://localhost:4317), same
 # BASTION_ENGINE_API_KEY requirement, same POST /events/ trigger + GET
 # /events/{event_id} poll to a terminal status (succeeded | failed |
@@ -41,7 +41,7 @@
 #   run_micro_spec.sh --help
 #
 # Required:
-#   --spec <slug>        micro-spec-small | micro-spec-large
+#   --spec <slug>        dev-tooling/micro-spec-small | dev-tooling/micro-spec-large
 #
 # Options:
 #   -k <N>                Number of consecutive runs (default: 3).
@@ -56,7 +56,7 @@
 #                          fallback would make every comparison number a lie
 #                          about which engine actually produced it.
 #   --out <dir>            Directory harvested records land in (default:
-#                          planning/micro-spec-runs/).
+#                          planning/dev-tooling/micro-spec-runs/).
 #   --defer-harvest       NEGATIVE CONTROL — see above. Run all k dispatches
 #                          before harvesting anything, instead of harvesting
 #                          before each next dispatch. Expected to produce
@@ -117,7 +117,7 @@ SPEC=""
 K=3
 PROFILE="cheap-fast"
 ENGINE="rust"
-OUT_DIR="planning/micro-spec-runs"
+OUT_DIR="planning/dev-tooling/micro-spec-runs"
 DEFER_HARVEST=0
 CLEAN_ONLY=0
 
@@ -130,7 +130,7 @@ Usage:
   run_micro_spec.sh --help
 
 Required:
-  --spec <slug>        micro-spec-small | micro-spec-large
+  --spec <slug>        dev-tooling/micro-spec-small | dev-tooling/micro-spec-large
 
 Options:
   -k <N>                Number of consecutive runs (default: 3).
@@ -145,7 +145,7 @@ Options:
                          make every comparison number a lie about which
                          engine actually produced it.
   --out <dir>            Directory harvested records land in (default:
-                         planning/micro-spec-runs/).
+                         planning/dev-tooling/micro-spec-runs/).
   --defer-harvest       NEGATIVE CONTROL, not a feature: run all k
                          dispatches before harvesting anything, instead of
                          harvesting before each next dispatch. This is
@@ -314,7 +314,7 @@ fi
 # ── Everything past this point dispatches, so --spec is mandatory ──────────
 
 if [ -z "$SPEC" ]; then
-    echo "error: --spec is required (micro-spec-small | micro-spec-large)" >&2
+    echo "error: --spec is required (dev-tooling/micro-spec-small | dev-tooling/micro-spec-large)" >&2
     print_help
     exit 3
 fi

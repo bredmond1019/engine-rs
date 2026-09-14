@@ -3,7 +3,7 @@
 # scripts/tests/test_run_micro_spec.sh
 #
 # EN.ticket.micro-spec-fixture-for-engine-seam-comparison task 5 — D64
-# fixture-evidence for scripts/run_micro_spec.sh. The fixture (the
+# fixture-evidence for scripts/dev-tooling/run_micro_spec.sh. The fixture (the
 # micro-spec) is itself the test instrument for engine comparison, so what
 # this gates is the RUNNER's harvest ORDERING, not the micro-spec's
 # content: a runner that harvests in the wrong order still exits 0 and
@@ -67,9 +67,9 @@ trap cleanup EXIT
 
 # ── Isolated playground: copy the runner into a scripts/ dir with no .env ──
 
-mkdir -p "$TMPDIR_ROOT/work/scripts"
-cp "$REPO_ROOT/scripts/run_micro_spec.sh" "$TMPDIR_ROOT/work/scripts/run_micro_spec.sh"
-chmod +x "$TMPDIR_ROOT/work/scripts/run_micro_spec.sh"
+mkdir -p "$TMPDIR_ROOT/work/scripts/dev-tooling"
+cp "$REPO_ROOT/scripts/dev-tooling/run_micro_spec.sh" "$TMPDIR_ROOT/work/scripts/dev-tooling/run_micro_spec.sh"
+chmod +x "$TMPDIR_ROOT/work/scripts/dev-tooling/run_micro_spec.sh"
 
 # ── Fake `curl` on PATH ─────────────────────────────────────────────────────
 
@@ -119,7 +119,7 @@ cd "$TMPDIR_ROOT/work"
 
 OUT1="$TMPDIR_ROOT/work/out-normal"
 set +e
-bash scripts/run_micro_spec.sh --spec micro-spec-small -k 3 --out "$OUT1" >"$TMPDIR_ROOT/case1.log" 2>&1
+bash scripts/dev-tooling/run_micro_spec.sh --spec micro-spec-small -k 3 --out "$OUT1" >"$TMPDIR_ROOT/case1.log" 2>&1
 CASE1_RC=$?
 set -e
 CASE1_COUNT="$(distinct_event_ids "$OUT1")"
@@ -142,7 +142,7 @@ fi
 
 OUT2="$TMPDIR_ROOT/work/out-deferred"
 set +e
-bash scripts/run_micro_spec.sh --spec micro-spec-small -k 3 --defer-harvest --out "$OUT2" >"$TMPDIR_ROOT/case2.log" 2>&1
+bash scripts/dev-tooling/run_micro_spec.sh --spec micro-spec-small -k 3 --defer-harvest --out "$OUT2" >"$TMPDIR_ROOT/case2.log" 2>&1
 CASE2_RC=$?
 set -e
 CASE2_COUNT="$(distinct_event_ids "$OUT2")"
@@ -168,7 +168,7 @@ if [ ! -f "$STATE_FILE" ]; then
 fi
 
 set +e
-bash scripts/run_micro_spec.sh --spec micro-spec-small --clean >"$TMPDIR_ROOT/case3.log" 2>&1
+bash scripts/dev-tooling/run_micro_spec.sh --spec micro-spec-small --clean >"$TMPDIR_ROOT/case3.log" 2>&1
 CASE3_RC=$?
 set -e
 echo "case 3: exit=$CASE3_RC state_file_present_after=$([ -f "$STATE_FILE" ] && echo yes || echo no) (log: $TMPDIR_ROOT/case3.log)"

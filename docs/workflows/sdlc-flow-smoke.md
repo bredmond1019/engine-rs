@@ -14,8 +14,8 @@ related: [sdlc-flow-workflow, sdlc-flow-policy, architecture]
 
 This guide documents how to prove the Rust `SDLC_FLOW` workflow works end to end — triggered
 from bastion-web, walking the real graph with real agentic write permission, reaching a terminal
-state on disk — using the minimal smoke spec at `planning/smoke-sdlc-flow/` and the harness script
-at `scripts/sdlc_smoke.sh`.
+state on disk — using the minimal smoke spec at `planning/dev-tooling/smoke-sdlc-flow/` and the harness script
+at `scripts/dev-tooling/sdlc_smoke.sh`.
 
 ## Prerequisites
 
@@ -47,12 +47,12 @@ unmet.
    it.
 5. **`git fetch origin` first** — `SetupWorktreeNode`'s `git worktree add ... origin/main` fails
    outright against a stale `origin/main` ref.
-6. **`trees/sdlc/smoke-sdlc-flow` must not already exist** — run `scripts/sdlc_smoke.sh --clean`
+6. **`trees/sdlc/dev-tooling/smoke-sdlc-flow` must not already exist** — run `scripts/dev-tooling/sdlc_smoke.sh --clean`
    first.
 
-## The `scripts/sdlc_smoke.sh --repo` flag
+## The `scripts/dev-tooling/sdlc_smoke.sh --repo` flag
 
-`scripts/sdlc_smoke.sh` (task 6, `EN.3.J`) accepts an optional `--repo <slug>` flag that adds an
+`scripts/dev-tooling/sdlc_smoke.sh` (task 6, `EN.3.J`) accepts an optional `--repo <slug>` flag that adds an
 explicit `"repo": "<slug>"` field to the triggered event's `data` object, so the run is targeted
 via the registry (`RepoRegistry`) instead of the serve process's cwd. `<slug>` is a registry slug,
 never a path — e.g. `--repo engine-rs`, matching `agentic-portfolio/brain.toml`'s
@@ -63,12 +63,12 @@ never a path — e.g. `--repo engine-rs`, matching `agentic-portfolio/brain.toml
 - **Without `--repo` (cwd fallback, the pre-`EN.3.K` path):**
   ```json
   { "workflow_type": "SDLC_FLOW",
-    "data": { "spec_slug": "smoke-sdlc-flow", "use_worktree": true, "auto_pr": false, "profile": "cheap-fast" } }
+    "data": { "spec_slug": "dev-tooling/smoke-sdlc-flow", "use_worktree": true, "auto_pr": false, "profile": "cheap-fast" } }
   ```
 - **With `--repo engine-rs` (registry-resolved, the `EN.3.K` path):**
   ```json
   { "workflow_type": "SDLC_FLOW",
-    "data": { "spec_slug": "smoke-sdlc-flow", "repo": "engine-rs", "use_worktree": true, "auto_pr": false, "profile": "cheap-fast" } }
+    "data": { "spec_slug": "dev-tooling/smoke-sdlc-flow", "repo": "engine-rs", "use_worktree": true, "auto_pr": false, "profile": "cheap-fast" } }
   ```
 
 **Hard prerequisite for the `--repo` variant:** a `repo`-bearing event requires `ENGINE_BRAIN_ROOT`
@@ -89,12 +89,12 @@ path, per `EN.3.K`). See tasks 7 and 9 of `planning/EN.3.J-sdlc-flow-smoke/tasks
 
 ```json
 { "workflow_type": "SDLC_FLOW",
-  "data": { "spec_slug": "smoke-sdlc-flow", "use_worktree": true, "auto_pr": false, "profile": "cheap-fast" } }
+  "data": { "spec_slug": "dev-tooling/smoke-sdlc-flow", "use_worktree": true, "auto_pr": false, "profile": "cheap-fast" } }
 ```
 
 - **`use_worktree: true` is not optional.** The field defaults to `false`
   (`crates/engine-core/src/workflows/sdlc_flow/schema.rs:133`), and on that path
-  `SetupWorktreeNode` runs `git checkout -B sdlc/smoke-sdlc-flow origin/main` in the **live
+  `SetupWorktreeNode` runs `git checkout -B sdlc/dev-tooling/smoke-sdlc-flow origin/main` in the **live
   checkout** (`crates/engine-core/src/workflows/sdlc_flow/setup.rs:673-682`) — moving HEAD out from
   under you while an agentic node with real write permission edits the real tree. Omitting this
   flag is the most damaging mistake available when running this smoke.
@@ -120,30 +120,30 @@ monitor — bastion-web consumes no SSE at all; live streaming is bastion-web bl
 started. QuickLaunch going quiet after ~6 seconds is expected behavior, not a failed run.
 
 **The procedure is therefore: trigger from QuickLaunch, watch from the terminal** with
-`scripts/sdlc_smoke.sh --watch <event_id>`.
+`scripts/dev-tooling/sdlc_smoke.sh --watch <event_id>`.
 
 ## Run procedure
 
 1. `git fetch origin`
-2. `scripts/sdlc_smoke.sh --clean` (tolerant of nothing existing yet)
+2. `scripts/dev-tooling/sdlc_smoke.sh --clean` (tolerant of nothing existing yet)
 3. Trigger the run — either:
    - from bastion-web QuickLaunch with `workflow_type: SDLC_FLOW` and the event body above, noting
      the `event_id` it reports, or
-   - directly via `scripts/sdlc_smoke.sh` (which triggers and watches in one step).
-4. If triggered from QuickLaunch, attach the watcher: `scripts/sdlc_smoke.sh --watch <event_id>`.
+   - directly via `scripts/dev-tooling/sdlc_smoke.sh` (which triggers and watches in one step).
+4. If triggered from QuickLaunch, attach the watcher: `scripts/dev-tooling/sdlc_smoke.sh --watch <event_id>`.
 5. Verify the three artifacts once the watcher reports `succeeded`:
-   - `trees/sdlc/smoke-sdlc-flow/SMOKE.md` contains `ENGINE-SMOKE`.
-   - `planning/smoke-sdlc-flow/sdlc/sdlc-flow-state.json` reports `status: "done"` with a `run_id`
+   - `trees/sdlc/dev-tooling/smoke-sdlc-flow/SMOKE.md` contains `ENGINE-SMOKE`.
+   - `planning/dev-tooling/smoke-sdlc-flow/sdlc/sdlc-flow-state.json` reports `status: "done"` with a `run_id`
      equal to the `event_id` from the 202 response.
    - The watcher itself exited 0.
-6. Clean up: `scripts/sdlc_smoke.sh --clean`.
+6. Clean up: `scripts/dev-tooling/sdlc_smoke.sh --clean`.
 
 ## Cleanup
 
 ```
-git worktree remove --force trees/sdlc/smoke-sdlc-flow
-git branch -D sdlc/smoke-sdlc-flow
-rm -rf planning/smoke-sdlc-flow/sdlc
+git worktree remove --force trees/sdlc/dev-tooling/smoke-sdlc-flow
+git branch -D sdlc/dev-tooling/smoke-sdlc-flow
+rm -rf planning/dev-tooling/smoke-sdlc-flow/sdlc
 ```
 
 The third command is not optional. `SpecExistsRouterNode::route`
@@ -154,7 +154,7 @@ therefore makes the next trigger **resume a run that is already `done`** — it 
 instantly having executed nothing at all. Deleting the state dir is what makes the next smoke a
 real one.
 
-`scripts/sdlc_smoke.sh --clean` runs all three steps for you, tolerating each resource already
+`scripts/dev-tooling/sdlc_smoke.sh --clean` runs all three steps for you, tolerating each resource already
 being absent.
 
 ## Status vocabulary

@@ -53,13 +53,13 @@ sed -n '/## Leaderboard/,/## Jobs/p' ../../planning/open-work/local-models/local
 **Always pass `--run-name`** for a sweep that may cross midnight. The default name is today's date,
 so a restart after midnight would start a new run instead of resuming.
 
-**Optional: watch system load during a long sweep.** `scripts/system_monitor.py` samples CPU/
+**Optional: watch system load during a long sweep.** `scripts/dev-tooling/system_monitor.py` samples CPU/
 memory/swap every 60s, keeps a rolling average, and fires a `bastion notify send` Telegram alert on
 a sustained problem (not per-sample noise) — useful for an unattended overnight run on a machine
 also running several loaded local models. Run it alongside the sweep, in a separate terminal:
 
 ```bash
-python3 scripts/system_monitor.py   # logs to /tmp/system_monitor.jsonl; --help for thresholds
+python3 scripts/dev-tooling/system_monitor.py   # logs to /tmp/system_monitor.jsonl; --help for thresholds
 ```
 
 ### What must exist first
@@ -134,9 +134,9 @@ that literal string resolves unchanged through a worktree's own `planning/` syml
 | Tier | Task | Checked by | Tests |
 |---|---|---|---|
 | `easy` | Write `BENCH_MARKER.md` with one exact line; write `bench_greeting.py` with `greet()` | `grep -qx`, a Python one-liner | Following exact instructions |
-| `edit` | Change one line of the existing `scripts/bench_verify_medium.py` | `planning/local-model-bench/checkers/verify_edit_one_line.py` — exactly 1 line added, 1 removed vs `origin/main` | Surgical edits (aider's whole-file format often drops or rewrites lines) |
-| `medium` | Run-length encode/decode in `rle.py` | [`scripts/bench_verify_medium.py`](../scripts/bench_verify_medium.py) | Real logic, exact outputs |
-| `hard` | Arithmetic evaluator with precedence and parentheses, no `eval()` | [`scripts/bench_verify_hard.py`](../scripts/bench_verify_hard.py) | Parsing |
+| `edit` | Change one line of the existing `scripts/dev-tooling/bench_verify_medium.py` | `planning/local-model-bench/checkers/verify_edit_one_line.py` — exactly 1 line added, 1 removed vs `origin/main` | Surgical edits (aider's whole-file format often drops or rewrites lines) |
+| `medium` | Run-length encode/decode in `rle.py` | [`scripts/dev-tooling/bench_verify_medium.py`](../scripts/dev-tooling/bench_verify_medium.py) | Real logic, exact outputs |
+| `hard` | Arithmetic evaluator with precedence and parentheses, no `eval()` | [`scripts/dev-tooling/bench_verify_hard.py`](../scripts/dev-tooling/bench_verify_hard.py) | Parsing |
 | `rust` | `top_words()` in a standalone `word_freq.rs` | `planning/local-model-bench/checkers/verify_rust_word_freq.sh` — 8 tests via `rustc --test`, no Cargo | Rust that compiles |
 
 **Every check runs under `perl -e 'alarm shift; exec @ARGV' 60`** (macOS has no `timeout`), and the
@@ -267,7 +267,7 @@ protection now lives, so nobody removes it as clutter.
 Everything is in [`scripts/bench_local_models.py`](../scripts/bench_local_models.py); tests in
 [`scripts/tests/test_bench_local_models.py`](../scripts/tests/test_bench_local_models.py), run with
 `python3 scripts/tests/test_bench_local_models.py` and gated as `bench-local-models-tests` in
-`planning/harness.json`. [`scripts/system_monitor.py`](../scripts/system_monitor.py) (optional,
+`planning/harness.json`. [`scripts/dev-tooling/system_monitor.py`](../scripts/dev-tooling/system_monitor.py) (optional,
 separate process, see Quickstart) is standalone — no bench-script dependency either direction.
 
 | Function | Job |

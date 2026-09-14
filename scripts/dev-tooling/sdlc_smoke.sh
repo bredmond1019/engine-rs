@@ -10,10 +10,10 @@
 # readback endpoint instead.
 #
 # Usage:
-#   scripts/sdlc_smoke.sh              trigger a fresh SDLC_FLOW run and watch it
-#   scripts/sdlc_smoke.sh --watch ID   attach to an existing run_id/event_id and watch it
-#   scripts/sdlc_smoke.sh --clean      cleanup only (see task 3) — no trigger, no watch
-#   scripts/sdlc_smoke.sh --help       show this help
+#   scripts/dev-tooling/sdlc_smoke.sh              trigger a fresh SDLC_FLOW run and watch it
+#   scripts/dev-tooling/sdlc_smoke.sh --watch ID   attach to an existing run_id/event_id and watch it
+#   scripts/dev-tooling/sdlc_smoke.sh --clean      cleanup only (see task 3) — no trigger, no watch
+#   scripts/dev-tooling/sdlc_smoke.sh --help       show this help
 #
 # Secrets: sourced from scripts/.env if present (gitignored), else read from
 # the environment. BASTION_SERVE_ADDR defaults to http://localhost:4317.
@@ -53,7 +53,7 @@ sdlc_smoke.sh — trigger and watch an SDLC_FLOW smoke run
 
 Usage:
   sdlc_smoke.sh              Trigger a fresh SDLC_FLOW run (spec_slug
-                              "smoke-sdlc-flow", use_worktree, no auto_pr,
+                              "dev-tooling/smoke-sdlc-flow", use_worktree, no auto_pr,
                               profile cheap-fast) and poll it to a terminal
                               state. The target root falls back to the
                               serve process's cwd (no "repo" field sent).
@@ -146,13 +146,13 @@ fi
 # which the next trigger starts clean.
 
 if [ "$MODE" = "clean" ]; then
-    echo "Removing worktree trees/sdlc/smoke-sdlc-flow ..."
-    git worktree remove --force trees/sdlc/smoke-sdlc-flow \
+    echo "Removing worktree trees/sdlc/dev-tooling/smoke-sdlc-flow ..."
+    git worktree remove --force trees/sdlc/dev-tooling/smoke-sdlc-flow \
         && echo "  removed." \
         || echo "  not present (ok)."
 
-    echo "Deleting branch sdlc/smoke-sdlc-flow ..."
-    git branch -D sdlc/smoke-sdlc-flow \
+    echo "Deleting branch sdlc/dev-tooling/smoke-sdlc-flow ..."
+    git branch -D sdlc/dev-tooling/smoke-sdlc-flow \
         && echo "  deleted." \
         || echo "  not present (ok)."
 
@@ -164,9 +164,9 @@ if [ "$MODE" = "clean" ]; then
     # smoke therefore makes the NEXT trigger RESUME a run that is already
     # `done` — it appears to succeed instantly having executed nothing at
     # all. Deleting the state dir is what makes the next smoke a real one.
-    echo "Removing leftover flow state planning/smoke-sdlc-flow/sdlc ..."
-    if [ -d "planning/smoke-sdlc-flow/sdlc" ]; then
-        rm -rf planning/smoke-sdlc-flow/sdlc
+    echo "Removing leftover flow state planning/dev-tooling/smoke-sdlc-flow/sdlc ..."
+    if [ -d "planning/dev-tooling/smoke-sdlc-flow/sdlc" ]; then
+        rm -rf planning/dev-tooling/smoke-sdlc-flow/sdlc
         echo "  removed."
     else
         echo "  not present (ok)."
@@ -187,16 +187,16 @@ fi
 EVENT_ID=""
 
 if [ "$MODE" = "trigger" ]; then
-    EVENT_BODY='{"workflow_type":"SDLC_FLOW","data":{"spec_slug":"smoke-sdlc-flow","use_worktree":true,"auto_pr":false,"profile":"cheap-fast"}}'
+    EVENT_BODY='{"workflow_type":"SDLC_FLOW","data":{"spec_slug":"dev-tooling/smoke-sdlc-flow","use_worktree":true,"auto_pr":false,"profile":"cheap-fast"}}'
     if [ -n "$REPO_SLUG" ]; then
-        EVENT_BODY='{"workflow_type":"SDLC_FLOW","data":{"spec_slug":"smoke-sdlc-flow","repo":"'"$REPO_SLUG"'","use_worktree":true,"auto_pr":false,"profile":"cheap-fast"}}'
+        EVENT_BODY='{"workflow_type":"SDLC_FLOW","data":{"spec_slug":"dev-tooling/smoke-sdlc-flow","repo":"'"$REPO_SLUG"'","use_worktree":true,"auto_pr":false,"profile":"cheap-fast"}}'
     fi
 
     if [ -n "$REPO_SLUG" ]; then
-        echo "Triggering SDLC_FLOW (spec_slug=smoke-sdlc-flow, repo=$REPO_SLUG, use_worktree=true, auto_pr=false, profile=cheap-fast) at $BASTION_ADDR ..."
+        echo "Triggering SDLC_FLOW (spec_slug=dev-tooling/smoke-sdlc-flow, repo=$REPO_SLUG, use_worktree=true, auto_pr=false, profile=cheap-fast) at $BASTION_ADDR ..."
         echo "Target mode: registry-resolved (repo=$REPO_SLUG; requires ENGINE_BRAIN_ROOT on the serve process)."
     else
-        echo "Triggering SDLC_FLOW (spec_slug=smoke-sdlc-flow, use_worktree=true, auto_pr=false, profile=cheap-fast) at $BASTION_ADDR ..."
+        echo "Triggering SDLC_FLOW (spec_slug=dev-tooling/smoke-sdlc-flow, use_worktree=true, auto_pr=false, profile=cheap-fast) at $BASTION_ADDR ..."
         echo "Target mode: cwd fallback (no repo field sent; target root is the serve process's current_dir())."
     fi
 
