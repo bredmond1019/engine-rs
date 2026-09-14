@@ -19,10 +19,14 @@ use engine_contract::TaskContext;
 use serde::Deserialize;
 use serde_json::json;
 
+use crate::cancellation::CancellationToken;
 use crate::node::{Node, NodeError};
-use crate::nodes::{AgentCodeStep, MetaTransport};
+use crate::nodes::AgentCodeStep;
 use crate::repo_registry::RepoRegistry;
 use crate::routing::Router;
+use crate::workflows::llm_node::{
+    Cancellable as LlmCancellable, TransportSlotted as LlmTransportSlotted,
+};
 
 use crate::policy::PolicyConfigSource;
 
@@ -1580,6 +1584,16 @@ fn truncate_context_section(section: String, file_name: &str, max_bytes: Option<
 pub struct GenerateTasksNode {
     config: Config,
     transport: TransportSlot,
+    /// Taken through this node's OWN builder, never inferred from context —
+    /// mirrors `task_loop::ImplementTaskNode`/`TriageTaskNode`'s own
+    /// `cancellation_token` field. `None` (the default) is behavior-stable:
+    /// no token, no cancellation check. Added by the `LlmNode` trait
+    /// consolidation (`EN.ticket.transport-slot-consolidation`) — this
+    /// node was the one migrated node that had never gained cancellation
+    /// support in its own onboarding ticket, purely because that ticket's
+    /// scope never covered it, not because the capability doesn't apply
+    /// here.
+    cancellation_token: Option<CancellationToken>,
 }
 
 impl GenerateTasksNode {
@@ -1593,37 +1607,30 @@ impl GenerateTasksNode {
             // dead source of truth for the same value (standing rule 6).
             config: Config::default(),
             transport: TransportSlot::default(),
+            cancellation_token: None,
         }
-    }
-
-    /// Override the transport used by the composed `AgentCodeStep`. Tests
-    /// use this to stub a real subprocess call with a canned `Outcome`, so
-    /// the gated suite never spawns a real `claude`.
-    #[must_use]
-    pub fn with_transport(mut self, transport: ModelTransport) -> Self {
-        self.transport.set_plain(transport);
-        self
-    }
-
-    /// Override the transport with a tier-aware [`MetaTransport`] that
-    /// reports the [`TransportInfo`] of whichever call actually executed,
-    /// taking precedence over a plain transport set via
-    /// [`Self::with_transport`] — mirrors `TriageTaskNode::with_meta_transport`.
-    /// This is what lets `graph.rs::registry_for_policy` route this node
-    /// through a local model when `policy.model_tiers.generate ==
-    /// ModelTier::Local`.
-    ///
-    /// [`TransportInfo`]: crate::nodes::TransportInfo
-    #[must_use]
-    pub fn with_meta_transport(mut self, transport: MetaTransport) -> Self {
-        self.transport.set_meta(transport);
-        self
     }
 }
 
 impl Default for GenerateTasksNode {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// See `llm_node::TransportSlotted`'s doc comment — `with_meta_transport`/
+/// `with_transport` are default methods over this one field.
+impl LlmTransportSlotted for GenerateTasksNode {
+    fn transport_slot_mut(&mut self) -> &mut TransportSlot {
+        &mut self.transport
+    }
+}
+
+/// See `llm_node::Cancellable`'s doc comment — `with_cancellation_token` is
+/// a default method over this one field.
+impl LlmCancellable for GenerateTasksNode {
+    fn cancellation_token_mut(&mut self) -> &mut Option<CancellationToken> {
+        &mut self.cancellation_token
     }
 }
 
@@ -1670,10 +1677,13 @@ impl Node for GenerateTasksNode {
 
         config.json_schema = Some(generated_tasks_schema());
 
-        let step = self.transport.apply(
+        let mut step = self.transport.apply(
             AgentCodeStep::new("GenerateTasksNode", config, prompt)
                 .with_retry_policy(policy.transport_retry),
         );
+        if let Some(token) = self.cancellation_token.clone() {
+            step = step.with_cancellation_token(token);
+        }
 
         let baseline = session_baseline(&ctx);
         let mut ctx = step.process(ctx).await?;
@@ -1763,6 +1773,7 @@ impl Node for GenerateTasksNode {
 mod tests {
     use super::super::policy::{CallTimeouts, ModelTier, ModelTiers};
     use super::*;
+    use crate::nodes::MetaTransport;
     use claude_code_rs::Outcome;
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicU64, Ordering};

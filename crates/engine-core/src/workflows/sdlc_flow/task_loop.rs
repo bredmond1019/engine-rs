@@ -30,6 +30,9 @@ use crate::node::{Node, NodeError};
 use crate::nodes::{AgentCodeStep, MetaTransport};
 use crate::routing::Router;
 use crate::suspend::{self, SuspendReason};
+use crate::workflows::llm_node::{
+    Cancellable as LlmCancellable, TransportSlotted as LlmTransportSlotted,
+};
 use crate::workflows::{admitted_command_runner, CommandSpec, SpecCommandRunner};
 
 use super::close_block::DEFAULT_REPO_SLUG;
@@ -1343,28 +1346,6 @@ impl ImplementTaskNode {
         }
     }
 
-    /// Override the transport used by the composed `AgentCodeStep`. Tests
-    /// use this to stub a real subprocess call with a canned `Outcome`, so
-    /// the gated suite never spawns a real `claude`.
-    #[must_use]
-    pub fn with_transport(mut self, transport: ModelTransport) -> Self {
-        self.transport.set_plain(transport);
-        self
-    }
-
-    /// Override the transport with a tier-aware [`MetaTransport`] that
-    /// reports the [`TransportInfo`] of whichever call actually executed
-    /// (e.g. `AgentBackend::Pi`'s `PiTransport`), taking precedence over a
-    /// plain transport set via [`Self::with_transport`] — mirrors
-    /// `TriageTaskNode::with_meta_transport`.
-    ///
-    /// [`TransportInfo`]: crate::nodes::TransportInfo
-    #[must_use]
-    pub fn with_meta_transport(mut self, transport: MetaTransport) -> Self {
-        self.transport.set_meta(transport);
-        self
-    }
-
     /// Override the command runner used to derive `modified_files` from the
     /// worktree's git state for a non-`claude_cli` backend (see
     /// [`git_worktree_changed_files`]). Tests use this to stub the
@@ -1372,18 +1353,6 @@ impl ImplementTaskNode {
     #[must_use]
     pub fn with_runner(mut self, runner: CommandRunner) -> Self {
         self.runner = runner;
-        self
-    }
-
-    /// Attach a `CancellationToken`, raced against the composed
-    /// `AgentCodeStep`'s in-flight model call (`AgentCodeStep::
-    /// with_cancellation_token`'s `tokio::select!`) so an abort issued
-    /// mid-call interrupts this node instead of only taking effect at the
-    /// next node boundary. With no token attached (the default), behavior
-    /// is unchanged from before this builder existed.
-    #[must_use]
-    pub fn with_cancellation_token(mut self, token: CancellationToken) -> Self {
-        self.cancellation_token = Some(token);
         self
     }
 
@@ -1404,6 +1373,24 @@ impl ImplementTaskNode {
 impl Default for ImplementTaskNode {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// See `llm_node::TransportSlotted`'s doc comment — `with_meta_transport`/
+/// `with_transport` are default methods over this one field.
+impl LlmTransportSlotted for ImplementTaskNode {
+    fn transport_slot_mut(&mut self) -> &mut TransportSlot {
+        &mut self.transport
+    }
+}
+
+/// See `llm_node::Cancellable`'s doc comment — `with_cancellation_token` is
+/// a default method over this one field. `None` (the default `new()` sets)
+/// is behavior-stable: no token, no cancellation check, identical to before
+/// this trait existed.
+impl LlmCancellable for ImplementTaskNode {
+    fn cancellation_token_mut(&mut self) -> &mut Option<CancellationToken> {
+        &mut self.cancellation_token
     }
 }
 
@@ -2991,36 +2978,6 @@ impl TriageTaskNode {
         }
     }
 
-    /// Override the transport used by the composed `AgentCodeStep` for the
-    /// `llm_triage` model branch. Tests use this to assert it is (or isn't)
-    /// invoked.
-    #[must_use]
-    pub fn with_transport(mut self, transport: ModelTransport) -> Self {
-        self.transport.set_plain(transport);
-        self
-    }
-
-    /// Attach a `CancellationToken`, raced against the composed
-    /// `AgentCodeStep`'s in-flight `llm_triage` model call so an abort
-    /// issued mid-call interrupts this node instead of only taking effect
-    /// at the next node boundary. With no token attached (the default),
-    /// behavior is unchanged from before this builder existed.
-    #[must_use]
-    pub fn with_cancellation_token(mut self, token: CancellationToken) -> Self {
-        self.cancellation_token = Some(token);
-        self
-    }
-
-    /// Override the transport with a tier-aware [`MetaTransport`] that
-    /// reports the [`TransportInfo`] of whichever call actually executed
-    /// (e.g. local vs. cloud fallback), taking precedence over a plain
-    /// transport set via [`Self::with_transport`].
-    #[must_use]
-    pub fn with_meta_transport(mut self, transport: MetaTransport) -> Self {
-        self.transport.set_meta(transport);
-        self
-    }
-
     /// Override the command runner used for the `git diff --numstat`
     /// trivial-classification invocation. Tests use this to stub the
     /// subprocess.
@@ -3043,6 +3000,24 @@ impl TriageTaskNode {
 impl Default for TriageTaskNode {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// See `llm_node::TransportSlotted`'s doc comment — `with_meta_transport`/
+/// `with_transport` are default methods over this one field.
+impl LlmTransportSlotted for TriageTaskNode {
+    fn transport_slot_mut(&mut self) -> &mut TransportSlot {
+        &mut self.transport
+    }
+}
+
+/// See `llm_node::Cancellable`'s doc comment — `with_cancellation_token` is
+/// a default method over this one field. `None` (the default `new()` sets)
+/// is behavior-stable: no token, no cancellation check, identical to before
+/// this trait existed.
+impl LlmCancellable for TriageTaskNode {
+    fn cancellation_token_mut(&mut self) -> &mut Option<CancellationToken> {
+        &mut self.cancellation_token
     }
 }
 
@@ -12182,14 +12157,8 @@ pub(crate) mod tests {
                 "GenerateTasksNode",
                 drive_generate_tasks_node_for_billing().await,
             ),
-            (
-                "EndReviewNode",
-                drive_end_review_node_for_billing().await,
-            ),
-            (
-                "PatchDocsNode",
-                drive_patch_docs_node_for_billing().await,
-            ),
+            ("EndReviewNode", drive_end_review_node_for_billing().await),
+            ("PatchDocsNode", drive_patch_docs_node_for_billing().await),
         ];
 
         // The table IS the contract: its stage set must equal

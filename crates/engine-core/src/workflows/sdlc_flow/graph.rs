@@ -70,6 +70,9 @@ use crate::nodes::pi_meta_transport_live;
 use crate::policy::AgentBackend;
 use crate::schema::{NodeConfig, WorkflowSchema};
 use crate::workflow::Workflow;
+use crate::workflows::llm_node::{
+    Cancellable as LlmCancellable, TransportSlotted as LlmTransportSlotted,
+};
 
 use super::close_block::CloseBlockNode;
 use super::docs::PatchDocsNode;
