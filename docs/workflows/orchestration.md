@@ -845,6 +845,13 @@ field — the way `child_sdlc_task_policy` or any other `OrchestrationPolicy` kn
 (the `ExecutionOutcome.repo_path` the composer reads), which is a standing, per-repo configuration
 choice, not a per-run one.
 
+**Why this seam is capped at 2 of the usual 4 policy layers, and what a real fix requires:**
+`planning/pre-plan/orchestration-harness-only-policy-gap/notes.md` — audited to be the only such
+gap in the codebase; the fix is architecturally straightforward (mirror `OrchestrationPolicy`'s
+`default_auto_pr` precedent) but mechanically wide (threads through 10 nested `integrate_chain*`
+wrapper functions and ~30 call sites), so it's captured as its own task rather than forced through
+inline.
+
 **Known gap, tracked not invented:** no production call site today files a remediation ticket from
 a `BailEntry` — the composer never proposes a `Remediation` object, and `call_site: NONE` is its
 honest answer. This is an open finding in
