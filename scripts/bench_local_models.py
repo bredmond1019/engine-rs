@@ -623,7 +623,19 @@ class SweepConfig:
 def build_event_body(spec: JobSpec, cfg: SweepConfig) -> dict:
     policy: dict = {
         "agent_backend": spec.backend,
-        "model_tiers": {"triage": "local", "review": "local"},
+        # Every non-agentic SDLC_FLOW model stage this bench dispatches must
+        # resolve to the local model under test — "triage"/"review" alone
+        # left `PatchDocsNode`/`GenerateTasksNode` silently calling the real
+        # `claude` CLI with sonnet/opus (measured 2026-09-14; see
+        # `docs/local-model-bench.md` § Pitfalls). `implement` is
+        # deliberately absent: the agentic implement stage routes through
+        # `agent_backend` (aider/pi), not a bare model-tier swap.
+        "model_tiers": {
+            "triage": "local",
+            "review": "local",
+            "docs": "local",
+            "generate": "local",
+        },
         "local": {
             "endpoint": cfg.endpoint,
             "model": (cfg.model_info.get(spec.model) or {}).get("ollama_model") or spec.model,
@@ -638,7 +650,13 @@ def build_event_body(spec: JobSpec, cfg: SweepConfig) -> dict:
     }
     if cfg.call_timeout_seconds:
         seconds = cfg.call_timeout_seconds
-        policy["timeouts"] = {"implement": seconds, "triage": seconds, "review": seconds}
+        policy["timeouts"] = {
+            "implement": seconds,
+            "triage": seconds,
+            "review": seconds,
+            "docs": seconds,
+            "generate": seconds,
+        }
     return {
         "workflow_type": "SDLC_FLOW",
         "data": {

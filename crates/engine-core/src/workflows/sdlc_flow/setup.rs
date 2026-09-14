@@ -20,7 +20,7 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::node::{Node, NodeError};
-use crate::nodes::AgentCodeStep;
+use crate::nodes::{AgentCodeStep, MetaTransport};
 use crate::repo_registry::RepoRegistry;
 use crate::routing::Router;
 
@@ -32,7 +32,7 @@ use super::schema::{SDLCFlowEventSchema, SDLCState, SDLCTask, SDLCTaskStatus};
 use super::task_loop::{apply_policy, resolve_harness_path, resolved_policy, worktree_path, Stage};
 use super::{
     carry_forward_billing, get_result, parse_structured_or_fenced, put_result, session_baseline,
-    sessions_since, DEFAULT_STATE_FILENAME,
+    sessions_since, TransportSlot, DEFAULT_STATE_FILENAME,
 };
 
 /// The `ctx.nodes` identity the resolved policy is stamped under, so every
@@ -1579,7 +1579,7 @@ fn truncate_context_section(section: String, file_name: &str, max_bytes: Option<
 /// literal this node used to carry in `new()`.
 pub struct GenerateTasksNode {
     config: Config,
-    transport: Option<ModelTransport>,
+    transport: TransportSlot,
 }
 
 impl GenerateTasksNode {
@@ -1592,7 +1592,7 @@ impl GenerateTasksNode {
             // `claude-opus-4-8` literal in place would be a second, silently
             // dead source of truth for the same value (standing rule 6).
             config: Config::default(),
-            transport: None,
+            transport: TransportSlot::default(),
         }
     }
 
@@ -1601,7 +1601,22 @@ impl GenerateTasksNode {
     /// the gated suite never spawns a real `claude`.
     #[must_use]
     pub fn with_transport(mut self, transport: ModelTransport) -> Self {
-        self.transport = Some(transport);
+        self.transport.set_plain(transport);
+        self
+    }
+
+    /// Override the transport with a tier-aware [`MetaTransport`] that
+    /// reports the [`TransportInfo`] of whichever call actually executed,
+    /// taking precedence over a plain transport set via
+    /// [`Self::with_transport`] — mirrors `TriageTaskNode::with_meta_transport`.
+    /// This is what lets `graph.rs::registry_for_policy` route this node
+    /// through a local model when `policy.model_tiers.generate ==
+    /// ModelTier::Local`.
+    ///
+    /// [`TransportInfo`]: crate::nodes::TransportInfo
+    #[must_use]
+    pub fn with_meta_transport(mut self, transport: MetaTransport) -> Self {
+        self.transport.set_meta(transport);
         self
     }
 }
@@ -1655,11 +1670,10 @@ impl Node for GenerateTasksNode {
 
         config.json_schema = Some(generated_tasks_schema());
 
-        let mut step = AgentCodeStep::new("GenerateTasksNode", config, prompt)
-            .with_retry_policy(policy.transport_retry);
-        if let Some(transport) = self.transport.clone() {
-            step = step.with_transport(move |config, prompt| (transport)(config, prompt));
-        }
+        let step = self.transport.apply(
+            AgentCodeStep::new("GenerateTasksNode", config, prompt)
+                .with_retry_policy(policy.transport_retry),
+        );
 
         let baseline = session_baseline(&ctx);
         let mut ctx = step.process(ctx).await?;
@@ -5578,5 +5592,127 @@ repo_path = "beta"
 
         let err = resolve_target_root(&event, None).expect_err("should fail, not fall back");
         assert!(err.message.contains("alpha"));
+    }
+
+    // --- `with_meta_transport` local-tier routing --------------------------
+    //
+    // Mirrors `task_loop::triage_meta_transport_stamps_local_tier_on_stubbed_
+    // local_success` / `..._stamps_cloud_tier_on_local_failure_fallback` —
+    // the exact pattern `graph::registry_for_policy_with_cancellation` relies
+    // on to route `GenerateTasksNode` through a local model when
+    // `policy.model_tiers.generate == ModelTier::Local`.
+
+    #[tokio::test]
+    async fn generate_meta_transport_stamps_local_tier_on_stubbed_local_success() {
+        use crate::nodes::openai_compat_meta_transport;
+        use crate::workflows::sdlc_flow::policy::LocalConfig;
+
+        let worktree = temp_dir();
+        let ctx = ctx_with_worktree("my-spec", &worktree);
+
+        let local = LocalConfig {
+            endpoint: "http://localhost:11434".to_string(),
+            model: "qwen2.5:7b-instruct".to_string(),
+            constrained_json: false,
+        };
+        let local_http_post: crate::nodes::LocalHttpPost = Arc::new(|_url, _body| {
+            Box::pin(async {
+                Ok(json!({
+                    "choices": [{ "message": {
+                        "content": json!({
+                            "tasks": [],
+                            "tasks_markdown": "",
+                        }).to_string()
+                    } }],
+                    "usage": { "prompt_tokens": 1, "completion_tokens": 1 },
+                }))
+            })
+        });
+        let cloud_fallback: ModelTransport = Arc::new(|_config, _prompt| {
+            Box::pin(async { panic!("cloud fallback must not be called when local succeeds") })
+        });
+        let meta_transport = openai_compat_meta_transport(local, local_http_post, cloud_fallback);
+
+        let node = GenerateTasksNode::new().with_meta_transport(meta_transport);
+        let out = node.process(ctx).await.expect("process should succeed");
+
+        assert_eq!(out.nodes["GenerateTasksNode"]["transport"]["tier"], "local");
+        assert_eq!(
+            out.nodes["GenerateTasksNode"]["transport"]["endpoint"],
+            "http://localhost:11434"
+        );
+
+        std::fs::remove_dir_all(&worktree).ok();
+    }
+
+    #[tokio::test]
+    async fn generate_meta_transport_stamps_cloud_tier_on_local_failure_fallback() {
+        use crate::nodes::openai_compat_meta_transport;
+        use crate::workflows::sdlc_flow::policy::LocalConfig;
+
+        let worktree = temp_dir();
+        let ctx = ctx_with_worktree("my-spec", &worktree);
+
+        let local = LocalConfig {
+            endpoint: "http://localhost:11434".to_string(),
+            model: "qwen2.5:7b-instruct".to_string(),
+            constrained_json: false,
+        };
+        let local_http_post: crate::nodes::LocalHttpPost =
+            Arc::new(|_url, _body| Box::pin(async { Err("connection refused".to_string()) }));
+        let cloud_fallback: ModelTransport = Arc::new(|_config, _prompt| {
+            let outcome =
+                stub_outcome_with_text(&json!({ "tasks": [], "tasks_markdown": "" }).to_string());
+            Box::pin(async move { Ok(outcome) })
+        });
+        let meta_transport = openai_compat_meta_transport(local, local_http_post, cloud_fallback);
+
+        let node = GenerateTasksNode::new().with_meta_transport(meta_transport);
+        let out = node.process(ctx).await.expect("process should succeed");
+
+        assert_eq!(
+            out.nodes["GenerateTasksNode"]["transport"]["tier"], "cloud",
+            "a down local endpoint must stamp the cloud fallback's actual tier"
+        );
+
+        std::fs::remove_dir_all(&worktree).ok();
+    }
+
+    #[tokio::test]
+    async fn generate_with_meta_transport_takes_precedence_over_plain_with_transport() {
+        use crate::nodes::TransportInfo;
+
+        let worktree = temp_dir();
+        let ctx = ctx_with_worktree("my-spec", &worktree);
+
+        let plain: ModelTransport = Arc::new(move |_config, _prompt| {
+            let outcome = stub_outcome_with_text(
+                &json!({ "tasks": [], "tasks_markdown": "plain" }).to_string(),
+            );
+            Box::pin(async move { Ok(outcome) })
+        });
+        let meta: MetaTransport = Arc::new(move |_config, _prompt| {
+            let outcome = stub_outcome_with_text(
+                &json!({ "tasks": [], "tasks_markdown": "meta" }).to_string(),
+            );
+            let info = TransportInfo {
+                tier: "local".to_string(),
+                model: "stub-model".to_string(),
+                endpoint: None,
+                backend: "openai_compat".to_string(),
+                cost_known: true,
+                extra: std::collections::BTreeMap::new(),
+            };
+            Box::pin(async move { Ok((outcome, info)) })
+        });
+
+        let node = GenerateTasksNode::new()
+            .with_transport(plain)
+            .with_meta_transport(meta);
+        let out = node.process(ctx).await.expect("process should succeed");
+
+        assert_eq!(out.nodes["GenerateTasksNode"]["transport"]["tier"], "local");
+
+        std::fs::remove_dir_all(&worktree).ok();
     }
 }

@@ -16,11 +16,12 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::node::{Node, NodeError};
-use crate::nodes::AgentCodeStep;
+use crate::nodes::{AgentCodeStep, MetaTransport};
 
 use super::task_loop::{apply_policy_config, resolved_policy, worktree_path, Stage};
 use super::{
     parse_model_verdict, session_baseline, sessions_since, ModelTransport, ModelVerdict,
+    TransportSlot,
 };
 
 /// Model output shape `PatchDocsNode` expects (strict JSON reply).
@@ -117,7 +118,7 @@ pub(super) const DOCS_STABLE_PROMPT: &str = include_str!("prompts/docs.md");
 /// identity so it can post-process the model's JSON output.
 pub struct PatchDocsNode {
     config: Config,
-    transport: Option<ModelTransport>,
+    transport: TransportSlot,
 }
 
 impl PatchDocsNode {
@@ -129,7 +130,7 @@ impl PatchDocsNode {
     pub fn new() -> Self {
         Self {
             config: Config::default(),
-            transport: None,
+            transport: TransportSlot::default(),
         }
     }
 
@@ -138,7 +139,21 @@ impl PatchDocsNode {
     /// the gated suite never spawns a real `claude`.
     #[must_use]
     pub fn with_transport(mut self, transport: ModelTransport) -> Self {
-        self.transport = Some(transport);
+        self.transport.set_plain(transport);
+        self
+    }
+
+    /// Override the transport with a tier-aware [`MetaTransport`] that
+    /// reports the [`TransportInfo`] of whichever call actually executed,
+    /// taking precedence over a plain transport set via
+    /// [`Self::with_transport`] — mirrors `TriageTaskNode::with_meta_transport`.
+    /// This is what lets `graph.rs::registry_for_policy` route this node
+    /// through a local model when `policy.model_tiers.docs == ModelTier::Local`.
+    ///
+    /// [`TransportInfo`]: crate::nodes::TransportInfo
+    #[must_use]
+    pub fn with_meta_transport(mut self, transport: MetaTransport) -> Self {
+        self.transport.set_meta(transport);
         self
     }
 
@@ -229,9 +244,7 @@ impl Node for PatchDocsNode {
             },
         )
         .with_retry_policy(policy.transport_retry);
-        if let Some(transport) = self.transport.clone() {
-            step = step.with_transport(move |config, prompt| (transport)(config, prompt));
-        }
+        step = self.transport.apply(step);
 
         let baseline = session_baseline(&ctx);
         let mut ctx = step.process(ctx).await?;
@@ -922,5 +935,185 @@ mod tests {
             "persistent failure must still halt the walk"
         );
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 4);
+    }
+
+    // --- `with_meta_transport` local-tier routing --------------------------
+    //
+    // Mirrors `task_loop::triage_meta_transport_stamps_local_tier_on_stubbed_
+    // local_success` / `..._stamps_cloud_tier_on_local_failure_fallback` —
+    // the exact pattern `graph::registry_for_policy_with_cancellation` relies
+    // on to route `PatchDocsNode` through a local model when
+    // `policy.model_tiers.docs == ModelTier::Local`.
+
+    #[tokio::test]
+    async fn meta_transport_stamps_local_tier_on_stubbed_local_success() {
+        use crate::nodes::openai_compat_meta_transport;
+        use crate::workflows::sdlc_flow::policy::LocalConfig;
+
+        let mut ctx = ctx_with_policy(&SdlcPolicy::default());
+        ctx.nodes.insert(
+            "ImplementTaskNode".to_string(),
+            json!({
+                "summary": "did the thing",
+                "modified_files": ["src/foo.rs"],
+                "tests_added": [],
+            }),
+        );
+
+        let local = LocalConfig {
+            endpoint: "http://localhost:11434".to_string(),
+            model: "qwen2.5:7b-instruct".to_string(),
+            constrained_json: false,
+        };
+        let local_http_post: crate::nodes::LocalHttpPost = Arc::new(|_url, _body| {
+            Box::pin(async {
+                Ok(json!({
+                    "choices": [{ "message": {
+                        "content": json!({
+                            "summary": "patched via local model",
+                            "files_patched": ["docs/foo.md"],
+                        }).to_string()
+                    } }],
+                    "usage": { "prompt_tokens": 1, "completion_tokens": 1 },
+                }))
+            })
+        });
+        let cloud_fallback: ModelTransport = Arc::new(|_config, _prompt| {
+            Box::pin(async { panic!("cloud fallback must not be called when local succeeds") })
+        });
+        let meta_transport = openai_compat_meta_transport(local, local_http_post, cloud_fallback);
+
+        let node = PatchDocsNode::new().with_meta_transport(meta_transport);
+        let out = node.process(ctx).await.expect("process should succeed");
+
+        assert_eq!(
+            out.nodes["PatchDocsNode"]["summary"],
+            "patched via local model"
+        );
+        assert_eq!(out.nodes["PatchDocsNode"]["transport"]["tier"], "local");
+        assert_eq!(
+            out.nodes["PatchDocsNode"]["transport"]["endpoint"],
+            "http://localhost:11434"
+        );
+    }
+
+    #[tokio::test]
+    async fn meta_transport_stamps_cloud_tier_on_local_failure_fallback() {
+        use crate::nodes::openai_compat_meta_transport;
+        use crate::workflows::sdlc_flow::policy::LocalConfig;
+
+        let mut ctx = ctx_with_policy(&SdlcPolicy::default());
+        ctx.nodes.insert(
+            "ImplementTaskNode".to_string(),
+            json!({
+                "summary": "did the thing",
+                "modified_files": ["src/foo.rs"],
+                "tests_added": [],
+            }),
+        );
+
+        let local = LocalConfig {
+            endpoint: "http://localhost:11434".to_string(),
+            model: "qwen2.5:7b-instruct".to_string(),
+            constrained_json: false,
+        };
+        let local_http_post: crate::nodes::LocalHttpPost =
+            Arc::new(|_url, _body| Box::pin(async { Err("connection refused".to_string()) }));
+        let cloud_fallback: ModelTransport = Arc::new(|_config, _prompt| {
+            let outcome = Outcome {
+                cost_usd: 0.0,
+                usage: claude_code_rs::parse::Usage {
+                    input_tokens: 1,
+                    output_tokens: 1,
+                    cache_creation_input_tokens: 0,
+                    cache_read_input_tokens: 0,
+                },
+                model_usage: std::collections::BTreeMap::new(),
+                text: json!({
+                    "summary": "patched via cloud fallback",
+                    "files_patched": [],
+                })
+                .to_string(),
+                is_error: false,
+                api_error_status: None,
+                session_id: None,
+                structured_output: None,
+            };
+            Box::pin(async move { Ok(outcome) })
+        });
+        let meta_transport = openai_compat_meta_transport(local, local_http_post, cloud_fallback);
+
+        let node = PatchDocsNode::new().with_meta_transport(meta_transport);
+        let out = node.process(ctx).await.expect("process should succeed");
+
+        assert_eq!(
+            out.nodes["PatchDocsNode"]["summary"],
+            "patched via cloud fallback"
+        );
+        assert_eq!(
+            out.nodes["PatchDocsNode"]["transport"]["tier"], "cloud",
+            "a down local endpoint must stamp the cloud fallback's actual tier"
+        );
+    }
+
+    #[tokio::test]
+    async fn with_meta_transport_takes_precedence_over_plain_with_transport() {
+        // Mirrors `implement_task_node_meta_transport_takes_precedence_over_
+        // plain_transport` (task_loop.rs) and `TransportSlot`'s own documented
+        // precedence: meta wins when both are set.
+        use crate::nodes::TransportInfo;
+
+        let mut ctx = ctx_with_policy(&SdlcPolicy::default());
+        ctx.nodes.insert(
+            "ImplementTaskNode".to_string(),
+            json!({
+                "summary": "did the thing",
+                "modified_files": ["src/foo.rs"],
+                "tests_added": [],
+            }),
+        );
+
+        let plain = stub_transport(json!({
+            "summary": "plain transport ran",
+            "files_patched": [],
+        }));
+        let meta: MetaTransport = Arc::new(move |_config, _prompt| {
+            let outcome = Outcome {
+                cost_usd: 0.0,
+                usage: claude_code_rs::parse::Usage {
+                    input_tokens: 1,
+                    output_tokens: 1,
+                    cache_creation_input_tokens: 0,
+                    cache_read_input_tokens: 0,
+                },
+                model_usage: std::collections::BTreeMap::new(),
+                text: json!({
+                    "summary": "meta transport ran",
+                    "files_patched": [],
+                })
+                .to_string(),
+                is_error: false,
+                api_error_status: None,
+                session_id: None,
+                structured_output: None,
+            };
+            let info = TransportInfo {
+                tier: "local".to_string(),
+                model: "stub-model".to_string(),
+                endpoint: None,
+                backend: "openai_compat".to_string(),
+                cost_known: true,
+                extra: std::collections::BTreeMap::new(),
+            };
+            Box::pin(async move { Ok((outcome, info)) })
+        });
+
+        let node = PatchDocsNode::new()
+            .with_transport(plain)
+            .with_meta_transport(meta);
+        let out = node.process(ctx).await.expect("process should succeed");
+
+        assert_eq!(out.nodes["PatchDocsNode"]["summary"], "meta transport ran");
+        assert_eq!(out.nodes["PatchDocsNode"]["transport"]["tier"], "local");
     }
 }

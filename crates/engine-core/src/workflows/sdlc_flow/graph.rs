@@ -386,16 +386,17 @@ fn real_cloud_transport() -> ModelTransport {
     })
 }
 
-/// Build a `NodeRegistry` like [`registry`], but with the single-shot
-/// judgment stages the `local` model tier is scoped to — `TriageTaskNode`'s
-/// `llm_triage` model branch and `ConsolidatedReviewNode` — wired to route
-/// through [`openai_compat_meta_transport_live`] whenever `policy`'s resolved
-/// tier for that stage is [`ModelTier::Local`]. **Never** rewires
-/// `ImplementTaskNode`: the local tier is scoped to single-shot judgment
-/// calls, not the agentic `implement` stage (spec Context Pointers,
-/// `planning/local-llm-tier-investigation/notes.md`). Any stage whose tier
-/// is not `Local` keeps [`registry`]'s default (real-`claude`-CLI)
-/// transport untouched.
+/// Build a `NodeRegistry` like [`registry`], but with every non-agentic
+/// model stage — `TriageTaskNode`'s `llm_triage` model branch,
+/// `ConsolidatedReviewNode`/`EndReviewNode`, `PatchDocsNode`, and
+/// `GenerateTasksNode` — wired to route through
+/// [`openai_compat_meta_transport_live`] whenever `policy`'s resolved tier
+/// for that stage is [`ModelTier::Local`]. **Never** rewires
+/// `ImplementTaskNode` via this path: the local tier there is scoped to the
+/// `Pi`/`Aider` agent backends below, not a bare local-model swap (spec
+/// Context Pointers, `planning/local-llm-tier-investigation/notes.md`). Any
+/// stage whose tier is not `Local` keeps [`registry`]'s default
+/// (real-`claude`-CLI) transport untouched.
 ///
 /// Any local-endpoint failure at call time falls back to the real `claude`
 /// CLI transport for that call — `openai_compat_transport`'s own fail-fast
@@ -505,6 +506,26 @@ pub fn registry_for_policy_with_cancellation(
         registry.register(Box::new(EndReviewNode::new().with_meta_transport(
             openai_compat_meta_transport_live(policy.local.clone(), real_cloud_transport()),
         )));
+    }
+
+    let docs_local = policy.model_tiers.docs == ModelTier::Local;
+    if docs_local {
+        let node = PatchDocsNode::new()
+            .with_config(agentic_write_config("claude-sonnet-4-5"))
+            .with_meta_transport(openai_compat_meta_transport_live(
+                policy.local.clone(),
+                real_cloud_transport(),
+            ));
+        registry.register(Box::new(node));
+    }
+
+    let generate_local = policy.model_tiers.generate == ModelTier::Local;
+    if generate_local {
+        let node = GenerateTasksNode::new().with_meta_transport(openai_compat_meta_transport_live(
+            policy.local.clone(),
+            real_cloud_transport(),
+        ));
+        registry.register(Box::new(node));
     }
 
     let pi_backend = policy.agent_backend == AgentBackend::Pi;
@@ -841,6 +862,28 @@ mod tests {
 
         let registry = registry_for_policy(&policy);
         assert!(registry.contains("ImplementTaskNode"));
+    }
+
+    #[test]
+    fn registry_for_policy_with_docs_and_generate_local_tiers_keeps_same_node_identities() {
+        // `PatchDocsNode`/`GenerateTasksNode` rewiring must not change the
+        // registry's node count or identity set — only the transport those
+        // nodes' composed `AgentCodeStep` uses. Mirrors
+        // `registry_for_policy_with_local_tiers_keeps_same_node_identities`.
+        let policy = SdlcPolicy {
+            model_tiers: super::super::policy::ModelTiers {
+                docs: ModelTier::Local,
+                generate: ModelTier::Local,
+                ..super::super::policy::ModelTiers::default()
+            },
+            ..SdlcPolicy::default()
+        };
+
+        let registry = registry_for_policy(&policy);
+
+        assert_eq!(registry.len(), super::registry().len());
+        assert!(registry.contains("PatchDocsNode"));
+        assert!(registry.contains("GenerateTasksNode"));
     }
 
     // --- EN.15.B task 1: agent identity threading ---

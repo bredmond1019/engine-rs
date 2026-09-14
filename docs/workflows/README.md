@@ -254,6 +254,18 @@ transport into `EndReviewNode` exactly as into `ConsolidatedReviewNode`; before,
 end_only` with a local review tier sent the local model name to the `claude` CLI and failed with
 HTTP 404.
 
+**`docs: local` and `generate: local` route `PatchDocsNode` and `GenerateTasksNode` the same way**
+(found by `scripts/bench_local_models.py`, 2026-09-14 — see `docs/local-model-bench.md`'s Pitfalls
+#20). Before this, only `triage`/`review`/`implement` had a local-tier branch in
+`registry_for_policy_with_cancellation`; `PatchDocsNode`/`GenerateTasksNode` had no
+`with_meta_transport` builder at all, so `model_tiers.docs`/`model_tiers.generate: local` was a
+silent no-op — the docs-patch and task-generation stages kept billing the real `claude` CLI
+regardless of the policy. Both nodes now carry the same `TransportSlot`/`with_meta_transport` shape
+as `TriageTaskNode`, wired in `graph.rs` (`SDLC_FLOW`, both stages) and `sdlc_task/graph.rs`
+(`SDLC_TASK`, `generate` only — `SDLC_TASK` has no `PatchDocsNode`). Any tool driving a full
+SDLC_FLOW/SDLC_TASK run entirely on a local model must set all four tiers
+(`triage`/`review`/`docs`/`generate`), not just `triage`/`review`.
+
 **Safety boundary — named, accepted for a local model on the operator's own machine, not closed.**
 `PiTransport` shells to `pi` with `--approval-mode yolo`, which lets the model's own output run
 shell, file and network actions with no per-tool gate — `policy/command_floor.rs` cannot reach it

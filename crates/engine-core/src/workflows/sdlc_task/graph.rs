@@ -354,6 +354,15 @@ pub fn registry_for_policy_with_cancellation(
         registry.register(Box::new(node));
     }
 
+    let generate_local = policy.model_tiers.generate == ModelTier::Local;
+    if generate_local {
+        let node = GenerateTasksNode::new().with_meta_transport(openai_compat_meta_transport_live(
+            policy.local.clone(),
+            real_cloud_transport(),
+        ));
+        registry.register(Box::new(node));
+    }
+
     let pi_backend = policy.agent_backend == AgentBackend::Pi;
     let aider_backend = policy.agent_backend == AgentBackend::Aider;
     if pi_backend || aider_backend || token.is_some() {
@@ -635,6 +644,22 @@ mod tests {
         assert_eq!(registry.len(), super::registry().len());
         assert!(registry.contains("TriageTaskNode"));
         assert!(registry.contains("ImplementTaskNode"));
+    }
+
+    #[test]
+    fn registry_for_policy_with_local_generate_tier_keeps_same_node_identities() {
+        let policy = SdlcTaskPolicy {
+            model_tiers: super::super::policy::SdlcTaskModelTiers {
+                generate: ModelTier::Local,
+                ..super::super::policy::SdlcTaskModelTiers::default()
+            },
+            ..SdlcTaskPolicy::default()
+        };
+
+        let registry = registry_for_policy(&policy);
+
+        assert_eq!(registry.len(), super::registry().len());
+        assert!(registry.contains("GenerateTasksNode"));
     }
 
     /// Renamed for `EN.16.B` task 8 (was

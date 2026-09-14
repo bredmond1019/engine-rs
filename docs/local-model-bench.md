@@ -142,6 +142,17 @@ that literal string resolves unchanged through a worktree's own `planning/` syml
 **Every check runs under `perl -e 'alarm shift; exec @ARGV' 60`** (macOS has no `timeout`), and the
 Rust test binary under a 30 s alarm. Model-written code can loop forever.
 
+**Standing convention: every SDLC_FLOW stage this bench dispatches must resolve to the local model
+under test** — verify via a run's `run-event.json` → `task_context.metadata.claude_sessions[].model`;
+none should show a cloud model id (`claude-sonnet-*`/`claude-opus-*`/`claude-haiku-*`). `triage` and
+`review` alone are not enough — see pitfall 20 below, where `PatchDocsNode`/`GenerateTasksNode` kept
+silently calling the real `claude` CLI because `build_event_body`'s `model_tiers` never named them.
+`build_event_body` (`scripts/bench_local_models.py`) now sets `triage`/`review`/`docs`/`generate` all
+to `"local"`; `implement` is the one deliberate exception (it routes through `agent_backend`, not a
+model-tier swap). Adding a new SDLC_FLOW model stage in the future means adding its tier here too —
+check `crates/engine-core/src/workflows/sdlc_flow/graph.rs`'s `registry_for_policy_with_cancellation`
+for the full list of stages a `Local` tier can route.
+
 **Changing a tier:**
 - Keep each task's `title` unique — see pitfall 7.
 - A repo path a check reads must already be on `origin/main`. A new checker goes in the vault's
@@ -248,6 +259,7 @@ protection now lives, so nobody removes it as clutter.
 | 17 | Every `pi`-backend job against a reasoning model (`deepseek-r1:*`) reported `no_change`/zero tokens near-instantly, though the model was actually generating real output | `pi_agent_rust`'s `OpenAIDelta` only recognized DeepSeek-official/OpenRouter's `reasoning_content` field name; Ollama's OpenAI-compat endpoint names the same field `reasoning`. Serde silently dropped every reasoning-phase delta | **Fixed locally**, not upstream: `core/pi_agent_rust` commit `87d475e5` adds a serde alias. Patched binary is now the installed `~/.local/bin/pi` (see the callout below — **this is not a stock `pi` install**) |
 | 18 | Every Ollama-streamed `pi` tool call whose content contained a literal newline (almost any multi-line file write) wrote a literal two-character `\n` to disk instead of a real newline byte | Ollama's `/v1/chat/completions` endpoint double-escapes `\n`/`\t`/`\r` inside a **streamed** tool call's `arguments` JSON (confirmed by curling Ollama directly with `stream:false` vs `stream:true` against the same generation — an Ollama server bug, not a `pi_agent_rust` decoding bug) | **Fixed locally**: `core/pi_agent_rust` commit `5fb9ab54` repairs the doubled escape before the final JSON parse, scoped to `provider == "ollama"`. Same patched binary as #17 |
 | 19 | (Not a bug, but looked like one at first) `llama3.1:8b` via `pi` wrote `return \"Hello, \\" + name + !\"` instead of `return 'Hello, ' + name + '!'` | 8 identical curl calls to Ollama with the same prompt/model produced 8 *different* escaping mistakes — non-deterministic model output, not a repeatable transport defect (contrast with #18, which is 100% deterministic) | Not fixable; documented as real bench data (`llama3.1:8b` is weak at nested-JSON string escaping in tool-call arguments), not chased further. See `findings-log.md` |
+| 20 | A bench run's `run-event.json` showed `PatchDocsNode` calling the real `claude` CLI with sonnet, not the local model under test | `registry_for_policy` only rewired `triage`/`review`/`implement` for the `local` tier; `PatchDocsNode` (docs.rs) and `GenerateTasksNode` (setup.rs) had no `with_meta_transport` builder at all, so `model_tiers.docs`/`model_tiers.generate: local` was a silent no-op | Engine: both nodes gained a `TransportSlot` field + `with_meta_transport`, wired in `graph.rs`'s `registry_for_policy_with_cancellation` (and `sdlc_task/graph.rs` for `generate`) exactly like `TriageTaskNode`. Bench: `build_event_body` now sets `docs`/`generate` to `"local"` too — see the standing convention above |
 
 ## Troubleshooting
 
