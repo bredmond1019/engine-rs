@@ -53,6 +53,15 @@ sed -n '/## Leaderboard/,/## Jobs/p' ../../planning/open-work/local-models/local
 **Always pass `--run-name`** for a sweep that may cross midnight. The default name is today's date,
 so a restart after midnight would start a new run instead of resuming.
 
+**Optional: watch system load during a long sweep.** `scripts/system_monitor.py` samples CPU/
+memory/swap every 60s, keeps a rolling average, and fires a `bastion notify send` Telegram alert on
+a sustained problem (not per-sample noise) — useful for an unattended overnight run on a machine
+also running several loaded local models. Run it alongside the sweep, in a separate terminal:
+
+```bash
+python3 scripts/system_monitor.py   # logs to /tmp/system_monitor.jsonl; --help for thresholds
+```
+
 ### What must exist first
 
 | Need | Why | If it's missing |
@@ -61,6 +70,7 @@ so a restart after midnight would start a new run instead of resuming.
 | `BASTION_ENGINE_API_KEY` in `scripts/.env` | Authenticates dispatches | Preflight reports the key as rejected |
 | Ollama running, models pulled | The models under test | `ollama pull <model>` |
 | `aider` and `pi` on `PATH` | The two backends | Preflight names the missing binary; or pass `--agent-backends aider` |
+| **`pi` is a LOCALLY PATCHED binary, not stock `pi_agent_rust`** | Fixes pitfalls 17/18 below — stock `pi` silently produces wrong data for reasoning models and any multi-line file write | `pi --version` must report a commit hash of `5fb9ab54` or later (not a bare version tag like `0.5.1` with no commit). If it doesn't: rebuild from `core/pi_agent_rust` (`cargo build --release`) and `cp target/release/pi ~/.local/bin/pi`. **Never run `pi`'s own installer/self-update against this bench** — it will silently overwrite the patched binary with stock upstream and pitfalls 17/18 will reappear with no warning. Pre-patch backups: `~/.local/bin/pi.upstream-0.5.0-backup`, `~/.local/bin/pi.pre-quote-fix-backup` |
 | Tier files on `origin/main` | Every run's worktree is cut from `origin/main`, not local `HEAD` | Preflight lists the missing path |
 | Free memory | 32B models plus a 16k context need ~24 GB | Reboot before a long sweep; see [Troubleshooting](#troubleshooting) |
 
@@ -151,6 +161,11 @@ still works too, via the compat symlink noted above):
 | `summary.json` | Every job record in one file |
 | `<tier>/<backend>/<model>-r<rep>.json` | One job's record. Its presence is what makes a re-run skip that job |
 | `artifacts/<job>/` | Evidence: the SDLC state file, the run event, aider's chat history (`.txt`), `git.txt` (log + diff vs `origin/main`), final check output |
+| `../findings-log.md` (one directory up, shared across every run) | **Read this before trusting any leaderboard.** Append-only record of every bug found while running the bench — symptom, root cause, fix, and which `run-name`/jobs it affects. `leaderboard.md` is regenerated wholesale on every run and carries no history of its own |
+
+**If a core engine/tool bug is found and fixed mid-sweep, retire that `run-name` as historical
+evidence (see `../index.md`'s `results/overnight-1/` row for the pattern) and start a fresh
+`--run-name` for the next real comparison — don't try to hand-filter a mixed leaderboard.**
 
 ### `outcome` — what happened to the job
 
@@ -199,6 +214,14 @@ Every preflight (dry-run or real) regenerates
 `planning/open-work/local-models/local-model-bench/model-capabilities.md` and `.json` — every resolved model's Ollama capability set, which models were excluded and why,
 distinct from other preflight warnings.
 
+### The `pi` backend's own hardening (`PiConfig`)
+
+Not a bench flag — a `SdlcTaskPolicy`/`SdlcPolicy` knob the engine resolves for every `pi`-backend
+call, set in the bench's own event body via `build_event_body`'s default profile. `docs/workflows/README.md`
+has the full table; in short: `no_context_files`/`no_session` default `true` (confirmed real ambient
+`AGENTS.md`/`CLAUDE.md` leakage into every local-model prompt otherwise, and a zero-downside hygiene
+default), `tools` scopes `pi`'s own 19-tool default down to 12 for a headless coding task.
+
 ## Pitfalls (every one of these happened)
 
 Each was measured on 2026-09-14 while getting the first clean run. The fix column says where the
@@ -214,7 +237,7 @@ protection now lives, so nobody removes it as clutter.
 | 6 | Through ORCHESTRATION, a passing job **closed its block, merged the branch into `main` and pushed `origin/main`**; every later job was skipped as "block closed" | ORCHESTRATION's integrate step merges, pushes and closes by design | Bench: dispatches `SDLC_FLOW` with no `block_id`; refuses a spec slug that is a block |
 | 7 | Tasks marked `done` with zero attempts | `LoadTaskStateNode` resumes a task when `feat(sdlc): <id> — <title>` is in git history; the pushed merge put bench titles there | Bench preflight: refuses a task title already committed on `origin/main` |
 | 8 | Tasks "passed" without work | The same merge put the easy tier's output files on `origin/main`, which every worktree is cut from | Bench preflight: runs every check on a pristine `origin/main` worktree and refuses any that already pass |
-| 9 | Every task failed with no feedback | `test_dispatch: queue_park` resumes checks with `passed: null` → failed, `check_results: []` | Bench: `--test-dispatch inline`. Engine defect still open |
+| 9 | Every task failed with no feedback | `test_dispatch: queue_park` resumes checks with `passed: null` → failed, `check_results: []` | **Fixed** (engine-rs `ed5050f`, 2026-09-14): `HeavyWorkQueue` now persists the real outcome + check results. Bench still defaults to `--test-dispatch inline` regardless — no reason to switch |
 | 10 | A check ran 7+ min, grew to 2.9 GB, filled swap; the bench was OOM-killed and abort could not land | A model's evaluator looped; engine checks have no timeout, and cancellation waits for the node boundary | Bench: 60 s alarm on every check. Engine defect still open |
 | 11 | Aider discarded a correct edit, then edited `.gitignore` | A reply naming another tracked file makes aider add it and re-prompt **before** applying the edit | Bench: `edit` tier targets a file that names no other tracked file. Engine defect still open |
 | 12 | `review_mode: end_only` failed with HTTP 404 | `EndReviewNode` ignored the local review tier | Engine: wired to the local transport |
@@ -222,6 +245,9 @@ protection now lives, so nobody removes it as clutter.
 | 14 | A checker failed correct work | `py_compile` with `cfile=/dev/null` raises on every file | Fixed in the checker; caught by testing it against a correct edit first |
 | 15 | Verifiably correct runs (checks 2/2, real commits) reported as a hard crash under `review_mode: end_only` | `EndReviewNode`'s strict JSON parse rejected `llama3.1:8b`/`llama3.2:3b`/`phi3.5:3.8b`'s prose-wrapped verdicts, and the parse failure returned a fatal `NodeError` instead of a labeled outcome | Engine: `parse_structured_or_fenced` (`workflows/mod.rs`) gained a balanced-JSON-extraction fallback for prose-wrapped replies; a still-unparseable reply now stamps a distinct `UNPARSEABLE` verdict (`EndReviewNode`, `end_review.rs`) that routes to `WrapUpNode` as a legible `blocked` run instead of crashing the whole run |
 | 16 | `--models all` dispatched `phi3.5:3.8b`/`codestral:22b` (and their `-ctxN` variants) through aider/pi, which sent tool definitions on every call; Ollama hard-rejected with HTTP 400 before generation started -- instant, uninformative failures with nothing to do with model quality | Model selection checked only `completion` capability, never `tools` | Bench: `--require-capability` (default `auto` = `tools` for aider/pi), queried per model via `POST /api/show`. `/api/tags`'s own `capabilities` array is **not** reliable for this: it reports `deepseek-r1:14b`/`32b` as `[completion, thinking]` (no `tools`), while `/api/show` for the same model returns `[tools, thinking, completion]` -- confirmed 2026-09-14 |
+| 17 | Every `pi`-backend job against a reasoning model (`deepseek-r1:*`) reported `no_change`/zero tokens near-instantly, though the model was actually generating real output | `pi_agent_rust`'s `OpenAIDelta` only recognized DeepSeek-official/OpenRouter's `reasoning_content` field name; Ollama's OpenAI-compat endpoint names the same field `reasoning`. Serde silently dropped every reasoning-phase delta | **Fixed locally**, not upstream: `core/pi_agent_rust` commit `87d475e5` adds a serde alias. Patched binary is now the installed `~/.local/bin/pi` (see the callout below — **this is not a stock `pi` install**) |
+| 18 | Every Ollama-streamed `pi` tool call whose content contained a literal newline (almost any multi-line file write) wrote a literal two-character `\n` to disk instead of a real newline byte | Ollama's `/v1/chat/completions` endpoint double-escapes `\n`/`\t`/`\r` inside a **streamed** tool call's `arguments` JSON (confirmed by curling Ollama directly with `stream:false` vs `stream:true` against the same generation — an Ollama server bug, not a `pi_agent_rust` decoding bug) | **Fixed locally**: `core/pi_agent_rust` commit `5fb9ab54` repairs the doubled escape before the final JSON parse, scoped to `provider == "ollama"`. Same patched binary as #17 |
+| 19 | (Not a bug, but looked like one at first) `llama3.1:8b` via `pi` wrote `return \"Hello, \\" + name + !\"` instead of `return 'Hello, ' + name + '!'` | 8 identical curl calls to Ollama with the same prompt/model produced 8 *different* escaping mistakes — non-deterministic model output, not a repeatable transport defect (contrast with #18, which is 100% deterministic) | Not fixable; documented as real bench data (`llama3.1:8b` is weak at nested-JSON string escaping in tool-call arguments), not chased further. See `findings-log.md` |
 
 ## Troubleshooting
 
@@ -241,7 +267,8 @@ protection now lives, so nobody removes it as clutter.
 Everything is in [`scripts/bench_local_models.py`](../scripts/bench_local_models.py); tests in
 [`scripts/tests/test_bench_local_models.py`](../scripts/tests/test_bench_local_models.py), run with
 `python3 scripts/tests/test_bench_local_models.py` and gated as `bench-local-models-tests` in
-`planning/harness.json`.
+`planning/harness.json`. [`scripts/system_monitor.py`](../scripts/system_monitor.py) (optional,
+separate process, see Quickstart) is standalone — no bench-script dependency either direction.
 
 | Function | Job |
 |---|---|
@@ -267,13 +294,16 @@ Engine code the bench depends on:
 
 ## Engine defects still open
 
-Filed as `carryover[]` in the private `planning/state.json`:
+Filed as `carryover[]` in the private `planning/state.json`. `heavy-work-queue-park-resume-reports-every-task-failed`
+(pitfall 9) is **fixed** (`ed5050f`) and cleared from this list. Still open:
 
-- `heavy-work-queue-park-resume-reports-every-task-failed` — pitfall 9
 - `sdlc-task-command-checks-have-no-timeout` — pitfall 10
 - `aider-mention-reflection-discards-pending-edit` — pitfall 11
 - `orchestration-merge-step-pushes-main-directly` — pitfall 6's push bypasses the fleet push script
 - `orchestration-dev-node-invocations-table-missing`
+
+Two more are fixed **outside this repo**, in the local `core/pi_agent_rust` clone (not yet filed
+upstream) — see pitfalls 17/18 above and the callout on the patched `pi` binary requirement.
 
 ## Opportunity not yet explored: completion-only models elsewhere in the engine
 
