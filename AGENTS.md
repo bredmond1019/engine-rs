@@ -144,7 +144,21 @@ housekeeping. There is no global scheduler.
 
 ## Known bugs
 
-None known at initialization.
+Measured 2026-09-14 while building the local-model bench; details and workarounds in
+[`docs/local-model-bench.md`](docs/local-model-bench.md) § Pitfalls. Each is a `carryover[]` entry in
+`planning/state.json`.
+
+- **`test_dispatch: queue_park` fails every task** — a parked check resumes with `passed: null`
+  (`heavy-work-queue-park-resume-reports-every-task-failed`). Use `inline`.
+- **Task checks have no timeout** — looping model code hangs the run and blocks abort
+  (`sdlc-task-command-checks-have-no-timeout`).
+- **ORCHESTRATION's integrate step pushes `origin main` itself**, bypassing `git_push.sh` (standing
+  rule 10), and closes the block (`orchestration-merge-step-pushes-main-directly`). Never dispatch a
+  throwaway block through it.
+- **aider discards an edit whose reply names another tracked file**
+  (`aider-mention-reflection-discards-pending-edit`).
+- **`LoadTaskStateNode` marks a task done if `feat(sdlc): <id> — <title>` is already in git history**
+  — reuse a task title only on purpose.
 
 ## Build / test / run
 

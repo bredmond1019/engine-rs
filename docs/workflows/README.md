@@ -241,6 +241,24 @@ directory, `~/.cargo`, the HQ vault behind the worktree's `planning/` symlink), 
 description or a cloud-hosted model without revisiting this boundary. See `pi_transport.rs`'s module
 doc for the same statement kept next to the code.
 
+**Pitfalls for local backends** (all measured 2026-09-14; the full list with fixes is in
+[local-model-bench.md](../local-model-bench.md)):
+
+- **Pi needs a raised context.** `pi` sends no `num_ctx`, and Ollama's default context silently
+  truncated the ~9k-token implement prompt to ~2k tokens: the model lost the task and tool definitions
+  and wrote nothing. Use an Ollama model whose Modelfile sets `PARAMETER num_ctx 16384` (for example
+  `ollama create <model>-ctx16384 -f <Modelfile>`), and point `local.model` at it. aider sizes
+  `num_ctx` itself.
+- **Aider drops an edit when its reply names another tracked file.** With `--yes-always`, aider adds
+  the mentioned file to the chat and re-prompts *before* applying the pending edit. There is no aider
+  flag to prevent it. Tracked as carryover `aider-mention-reflection-discards-pending-edit`.
+- **Checks can hang.** `TestTaskNode` runs task checks with no timeout, so model code that loops
+  blocks the run, and `POST /events/{id}/abort` waits for the node to return. Wrap checks in a time
+  limit (`perl -e 'alarm shift; exec @ARGV' 60 …` on macOS). Tracked as carryover
+  `sdlc-task-command-checks-have-no-timeout`.
+- **Avoid `test_dispatch: queue_park`** until
+  [heavy-work-queue.md § Known defect](../heavy-work-queue.md) is fixed.
+
 **Safety boundary — `aider` shares `pi`'s, not a new one.** `AiderTransport` shells to `aider` with
 `--yes-always`, which bypasses per-tool approval exactly as `pi`'s `--approval-mode yolo` does, and
 the scoped git worktree passed as `current_dir` is **not containment** for the same reasons given

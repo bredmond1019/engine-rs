@@ -216,6 +216,22 @@ An admitted job's own subprocess calls run through
 command's env alongside whatever the caller already set. A stub runner injected with
 `TestTaskNode::with_runner` continues to be used unchanged — the seam wraps, it does not replace.
 
+### Known defect: a queue-parked check always resumes as failed
+
+**Measured 2026-09-14, unfixed.** With `test_dispatch: queue_park` and the `test` class configured
+(HQ's `brain.toml` configures it), every `SDLC_FLOW` task fails — including a task whose work was
+verifiably correct — and the retry prompt carries no check output.
+
+- The job record under `<brain>/heavy-work/jobs/<id>.json` finishes `state: done` with `passed: null`.
+  `HeavyWorkQueue` is generic over the work's output type and never persists a pass/fail or the
+  `CheckResult` list.
+- `engine-serve`'s `DiskHeavyJobLookup::await_outcome` (`crates/engine-serve/src/suspend.rs`) resumes
+  `TestTaskNode` with `all_passed = job.passed.unwrap_or(false)` and `check_results: []`.
+- **Workaround:** run with `test_dispatch: inline`. The [local-model bench](local-model-bench.md) does.
+- Tracked as carryover `heavy-work-queue-park-resume-reports-every-task-failed`. The fix must persist
+  the outcome and check results in the job record, and read them in both lookups (engine-serve's and
+  `orchestration::execute`'s private copy).
+
 ## The `FLEET_BUILD_PREADMITTED` hand-off
 
 `scripts/fleet_build.py` still fronts every `test`/`build` harness command engine-rs's own

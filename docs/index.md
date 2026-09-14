@@ -36,6 +36,7 @@ the engine can do, and [architecture.md](architecture.md) for how it's built.
 | [suspend-resume.md](suspend-resume.md) | Pausing and resuming a run, and campaign-level crash recovery |
 | [orphan-recovery.md](orphan-recovery.md) | What happens to runs stranded by a crash — the boot sweep and the stale-run alarm |
 | [cron-primitive.md](cron-primitive.md) | The durable scheduling primitive: calendar vs. interval schedules, and the restart-durable store |
+| [local-model-bench.md](local-model-bench.md) | Runbook for comparing local Ollama models and the aider/pi backends on real `SDLC_FLOW` runs, unattended — quickstart, reading the leaderboard, and every pitfall found building it |
 
 ## Deploying and testing
 

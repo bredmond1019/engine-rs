@@ -135,6 +135,26 @@ the step.
 Readiness always comes from the graph, never from a roadmap's hand-written wave table. A roadmap is
 an authored snapshot and has been wrong; the `depends_on` edges are the fact.
 
+## Pitfall: a passing step merges into `main` and pushes it
+
+**Do not point ORCHESTRATION at a throwaway or benchmark block.** Its integrate step is built for
+real chains, so on a passing step it does three things a disposable run must never do:
+
+1. **Merges the step's branch into `main` in the repo's primary checkout** (`merge_step_branch`,
+   `crates/engine-core/src/workflows/orchestration/integrate.rs`).
+2. **Runs `git push origin main` itself.** This bypasses `agentic-portfolio/scripts/sync/git_push.sh`,
+   the fleet's dependency-ordered push with its `ci-blocked` gate (engine-rs `CLAUDE.md` standing rule
+   10). Tracked as carryover `orchestration-merge-step-pushes-main-directly`.
+3. **Closes the block in `planning/state.json`**, which re-runs a fleet-wide `emit-state --write`.
+   After that, every further dispatch of the same block is skipped as `block status is 'closed'`.
+
+Measured 2026-09-14: a local-model benchmark dispatched through ORCHESTRATION pushed `8318e32` (bench
+output files) to engine-rs `origin/main`. Every worktree is cut from `origin/main`, and
+`LoadTaskStateNode` resumes tasks by commit title, so later benchmark tasks were silently skipped.
+
+**For disposable runs, dispatch `SDLC_FLOW` directly with no `block_id`.** `CloseBlockNode` no-ops
+without one, and `PullRequestNode` never merges. The [local-model bench](../local-model-bench.md) does this.
+
 ## The lane-log contract
 
 Exactly one line per integrated block — not zero, not two. The log is the cross-lane channel, so a

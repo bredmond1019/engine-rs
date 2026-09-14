@@ -5,7 +5,7 @@ description: Chronological log of work completed for engine-rs.
 doc_id: log
 layer: [factory]
 status: active
-timestamp: "2026-09-14T01:19:00Z"
+timestamp: "2026-09-14T08:11:43Z"
 keywords: [work log, session history, development log]
 related: [status, context]
 ---
@@ -13,6 +13,40 @@ related: [status, context]
 # Log — engine-rs
 
 *Append-only working log. One dated entry per session. Newest entries at the top.*
+
+## [2026-09-14]
+
+### Local-model bench: seven engine/harness defects behind "every model fails", fixed; clean smoke
+- **What:**
+  - **Engine** (`eefb07c`):
+    - aider gets its declared files as args and in the prompt (small models wrote `path/to/<file>`).
+    - pi gets a tool-call contract, not a JSON reply ask (models replied with JSON claiming a write they never made).
+    - aider write-verification, review diff and trivial-classification use the task's first-attempt HEAD
+      (after aider's auto-commit, `HEAD` diffs were empty and correct work was failed).
+    - `EndReviewNode` is wired to the local transport (was HTTP 404).
+  - **Bench:** `scripts/bench_local_models.py` rewritten:
+    - Dispatches `SDLC_FLOW` directly: the ORCHESTRATION chain closed the bench block, merged it and
+      pushed `8318e32` to `origin/main`.
+    - Compares aider × pi; resume, deadline, abort-on-timeout.
+    - Per-model Ollama num_ctx variants: Ollama's default context truncated pi's ~9k-token prompt to ~2k.
+    - Preflight guards against tasks already satisfied or already committed on `origin/main`: engine-rs
+      resumes tasks by commit title.
+    - Final-tree classification; evidence capture; leaderboard.
+  - **Tiers:** new `edit` and `rust` tiers with controlled checkers; every check under a 60s alarm after a
+    model's runaway evaluator hung a check and exhausted swap.
+  - **Smoke:** `smoke5-2026-09-14` has `qwen2.5:7b-instruct` pass easy on both backends and fail the other
+    tiers for genuine model reasons, with no engine anomalies.
+  - **Docs:**
+    - New runbook `docs/local-model-bench.md`.
+    - Pitfall sections in `docs/workflows/README.md`, `docs/heavy-work-queue.md` and
+      `docs/workflows/orchestration.md`.
+    - `AGENTS.md` "Known bugs".
+    - `planning/knowledge.md` section "Local agent backends and disposable engine runs".
+- **Why:** the operator wants to run the bench unattended overnight across every pulled model; the prior
+  session's data could not be trusted because the harness had never produced a correct pass.
+- **Refs:** `planning/handoff.md`; carryover `heavy-work-queue-park-resume-reports-every-task-failed`,
+  `sdlc-task-command-checks-have-no-timeout`, `aider-mention-reflection-discards-pending-edit`,
+  `orchestration-merge-step-pushes-main-directly`, `orchestration-dev-node-invocations-table-missing`.
 
 ## [2026-09-13]
 
