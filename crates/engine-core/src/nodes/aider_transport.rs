@@ -343,6 +343,7 @@ fn build_agent_outcome(
 }
 
 #[cfg(test)]
+#[allow(clippy::await_holding_lock)]
 mod tests {
     use super::*;
     use std::io::Write;

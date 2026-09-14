@@ -386,6 +386,29 @@ class StrandedPermitTtlTest(unittest.TestCase):
                 stale_entry.exists(), "stranded permit was not swept away"
             )
 
+    def test_live_permit_past_ttl_is_not_swept(self) -> None:
+        """A live holder process past TTL must retain its permit."""
+        import json
+        if str(REPO_ROOT) not in sys.path:
+            sys.path.insert(0, str(REPO_ROOT))
+        from fleet_build import _sweep_stale
+
+        with tempfile.TemporaryDirectory() as tmp:
+            lock_dir = Path(tmp) / ".fleet-locks" / "builds"
+            lock_dir.mkdir(parents=True)
+
+            # Live process (this test runner's pid) with age well past TTL (3600s > 60s)
+            live_entry = lock_dir / "live-permit.json"
+            live_entry.write_text(
+                json.dumps({"pid": os.getpid(), "started_at": time.time() - 3600})
+            )
+
+            _sweep_stale(lock_dir, ttl_seconds=60)
+            self.assertTrue(
+                live_entry.exists(),
+                "live permit was swept away purely due to age > ttl_seconds",
+            )
+
 
 class PreadmittedTest(unittest.TestCase):
     """`FLEET_BUILD_PREADMITTED` bypasses permit acquisition (and `_sweep_stale`) entirely --

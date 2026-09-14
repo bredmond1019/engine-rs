@@ -581,6 +581,7 @@ async fn real_kill_server_makes_the_chain_record_session_lost_not_done() {
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 let result = node.process(held_ctx(&run_id)).await;
+                #[allow(clippy::question_mark)]
                 if result.is_err() {
                     return result;
                 }

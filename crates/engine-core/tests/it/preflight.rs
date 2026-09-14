@@ -240,8 +240,10 @@ async fn preflight_claim_cap_is_enforced() {
             })
         })
         .collect();
-    let mut config = PreflightConfig::default();
-    config.max_claims = 2;
+    let config = PreflightConfig {
+        max_claims: 2,
+        ..Default::default()
+    };
     let runner = PreflightRunner::new(config).with_transport(stub_claims(json!(many_claims)));
 
     let result = runner

@@ -136,7 +136,7 @@ async fn retried_node_leaves_more_ledger_rows_than_ctx_nodes_has_keys() {
     // be FALSE on this same run — proving the assertion above is actually
     // capable of failing, not vacuously true.
     assert!(
-        !(invocations.len() == ctx_nodes_count),
+        invocations.len() != ctx_nodes_count,
         "equality form must be FALSE on a retried run — otherwise this test could never catch a regression"
     );
 

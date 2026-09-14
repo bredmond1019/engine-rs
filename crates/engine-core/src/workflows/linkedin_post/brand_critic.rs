@@ -58,7 +58,10 @@ use crate::node::{InputBinding, Node, NodeError};
 use crate::nodes::AgentCodeStep;
 use crate::workflows::content_pipeline::increment_critic_iteration;
 use crate::workflows::content_pipeline::schema::{CriticEvaluation, CriticVerdict};
-use crate::workflows::{get_result, parse_model_verdict, put_result, ModelTransport, ModelVerdict};
+use crate::workflows::{
+    get_result, parse_model_verdict, put_result, session_baseline, sessions_since, ModelTransport,
+    ModelVerdict,
+};
 
 use super::policy::LinkedInPostPolicy;
 use super::{draft, revise};
@@ -345,6 +348,7 @@ impl Default for BrandCriticNode {
 #[async_trait::async_trait]
 impl Node for BrandCriticNode {
     async fn process(&self, ctx: TaskContext) -> Result<TaskContext, NodeError> {
+        let baseline = session_baseline(&ctx);
         let draft = read_draft(&ctx, &self.draft_input)?;
         let iteration = read_iteration(&ctx, &self.iteration_input);
         let policy: LinkedInPostPolicy = crate::policy::resolved_policy_strict(&ctx)?;
@@ -431,6 +435,7 @@ impl Node for BrandCriticNode {
 
         let mut result = serde_json::to_value(&evaluation).map_err(|err| {
             NodeError::new(format!("failed to serialize CriticEvaluation: {err}"))
+                .with_sessions(sessions_since(&ctx, baseline))
         })?;
         result["capped"] = json!(capped);
         if let Some(raw_output_preview) = raw_output_preview {

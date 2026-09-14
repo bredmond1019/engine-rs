@@ -1094,15 +1094,20 @@ fn render_feedback_block(header: &str, entries: &[FeedbackEntry], budget: usize)
 /// `crate::workflow`), so `process` decides+stores the current task's
 /// fields and `route` stays a pure read of the same state to pick
 /// `ImplementTaskNode` vs `PatchDocsNode`.
+fn allowed_task_ids(ctx: &TaskContext) -> Option<Vec<u32>> {
+    let raw = ctx.event.get("task_range").and_then(|v| v.as_str());
+    super::schema::parse_task_range(raw).ok().flatten()
+}
+
 pub struct TaskQueueRouterNode;
 
 impl TaskQueueRouterNode {
-    /// Find the first `PENDING` task in `state`, if any.
-    fn next_pending(state: &SDLCState) -> Option<&SDLCTask> {
-        state
-            .tasks
-            .iter()
-            .find(|task| task.status == SDLCTaskStatus::Pending)
+    /// Find the first `PENDING` task in `state` that matches `allowed_ids`, if any.
+    fn next_pending<'a>(state: &'a SDLCState, allowed_ids: Option<&[u32]>) -> Option<&'a SDLCTask> {
+        state.tasks.iter().find(|task| {
+            task.status == SDLCTaskStatus::Pending
+                && allowed_ids.is_none_or(|ids| ids.contains(&task.task_id))
+        })
     }
 }
 
@@ -1110,7 +1115,8 @@ impl TaskQueueRouterNode {
 impl Node for TaskQueueRouterNode {
     async fn process(&self, mut ctx: TaskContext) -> Result<TaskContext, NodeError> {
         let state = latest_state(&ctx)?;
-        if let Some(task) = Self::next_pending(&state) {
+        let allowed = allowed_task_ids(&ctx);
+        if let Some(task) = Self::next_pending(&state, allowed.as_deref()) {
             put_result(
                 &mut ctx,
                 "TaskQueueRouterNode",
@@ -1139,7 +1145,8 @@ impl Node for TaskQueueRouterNode {
 impl Router for TaskQueueRouterNode {
     fn route(&self, ctx: &TaskContext) -> Option<String> {
         let state = latest_state(ctx).ok()?;
-        if Self::next_pending(&state).is_some() {
+        let allowed = allowed_task_ids(ctx);
+        if Self::next_pending(&state, allowed.as_deref()).is_some() {
             Some("ImplementTaskNode".to_string())
         } else {
             // Drain branch: route through the run-level `FinalValidationNode`
@@ -4855,6 +4862,37 @@ pub(crate) mod tests {
         assert_eq!(node.route(&out), Some("FinalValidationNode".to_string()));
     }
 
+    #[tokio::test]
+    async fn task_queue_filters_by_task_range() {
+        let task1 = SDLCTask::new(1, "One", "d1");
+        let task2 = SDLCTask::new(2, "Two", "d2");
+        let task3 = SDLCTask::new(3, "Three", "d3");
+        let state = state_with_tasks(vec![task1, task2, task3]);
+        let mut ctx = ctx_with_state(&state);
+        ctx.event = json!({ "spec_slug": "my-spec", "task_range": "2-2" });
+
+        let node = TaskQueueRouterNode;
+        let out = node.process(ctx).await.expect("process should succeed");
+        let result = out
+            .nodes
+            .get("TaskQueueRouterNode")
+            .expect("output present");
+        assert_eq!(result["current_task_id"], 2);
+        assert_eq!(node.route(&out), Some("ImplementTaskNode".to_string()));
+
+        // When all tasks in range are complete, route to drain even if other tasks remain Pending
+        let task1 = SDLCTask::new(1, "One", "d1");
+        let mut task2 = SDLCTask::new(2, "Two", "d2");
+        task2.status = SDLCTaskStatus::Done;
+        let task3 = SDLCTask::new(3, "Three", "d3");
+        let state2 = state_with_tasks(vec![task1, task2, task3]);
+        let mut ctx2 = ctx_with_state(&state2);
+        ctx2.event = json!({ "spec_slug": "my-spec", "task_range": "2-2" });
+        let out2 = node.process(ctx2).await.expect("process should succeed");
+        assert!(!out2.nodes.contains_key("TaskQueueRouterNode"));
+        assert_eq!(node.route(&out2), Some("FinalValidationNode".to_string()));
+    }
+
     // --- TriageTaskNode ------------------------------------------------------
 
     fn ctx_with_test_result(all_passed: bool, task: &SDLCTask) -> TaskContext {
@@ -5153,8 +5191,10 @@ pub(crate) mod tests {
         let ctx = ctx_with_test_result(false, &task);
         // No `event.llm_triage` field at all — only the resolved policy
         // enables triage.
-        let mut policy = SdlcPolicy::default();
-        policy.llm_triage = true;
+        let policy = SdlcPolicy {
+            llm_triage: true,
+            ..Default::default()
+        };
         let ctx = ctx_with_policy(ctx, &policy);
 
         let out = node.process(ctx).await.expect("process should succeed");
@@ -5173,8 +5213,10 @@ pub(crate) mod tests {
 
         let node = TriageTaskNode::new().with_transport(panicking_transport());
         let mut ctx = ctx_with_test_result(false, &task);
-        let mut policy = SdlcPolicy::default();
-        policy.llm_triage = true;
+        let policy = SdlcPolicy {
+            llm_triage: true,
+            ..Default::default()
+        };
         ctx = ctx_with_policy(ctx, &policy);
         ctx.event = json!({ "spec_slug": "my-spec", "llm_triage": false });
 
@@ -12048,6 +12090,76 @@ pub(crate) mod tests {
         out
     }
 
+    pub(crate) async fn drive_end_review_node_for_billing() -> TaskContext {
+        use crate::workflows::sdlc_flow::end_review::EndReviewNode;
+        use crate::workflows::sdlc_flow::policy::ReviewMode;
+
+        let task = SDLCTask::new(1, "One", "d1");
+        let state = state_with_tasks(vec![task.clone()]);
+        let mut ctx = ctx_with_current_task(&state, &task);
+        ctx.nodes.insert(
+            "SetupWorktreeNode".to_string(),
+            json!({ "worktree_path": "." }),
+        );
+        let policy = SdlcPolicy {
+            review_mode: ReviewMode::EndOnly,
+            ..Default::default()
+        };
+        ctx.nodes.insert(
+            RESOLVED_POLICY_IDENTITY.to_string(),
+            serde_json::to_value(policy).expect("SdlcPolicy serializes"),
+        );
+
+        let runner: CommandRunner = Arc::new(|_program, _args, _cwd| {
+            Ok(CommandOutput {
+                status: 0,
+                stdout: "diff --git a b".to_string(),
+                stderr: String::new(),
+            })
+        });
+        let transport: ModelTransport = Arc::new(|_config, _prompt| {
+            Box::pin(async {
+                Ok(billing_outcome(
+                    &json!({ "verdict": "PASS", "summary": "looks good", "issues": [], "localized": true })
+                        .to_string(),
+                ))
+            })
+        });
+        let node = EndReviewNode::new()
+            .with_runner(runner)
+            .with_transport(transport);
+        node.process(ctx)
+            .await
+            .expect("EndReviewNode should succeed")
+    }
+
+    pub(crate) async fn drive_patch_docs_node_for_billing() -> TaskContext {
+        use crate::workflows::sdlc_flow::docs::PatchDocsNode;
+
+        let mut ctx = empty_context(json!({ "spec_slug": "my-spec" }));
+        ctx.nodes.insert(
+            "SetupWorktreeNode".to_string(),
+            json!({ "worktree_path": "." }),
+        );
+        ctx.nodes.insert(
+            RESOLVED_POLICY_IDENTITY.to_string(),
+            serde_json::to_value(SdlcPolicy::default()).expect("SdlcPolicy serializes"),
+        );
+
+        let transport: ModelTransport = Arc::new(|_config, _prompt| {
+            Box::pin(async {
+                Ok(billing_outcome(
+                    &json!({ "summary": "patched", "files_patched": ["docs/x.md"], "created": [], "flagged": [] })
+                        .to_string(),
+                ))
+            })
+        });
+        let node = PatchDocsNode::new().with_transport(transport);
+        node.process(ctx)
+            .await
+            .expect("PatchDocsNode should succeed")
+    }
+
     /// The headline regression: every `COST_BEARING_STAGES` entry retains
     /// `cost_usd` and both cache channels after its wrapper's `put_result`
     /// (positive), and the carry-forward is proven selective rather than a
@@ -12069,6 +12181,14 @@ pub(crate) mod tests {
             (
                 "GenerateTasksNode",
                 drive_generate_tasks_node_for_billing().await,
+            ),
+            (
+                "EndReviewNode",
+                drive_end_review_node_for_billing().await,
+            ),
+            (
+                "PatchDocsNode",
+                drive_patch_docs_node_for_billing().await,
             ),
         ];
 

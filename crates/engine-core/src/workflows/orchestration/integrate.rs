@@ -6095,16 +6095,15 @@ mod tests {
 
     // ── `EN.12.D` task 4: journal emissions at the five decision points ──
 
-    fn recording_journal_sink() -> (
-        std::sync::Arc<dyn Fn(engine_contract::JournalRow) + Send + Sync>,
-        Arc<Mutex<Vec<engine_contract::JournalRow>>>,
-    ) {
-        let rows: Arc<Mutex<Vec<engine_contract::JournalRow>>> = Arc::new(Mutex::new(Vec::new()));
+    type RecordedJournalRows = Arc<Mutex<Vec<engine_contract::JournalRow>>>;
+    type JournalSinkFn = std::sync::Arc<dyn Fn(engine_contract::JournalRow) + Send + Sync>;
+
+    fn recording_journal_sink() -> (JournalSinkFn, RecordedJournalRows) {
+        let rows: RecordedJournalRows = Arc::new(Mutex::new(Vec::new()));
         let recorded = rows.clone();
-        let sink: std::sync::Arc<dyn Fn(engine_contract::JournalRow) + Send + Sync> =
-            std::sync::Arc::new(move |row: engine_contract::JournalRow| {
-                recorded.lock().unwrap().push(row);
-            });
+        let sink: JournalSinkFn = std::sync::Arc::new(move |row: engine_contract::JournalRow| {
+            recorded.lock().unwrap().push(row);
+        });
         (sink, rows)
     }
 

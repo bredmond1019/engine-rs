@@ -35,7 +35,8 @@ use serde_json::json;
 use crate::node::{Node, NodeError};
 use crate::nodes::{AgentCodeStep, MetaTransport};
 use crate::workflows::{
-    get_result, parse_structured_or_fenced, put_result, ModelTransport, TransportSlot,
+    get_result, parse_structured_or_fenced, put_result, session_baseline, sessions_since,
+    ModelTransport, TransportSlot,
 };
 
 use super::policy::ProposalGeneratorPolicy;
@@ -264,6 +265,7 @@ impl Node for OpportunityIdentifierNode {
             .transport
             .apply(AgentCodeStep::new(NODE_NAME, config, prompt));
 
+        let baseline = session_baseline(&ctx);
         let mut ctx = step.process(ctx).await?;
 
         let content = ctx
@@ -289,6 +291,7 @@ impl Node for OpportunityIdentifierNode {
                 NodeError::new(format!(
                     "{NODE_NAME}: failed to parse scored candidates from the model's reply: {err}"
                 ))
+                .with_sessions(sessions_since(&ctx, baseline))
             })?;
 
         let candidates = score_and_sort(raw.candidates);
@@ -296,6 +299,7 @@ impl Node for OpportunityIdentifierNode {
         let mut result =
             serde_json::to_value(json!({ "candidates": candidates })).map_err(|err| {
                 NodeError::new(format!("failed to serialize scored candidates: {err}"))
+                    .with_sessions(sessions_since(&ctx, baseline))
             })?;
         if let Some(transport) = transport_stamp {
             result["transport"] = transport;

@@ -30,7 +30,8 @@ use crate::node::{Node, NodeError};
 use crate::nodes::{AgentCodeStep, MetaTransport};
 use crate::policy::telemetry::RunTelemetryInputs;
 use crate::workflows::{
-    get_result, parse_structured_or_fenced, put_result, ModelTransport, TransportSlot,
+    get_result, parse_structured_or_fenced, put_result, session_baseline, sessions_since,
+    ModelTransport, TransportSlot,
 };
 
 use super::policy::{DiagnosticIntakePolicy, ModelTier};
@@ -263,6 +264,7 @@ impl Node for IntakeExtractNode {
             .transport
             .apply(AgentCodeStep::new(NODE_NAME, config, prompt));
 
+        let baseline = session_baseline(&ctx);
         let mut ctx = step.process(ctx).await?;
 
         let content = ctx
@@ -288,10 +290,12 @@ impl Node for IntakeExtractNode {
                 NodeError::new(format!(
                     "{NODE_NAME}: failed to parse a DiagnosticIntake from the model's reply: {err}"
                 ))
+                .with_sessions(sessions_since(&ctx, baseline))
             })?;
 
         let mut intake_value = serde_json::to_value(&intake).map_err(|err| {
             NodeError::new(format!("failed to serialize DiagnosticIntake: {err}"))
+                .with_sessions(sessions_since(&ctx, baseline))
         })?;
         // Stamp the resolved locale alongside the intake so EN.4.0 telemetry
         // can attribute prose-language cost/quality to the locale that

@@ -28,7 +28,8 @@ use crate::node::{InputBinding, Node, NodeError};
 use crate::nodes::{AgentCodeStep, MetaTransport};
 use crate::policy::PolicyConfigSource;
 use crate::workflows::{
-    get_result, parse_structured_or_fenced, put_result, ModelTransport, TransportSlot,
+    get_result, parse_structured_or_fenced, put_result, session_baseline, sessions_since,
+    ModelTransport, TransportSlot,
 };
 
 use super::policy::ProposalGeneratorPolicy;
@@ -212,6 +213,7 @@ impl Node for ProposalReviseNode {
             .transport
             .apply(AgentCodeStep::new(NODE_NAME, config, prompt));
 
+        let baseline = session_baseline(&ctx);
         let mut ctx = step.process(ctx).await?;
 
         let content = ctx
@@ -238,6 +240,7 @@ impl Node for ProposalReviseNode {
                     "{NODE_NAME}: failed to parse a corrected AutomationRoadmap from the \
                      model's reply: {err}"
                 ))
+                .with_sessions(sessions_since(&ctx, baseline))
             })?;
 
         // Deterministic stamp: the event's locale always wins over anything
@@ -251,7 +254,8 @@ impl Node for ProposalReviseNode {
         // `ProposalWriterNode`. `PolicyConfigSource::Builtin` is correct
         // here: served runs resolve config at dispatch time (EN.5.D) and
         // this node has no worktree path.
-        let rate_card = RateCard::load_from(&PolicyConfigSource::Builtin)?;
+        let rate_card = RateCard::load_from(&PolicyConfigSource::Builtin)
+            .map_err(|err| err.with_sessions(sessions_since(&ctx, baseline)))?;
         if let Some(recommendation) = roadmap.recommendation.as_mut() {
             recommendation.investment = Some(engagement_range(
                 rate_card.sheet(event.locale),
@@ -273,6 +277,7 @@ impl Node for ProposalReviseNode {
             NodeError::new(format!(
                 "failed to serialize corrected AutomationRoadmap: {err}"
             ))
+            .with_sessions(sessions_since(&ctx, baseline))
         })?;
         if let Some(transport) = transport_stamp {
             result["transport"] = transport;

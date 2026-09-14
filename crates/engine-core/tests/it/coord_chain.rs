@@ -898,7 +898,7 @@ fn a_denied_action_through_check_permission_gate_also_enqueues_a_notification_es
     assert_eq!(value["kind"], "operator-gate");
     assert_eq!(value["channel"], "notification");
     assert!(
-        value["summary"].as_str().unwrap_or_default().len() > 0,
+        !value["summary"].as_str().unwrap_or_default().is_empty(),
         "the escalation must name the gate: {value:?}"
     );
 }

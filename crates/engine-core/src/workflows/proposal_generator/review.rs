@@ -203,6 +203,8 @@ impl Node for ProposalReviewNode {
             .transport
             .apply(AgentCodeStep::new(NODE_NAME, config, prompt));
 
+        // `AgentCodeStep::process` already attaches sessions via `with_sessions` on failure;
+        // no downstream parsing emits a NodeError here.
         let mut ctx = step.process(ctx).await?;
 
         let content = ctx

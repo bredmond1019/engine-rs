@@ -25,7 +25,8 @@ use serde_json::{json, Value};
 use crate::node::{Node, NodeError};
 use crate::nodes::{AgentCodeStep, MetaTransport};
 use crate::workflows::{
-    get_result, parse_structured_or_fenced, put_result, ModelTransport, TransportSlot,
+    get_result, parse_structured_or_fenced, put_result, session_baseline, sessions_since,
+    ModelTransport, TransportSlot,
 };
 
 use super::policy::ContentPipelinePolicy;
@@ -215,6 +216,7 @@ impl Node for SummarizeNode {
             .transport
             .apply(AgentCodeStep::new(NODE_NAME, config, prompt));
 
+        let baseline = session_baseline(&ctx);
         let mut ctx = step.process(ctx).await?;
 
         let response_content = ctx
@@ -240,10 +242,14 @@ impl Node for SummarizeNode {
                 NodeError::new(format!(
                     "{NODE_NAME}: failed to parse a SummaryResult from the model's reply: {err}"
                 ))
+                .with_sessions(sessions_since(&ctx, baseline))
             })?;
 
         let mut result = serde_json::to_value(&summary)
-            .map_err(|err| NodeError::new(format!("failed to serialize SummaryResult: {err}")))?;
+            .map_err(|err| {
+                NodeError::new(format!("failed to serialize SummaryResult: {err}"))
+                    .with_sessions(sessions_since(&ctx, baseline))
+            })?;
         if let Some(transport) = transport_stamp {
             result["transport"] = transport;
         }

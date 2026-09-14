@@ -554,7 +554,7 @@ mod tests {
             ]),
         );
         let history = build_dedup_history(&dir, None);
-        assert!(history.get("G1").is_none());
+        assert!(!history.contains_key("G1"));
     }
 
     #[test]

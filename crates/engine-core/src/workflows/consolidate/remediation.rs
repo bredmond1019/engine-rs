@@ -39,8 +39,8 @@ use serde_json::{json, Map, Value};
 use crate::workflows::orchestration::ledger::LedgerEntry;
 
 /// Where the remediation ledger + findings register live, relative to an HQ root.
-const REMEDIATION_REL: &str = "docs/sandbox/remediation.json";
-const FINDINGS_REL: &str = "docs/sandbox/findings.json";
+const REMEDIATION_REL: &str = "docs/sandbox/findings/remediation.json";
+const FINDINGS_REL: &str = "docs/sandbox/findings/findings.json";
 
 /// Errors promoting a ledger entry into the HQ remediation/findings pair.
 #[derive(Debug, thiserror::Error)]
@@ -473,7 +473,8 @@ mod tests {
         let root = dir.path();
 
         fs::create_dir_all(root.join("scripts")).unwrap();
-        fs::create_dir_all(root.join("docs/sandbox/results")).unwrap();
+        fs::create_dir_all(root.join("docs/sandbox/findings")).unwrap();
+        fs::create_dir_all(root.join("docs/sandbox/testing/results")).unwrap();
         fs::create_dir_all(root.join("core/engine-rs/planning")).unwrap();
 
         for name in [
@@ -489,7 +490,7 @@ mod tests {
         }
 
         fs::write(
-            root.join("docs/sandbox/remediation.json"),
+            root.join(REMEDIATION_REL),
             serde_json::to_string_pretty(&json!({
                 "schema_version": 1,
                 "updated": "2026-09-10",
@@ -506,7 +507,7 @@ mod tests {
         .unwrap();
 
         fs::write(
-            root.join("docs/sandbox/findings.json"),
+            root.join(FINDINGS_REL),
             serde_json::to_string_pretty(&json!({
                 "schema_version": 1,
                 "updated": "2026-09-10",
@@ -524,7 +525,7 @@ mod tests {
         .unwrap();
 
         fs::write(
-            root.join("docs/sandbox/test-catalogue.json"),
+            root.join("docs/sandbox/testing/test-catalogue.json"),
             serde_json::to_string_pretty(&json!({
                 "schema_version": 1,
                 "tests": []
@@ -627,7 +628,7 @@ mod tests {
         assert_eq!(finding, 1);
 
         let rem_doc: Value = serde_json::from_str(
-            &fs::read_to_string(hq.path().join("docs/sandbox/remediation.json")).unwrap(),
+            &fs::read_to_string(hq.path().join(REMEDIATION_REL)).unwrap(),
         )
         .unwrap();
         let rems = rem_doc["remediations"].as_array().unwrap();
@@ -636,7 +637,7 @@ mod tests {
         assert_eq!(rems[0]["finding"], 1);
 
         let findings_doc: Value = serde_json::from_str(
-            &fs::read_to_string(hq.path().join("docs/sandbox/findings.json")).unwrap(),
+            &fs::read_to_string(hq.path().join(FINDINGS_REL)).unwrap(),
         )
         .unwrap();
         let findings = findings_doc["findings"].as_array().unwrap();
@@ -644,11 +645,11 @@ mod tests {
         assert_eq!(findings[0]["remediation"], "REM-001");
 
         assert!(
-            hq.path().join("docs/sandbox/remediation.md").is_file(),
+            hq.path().join("docs/sandbox/findings/remediation.md").is_file(),
             "render_remediation.py should have regenerated remediation.md"
         );
         assert!(
-            hq.path().join("docs/sandbox/findings.md").is_file(),
+            hq.path().join("docs/sandbox/findings/findings.md").is_file(),
             "render_findings.py should have regenerated findings.md"
         );
     }
@@ -671,7 +672,7 @@ mod tests {
         assert!(matches!(outcome, PromoteOutcome::Promoted { .. }));
 
         let rem_doc: Value = serde_json::from_str(
-            &fs::read_to_string(hq.path().join("docs/sandbox/remediation.json")).unwrap(),
+            &fs::read_to_string(hq.path().join(REMEDIATION_REL)).unwrap(),
         )
         .unwrap();
         assert_eq!(rem_doc["remediations"][0]["status"], "fixed");
@@ -697,7 +698,7 @@ mod tests {
             other => panic!("expected Promoted, got {other:?}"),
         };
 
-        let rem_mtime_before = fs::metadata(hq.path().join("docs/sandbox/remediation.json"))
+        let rem_mtime_before = fs::metadata(hq.path().join(REMEDIATION_REL))
             .unwrap()
             .modified()
             .unwrap();
@@ -705,7 +706,7 @@ mod tests {
         let second = promote_remediation(hq.path(), &entry).expect("second call does not error");
         assert_eq!(second, PromoteOutcome::AlreadyPromoted { rem_id });
 
-        let rem_mtime_after = fs::metadata(hq.path().join("docs/sandbox/remediation.json"))
+        let rem_mtime_after = fs::metadata(hq.path().join(REMEDIATION_REL))
             .unwrap()
             .modified()
             .unwrap();
@@ -715,7 +716,7 @@ mod tests {
         );
 
         let rem_doc: Value = serde_json::from_str(
-            &fs::read_to_string(hq.path().join("docs/sandbox/remediation.json")).unwrap(),
+            &fs::read_to_string(hq.path().join(REMEDIATION_REL)).unwrap(),
         )
         .unwrap();
         assert_eq!(

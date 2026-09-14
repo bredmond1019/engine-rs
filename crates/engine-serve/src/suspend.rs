@@ -1474,6 +1474,7 @@ mod tests {
         /// readback goes cleanly terminal once the pre-written `Done` job
         /// resolves.
         #[actix_web::test]
+        #[allow(clippy::await_holding_lock)]
         async fn spawn_run_drives_a_queue_parked_run_to_completion_never_appearing_suspended() {
             let _guard = registry_test_lock()
                 .lock()
@@ -1907,24 +1908,19 @@ mod tests {
             spawn_run(spawned);
 
             let mut sse_step_progress_frames = 0;
-            loop {
-                match tokio::time::timeout(std::time::Duration::from_millis(500), sse_rx.recv())
-                    .await
+            while let Ok(Ok(frame)) =
+                tokio::time::timeout(std::time::Duration::from_millis(500), sse_rx.recv()).await
+            {
+                if frame
+                    .task_context
+                    .metadata
+                    .get("orchestration_step_progress")
+                    .is_some()
                 {
-                    Ok(Ok(frame)) => {
-                        if frame
-                            .task_context
-                            .metadata
-                            .get("orchestration_step_progress")
-                            .is_some()
-                        {
-                            sse_step_progress_frames += 1;
-                        }
-                        if frame.terminal {
-                            break;
-                        }
-                    }
-                    _ => break,
+                    sse_step_progress_frames += 1;
+                }
+                if frame.terminal {
+                    break;
                 }
             }
 

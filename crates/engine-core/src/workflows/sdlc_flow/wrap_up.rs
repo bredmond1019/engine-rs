@@ -593,11 +593,13 @@ const VERDICT_STAGES: [&str; 2] = ["TriageTaskNode", "ConsolidatedReviewNode"];
 /// `"cost_usd"` field (`AgentCodeStep`'s output shape). Passed to the
 /// generic `crate::policy::telemetry::harvest` as
 /// `RunTelemetryInputs::cost_bearing_stages` (EN.4.0).
-pub(crate) const COST_BEARING_STAGES: [&str; 4] = [
+pub(crate) const COST_BEARING_STAGES: [&str; 6] = [
     "ImplementTaskNode",
     "TriageTaskNode",
     "ConsolidatedReviewNode",
     "GenerateTasksNode",
+    "EndReviewNode",
+    "PatchDocsNode",
 ];
 
 /// The resolved policy's per-stage tier, keyed by `ModelTiers` field name.

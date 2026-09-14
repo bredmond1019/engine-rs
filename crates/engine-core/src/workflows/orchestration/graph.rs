@@ -4024,6 +4024,7 @@ mod tests {
         let chain = resolve_explicit_chain(vec![("bastion".to_string(), "BA.1.A".to_string())]);
         let repo = chain.first().map(|step| step.repo.clone()).unwrap();
         let resolved_lane: Option<String> = None;
+        #[allow(clippy::unnecessary_literal_unwrap)]
         let lane = resolved_lane.unwrap_or_else(|| repo.clone());
 
         assert_eq!(held_session_name(&repo, &lane), "lane-bastion-bastion");

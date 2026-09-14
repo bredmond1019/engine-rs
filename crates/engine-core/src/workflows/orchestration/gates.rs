@@ -1106,12 +1106,14 @@ mod tests {
 
     // ── Task 5: the permission gate ─────────────────────────────────────
 
+    type RecordedGateRequests = Arc<std::sync::Mutex<Vec<OperatorGateRequest>>>;
+
     /// A closure double that records every [`OperatorGateRequest`] it is called
     /// with, so a test can assert both "called exactly once with this shape" and
     /// "never called at all".
     fn recording_author() -> (
         impl Fn(&OperatorGateRequest) -> Result<(), String>,
-        Arc<std::sync::Mutex<Vec<OperatorGateRequest>>>,
+        RecordedGateRequests,
     ) {
         let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
         let recorder = calls.clone();

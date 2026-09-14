@@ -546,7 +546,6 @@ pub fn workflow() -> Workflow {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::node::Node as _;
     use crate::validate::WorkflowValidator;
 
     #[test]

@@ -169,15 +169,13 @@ def _pid_running(pid: int) -> bool:
     return True
 
 
-def _sweep_stale(lock_dir: Path, ttl_seconds: int) -> None:
+def _sweep_stale(lock_dir: Path, ttl_seconds: int = DEFAULT_TTL_SECONDS) -> None:
     """Remove stale permit entries in place.
 
     An entry is stale when its recorded holder pid is no longer running
     (immediate reclaim -- e.g. a SIGKILLed build whose wrapper never got to
-    run its `finally`) OR when it has simply outlived the TTL (a
-    belt-and-braces catch for anything the liveness check missed).
+    run its `finally`). A live holder process is never swept regardless of duration.
     """
-    now = time.time()
     for entry_path in sorted(lock_dir.glob("*.json")):
         try:
             data = json.loads(entry_path.read_text())
@@ -186,10 +184,8 @@ def _sweep_stale(lock_dir: Path, ttl_seconds: int) -> None:
             continue
 
         pid = data.get("pid")
-        started_at = data.get("started_at", 0)
-        age = now - started_at
         alive = isinstance(pid, int) and _pid_running(pid)
-        if (not alive) or age > ttl_seconds:
+        if not alive:
             entry_path.unlink(missing_ok=True)
 
 

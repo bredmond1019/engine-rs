@@ -800,6 +800,6 @@ mod recall_node_tests {
     #[test]
     fn defaults_are_limit_five_and_hybrid_true() {
         assert_eq!(DEFAULT_RECALL_LIMIT, 5);
-        assert!(DEFAULT_RECALL_HYBRID);
+        const { assert!(DEFAULT_RECALL_HYBRID) };
     }
 }

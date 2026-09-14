@@ -28,11 +28,11 @@ use crate::policy::PolicyConfigSource;
 
 use super::policy::{self, PartialPolicy, SdlcPolicy};
 use super::profiles;
-use super::schema::{parse_task_range, SDLCFlowEventSchema, SDLCState, SDLCTask, SDLCTaskStatus};
+use super::schema::{SDLCFlowEventSchema, SDLCState, SDLCTask, SDLCTaskStatus};
 use super::task_loop::{apply_policy, resolve_harness_path, resolved_policy, worktree_path, Stage};
 use super::{
-    carry_forward_billing, get_result, parse_structured_or_fenced, put_result,
-    DEFAULT_STATE_FILENAME,
+    carry_forward_billing, get_result, parse_structured_or_fenced, put_result, session_baseline,
+    sessions_since, DEFAULT_STATE_FILENAME,
 };
 
 /// The `ctx.nodes` identity the resolved policy is stamped under, so every
@@ -1198,12 +1198,6 @@ impl Node for LoadTaskStateNode {
             task.attempt_count = 0;
             task.review_attempt_count = 0;
 
-            if let Some(ids) =
-                parse_task_range(event.task_range.as_deref()).map_err(NodeError::new)?
-            {
-                state.tasks.retain(|task| ids.contains(&task.task_id));
-            }
-
             let value = serde_json::to_value(&state)
                 .map_err(|err| NodeError::new(format!("failed to serialize SDLCState: {err}")))?;
             put_result(&mut ctx, "LoadTaskStateNode", value);
@@ -1224,7 +1218,7 @@ impl Node for LoadTaskStateNode {
 
         let resumed_state = if restarting { None } else { existing_state };
 
-        let mut state: SDLCState = if let Some(value) = resumed_state {
+        let state: SDLCState = if let Some(value) = resumed_state {
             let state = SDLCState::from_committed_state_json(&value)?;
             // Without this, a resumed run's `ctx.metadata` ledger starts
             // empty, so `total_cost_usd` under-reports by every segment
@@ -1290,10 +1284,6 @@ impl Node for LoadTaskStateNode {
                 dir.display()
             )));
         };
-
-        if let Some(ids) = parse_task_range(event.task_range.as_deref()).map_err(NodeError::new)? {
-            state.tasks.retain(|task| ids.contains(&task.task_id));
-        }
 
         let value = serde_json::to_value(&state)
             .map_err(|err| NodeError::new(format!("failed to serialize SDLCState: {err}")))?;
@@ -1671,6 +1661,7 @@ impl Node for GenerateTasksNode {
             step = step.with_transport(move |config, prompt| (transport)(config, prompt));
         }
 
+        let baseline = session_baseline(&ctx);
         let mut ctx = step.process(ctx).await?;
 
         let content = ctx
@@ -1678,7 +1669,10 @@ impl Node for GenerateTasksNode {
             .get("GenerateTasksNode")
             .and_then(|value| value.get("content"))
             .and_then(|value| value.as_str())
-            .ok_or_else(|| NodeError::new("GenerateTasksNode: model returned no content"))?
+            .ok_or_else(|| {
+                NodeError::new("GenerateTasksNode: model returned no content")
+                    .with_sessions(sessions_since(&ctx, baseline))
+            })?
             .to_string();
 
         let generated: GeneratedTasks =
@@ -1686,6 +1680,7 @@ impl Node for GenerateTasksNode {
                 NodeError::new(format!(
                     "GenerateTasksNode: failed to parse model output as JSON: {err}"
                 ))
+                .with_sessions(sessions_since(&ctx, baseline))
             })?;
 
         // Seed max_attempts from the resolved policy for any task the model
@@ -1695,26 +1690,33 @@ impl Node for GenerateTasksNode {
             NodeError::new(format!(
                 "GenerateTasksNode: invalid task shape in model output: {err}"
             ))
+            .with_sessions(sessions_since(&ctx, baseline))
         })?;
 
-        std::fs::create_dir_all(&dir)
-            .map_err(|err| NodeError::new(format!("failed to create {}: {err}", dir.display())))?;
+        std::fs::create_dir_all(&dir).map_err(|err| {
+            NodeError::new(format!("failed to create {}: {err}", dir.display()))
+                .with_sessions(sessions_since(&ctx, baseline))
+        })?;
 
         let tasks_json_path = dir.join("tasks.json");
         let tasks_md_path = dir.join("tasks.md");
-        let tasks_json = serde_json::to_string_pretty(&tasks)
-            .map_err(|err| NodeError::new(format!("failed to serialize tasks.json: {err}")))?;
+        let tasks_json = serde_json::to_string_pretty(&tasks).map_err(|err| {
+            NodeError::new(format!("failed to serialize tasks.json: {err}"))
+                .with_sessions(sessions_since(&ctx, baseline))
+        })?;
         std::fs::write(&tasks_json_path, tasks_json).map_err(|err| {
             NodeError::new(format!(
                 "failed to write {}: {err}",
                 tasks_json_path.display()
             ))
+            .with_sessions(sessions_since(&ctx, baseline))
         })?;
         std::fs::write(&tasks_md_path, &generated.tasks_markdown).map_err(|err| {
             NodeError::new(format!(
                 "failed to write {}: {err}",
                 tasks_md_path.display()
             ))
+            .with_sessions(sessions_since(&ctx, baseline))
         })?;
 
         let mut result = json!({
@@ -1937,7 +1939,7 @@ mod tests {
         // Multibyte content whose naive byte-`cap` cutoff would land
         // mid-character (each 'é' is 2 bytes in UTF-8).
         let dir = temp_dir();
-        let content: String = std::iter::repeat('é').take(100).collect();
+        let content = "é".repeat(100);
         std::fs::write(dir.join("multibyte.md"), &content).unwrap();
 
         // Header is "## multibyte.md\n\n" (18 bytes) then 100 * 2 = 200
@@ -2230,7 +2232,7 @@ mod tests {
     // --- LoadTaskStateNode ------------------------------------------------
 
     #[tokio::test]
-    async fn load_bootstraps_from_tasks_json_and_filters_by_range() {
+    async fn load_task_state_preserves_all_tasks_with_task_range() {
         let worktree = temp_dir();
         let dir = worktree.join("planning").join("my-spec");
         std::fs::create_dir_all(&dir).unwrap();
@@ -2261,7 +2263,10 @@ mod tests {
             .iter()
             .map(|t| t["task_id"].as_u64().unwrap())
             .collect();
-        assert_eq!(task_ids, vec![1, 3]);
+        // LoadTaskStateNode preserves all tasks in state; filtering by range
+        // happens at dispatch time in TaskQueueRouterNode so the persisted
+        // state record is never truncated.
+        assert_eq!(task_ids, vec![1, 2, 3]);
     }
 
     /// A runner that answers `git log --format=%s` with the given commit
@@ -2992,7 +2997,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn restart_keeps_the_task_range_filter() {
+    async fn restart_preserves_all_tasks_with_task_range() {
         let worktree = temp_dir();
         let (_dir, _sdlc_dir) = seed_bailed_spec(&worktree, "my-spec", 3, Some("run-cccc"));
 
@@ -3006,7 +3011,7 @@ mod tests {
             .iter()
             .map(|t| t["task_id"].as_u64().unwrap())
             .collect();
-        assert_eq!(ids, vec![2, 3]);
+        assert_eq!(ids, vec![1, 2, 3]);
     }
 
     #[tokio::test]

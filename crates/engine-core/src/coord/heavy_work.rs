@@ -1501,7 +1501,7 @@ Swapouts:                                      0.\n";
         let early = "2026-09-10T09:00:00Z";
         let late = "2026-09-10T09:00:01Z";
 
-        let mut jobs = vec![
+        let mut jobs = [
             job_at(late, Uuid::from_u128(2)),
             job_at(early, Uuid::from_u128(3)),
             job_at(early, Uuid::from_u128(1)),

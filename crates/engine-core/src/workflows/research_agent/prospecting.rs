@@ -27,7 +27,10 @@ use crate::locale::{language_directive, Locale};
 use crate::node::{Node, NodeError};
 use crate::nodes::AgentCodeStep;
 use crate::policy::telemetry::RunTelemetryInputs;
-use crate::workflows::{get_result, parse_structured_or_fenced, put_result, ModelTransport};
+use crate::workflows::{
+    get_result, parse_structured_or_fenced, put_result, session_baseline, sessions_since,
+    ModelTransport,
+};
 
 use super::policy::{ContactDepth, GroundingDepth, ModelTier, ResearchAgentPolicy};
 use super::schema::{prospecting_result_json_schema, ProspectingResult, ResearchAgentEventSchema};
@@ -343,6 +346,7 @@ impl Node for ProspectingResearchNode {
             step = step.with_transport(move |config, prompt| (transport)(config, prompt));
         }
 
+        let baseline = session_baseline(&ctx);
         let mut ctx = step.process(ctx).await?;
 
         let content = ctx
@@ -358,6 +362,7 @@ impl Node for ProspectingResearchNode {
                 NodeError::new(format!(
                     "{NODE_NAME}: failed to parse a ProspectingResult from the model's reply: {err}"
                 ))
+                .with_sessions(sessions_since(&ctx, baseline))
             })?;
 
         // Sweep-level union of every lead's flagged claims (order-stable,
@@ -377,6 +382,7 @@ impl Node for ProspectingResearchNode {
 
         let mut result_value = serde_json::to_value(&result).map_err(|err| {
             NodeError::new(format!("failed to serialize ProspectingResult: {err}"))
+                .with_sessions(sessions_since(&ctx, baseline))
         })?;
         // Stamp the resolved contact-enrichment depth alongside the result so
         // EN.4.0 telemetry can attribute cost to the setting that caused it.

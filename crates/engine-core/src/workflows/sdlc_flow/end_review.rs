@@ -52,8 +52,8 @@ use super::task_loop::{
     stage_untracked_intent, worktree_path, ReviewOutput, Stage, REVIEW_STABLE_PROMPT,
 };
 use super::{
-    carry_forward_billing, get_result, parse_model_verdict, put_result, CommandRunner,
-    ModelTransport, ModelVerdict, TransportSlot,
+    carry_forward_billing, get_result, parse_model_verdict, put_result, session_baseline,
+    sessions_since, CommandRunner, ModelTransport, ModelVerdict, TransportSlot,
 };
 
 /// The result-node name [`EndReviewNode`] stamps under, and the name
@@ -215,13 +215,17 @@ impl Node for EndReviewNode {
             AgentCodeStep::new(NODE_NAME, config, prompt).with_retry_policy(policy.transport_retry),
         );
 
+        let baseline = session_baseline(&ctx);
         let mut ctx = step.process(ctx).await?;
         let content = ctx
             .nodes
             .get(NODE_NAME)
             .and_then(|value| value.get("content"))
             .and_then(|value| value.as_str())
-            .ok_or_else(|| NodeError::new(format!("{NODE_NAME}: model returned no content")))?
+            .ok_or_else(|| {
+                NodeError::new(format!("{NODE_NAME}: model returned no content"))
+                    .with_sessions(sessions_since(&ctx, baseline))
+            })?
             .to_string();
 
         // Design decision (local-model bench false negatives, 2026-09-14):

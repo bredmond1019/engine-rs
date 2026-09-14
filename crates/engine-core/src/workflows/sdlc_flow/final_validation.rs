@@ -669,8 +669,9 @@ mod tests {
 
     #[test]
     fn select_reconcile_checks_filter_table() {
+        type TestCase = (bool, Option<&'static str>, Option<&'static str>, Option<bool>, bool);
         // (gates, fastCommand, command, perTask, expected_kept)
-        let cases: Vec<(bool, Option<&str>, Option<&str>, Option<bool>, bool)> = vec![
+        let cases: Vec<TestCase> = vec![
             // gating + fastCommand differs from command -> keep
             (true, Some("fast"), Some("full"), None, true),
             // gating + fastCommand equals command -> drop (no gap to reconcile)

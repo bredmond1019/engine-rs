@@ -107,7 +107,10 @@ use crate::workflow::Workflow;
 use crate::workflows::content_pipeline::increment_critic_iteration::{
     self, IncrementCriticIterationNode,
 };
-use crate::workflows::{get_result, parse_structured_or_fenced, put_result, ModelTransport};
+use crate::workflows::{
+    get_result, parse_structured_or_fenced, put_result, session_baseline, sessions_since,
+    ModelTransport,
+};
 
 use super::brand_critic::{self, BrandCriticNode};
 use super::draft::{self, PostDraftNode};
@@ -341,6 +344,7 @@ impl Node for TranslateGateNode {
             step = step.with_transport(move |config, prompt| (transport)(config, prompt));
         }
 
+        let baseline = session_baseline(&ctx);
         let mut ctx = step.process(ctx).await?;
 
         let content = ctx
@@ -356,6 +360,7 @@ impl Node for TranslateGateNode {
                 NodeError::new(format!(
                 "{TRANSLATE_NODE_NAME}: failed to parse a translation from the model's reply: {err}"
             ))
+            .with_sessions(sessions_since(&ctx, baseline))
             })?;
 
         put_result(

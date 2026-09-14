@@ -662,10 +662,12 @@ mod tests {
 
     // ── fetch_frontier_slate ─────────────────────────────────────────────
 
+    type RecordedConductorCall = (String, Vec<String>, String);
+    type RecordedConductorCalls = Arc<Mutex<Vec<RecordedConductorCall>>>;
+
     #[test]
     fn fetch_frontier_slate_invokes_mev_frontier_json_through_the_injected_runner() {
-        let calls: Arc<Mutex<Vec<(String, Vec<String>, String)>>> =
-            Arc::new(Mutex::new(Vec::new()));
+        let calls: RecordedConductorCalls = Arc::new(Mutex::new(Vec::new()));
         let calls_clone = calls.clone();
         let stdout = SAMPLE_FRONTIER.to_string();
         let runner: Runner<TestOutput> = Arc::new(move |program, args, cwd| {
@@ -983,7 +985,7 @@ mod tests {
     /// (the positive control) survives.
     fn selective_history_git_runner() -> Runner<TestOutput> {
         Arc::new(|_program, args, _cwd| {
-            let matched_en_12_f = args.iter().any(|a| *a == "-SEN.12.F");
+            let matched_en_12_f = args.contains(&"-SEN.12.F");
             Ok(TestOutput {
                 status: 0,
                 stdout: if matched_en_12_f {
@@ -1029,7 +1031,7 @@ mod tests {
 
     #[test]
     fn git_log_dash_s_preflight_invokes_git_log_dash_s_through_the_injected_runner() {
-        let calls: Arc<Mutex<Vec<(String, Vec<String>, String)>>> =
+        let calls: RecordedConductorCalls =
             Arc::new(Mutex::new(Vec::new()));
         let calls_clone = calls.clone();
         let runner: Runner<TestOutput> = Arc::new(move |program, args, cwd| {

@@ -184,16 +184,13 @@ mod tests {
         }
     }
 
+    type RecordedRunnerCall = (String, Vec<String>, PathBuf);
+    type RecordedRunnerCalls = Arc<Mutex<Vec<RecordedRunnerCall>>>;
+
     /// A stub `CommandRunner` that records every call it receives and
     /// returns a fixed `CommandOutput`, never touching a real subprocess.
-    fn stub_runner(
-        output: CommandOutput,
-    ) -> (
-        CommandRunner,
-        Arc<Mutex<Vec<(String, Vec<String>, PathBuf)>>>,
-    ) {
-        let calls: Arc<Mutex<Vec<(String, Vec<String>, PathBuf)>>> =
-            Arc::new(Mutex::new(Vec::new()));
+    fn stub_runner(output: CommandOutput) -> (CommandRunner, RecordedRunnerCalls) {
+        let calls: RecordedRunnerCalls = Arc::new(Mutex::new(Vec::new()));
         let recorded = Arc::clone(&calls);
         let runner: CommandRunner = Arc::new(move |program, args, cwd| {
             recorded.lock().unwrap().push((

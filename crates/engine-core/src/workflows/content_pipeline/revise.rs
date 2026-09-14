@@ -29,7 +29,8 @@ use serde_json::Value;
 use crate::node::{InputBinding, Node, NodeError};
 use crate::nodes::{AgentCodeStep, MetaTransport};
 use crate::workflows::{
-    get_result, parse_structured_or_fenced, put_result, ModelTransport, TransportSlot,
+    get_result, parse_structured_or_fenced, put_result, session_baseline, sessions_since,
+    ModelTransport, TransportSlot,
 };
 
 use super::policy::ContentPipelinePolicy;
@@ -227,6 +228,7 @@ impl Node for ReviseNode {
             .transport
             .apply(AgentCodeStep::new(NODE_NAME, config, prompt));
 
+        let baseline = session_baseline(&ctx);
         let mut ctx = step.process(ctx).await?;
 
         let content = ctx
@@ -253,10 +255,12 @@ impl Node for ReviseNode {
                     "{NODE_NAME}: failed to parse a revised SummaryResult from the model's \
                      reply: {err}"
                 ))
+                .with_sessions(sessions_since(&ctx, baseline))
             })?;
 
         let mut result = serde_json::to_value(&revised).map_err(|err| {
             NodeError::new(format!("failed to serialize revised SummaryResult: {err}"))
+                .with_sessions(sessions_since(&ctx, baseline))
         })?;
         if let Some(transport) = transport_stamp {
             result["transport"] = transport;

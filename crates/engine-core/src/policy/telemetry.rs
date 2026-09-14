@@ -1029,8 +1029,9 @@ mod tests {
     #[tokio::test]
     async fn total_cost_usd_and_node_cost_usd_see_a_real_number_from_wrapper_produced_context() {
         use crate::workflows::sdlc_flow::task_loop::tests::{
-            drive_consolidated_review_node_for_billing, drive_generate_tasks_node_for_billing,
-            drive_implement_task_node_for_billing, drive_triage_task_node_for_billing,
+            drive_consolidated_review_node_for_billing, drive_end_review_node_for_billing,
+            drive_generate_tasks_node_for_billing, drive_implement_task_node_for_billing,
+            drive_patch_docs_node_for_billing, drive_triage_task_node_for_billing,
         };
         use crate::workflows::sdlc_flow::wrap_up::COST_BEARING_STAGES;
 
@@ -1053,6 +1054,14 @@ mod tests {
             (
                 "GenerateTasksNode",
                 drive_generate_tasks_node_for_billing().await,
+            ),
+            (
+                "EndReviewNode",
+                drive_end_review_node_for_billing().await,
+            ),
+            (
+                "PatchDocsNode",
+                drive_patch_docs_node_for_billing().await,
             ),
         ] {
             let entry = ctx

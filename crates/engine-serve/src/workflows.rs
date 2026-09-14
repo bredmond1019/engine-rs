@@ -1861,7 +1861,6 @@ pub fn register_builtin_workflows_with_operator(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use engine_core::Node as _;
 
     #[test]
     fn register_sdlc_flow_populates_both_registries() {

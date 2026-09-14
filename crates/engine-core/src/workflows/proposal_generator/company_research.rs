@@ -25,7 +25,9 @@ use engine_contract::TaskContext;
 use crate::node::{Node, NodeError};
 use crate::nodes::AgentCodeStep;
 use crate::workflows::research_agent::schema::{company_brief_json_schema, CompanyBrief};
-use crate::workflows::{parse_structured_or_fenced, put_result, ModelTransport};
+use crate::workflows::{
+    parse_structured_or_fenced, put_result, session_baseline, sessions_since, ModelTransport,
+};
 
 use super::policy::ProposalGeneratorPolicy;
 use super::schema::ProposalGeneratorEventSchema;
@@ -137,6 +139,7 @@ impl Node for ProposalCompanyResearchNode {
             step = step.with_transport(move |config, prompt| (transport)(config, prompt));
         }
 
+        let baseline = session_baseline(&ctx);
         let mut ctx = step.process(ctx).await?;
 
         let content = ctx
@@ -152,15 +155,14 @@ impl Node for ProposalCompanyResearchNode {
                 NodeError::new(format!(
                     "{NODE_NAME}: failed to parse a CompanyBrief from the model's reply: {err}"
                 ))
+                .with_sessions(sessions_since(&ctx, baseline))
             })?;
 
-        put_result(
-            &mut ctx,
-            NODE_NAME,
-            serde_json::to_value(&brief).map_err(|err| {
-                NodeError::new(format!("failed to serialize CompanyBrief: {err}"))
-            })?,
-        );
+        let result = serde_json::to_value(&brief).map_err(|err| {
+            NodeError::new(format!("failed to serialize CompanyBrief: {err}"))
+                .with_sessions(sessions_since(&ctx, baseline))
+        })?;
+        put_result(&mut ctx, NODE_NAME, result);
 
         Ok(ctx)
     }

@@ -603,7 +603,7 @@ mod tests {
         // `resume_at`) and ran to completion -- not suspended any more.
         let suspension = suspend::read_suspension(&ctx.metadata);
         assert!(
-            suspension.map(|s| s.suspended).unwrap_or(false) == false,
+            !suspension.map(|s| s.suspended).unwrap_or(false),
             "walk must no longer be suspended once resumed to completion"
         );
         assert!(

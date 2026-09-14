@@ -309,6 +309,8 @@ impl Node for CommanderTriageNode {
                 );
                 Ok(ctx)
             }
+            // `step` is an `AgentCodeStep`, which attaches `with_sessions` to any `NodeError` it produces;
+            // no downstream parsing occurs here.
             triage::TriageOutcome::Step(step) => step.process(ctx).await,
         }
     }

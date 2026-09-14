@@ -19,7 +19,9 @@ use crate::node::{Node, NodeError};
 use crate::nodes::AgentCodeStep;
 
 use super::task_loop::{apply_policy_config, resolved_policy, worktree_path, Stage};
-use super::{parse_model_verdict, ModelTransport, ModelVerdict};
+use super::{
+    parse_model_verdict, session_baseline, sessions_since, ModelTransport, ModelVerdict,
+};
 
 /// Model output shape `PatchDocsNode` expects (strict JSON reply).
 #[derive(Debug, Deserialize)]
@@ -231,6 +233,7 @@ impl Node for PatchDocsNode {
             step = step.with_transport(move |config, prompt| (transport)(config, prompt));
         }
 
+        let baseline = session_baseline(&ctx);
         let mut ctx = step.process(ctx).await?;
 
         let content = ctx
@@ -238,7 +241,10 @@ impl Node for PatchDocsNode {
             .get("PatchDocsNode")
             .and_then(|value| value.get("content"))
             .and_then(|value| value.as_str())
-            .ok_or_else(|| NodeError::new("PatchDocsNode: model returned no content"))?
+            .ok_or_else(|| {
+                NodeError::new("PatchDocsNode: model returned no content")
+                    .with_sessions(sessions_since(&ctx, baseline))
+            })?
             .to_string();
 
         // A docs-patch reply that survives `parse_structured_or_fenced`'s
@@ -291,6 +297,7 @@ impl Node for PatchDocsNode {
             // reading committed state, not something any Rust branch parses.
             result["raw_output_preview"] = json!(raw_output_preview);
         }
+        super::carry_forward_billing(&ctx, "PatchDocsNode", &mut result);
         super::put_result(&mut ctx, "PatchDocsNode", result);
 
         Ok(ctx)

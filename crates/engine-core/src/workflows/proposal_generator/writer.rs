@@ -27,7 +27,10 @@ use crate::locale::{EngagementKind, Locale, MoneyRange, RateCard, RateSheet};
 use crate::node::{Node, NodeError};
 use crate::nodes::AgentCodeStep;
 use crate::policy::PolicyConfigSource;
-use crate::workflows::{get_result, parse_structured_or_fenced, put_result, ModelTransport};
+use crate::workflows::{
+    get_result, parse_structured_or_fenced, put_result, session_baseline, sessions_since,
+    ModelTransport,
+};
 
 use super::policy::ProposalGeneratorPolicy;
 use super::schema::{
@@ -171,6 +174,7 @@ impl Node for ProposalWriterNode {
             step = step.with_transport(move |config, prompt| (transport)(config, prompt));
         }
 
+        let baseline = session_baseline(&ctx);
         let mut ctx = step.process(ctx).await?;
 
         let content = ctx
@@ -186,6 +190,7 @@ impl Node for ProposalWriterNode {
                 NodeError::new(format!(
                     "{NODE_NAME}: failed to parse an AutomationRoadmap from the model's reply: {err}"
                 ))
+                .with_sessions(sessions_since(&ctx, baseline))
             })?;
 
         // Deterministic stamp: the event's locale always wins over anything
@@ -199,7 +204,8 @@ impl Node for ProposalWriterNode {
         // Builtin` is correct here: served runs resolve config at dispatch
         // time (EN.5.D) and this node has no worktree path to read a
         // `harness.json` override from.
-        let rate_card = RateCard::load_from(&PolicyConfigSource::Builtin)?;
+        let rate_card = RateCard::load_from(&PolicyConfigSource::Builtin)
+            .map_err(|err| err.with_sessions(sessions_since(&ctx, baseline)))?;
         if let Some(recommendation) = roadmap.recommendation.as_mut() {
             recommendation.investment = Some(engagement_range(
                 rate_card.sheet(event.locale),
@@ -217,13 +223,11 @@ impl Node for ProposalWriterNode {
         // (`PersistToBrainNode` re-serializes the strict schema type, which
         // would silently drop any extra sibling key and break that
         // round-trip).
-        put_result(
-            &mut ctx,
-            NODE_NAME,
-            serde_json::to_value(&roadmap).map_err(|err| {
-                NodeError::new(format!("failed to serialize AutomationRoadmap: {err}"))
-            })?,
-        );
+        let result = serde_json::to_value(&roadmap).map_err(|err| {
+            NodeError::new(format!("failed to serialize AutomationRoadmap: {err}"))
+                .with_sessions(sessions_since(&ctx, baseline))
+        })?;
+        put_result(&mut ctx, NODE_NAME, result);
 
         Ok(ctx)
     }

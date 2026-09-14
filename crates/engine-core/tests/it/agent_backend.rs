@@ -16,6 +16,8 @@
 //! `cargo nextest run -p engine-core -E 'test(agent_backend_)'` selects
 //! exactly this suite.
 
+#![allow(clippy::await_holding_lock)]
+
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex};

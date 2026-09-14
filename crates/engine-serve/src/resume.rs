@@ -1300,9 +1300,11 @@ mod campaign_resume_tests {
 
     // ── `reconcile_stale_branch` ────────────────────────────────────────
 
+    type RecordedCalls = Arc<Mutex<Vec<(String, Vec<String>)>>>;
+
     #[test]
     fn reconcile_stale_branch_removes_the_worktree_then_deletes_the_branch() {
-        let calls: Arc<Mutex<Vec<(String, Vec<String>)>>> = Arc::new(Mutex::new(Vec::new()));
+        let calls: RecordedCalls = Arc::new(Mutex::new(Vec::new()));
         let recorded = calls.clone();
         let runner: CommandRunner = Arc::new(move |program, args, _cwd| {
             recorded.lock().unwrap().push((

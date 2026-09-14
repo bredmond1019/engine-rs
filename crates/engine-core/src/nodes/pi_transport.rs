@@ -534,6 +534,7 @@ fn build_agent_outcome(parsed: ParsedStream, exit_code: Option<i32>, stderr: &st
 }
 
 #[cfg(test)]
+#[allow(clippy::await_holding_lock)]
 mod tests {
     use super::*;
     use std::io::Write;

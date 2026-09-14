@@ -406,8 +406,8 @@ mod tests {
             1,
         );
         // Neither alone clears the bar...
-        assert!(!rows_clear_draft_bar(&[with_number.clone()]));
-        assert!(!rows_clear_draft_bar(&[with_path.clone()]));
+        assert!(!rows_clear_draft_bar(std::slice::from_ref(&with_number)));
+        assert!(!rows_clear_draft_bar(std::slice::from_ref(&with_path)));
         // ...but together, across two different rows, they do.
         assert!(rows_clear_draft_bar(&[with_number, with_path]));
     }
