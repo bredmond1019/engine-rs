@@ -1731,6 +1731,25 @@ pub struct CheckResult {
     failure_class: FailureClass,
 }
 
+/// Extracts a [`crate::coord::heavy_work::HeavyWorkJobResult`] from a completed check run's
+/// `(results, failed_names)` output — the single place both `TestTaskNode::process`'s
+/// queue-park/inline branches and `FinalValidationNode::process` (which shares this exact
+/// check-run shape via [`TestTaskNode::run_checks`]) turn a heavy-work job's real output into
+/// what gets persisted onto its on-disk job record, so a queue-park resume
+/// (`DiskHeavyJobLookup::await_outcome` in `engine-serve` and its sibling in
+/// `workflows::orchestration::execute`) can read a genuine `passed`/`check_results` verdict back
+/// out instead of the previously fabricated `false`/`[]`
+/// (EN.17.J follow-up: heavy-work-queue-park-resume-reports-every-task-failed).
+pub(crate) fn check_run_heavy_work_result(
+    output: &(Vec<CheckResult>, Vec<String>),
+) -> crate::coord::heavy_work::HeavyWorkJobResult {
+    let (results, failed_names) = output;
+    crate::coord::heavy_work::HeavyWorkJobResult {
+        passed: failed_names.is_empty(),
+        check_results: serde_json::to_value(results).unwrap_or(serde_json::Value::Null),
+    }
+}
+
 /// How a task loop should treat a failed check: retry it like any other
 /// (`Fixable`, the behavior-stable default) or bail the task on the first
 /// failure without spending further fix attempts (`Escalate`). Read from a
@@ -2797,9 +2816,18 @@ impl Node for TestTaskNode {
                 // returns.
                 let _job_handle = self
                     .heavy_work
-                    .submit_with_id(job_id, heavy_work_spec, move || {
-                        job_node.run_checks(&checks_for_job, &worktree_for_job, &spec_dir_for_job)
-                    })
+                    .submit_with_id_recording(
+                        job_id,
+                        heavy_work_spec,
+                        move || {
+                            job_node.run_checks(
+                                &checks_for_job,
+                                &worktree_for_job,
+                                &spec_dir_for_job,
+                            )
+                        },
+                        check_run_heavy_work_result,
+                    )
                     .await;
 
                 put_result(
@@ -2826,9 +2854,13 @@ impl Node for TestTaskNode {
 
             let outcome = self
                 .heavy_work
-                .run(heavy_work_spec, move || {
-                    job_node.run_checks(&checks_for_job, &worktree_for_job, &spec_dir_for_job)
-                })
+                .run_recording(
+                    heavy_work_spec,
+                    move || {
+                        job_node.run_checks(&checks_for_job, &worktree_for_job, &spec_dir_for_job)
+                    },
+                    check_run_heavy_work_result,
+                )
                 .await;
 
             let heavy_work_json = json!({

@@ -72,10 +72,24 @@ impl HeavyJobLookup for DiskHeavyJobLookup {
                     job.state,
                     JobState::Done | JobState::Cancelled | JobState::Abandoned
                 ) {
+                    // Read the job's real outcome back out, persisted by
+                    // `HeavyWorkQueue::run_recording`/`submit_with_id_recording`
+                    // (`coord::heavy_work`) — falling back to a fabricated
+                    // `false`/`[]` only for a job that never went through a
+                    // recording call (a job record written before this field
+                    // existed, or a future non-`test`/`build` class that never
+                    // persists check outcomes). This is the fix for
+                    // `heavy-work-queue-park-resume-reports-every-task-failed`:
+                    // previously EVERY queue-parked job hit this fallback,
+                    // even ones whose checks genuinely passed.
                     let all_passed = job.passed.unwrap_or(false);
+                    let check_results = job
+                        .check_results
+                        .clone()
+                        .unwrap_or_else(|| serde_json::Value::Array(Vec::new()));
                     return serde_json::json!({
                         "all_passed": all_passed,
-                        "check_results": [],
+                        "check_results": check_results,
                         "failure_summary": if all_passed {
                             String::new()
                         } else {
@@ -1489,6 +1503,7 @@ mod tests {
                     heartbeat_at: None,
                     finished_at: Some(Utc::now()),
                     passed: Some(true),
+                    check_results: Some(serde_json::json!([])),
                 },
             )
             .expect("write_job should succeed under a tempdir");

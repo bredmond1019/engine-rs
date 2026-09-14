@@ -1001,10 +1001,22 @@ impl HeavyJobLookup for DiskHeavyJobLookup {
                     job.state,
                     JobState::Done | JobState::Cancelled | JobState::Abandoned
                 ) {
+                    // Read the job's real outcome back out, persisted by
+                    // `HeavyWorkQueue::run_recording`/`submit_with_id_recording`
+                    // (`coord::heavy_work`) — falling back to a fabricated
+                    // `false`/`[]` only for a job that never went through a
+                    // recording call. This is the fix for
+                    // `heavy-work-queue-park-resume-reports-every-task-failed`
+                    // (this module's own copy of the same defect fixed in
+                    // `engine-serve::suspend::DiskHeavyJobLookup`).
                     let all_passed = job.passed.unwrap_or(false);
+                    let check_results = job
+                        .check_results
+                        .clone()
+                        .unwrap_or_else(|| serde_json::Value::Array(Vec::new()));
                     return json!({
                         "all_passed": all_passed,
-                        "check_results": [],
+                        "check_results": check_results,
                         "failure_summary": if all_passed {
                             String::new()
                         } else {

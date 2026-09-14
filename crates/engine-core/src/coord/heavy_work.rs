@@ -127,7 +127,41 @@ pub struct HeavyWorkJob {
     pub finished_at: Option<DateTime<Utc>>,
     /// The check run's pass/fail outcome, set only when `state == Done`.
     pub passed: Option<bool>,
+    /// The check-by-check results behind `passed`, set alongside it — only by
+    /// [`HeavyWorkQueue::run_recording`] / [`HeavyWorkQueue::submit_with_id_recording`], which
+    /// know how to extract a [`HeavyWorkJobResult`] from their generic `T`. `None` for a job
+    /// finished through the plain (non-recording) `run`/`submit`/`submit_with_id` — including
+    /// every job record written before this field existed, via `#[serde(default)]` — so a
+    /// consumer reading this back (`DiskHeavyJobLookup::await_outcome` and its sibling in
+    /// `orchestration::execute`, EN.17.J follow-up:
+    /// heavy-work-queue-park-resume-reports-every-task-failed) must still treat `None` as "no
+    /// check feedback available" rather than assuming it is always populated.
+    #[serde(default)]
+    pub check_results: Option<serde_json::Value>,
 }
+
+/// What a heavy-work job's `work` closure reports about its own pass/fail outcome, extracted by
+/// a caller-supplied closure passed to [`HeavyWorkQueue::run_recording`] /
+/// [`HeavyWorkQueue::submit_with_id_recording`] and persisted into the job record
+/// ([`HeavyWorkJob::passed`] / [`HeavyWorkJob::check_results`]) so a queue-park resume can read a
+/// real verdict back out instead of fabricating `false`/`[]`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HeavyWorkJobResult {
+    pub passed: bool,
+    /// Arbitrary JSON — in practice a serialized `Vec<CheckResult>` (`workflows::sdlc_flow::
+    /// task_loop::CheckResult`), but `coord::heavy_work` is generic over the work being queued
+    /// (`test`/`build` classes today, any future class tomorrow) and must not depend on a
+    /// workflow-specific type.
+    pub check_results: serde_json::Value,
+}
+
+/// A caller-supplied extractor turning a completed `work`'s output (`&T`) into a
+/// [`HeavyWorkJobResult`] to persist onto the job record — the shared alias
+/// [`HeavyWorkQueue::submit_with_id_recording`]/[`HeavyWorkQueue::run_recording`] and their
+/// private plumbing pass around, factored out purely to keep `clippy::type_complexity` quiet
+/// (the same three-generic-layer `Option<Arc<dyn Fn(..) -> .. + Send + Sync>>` shape repeated
+/// verbatim across every signature it threads through).
+type HeavyWorkResultExtractor<T> = Arc<dyn Fn(&T) -> HeavyWorkJobResult + Send + Sync>;
 
 /// Everything that can go wrong reading or writing a [`HeavyWorkJob`] through the store.
 #[derive(Debug, thiserror::Error)]
@@ -696,7 +730,50 @@ impl HeavyWorkQueue {
     /// [`Uuid::new_v4`] — this is what lets a caller (e.g. `TestTaskNode`) learn the job's real
     /// on-disk id *before* submitting, so a production [`crate::workflows::queue_park::HeavyJobLookup`]
     /// can later resolve the same job by that same id.
+    ///
+    /// Persists no [`HeavyWorkJobResult`] into the job record — use
+    /// [`Self::submit_with_id_recording`] when a resumed queue-park caller needs the real
+    /// pass/fail verdict and check results read back later rather than a fabricated one.
     pub async fn submit_with_id<F, T>(&self, id: Uuid, spec: HeavyWorkSpec, work: F) -> JobHandle<T>
+    where
+        F: FnOnce() -> T + Send + 'static,
+        T: Send + 'static,
+    {
+        self.submit_with_id_impl(id, spec, work, None).await
+    }
+
+    /// Same as [`Self::submit_with_id`], but `to_result` extracts a [`HeavyWorkJobResult`] from
+    /// the completed `work`'s output and persists it into the job record
+    /// (`HeavyWorkJob::passed`/`check_results`) before the job reaches `Done`/`Abandoned`. This is
+    /// what lets a queue-park resume (`DiskHeavyJobLookup::await_outcome` in `engine-serve` and
+    /// its sibling in `workflows::orchestration::execute`) read the real check outcome back out
+    /// instead of fabricating `all_passed: false, check_results: []` for every parked job
+    /// (EN.17.J follow-up: heavy-work-queue-park-resume-reports-every-task-failed). `to_result` is
+    /// never called on a path that never produces a job record (disabled queue, an unconfigured
+    /// class, or an unwritable lock dir) — those run inline via [`Self::run_inline`], which has no
+    /// job record to persist into.
+    pub async fn submit_with_id_recording<F, T>(
+        &self,
+        id: Uuid,
+        spec: HeavyWorkSpec,
+        work: F,
+        to_result: impl Fn(&T) -> HeavyWorkJobResult + Send + Sync + 'static,
+    ) -> JobHandle<T>
+    where
+        F: FnOnce() -> T + Send + 'static,
+        T: Send + 'static,
+    {
+        self.submit_with_id_impl(id, spec, work, Some(Arc::new(to_result)))
+            .await
+    }
+
+    async fn submit_with_id_impl<F, T>(
+        &self,
+        id: Uuid,
+        spec: HeavyWorkSpec,
+        work: F,
+        to_result: Option<HeavyWorkResultExtractor<T>>,
+    ) -> JobHandle<T>
     where
         F: FnOnce() -> T + Send + 'static,
         T: Send + 'static,
@@ -704,20 +781,39 @@ impl HeavyWorkQueue {
         let (tx, rx) = oneshot::channel();
         let this = self.clone();
         tokio::spawn(async move {
-            let outcome = this.run_to_completion_with_id(id, spec, work).await;
+            let outcome = this
+                .run_to_completion_with_id(id, spec, work, to_result)
+                .await;
             let _ = tx.send(outcome);
         });
         JobHandle { receiver: rx }
     }
 
     /// `submit(..).await.await` — the shape task 5/6 actually call: submit, then wait for the
-    /// outcome.
+    /// outcome. Persists no [`HeavyWorkJobResult`] — see [`Self::run_recording`].
     pub async fn run<F, T>(&self, spec: HeavyWorkSpec, work: F) -> HeavyWorkOutcome<T>
     where
         F: FnOnce() -> T + Send + 'static,
         T: Send + 'static,
     {
         self.submit(spec, work).await.await
+    }
+
+    /// Same as [`Self::run`], but extracts and persists a [`HeavyWorkJobResult`] via `to_result`
+    /// — see [`Self::submit_with_id_recording`].
+    pub async fn run_recording<F, T>(
+        &self,
+        spec: HeavyWorkSpec,
+        work: F,
+        to_result: impl Fn(&T) -> HeavyWorkJobResult + Send + Sync + 'static,
+    ) -> HeavyWorkOutcome<T>
+    where
+        F: FnOnce() -> T + Send + 'static,
+        T: Send + 'static,
+    {
+        self.submit_with_id_recording(Uuid::new_v4(), spec, work, to_result)
+            .await
+            .await
     }
 
     // Kept as a thin, behavior-preserving wrapper over `run_to_completion_with_id` (mirroring
@@ -731,7 +827,7 @@ impl HeavyWorkQueue {
         F: FnOnce() -> T + Send + 'static,
         T: Send + 'static,
     {
-        self.run_to_completion_with_id(Uuid::new_v4(), spec, work)
+        self.run_to_completion_with_id(Uuid::new_v4(), spec, work, None)
             .await
     }
 
@@ -740,6 +836,7 @@ impl HeavyWorkQueue {
         id: Uuid,
         spec: HeavyWorkSpec,
         work: F,
+        to_result: Option<HeavyWorkResultExtractor<T>>,
     ) -> HeavyWorkOutcome<T>
     where
         F: FnOnce() -> T + Send + 'static,
@@ -758,7 +855,7 @@ impl HeavyWorkQueue {
         };
 
         match self.enqueue_with_id(id, &spec) {
-            Ok(job) => self.admit_and_run(job, class_limit, work).await,
+            Ok(job) => self.admit_and_run(job, class_limit, work, to_result).await,
             Err(err) => {
                 tracing::warn!(
                     class = %spec.class,
@@ -824,6 +921,7 @@ impl HeavyWorkQueue {
             heartbeat_at: None,
             finished_at: None,
             passed: None,
+            check_results: None,
         };
         write_job(&self.lock_dir, &job)?;
         Ok(job)
@@ -834,6 +932,7 @@ impl HeavyWorkQueue {
         job: HeavyWorkJob,
         class_limit: ClassLimit,
         work: F,
+        to_result: Option<HeavyWorkResultExtractor<T>>,
     ) -> HeavyWorkOutcome<T>
     where
         F: FnOnce() -> T + Send + 'static,
@@ -850,6 +949,18 @@ impl HeavyWorkQueue {
         let result = tokio::task::spawn_blocking(work).await;
         heartbeat.abort();
 
+        // Extract the job's real outcome BEFORE `result.expect(..)` below consumes it — `Ok`
+        // only, since a panicked/aborted `work` (the `Abandoned` branch) has no output to extract
+        // from. This is the fix for `heavy-work-queue-park-resume-reports-every-task-failed`: a
+        // job record used to reach `Done` with `passed`/`check_results` permanently `None`, which
+        // is what forced `DiskHeavyJobLookup::await_outcome` (in both `engine-serve` and
+        // `workflows::orchestration::execute`) to fabricate `all_passed: false, check_results: []`
+        // for every queue-parked check run, correct or not.
+        let job_result = match (&result, &to_result) {
+            (Ok(output), Some(extract)) => Some(extract(output)),
+            _ => None,
+        };
+
         self.finish_job(
             job_id,
             if result.is_ok() {
@@ -857,6 +968,7 @@ impl HeavyWorkQueue {
             } else {
                 JobState::Abandoned
             },
+            job_result,
         )
         .await;
 
@@ -935,12 +1047,16 @@ impl HeavyWorkQueue {
         })
     }
 
-    async fn finish_job(&self, job_id: Uuid, state: JobState) {
+    async fn finish_job(&self, job_id: Uuid, state: JobState, result: Option<HeavyWorkJobResult>) {
         let path = job_path(&self.lock_dir, job_id);
         let now = (self.clock)();
         if let Ok(mut job) = read_job(&path) {
             job.state = state;
             job.finished_at = Some(now);
+            if let Some(result) = result {
+                job.passed = Some(result.passed);
+                job.check_results = Some(result.check_results);
+            }
             let _ = write_job(&self.lock_dir, &job);
         }
     }
@@ -1042,6 +1158,7 @@ mod tests {
             heartbeat_at: None,
             finished_at: None,
             passed: None,
+            check_results: None,
         }
     }
 
@@ -1062,6 +1179,7 @@ mod tests {
             keys,
             vec![
                 "admitted_at",
+                "check_results",
                 "class",
                 "commands",
                 "cwd",

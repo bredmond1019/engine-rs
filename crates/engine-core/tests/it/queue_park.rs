@@ -1284,25 +1284,50 @@ async fn queue_park_sdlc_task_registry_parks_and_resumes_through_disk_heavy_work
     let test_task_result = final_ctx.nodes.get("TestTaskNode").cloned().expect(
         "TestTaskNode must have stamped a result via the injected DiskHeavyJobLookup outcome",
     );
-    // `DiskHeavyJobLookup::await_outcome` reads `job.passed` off the REAL
-    // on-disk `HeavyWorkJob`, and `HeavyWorkQueue::finish_job` never sets
-    // that field (a known, already-documented limitation of
-    // `DiskHeavyJobLookup` itself -- see its own doc comment in
-    // `orchestration::execute` -- outside this ticket's declared files),
-    // so the injected outcome is always `all_passed: false` regardless of
-    // the admitted check's own real exit code. That IS this fixture's
-    // expected outcome: this test proves the production wiring resolves a
-    // REAL queued job by the REAL id end to end, not that the bridged
-    // pass/fail signal is accurate.
-    assert_eq!(test_task_result["all_passed"], json!(false));
+    // The fixture's own check command is `true` -- a genuinely passing check. Before the fix for
+    // `heavy-work-queue-park-resume-reports-every-task-failed`, `DiskHeavyJobLookup::await_outcome`
+    // read `job.passed` off the REAL on-disk `HeavyWorkJob`, but `HeavyWorkQueue::finish_job`
+    // never set that field (or `check_results`) at all, so this assertion used to read
+    // `all_passed: false` and `check_results: []` regardless of the admitted check's own real
+    // exit code -- the exact defect this test now proves is fixed: the REAL outcome (a genuine
+    // pass, with the real check's own name and verdict) reaches the resumed walk end to end
+    // through the production `HeavyWorkQueue` -> `run_recording` -> `DiskHeavyJobLookup` wiring.
+    assert_eq!(
+        test_task_result["all_passed"],
+        json!(true),
+        "the fixture's `true` check genuinely passes -- the resumed walk must see that, not a \
+         fabricated failure: {test_task_result}"
+    );
+    let check_results = test_task_result["check_results"]
+        .as_array()
+        .expect("check_results must be a real array, not the fabricated empty one");
+    assert_eq!(
+        check_results.len(),
+        1,
+        "the fixture declares exactly one check: {test_task_result}"
+    );
+    assert_eq!(check_results[0]["name"], json!("tests"));
+    assert_eq!(
+        check_results[0]["passed"],
+        json!(true),
+        "the fixture's `true` check result itself must carry a genuine pass: {test_task_result}"
+    );
     let job_id = test_task_result["heavy_work"]["job_id"]
         .as_str()
         .expect("TestTaskNode's queue-park output must carry a job_id string");
     Uuid::parse_str(job_id).expect("job_id must be a real uuid");
 
+    assert_eq!(
+        engine_core::completion::derive_terminal_status(&final_ctx),
+        "succeeded",
+        "a genuinely-passing task must reach a succeeded terminal status, not exhaust its \
+         attempt budget and bail"
+    );
     assert!(
         final_ctx.nodes.contains_key("LeanBookkeepNode"),
-        "a task that never passes must reach the bail tail once its attempt budget is exhausted: {:?}",
+        "LeanBookkeepNode sits on the terminal path for both a pass and a bail \
+         (FinalValidationNode -> LeanBookkeepNode -> CloseBlockNode) -- it must still be reached \
+         on this genuine pass: {:?}",
         final_ctx.nodes.keys().collect::<Vec<_>>()
     );
 }

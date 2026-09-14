@@ -48,8 +48,8 @@ use crate::workflows::{admitted_command_runner, CommandSpec, SpecCommandRunner};
 use super::close_block::DEFAULT_REPO_SLUG;
 use super::policy::TestDepth;
 use super::task_loop::{
-    resolve_harness_path, resolved_policy, select_task_checks, spec_dir_for_baseline,
-    worktree_path, CheckResult, TestTaskNode,
+    check_run_heavy_work_result, resolve_harness_path, resolved_policy, select_task_checks,
+    spec_dir_for_baseline, worktree_path, CheckResult, TestTaskNode,
 };
 use super::{put_result, CommandRunner};
 
@@ -272,9 +272,13 @@ impl FinalValidationNode {
 
             let outcome = self
                 .heavy_work
-                .run(heavy_work_spec, move || {
-                    job_node.run_checks(&checks_for_job, &worktree_for_job, &spec_dir_for_job)
-                })
+                .run_recording(
+                    heavy_work_spec,
+                    move || {
+                        job_node.run_checks(&checks_for_job, &worktree_for_job, &spec_dir_for_job)
+                    },
+                    check_run_heavy_work_result,
+                )
                 .await;
 
             let heavy_work_json = json!({

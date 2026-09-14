@@ -503,3 +503,221 @@ async fn heavy_work_unwritable_lock_dir_degrades_open() {
     }
     std::fs::set_permissions(&lock_dir, restore).expect("restore permissions");
 }
+
+// -------------------------------------------------------------------------------------------
+// `run_recording` / `submit_with_id_recording` — the fix for
+// `heavy-work-queue-park-resume-reports-every-task-failed`: the job record must actually carry
+// the work's real pass/fail verdict and check results, not a permanently-`None` `passed` and no
+// `check_results` field at all.
+// -------------------------------------------------------------------------------------------
+
+use engine_core::coord::heavy_work::HeavyWorkJobResult;
+
+/// A `to_result` extractor mirroring `workflows::sdlc_flow::task_loop::check_run_heavy_work_result`'s
+/// shape (a `(passed, check_results_json)` pair) without pulling in that module's
+/// workflow-specific `CheckResult` type — this test only needs the same generic contract
+/// `coord::heavy_work` itself is written against.
+fn to_job_result(output: &(bool, serde_json::Value)) -> HeavyWorkJobResult {
+    HeavyWorkJobResult {
+        passed: output.0,
+        check_results: output.1.clone(),
+    }
+}
+
+/// OBSERVED RED (pre-fix): `run`/`submit_with_id` never touched a job's `passed`/`check_results`
+/// fields at all — `finish_job` only ever stamped `state`/`finished_at`. This is the direct
+/// unit-level manifestation of `heavy-work-queue-park-resume-reports-every-task-failed`: with no
+/// persisted outcome, `DiskHeavyJobLookup::await_outcome` (`engine-serve::suspend` and
+/// `workflows::orchestration::execute`) had nothing to read but `None`, and fabricated
+/// `all_passed: false, check_results: []` for every queue-parked job -- including ones whose
+/// checks genuinely passed. `run_recording` is the fix: it persists the real outcome via a
+/// caller-supplied extractor.
+#[tokio::test]
+async fn run_recording_persists_the_real_passed_and_check_results_onto_the_job_record() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let config = config_with_class("test", 1, 0);
+    let queue =
+        HeavyWorkQueue::new(dir.path().to_path_buf(), config).with_probe(Arc::new(AlwaysFreeProbe));
+
+    let real_checks = serde_json::json!([
+        {"name": "cargo-test", "passed": true},
+        {"name": "cargo-clippy", "passed": true},
+    ]);
+    let checks_for_work = real_checks.clone();
+    let outcome = queue
+        .run_recording(
+            spec(dir.path(), "test"),
+            move || (true, checks_for_work),
+            to_job_result,
+        )
+        .await;
+
+    let job_id = outcome
+        .job_id
+        .expect("an enabled, configured class must produce a job id");
+    let job = read_job(&job_path(dir.path(), job_id)).expect("job record must exist");
+
+    assert_eq!(job.state, JobState::Done);
+    assert_eq!(
+        job.passed,
+        Some(true),
+        "a genuinely-passing job must persist passed: Some(true), not None"
+    );
+    assert_eq!(
+        job.check_results,
+        Some(real_checks),
+        "the real check results must be persisted, not left as None/fabricated []"
+    );
+}
+
+/// The failure-path sibling of the test above: a genuinely-failing job's real failure detail
+/// must also survive onto the job record — the resume/triage path needs check-level feedback on
+/// failure at least as much as it needs a true verdict on success (a bare `all_passed: false`
+/// with no `check_results` is exactly the "failure it cannot explain" the carryover describes).
+#[tokio::test]
+async fn run_recording_persists_real_check_results_on_a_genuine_failure_too() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let config = config_with_class("test", 1, 0);
+    let queue =
+        HeavyWorkQueue::new(dir.path().to_path_buf(), config).with_probe(Arc::new(AlwaysFreeProbe));
+
+    let real_checks = serde_json::json!([
+        {"name": "cargo-test", "passed": false, "message": "assertion failed: left == right"},
+    ]);
+    let checks_for_work = real_checks.clone();
+    let outcome = queue
+        .run_recording(
+            spec(dir.path(), "test"),
+            move || (false, checks_for_work),
+            to_job_result,
+        )
+        .await;
+
+    let job_id = outcome
+        .job_id
+        .expect("an enabled, configured class must produce a job id");
+    let job = read_job(&job_path(dir.path(), job_id)).expect("job record must exist");
+
+    assert_eq!(job.state, JobState::Done);
+    assert_eq!(job.passed, Some(false));
+    assert_eq!(
+        job.check_results,
+        Some(real_checks),
+        "a genuine failure's real check detail must be persisted, not just a bare false"
+    );
+}
+
+/// `submit_with_id_recording` — the suspend/resume path's own entry point (`TestTaskNode`'s
+/// `QueuePark` branch uses this, not `run_recording`, since it must not await the job inline) —
+/// persists the same outcome as `run_recording` once the background job finishes.
+#[tokio::test]
+async fn submit_with_id_recording_persists_the_outcome_once_the_background_job_finishes() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let config = config_with_class("test", 1, 0);
+    let queue =
+        HeavyWorkQueue::new(dir.path().to_path_buf(), config).with_probe(Arc::new(AlwaysFreeProbe));
+
+    let job_id = uuid::Uuid::new_v4();
+    let real_checks = serde_json::json!([{"name": "cargo-build", "passed": true}]);
+    let checks_for_work = real_checks.clone();
+    let handle = queue
+        .submit_with_id_recording(
+            job_id,
+            spec(dir.path(), "test"),
+            move || (true, checks_for_work),
+            to_job_result,
+        )
+        .await;
+
+    // Await the handle so the test doesn't race the background job's own write.
+    let outcome = handle.await;
+    assert_eq!(outcome.job_id, Some(job_id));
+
+    let job = read_job(&job_path(dir.path(), job_id)).expect("job record must exist");
+    assert_eq!(job.passed, Some(true));
+    assert_eq!(job.check_results, Some(real_checks));
+}
+
+// -------------------------------------------------------------------------------------------
+// End-to-end: `DiskHeavyJobLookup` (the queue-park resume's production seam,
+// `workflows::orchestration::execute`) reads the REAL outcome back out of a
+// `run_recording`/`submit_with_id_recording`-finished job, rather than fabricating
+// `all_passed: false, check_results: []` for every job regardless of what actually happened.
+// This is the positive control the carryover note asks for: "confirm a queue_park run actually
+// passes a correct task" (and, symmetrically, surfaces real feedback on a failing one).
+// -------------------------------------------------------------------------------------------
+
+use engine_core::workflows::orchestration::execute::DiskHeavyJobLookup;
+use engine_core::workflows::queue_park::HeavyJobLookup;
+
+#[tokio::test]
+async fn disk_heavy_job_lookup_reports_the_real_outcome_for_a_genuinely_passing_job() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let config = config_with_class("test", 1, 0);
+    let queue =
+        HeavyWorkQueue::new(dir.path().to_path_buf(), config).with_probe(Arc::new(AlwaysFreeProbe));
+
+    let job_id = uuid::Uuid::new_v4();
+    let real_checks = serde_json::json!([
+        {"name": "cargo-nextest", "passed": true},
+        {"name": "cargo-fmt", "passed": true},
+    ]);
+    let checks_for_work = real_checks.clone();
+    // Submitted but not awaited here -- `DiskHeavyJobLookup::await_outcome` below is what a
+    // production queue-park resume actually polls with, so this test drives the SAME seam
+    // `queue_park::drive` uses rather than awaiting the `JobHandle` directly.
+    let _handle = queue
+        .submit_with_id_recording(
+            job_id,
+            spec(dir.path(), "test"),
+            move || (true, checks_for_work),
+            to_job_result,
+        )
+        .await;
+
+    let lookup = DiskHeavyJobLookup::new(dir.path().to_path_buf());
+    let outcome_json = lookup.await_outcome(job_id).await;
+
+    assert_eq!(
+        outcome_json["all_passed"],
+        serde_json::json!(true),
+        "a genuinely-passing task's queue-park resume must report all_passed: true -- \
+         BEFORE this fix, every queue-parked job reported false regardless of the real outcome"
+    );
+    assert_eq!(
+        outcome_json["check_results"], real_checks,
+        "the resumed walk must see the REAL check results, not a fabricated empty array"
+    );
+}
+
+#[tokio::test]
+async fn disk_heavy_job_lookup_surfaces_real_failure_detail_for_a_genuinely_failing_job() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let config = config_with_class("test", 1, 0);
+    let queue =
+        HeavyWorkQueue::new(dir.path().to_path_buf(), config).with_probe(Arc::new(AlwaysFreeProbe));
+
+    let job_id = uuid::Uuid::new_v4();
+    let real_checks = serde_json::json!([
+        {"name": "cargo-nextest", "passed": false, "message": "3 tests failed"},
+    ]);
+    let checks_for_work = real_checks.clone();
+    let _handle = queue
+        .submit_with_id_recording(
+            job_id,
+            spec(dir.path(), "test"),
+            move || (false, checks_for_work),
+            to_job_result,
+        )
+        .await;
+
+    let lookup = DiskHeavyJobLookup::new(dir.path().to_path_buf());
+    let outcome_json = lookup.await_outcome(job_id).await;
+
+    assert_eq!(outcome_json["all_passed"], serde_json::json!(false));
+    assert_eq!(
+        outcome_json["check_results"], real_checks,
+        "a failing job's real check detail (not just a bare false) must reach the resumed walk \
+         so triage/retry has something to act on"
+    );
+}

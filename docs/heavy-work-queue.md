@@ -50,8 +50,13 @@ pub struct HeavyWorkJob {
     pub heartbeat_at: Option<DateTime<Utc>>,
     pub finished_at: Option<DateTime<Utc>>,
     pub passed: Option<bool>,
+    pub check_results: Option<serde_json::Value>,
 }
 ```
+
+`passed`/`check_results` are set together, only by [`HeavyWorkQueue::run_recording`] /
+[`HeavyWorkQueue::submit_with_id_recording`] — the plain (non-recording) `run`/`submit`/
+`submit_with_id` still leave both `None` (see "Fixed defect" below).
 
 Each job is one JSON file at `<lock_dir>/heavy-work/jobs/<job_id>.json` (`lock_dir` comes from the
 existing `coord::resolve_lock_dir`), written temp-file-plus-rename so a reader never observes a
@@ -216,21 +221,42 @@ An admitted job's own subprocess calls run through
 command's env alongside whatever the caller already set. A stub runner injected with
 `TestTaskNode::with_runner` continues to be used unchanged — the seam wraps, it does not replace.
 
-### Known defect: a queue-parked check always resumes as failed
+### Fixed defect: a queue-parked check used to always resume as failed
 
-**Measured 2026-09-14, unfixed.** With `test_dispatch: queue_park` and the `test` class configured
-(HQ's `brain.toml` configures it), every `SDLC_FLOW` task fails — including a task whose work was
-verifiably correct — and the retry prompt carries no check output.
+**Measured 2026-09-14, fixed 2026-09-14** (carryover
+`heavy-work-queue-park-resume-reports-every-task-failed`). With `test_dispatch: queue_park` and the
+`test` class configured (HQ's `brain.toml` configures it), every `SDLC_FLOW`/`SDLC_TASK` task used
+to fail — including a task whose work was verifiably correct — and the retry prompt carried no
+check output.
 
-- The job record under `<brain>/heavy-work/jobs/<id>.json` finishes `state: done` with `passed: null`.
-  `HeavyWorkQueue` is generic over the work's output type and never persists a pass/fail or the
-  `CheckResult` list.
-- `engine-serve`'s `DiskHeavyJobLookup::await_outcome` (`crates/engine-serve/src/suspend.rs`) resumes
-  `TestTaskNode` with `all_passed = job.passed.unwrap_or(false)` and `check_results: []`.
-- **Workaround:** run with `test_dispatch: inline`. The [local-model bench](local-model-bench.md) does.
-- Tracked as carryover `heavy-work-queue-park-resume-reports-every-task-failed`. The fix must persist
-  the outcome and check results in the job record, and read them in both lookups (engine-serve's and
-  `orchestration::execute`'s private copy).
+- **Root cause:** the job record under `<brain>/heavy-work/jobs/<id>.json` finished `state: done`
+  with `passed: null` and no check-results field at all. `HeavyWorkQueue` is generic over the
+  work's output type (`T`) and `finish_job` only ever stamped `state`/`finished_at` — it never had
+  a way to extract a pass/fail verdict or the `CheckResult` list out of a generic `T`.
+- Both `DiskHeavyJobLookup::await_outcome` implementations — `engine-serve`'s
+  (`crates/engine-serve/src/suspend.rs`) and `workflows::orchestration::execute`'s own private
+  copy — read `job.passed.unwrap_or(false)` and fabricated `check_results: []`, so a resumed walk
+  always saw a failure it could not explain.
+- **The fix:** `HeavyWorkJob` gained a `check_results: Option<serde_json::Value>` field alongside
+  `passed`. Two new `HeavyWorkQueue` methods, `run_recording` and `submit_with_id_recording`, take
+  a caller-supplied `to_result: impl Fn(&T) -> HeavyWorkJobResult` extractor and persist the real
+  `{ passed, check_results }` onto the job record once `work` completes. `TestTaskNode::process`
+  (`workflows::sdlc_flow::task_loop`) and `FinalValidationNode::process` (`final_validation.rs`)
+  now call the `_recording` variants with a shared extractor,
+  `task_loop::check_run_heavy_work_result`, that turns their `(Vec<CheckResult>, Vec<String>)`
+  check-run output into a `HeavyWorkJobResult`. Both `DiskHeavyJobLookup::await_outcome`
+  implementations now read `job.check_results` back, falling back to `[]` only for a job that never
+  went through a `_recording` call (e.g. a job record written before this field existed). The plain
+  (non-recording) `run`/`submit`/`submit_with_id` are unchanged and still leave `passed`/
+  `check_results` as `None` — they remain the right choice for a caller with no pass/fail concept
+  of its own.
+- Verified end to end: `crates/engine-core/tests/it/heavy_work.rs`'s `disk_heavy_job_lookup_*`
+  tests drive `DiskHeavyJobLookup` directly over a `run_recording`/`submit_with_id_recording`-
+  finished job (both a genuine pass and a genuine failure), and
+  `crates/engine-core/tests/it/queue_park.rs`'s
+  `queue_park_sdlc_task_registry_parks_and_resumes_through_disk_heavy_work_queue` drives a real
+  `SDLC_TASK` registry through `queue_park::drive` with a real `DiskHeavyJobLookup` and asserts the
+  resumed walk sees `all_passed: true` for its genuinely-passing `true` check.
 
 ## The `FLEET_BUILD_PREADMITTED` hand-off
 

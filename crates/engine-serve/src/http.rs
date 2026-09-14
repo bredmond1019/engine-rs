@@ -4914,6 +4914,7 @@ mod tests {
                 heartbeat_at: None,
                 finished_at: None,
                 passed: None,
+                check_results: None,
             }
         }
 

@@ -915,6 +915,7 @@ mod tests {
                 heartbeat_at: None,
                 finished_at: None,
                 passed: None,
+                check_results: None,
             },
         )
         .expect("write_job should succeed under a tempdir");
