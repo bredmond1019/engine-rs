@@ -57,22 +57,16 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Arc;
 
 use claude_code_rs::Config;
 
 use crate::cancellation::CancellationToken;
 use crate::coord::heavy_work::{HeavyWorkConfig, HeavyWorkQueue};
 use crate::node::NodeRegistry;
-use crate::nodes::aider_meta_transport_live;
-use crate::nodes::openai_compat_transport::openai_compat_meta_transport_live;
-use crate::nodes::pi_meta_transport_live;
 use crate::policy::AgentBackend;
 use crate::schema::{NodeConfig, WorkflowSchema};
 use crate::workflow::Workflow;
-use crate::workflows::llm_node::{
-    Cancellable as LlmCancellable, TransportSlotted as LlmTransportSlotted,
-};
+use crate::workflows::llm_node::{resolve_meta_transport, wire};
 
 use super::close_block::CloseBlockNode;
 use super::docs::PatchDocsNode;
@@ -88,7 +82,6 @@ use super::task_loop::{
     UpdateTaskStatusNode,
 };
 use super::wrap_up::WrapUpNode;
-use super::ModelTransport;
 
 /// The `SDLC_FLOW` workflow's declared identity/type name, used both to
 /// register the workflow (engine-serve, Task 5) and as `WorkflowSchema::workflow_type`.
@@ -377,29 +370,21 @@ pub fn agentic_write_config(model: &str) -> Config {
     }
 }
 
-/// The real `claude_code_rs::execute` transport — the cloud fallback a
-/// `local`-tier judgment stage's `openai_compat_transport` routes to when
-/// its local endpoint is unavailable. `AgentCodeStep` deliberately keeps
-/// its own equivalent default private (D4 owns that seam); this is the same
-/// one-line delegation, just visible to this module so `registry_for_policy`
-/// can hand it to `openai_compat_transport_live` as the fallback.
-fn real_cloud_transport() -> ModelTransport {
-    Arc::new(|config, prompt| {
-        Box::pin(async move { claude_code_rs::execute(&config, &prompt).await })
-    })
-}
-
 /// Build a `NodeRegistry` like [`registry`], but with every non-agentic
 /// model stage — `TriageTaskNode`'s `llm_triage` model branch,
 /// `ConsolidatedReviewNode`/`EndReviewNode`, `PatchDocsNode`, and
-/// `GenerateTasksNode` — wired to route through
-/// [`openai_compat_meta_transport_live`] whenever `policy`'s resolved tier
-/// for that stage is [`ModelTier::Local`]. **Never** rewires
-/// `ImplementTaskNode` via this path: the local tier there is scoped to the
-/// `Pi`/`Aider` agent backends below, not a bare local-model swap (spec
-/// Context Pointers, `planning/local-llm-tier-investigation/notes.md`). Any
-/// stage whose tier is not `Local` keeps [`registry`]'s default
-/// (real-`claude`-CLI) transport untouched.
+/// `GenerateTasksNode` — wired through [`resolve_meta_transport`] (via
+/// [`wire`]), which routes through the OpenAI-compatible local transport
+/// whenever `policy`'s resolved tier for that stage is [`ModelTier::Local`].
+/// **Never** rewires `ImplementTaskNode` via a stage tier: the local tier
+/// there is scoped to the `Pi`/`Aider` agent backends only, not a bare
+/// local-model swap (spec Context Pointers,
+/// `planning/local-llm-tier-investigation/notes.md`) — see that stage's own
+/// call site below for how this is enforced. Any stage whose tier is not
+/// `Local` keeps [`registry`]'s default (real-`claude`-CLI) transport
+/// untouched; `wire`/`resolve_meta_transport` returning `None` is a true
+/// no-op, so every stage below is registered unconditionally rather than
+/// gated behind an `if tier == Local` check.
 ///
 /// Any local-endpoint failure at call time falls back to the real `claude`
 /// CLI transport for that call — `openai_compat_transport`'s own fail-fast
@@ -471,84 +456,77 @@ pub fn registry_for_policy_with_cancellation(
 ) -> NodeRegistry {
     let mut registry = registry_with_agent(agent);
 
-    let triage_local = policy.model_tiers.triage == ModelTier::Local;
-    if triage_local || token.is_some() {
-        let mut node = TriageTaskNode::new();
-        if triage_local {
-            node = node.with_meta_transport(openai_compat_meta_transport_live(
-                policy.local.clone(),
-                real_cloud_transport(),
-            ));
-        }
-        if let Some(t) = token.clone() {
-            node = node.with_cancellation_token(t);
-        }
-        registry.register(Box::new(node));
-    }
-
-    let review_local = policy.model_tiers.review == ModelTier::Local;
-    if review_local || token.is_some() {
-        let mut node = ConsolidatedReviewNode::new();
-        if review_local {
-            node = node.with_meta_transport(openai_compat_meta_transport_live(
-                policy.local.clone(),
-                real_cloud_transport(),
-            ));
-        }
-        if let Some(t) = token.clone() {
-            node = node.with_cancellation_token(t);
-        }
-        registry.register(Box::new(node));
-    }
+    registry.register(Box::new(wire(
+        TriageTaskNode::new(),
+        resolve_meta_transport(
+            policy.model_tiers.triage,
+            AgentBackend::ClaudeCli,
+            &policy.local,
+            &policy.pi,
+        ),
+        token.clone(),
+    )));
 
     // `review_mode: end_only` reviews through `EndReviewNode`, which must
-    // honour the local tier exactly as `ConsolidatedReviewNode` does — left on
-    // the base registry it sent the local model name to the claude CLI and
-    // failed with HTTP 404 (measured 2026-09-14).
-    if review_local {
-        registry.register(Box::new(EndReviewNode::new().with_meta_transport(
-            openai_compat_meta_transport_live(policy.local.clone(), real_cloud_transport()),
-        )));
-    }
+    // honour the same tier `ConsolidatedReviewNode` does — left unwired it
+    // sent the local model name to the claude CLI and failed with HTTP 404
+    // (measured 2026-09-14).
+    let review_transport = resolve_meta_transport(
+        policy.model_tiers.review,
+        AgentBackend::ClaudeCli,
+        &policy.local,
+        &policy.pi,
+    );
+    registry.register(Box::new(wire(
+        ConsolidatedReviewNode::new(),
+        review_transport.clone(),
+        token.clone(),
+    )));
+    registry.register(Box::new(wire(
+        EndReviewNode::new(),
+        review_transport,
+        token.clone(),
+    )));
 
-    let docs_local = policy.model_tiers.docs == ModelTier::Local;
-    if docs_local {
-        let node = PatchDocsNode::new()
-            .with_config(agentic_write_config("claude-sonnet-4-5"))
-            .with_meta_transport(openai_compat_meta_transport_live(
-                policy.local.clone(),
-                real_cloud_transport(),
-            ));
-        registry.register(Box::new(node));
-    }
+    registry.register(Box::new(wire(
+        PatchDocsNode::new().with_config(agentic_write_config("claude-sonnet-4-5")),
+        resolve_meta_transport(
+            policy.model_tiers.docs,
+            AgentBackend::ClaudeCli,
+            &policy.local,
+            &policy.pi,
+        ),
+        token.clone(),
+    )));
 
-    let generate_local = policy.model_tiers.generate == ModelTier::Local;
-    if generate_local {
-        let node = GenerateTasksNode::new().with_meta_transport(openai_compat_meta_transport_live(
-            policy.local.clone(),
-            real_cloud_transport(),
-        ));
-        registry.register(Box::new(node));
-    }
+    registry.register(Box::new(wire(
+        GenerateTasksNode::new(),
+        resolve_meta_transport(
+            policy.model_tiers.generate,
+            AgentBackend::ClaudeCli,
+            &policy.local,
+            &policy.pi,
+        ),
+        token.clone(),
+    )));
 
-    let pi_backend = policy.agent_backend == AgentBackend::Pi;
-    let aider_backend = policy.agent_backend == AgentBackend::Aider;
-    if pi_backend || aider_backend || token.is_some() {
-        let mut node =
-            ImplementTaskNode::new().with_config(agentic_write_config("claude-sonnet-4-5"));
-        if pi_backend {
-            node = node.with_meta_transport(pi_meta_transport_live(
-                policy.local.clone(),
-                policy.pi.clone(),
-            ));
-        } else if aider_backend {
-            node = node.with_meta_transport(aider_meta_transport_live(policy.local.clone()));
-        }
-        if let Some(t) = token {
-            node = node.with_cancellation_token(t);
-        }
-        registry.register(Box::new(node));
-    }
+    // `ImplementTaskNode` never consults its own stage's
+    // `model_tiers.implement` tier — only the `Pi`/`Aider` agent backends
+    // route it local, regardless of tier (spec Context Pointers,
+    // `planning/local-llm-tier-investigation/notes.md`). Passing a fixed
+    // non-`Local` tier here means `resolve_meta_transport`'s `ClaudeCli` arm
+    // can never fire for this stage — reproducing every pre-consolidation
+    // call site exactly, which never checked `model_tiers.implement` either.
+    registry.register(Box::new(wire(
+        ImplementTaskNode::new().with_config(agentic_write_config("claude-sonnet-4-5")),
+        resolve_meta_transport(
+            ModelTier::Sonnet,
+            policy.agent_backend,
+            &policy.local,
+            &policy.pi,
+        ),
+        token,
+    )));
 
     registry
 }
