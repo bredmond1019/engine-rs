@@ -39,6 +39,7 @@ pub mod linkedin_post;
 pub mod llm_node;
 pub mod opportunity_edit;
 pub mod orchestration;
+pub mod plan_authoring;
 pub mod proposal_generator;
 pub mod queue_park;
 pub mod recall;
