@@ -5,7 +5,7 @@ description: Chronological log of work completed for engine-rs.
 doc_id: log
 layer: [factory]
 status: active
-timestamp: "2026-09-14T08:11:43Z"
+timestamp: "2026-09-15T00:42:55Z"
 keywords: [work log, session history, development log]
 related: [status, context]
 ---
@@ -15,6 +15,47 @@ related: [status, context]
 *Append-only working log. One dated entry per session. Newest entries at the top.*
 
 ## [2026-09-14]
+
+### llm_node trait consolidation across sdlc_flow/sdlc_task/orchestration; local-only ORCHESTRATION hardening
+- **What:**
+  - New `crates/engine-core/src/workflows/llm_node.rs` — `TransportSlotted`/`Cancellable` traits +
+    `resolve_meta_transport`/`wire`, the one shared mechanism every LLM-calling node/seam must now
+    use (`AGENTS.md` standing rule 11, new). Migrated `sdlc_task`, `sdlc_flow`, and `orchestration`'s
+    `JudgmentNode<T>` (backing `InboxTriageRunner`/`PreflightRunner`) onto it, collapsing 16+
+    hand-duplicated field/builder pairs and 13+ hand-written graph-side conditionals.
+  - Wired real local-model routing into `engine-serve/workflows.rs` for preflight/inbox-triage
+    (`OrchestrationPolicy` gained `local`/`pi` config it never had).
+  - Fixed the D57 ledger composer (`journal.rs::compose_ledger_entries_via_agent`) — was a plain
+    function with zero transport override, making one real cloud call on every passing
+    `ORCHESTRATION` step. Now local-capable via `orchestration.policy.ledger_composer_model_tier`,
+    with a documented caveat: only resolves 2 of the usual 4 policy layers (no per-run override).
+  - Fixed `orchestration-merge-step-pushes-main-directly`: `OrchestrationPolicy` gained
+    `default_auto_merge`/`default_auto_push` (new `default_auto_push:false` — deliberate rule-6
+    exception), gating `merge_step_branch`'s local merge and remote push independently. Found and
+    documented a real trade-off via an actual failing test: with `auto_push:false`, a multi-block
+    chain's later blocks won't see earlier blocks' work unless the run opts into `auto_push:true` or
+    `default_use_worktree:false`.
+  - Set the pre-existing `default_auto_pr` knob to `false` in this repo's `planning/harness.json` and
+    the sandbox's — an orchestration-mode run got a real local model all the way through a full
+    `SDLC_TASK` chain, only failing at the final `PullRequestNode` on missing `gh auth login`.
+  - `scripts/bench_local_models.py` gained `--parallel N` (direct-dispatch only) and
+    `--dispatch orchestration` (sandbox-only, hard-guarded against ever targeting the real fleet) +
+    auto-launched `system_monitor.py`.
+  - Merge-train for same-repo concurrent dispatch scoped as a design note in
+    `docs/workflows/orchestration.md` — judged genuinely new infrastructure, not built.
+  - Consolidated three capture notes under `planning/pre-plan/orchestration-improvements/` (added a
+    third, `end-of-chain-concurrency-cleanup`, covering the `Arc<OrchestrationRunDefaults>` design
+    and the safe/unsafe same-repo-parallel scenario table).
+  - Authored + synced the `create-llm-node` skill (base-template → global install).
+  - Sandbox refreshed to this session's `HEAD`; full gate stayed green throughout (4509/4510, one
+    pre-existing unrelated failure).
+- **Why:** the operator wants `ORCHESTRATION` runnable with certainty of zero real Claude calls, so
+  the local-model bench can exercise the real orchestration system rather than only direct
+  `SDLC_FLOW` dispatch — and wants the transport-selection pattern consolidated so a new LLM call
+  site can't silently ship without local routing again, the way the ledger composer did.
+- **Refs:** `planning/pre-plan/orchestration-improvements/{transport-slot-consolidation,
+  orchestration-harness-only-policy-gap, end-of-chain-concurrency-cleanup}/notes.md`,
+  `planning/handoff.md`
 
 ### Local-model bench: seven engine/harness defects behind "every model fails", fixed; clean smoke
 - **What:**
