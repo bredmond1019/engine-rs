@@ -5,7 +5,7 @@ description: Chronological log of work completed for engine-rs.
 doc_id: log
 layer: [factory]
 status: active
-timestamp: "2026-09-15T00:42:55Z"
+timestamp: "2026-09-15T01:20:00Z"
 keywords: [work log, session history, development log]
 related: [status, context]
 ---
@@ -15,6 +15,32 @@ related: [status, context]
 *Append-only working log. One dated entry per session. Newest entries at the top.*
 
 ## [2026-09-14]
+
+### Fleet-wide push, ledger-composer key-mismatch bug fixed, handoff reprioritized for tonight's overnight sweep
+- **What:**
+  - Pushed the entire fleet (17 repos) to `origin/main` one at a time, plain `git push`, no
+    build/test step, in dependency order — 10 repos had real commits (`engine-rs`, `bastion`,
+    `bastion-ui`, `bastion-web`, `brazilianportugui`, `feli`, `jardins-fitness`, `jynx`, `learn-ai`,
+    `price-scout`, `synapse`), 7 already in sync. `engine-rs` moved `8318e32..51362cc`, finally
+    landing the long-pending `8080736` revert of the old bench-junk merge.
+  - Found a real bug verifying tonight's sandbox sweep would be genuinely zero-cloud: the D57 ledger
+    composer's local-routing config key is `ledger_composer_model_tier`, but every place this
+    session had set or tested it earlier used the wrong, pre-existing `composer_model_tier` key (a
+    name collision with an older, unrelated knob) — silently ignored by serde, falling through to
+    the built-in cloud default. Fixed for real in the sandbox's own `planning/harness.json`.
+    Confirmed the `#[ignore]`'d unit test for this has the same wrong-key bug in its own fixture,
+    and its assertion can't actually distinguish a real Ollama response from a real Claude one that
+    also failed to parse — flagged as carryover, not fixed tonight.
+  - Re-verified the sandbox after refresh: `--dry-run` now shows 130 jobs planned across all 5
+    tiers with 0 preflight failures (the `edit`/`medium`/`hard` tiers had failed earlier tonight
+    because their checker scripts lived only in unpushed local commits).
+  - Rewrote `planning/handoff.md` to lead with tonight's actual priority — the overnight sandbox
+    model sweep (`docs/overnight-sandbox-sweep-quickstart.md`) — with tomorrow morning's
+    orchestration-verification pass second.
+- **Why:** the operator wants to hand tonight's full local-model sweep to a fresh (Gemini Flash)
+  agent right now, cold, off the handoff alone — that required the sandbox to actually be pushable
+  end to end (all 5 tiers, not 2) and genuinely zero-cloud (not just configured-and-unverified).
+- **Refs:** `planning/handoff.md`, `planning/pre-plan/orchestration-improvements/`
 
 ### llm_node trait consolidation across sdlc_flow/sdlc_task/orchestration; local-only ORCHESTRATION hardening
 - **What:**
