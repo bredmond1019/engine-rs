@@ -2789,18 +2789,21 @@ async fn permission_gate_refusal_under_stop_chain_authors_edge_and_stops_chain()
     .expect_err("locked profile must deny InstallOnMini and stop chain");
 
     match err {
-        IntegrateError::PermissionGate(PermissionGateError::Denied {
-            repo,
-            block_id,
-            action,
-            edge,
-            ..
-        }) => {
-            assert_eq!(repo, "repo-a");
-            assert_eq!(block_id, "A.1");
-            assert_eq!(action, GatedAction::InstallOnMini);
-            assert_eq!(edge.slug, "permission-install_on_mini");
-        }
+        IntegrateError::PermissionGate(boxed) => match *boxed {
+            PermissionGateError::Denied {
+                repo,
+                block_id,
+                action,
+                edge,
+                ..
+            } => {
+                assert_eq!(repo, "repo-a");
+                assert_eq!(block_id, "A.1");
+                assert_eq!(action, GatedAction::InstallOnMini);
+                assert_eq!(edge.slug, "permission-install_on_mini");
+            }
+            other => panic!("expected PermissionGateError::Denied, got {other:?}"),
+        },
         other => panic!("expected IntegrateError::PermissionGate, got {other:?}"),
     }
 
