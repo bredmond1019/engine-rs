@@ -360,7 +360,7 @@ impl Node for TranslateGateNode {
                 NodeError::new(format!(
                 "{TRANSLATE_NODE_NAME}: failed to parse a translation from the model's reply: {err}"
             ))
-            .with_sessions(sessions_since(&ctx, baseline))
+                .with_sessions(sessions_since(&ctx, baseline))
             })?;
 
         put_result(

@@ -319,7 +319,7 @@ pub fn openai_compat_meta_transport(
                         tier: "local".to_string(),
                         model: local.model.clone(),
                         endpoint: Some(local.endpoint.clone()),
-                        backend: "claude_cli".to_string(),
+                        backend: "openai_compat".to_string(),
                         cost_known: true,
                         extra: BTreeMap::new(),
                     };

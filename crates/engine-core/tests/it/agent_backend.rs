@@ -27,6 +27,7 @@ use claude_code_rs::{Config, Outcome};
 use engine_contract::TaskContext;
 use engine_core::nodes::{
     aider_meta_transport, pi_meta_transport, translate_agent_outcome, AgentOutcome, CostEstimate,
+    AIDER_FILES_ENV,
 };
 use engine_core::policy::telemetry::{harvest as harvest_telemetry, RunTelemetryInputs};
 use engine_core::policy::{AgentBackend, LocalConfig, PiConfig, Policy, RESOLVED_POLICY_IDENTITY};
@@ -1051,6 +1052,66 @@ printf 'Applied edit to hello.txt\n'
         "child must have run with the configured worktree cwd: {} not found in {}",
         expected_cwd.display(),
         outcome.text
+    );
+}
+
+/// `AiderTransport` passes `--no-gitignore` and `--aiderignore` with an isolated ignore file
+/// unignoring only declared files, preventing `aider-mention-reflection-discards-pending-edit`.
+#[cfg(unix)]
+#[tokio::test]
+async fn agent_backend_aider_passes_aiderignore_and_no_gitignore() {
+    let _guard = AIDER_BINARY_ENV_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let (_dir, script) = write_fake_aider_binary(
+        r#"prev=""
+for a in "$@"; do
+    if [ "$prev" = "--aiderignore" ]; then
+        printf 'ignore_path:%s\n' "$a"
+        printf 'ignore_body:\n%s\n' "$(cat "$a")"
+    fi
+    prev="$a"
+    printf 'arg:%s\n' "$a"
+done
+printf 'Applied edit to foo.rs\n'
+"#,
+    );
+    unsafe {
+        std::env::set_var("AIDER_BINARY", &script);
+    }
+
+    let config = Config {
+        env: vec![(
+            AIDER_FILES_ENV.to_string(),
+            "foo.rs\nbar/baz.rs\n".to_string(),
+        )],
+        ..Config::default()
+    };
+
+    let transport = aider_meta_transport(local_config(), None);
+    let result = transport(config, "prompt".to_string()).await;
+
+    unsafe {
+        std::env::remove_var("AIDER_BINARY");
+    }
+
+    let (outcome, _info) = result.expect("fake aider script run must succeed");
+    let text = outcome.text;
+    assert!(text.contains("arg:--no-gitignore"), "{text}");
+    assert!(text.contains("arg:--aiderignore"), "{text}");
+    assert!(
+        text.contains("ignore_body:\n*\n!foo.rs\n!bar/baz.rs"),
+        "{text}"
+    );
+
+    let path_line = text
+        .lines()
+        .find(|l| l.starts_with("ignore_path:"))
+        .expect("must report ignore file path");
+    let ignore_path = path_line.strip_prefix("ignore_path:").unwrap().trim();
+    assert!(
+        !std::path::Path::new(ignore_path).exists(),
+        "temp ignore file must be cleaned up on drop: {ignore_path}"
     );
 }
 

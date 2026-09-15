@@ -193,7 +193,7 @@ pub struct OperatorGateRequest {
 /// `resolved_permission_profile_identifier` in `integrate.rs` already follows for
 /// [`PermissionProfile`]) rather than a hand-written string, so it cannot drift from
 /// the closed action vocabulary `permission.rs` owns.
-fn permission_gate_slug(action: GatedAction) -> String {
+pub fn permission_gate_slug(action: GatedAction) -> String {
     let wire_id = serde_json::to_value(action)
         .ok()
         .and_then(|value| value.as_str().map(str::to_string))

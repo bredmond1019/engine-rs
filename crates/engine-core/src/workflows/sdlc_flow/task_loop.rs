@@ -48,8 +48,9 @@ use super::setup::baseline_snapshot_path;
 #[cfg(test)]
 use super::ModelTransport;
 use super::{
-    carry_forward_billing, get_result, parse_model_verdict, parse_structured_or_fenced, put_result,
-    session_baseline, sessions_since, CommandOutput, CommandRunner, ModelVerdict, TransportSlot,
+    carry_forward_billing, get_result, normalize_pass_fail_partial_synonym, parse_model_verdict,
+    parse_structured_or_fenced, put_result, session_baseline, sessions_since, CommandOutput,
+    CommandRunner, ModelVerdict, TransportSlot,
 };
 #[cfg(test)]
 use crate::policy::RESOLVED_POLICY_IDENTITY;
@@ -3663,7 +3664,8 @@ impl Node for ConsolidatedReviewNode {
                 ),
             };
 
-        let normalized_verdict = parsed.verdict.trim().to_uppercase();
+        let normalized_verdict =
+            normalize_pass_fail_partial_synonym(parsed.verdict.trim().to_uppercase().as_str());
         let mut result = json!({
             // Normalized to the canonical uppercase form `ReviewRouterNode`
             // matches on — a real model reply doesn't reliably preserve

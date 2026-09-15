@@ -245,11 +245,10 @@ impl Node for SummarizeNode {
                 .with_sessions(sessions_since(&ctx, baseline))
             })?;
 
-        let mut result = serde_json::to_value(&summary)
-            .map_err(|err| {
-                NodeError::new(format!("failed to serialize SummaryResult: {err}"))
-                    .with_sessions(sessions_since(&ctx, baseline))
-            })?;
+        let mut result = serde_json::to_value(&summary).map_err(|err| {
+            NodeError::new(format!("failed to serialize SummaryResult: {err}"))
+                .with_sessions(sessions_since(&ctx, baseline))
+        })?;
         if let Some(transport) = transport_stamp {
             result["transport"] = transport;
         }

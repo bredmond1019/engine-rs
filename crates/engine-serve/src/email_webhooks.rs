@@ -37,7 +37,11 @@ const INBOUND_WORKFLOW_TYPE: &str = "CONTENT_PIPELINE";
 /// Returns the minted `run_id` on success, or the same 422 shape
 /// `post_events` returns for an unregistered `workflow_type` / a policy
 /// resolution failure.
-fn dispatch_and_spawn(
+///
+/// `pub(crate)` (rather than private to this module) so `crate::pre_plan_webhook`
+/// (`EN.19.A` task 5) can dispatch `PRE_PLAN` through this exact same
+/// fresh-trigger path instead of re-implementing it.
+pub(crate) fn dispatch_and_spawn(
     state: &web::Data<AppState>,
     workflow_type: &str,
     event: serde_json::Value,

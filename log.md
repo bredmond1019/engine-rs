@@ -5,7 +5,7 @@ description: Chronological log of work completed for engine-rs.
 doc_id: log
 layer: [factory]
 status: active
-timestamp: "2026-09-15T00:42:55Z"
+timestamp: "2026-09-15T02:00:36Z"
 keywords: [work log, session history, development log]
 related: [status, context]
 ---
@@ -14,7 +14,131 @@ related: [status, context]
 
 *Append-only working log. One dated entry per session. Newest entries at the top.*
 
+## [run: 2026-09-15]
+
+`/sdlc-flow` on branch `EN.19.A-flow` (resumed from the earlier task-1 bail) ran tasks 1-7 and
+BAILED after task 7. Tasks 1-6 all passed with confirmed `workAssertionPassed` outcomes: the
+`pre_plan` module scaffold (`CheckExistingNotesNode`, `IntakeIdeaNode`), `ResearchCodebaseNode`
+(a read-only `AgentCodeStep` session scoped to Read/Grep/Glob, `TransportSlotted`/`Cancellable`
+per standing rule 11, prompt externalized to `prompts/research_codebase.md` per D24),
+`WriteNotesNode` (renders research findings into a `capture.md`-shaped `notes.md`), the full
+`PRE_PLAN` graph assembly + `workflow_type` registration behind a standing-rule-12 kill switch
+with baseline/cheap-fast/thorough profiles, `POST /webhooks/pre-plan/inbound` (X-API-Key gate,
+400/409/202 responses, docs in `docs/workflows/README.md`), and a hermetic `pre_plan.rs`
+integration suite (idempotency short-circuit, `force_regenerate` overwrite, prompt-injection
+containment, read-only tool-scope verification). Task 7 (expanding the webhook module's
+deploy-boundary doc comment) landed a real, in-scope diff (commit `8ab34fa`) but the run BAILED
+on `task_validation_3` — `cargo nextest run --workspace --all-features`'s
+`consolidate::remediation_promotion_through_the_full_graph_is_idempotent` fails deterministically
+with `NodeError: I/O error on .../docs/sandbox/findings/remediation.json: No such file or
+directory`, unrelated to task 7's file (`pre_plan_webhook.rs`). Independently re-verified this
+wrap-up turn: checked out an isolated worktree at merge-base `41fb3be0a27b9e382dbee32b06713851f03970bd`
+and ran the identical test — it fails there with the same error signature, confirming the defect
+predates `EN.19.A` and originates at commit `116d994` (`EN.15.K`), which `git merge-base
+--is-ancestor` confirms is an ancestor of the branch's merge-base. Next: file/track the
+`consolidate::remediation_promotion_through_the_full_graph_is_idempotent` pre-existing defect as
+housekeeping outside `EN.19.A`'s scope, then resume `EN.19.A` to close out task 7's validation.
+
+```
+8ab34fa feat: implement EN.19.A-task7
+f49c1e3 feat: implement EN.19.A-task6
+aa79f4e feat: implement EN.19.A-task5
+4e82044 feat: implement EN.19.A-task4
+1ba1a8f feat: implement EN.19.A-task3
+eacdb70 feat: implement EN.19.A-task2
+1dd6276 Merge branch 'main' into EN.19.A-flow
+41fb3be feat: implement EN.chore.fmt-clippy-baseline-repair-task1
+```
+
+## [run: 2026-09-15]
+
+`/sdlc-flow` on branch `EN.19.A-flow` BAILED after task 1. Task 1 landed the `pre_plan` module
+scaffold — `CheckExistingNotesNode` (router, exists()-checks the brain-root-resolved
+`notes.md`, short-circuits unless `force_regenerate`) and `IntakeIdeaNode` (validates
+`idea`/`slug`), registered via `pub mod pre_plan;` in `workflows/mod.rs` (commit `ac38793`).
+Tasks 2-7 did not run. The run bailed on `cargo fmt --check`/`cargo clippy -p engine-core
+--all-features` failures that were verified pre-existing rather than introduced by task 1: a
+worktree built at `base_sha` `d1dd79e` (the commit immediately before task 1's) already shows
+`cargo fmt --check` reporting 29 file diffs (none in the files task 1 touched —
+`workflows/mod.rs`, `pre_plan/mod.rs`, `check_existing.rs`, `intake.rs`) and `cargo clippy -p
+engine-core --all-features` already emitting the same 8 warnings (5x `result_large_err`, 3x
+`type_complexity`, all in `workflows/orchestration/integrate.rs`) at that base commit. Fixing
+either requires touching modules well outside task 1's declared scope. Notable decisions
+carried in task 1: `route()` returns explicit `Some(EXISTS_ROUTE)`/`Some(CONTINUE_ROUTE)`
+rather than `None`, since a router returning `None` ends the graph walk rather than falling
+through to declared connections; `EXISTS_ROUTE` is a placeholder identity task 4 must register
+a node under; `notes_path()` was made `pub` for task 3's reuse. Next: get task 1's baseline
+failures fixed as a separate housekeeping pass (outside EN.19.A's scope), then resume
+`EN.19.A` at task 2 (`ResearchCodebaseNode`).
+
+```
+ac38793 feat: implement EN.19.A-task1
+d1dd79e docs(log): record local-model-bench root-cause pass (worktree reuse, ORCHESTRATION attribution, review fixes, pi tool-call gap)
+a13569c fix(bench): capture_evidence must locate sdlc/ state in the repo the job actually ran in
+629de87 fix(orchestration): surface the real reason instead of <unknown> for an attempts-exhausted child
+fea8a83 fix(bench): harden job-boundary cleanup, add model/backend selection, retire weak models
+```
+
+## [2026-09-15]
+
+### Local-model-bench root-cause pass: worktree-slot reuse, ORCHESTRATION error attribution, review-verdict/prompt fixes, model retirement, and the real pi-vs-aider gap
+- **What:**
+  - **Worktree/block-slot reuse hardened:** `run_one_job_orchestration`'s end-of-job block reopen (`mev set-block-status ... open --write`) was fire-and-forget, leaving the shared slot wrong for the next job on failure. Now checked and logged against the job that caused it. Added `unload_ollama_model()` (`keep_alive: 0`) after every job in both dispatch modes to remove model-switch resource contention. Retired `qwen2.5:3b`/`llama3.2:3b` from `--models all` (genuine model-capacity losses, not harness bugs); `--models` now also accepts a JSON array. `--include-retired` re-adds them. (`fea8a83`)
+  - **`capture_evidence()` fixed for orchestration mode:** hardcoded the module-level `REPO_DIR` instead of the sandbox's own checkout, so orchestration-mode jobs never had their `sdlc/` state captured into artifacts (scored results were unaffected — `harvest_state()` was already sandbox-aware). Now takes an explicit `repo_dir`, resolved at call time. (`a13569c`)
+  - **ORCHESTRATION misattribution fixed:** an attempts-exhausted run (`WrapUpNode`→`CloseBlockNode`→`PullRequestNode`→`EmitStateNode` all succeed as nodes on this path) was reported as the opaque `node '<unknown>' did not succeed`, indistinguishable from a real crash. `execute_step`'s `ChildFailed` attribution now falls back to `metadata.failure.error` before the placeholder. (`629de87`, 3239/3239 `cargo nextest run -p engine-core --lib`)
+  - **Review verdict/prompt fixes:** `unrecognized end-review verdict: NOT_MET` (model echoing per-criterion vocabulary into the top-level verdict field) fixed via `normalize_pass_fail_partial_synonym` in `EndReviewNode`/`ConsolidatedReviewNode` (`a323bab`). Review prompt was penalizing runs for requirements never in the stated AC (e.g. demanding a test the AC didn't ask for) — added explicit scope-discipline instruction (`c40fb90`).
+  - **Root-caused the real pi-vs-aider gap:** a `pi`-only rerun (no aider ordering confound) still scored `qwen2.5-coder:14b`/`deepseek-r1:14b` 0/3, with real 4-attempt runs (3200+ output tokens each) but zero file changes — confirmed via direct `curl` to local Ollama that its OpenAI-compat endpoint doesn't populate `tool_calls` for these models' chat templates (`gpt-oss:20b` does, cleanly). Matches `pi_agent_rust` upstream issue #148; a fallback tool-call-recovery patch is in progress in `core/pi_agent_rust`. `aider` never hits this — it doesn't use `tools`/`tool_calls` at all.
+- **Why:** Operator-directed deep dive into the overnight sandbox sweep's failure patterns, to separate real model-quality misses from harness/engine bugs before trusting any aider-vs-pi comparison.
+- **Refs:** `planning/open-work/local-models/local-model-bench/findings-log.md` (full root-cause writeups), `docs/local-model-bench.md` pitfalls #21-25.
+
+### Overnight sweep telemetry investigation, data cleanup, and local reporting fixes across fleet & sandbox
+- **What:**
+  - **Telemetry Investigation:** Investigated appearance of `claude_cli` and `sonnet` in `summary.json`. Confirmed 0 cloud spend in reality (71/72 jobs cost $0.00; single job was reading stale state left over from manual testing). Backed up raw dataset to `summary.raw-backup.json` and documented full investigation in `TELEMETRY_INVESTIGATION.md`. Cleaned all 72 individual job JSON files and `summary.json` to accurately reflect local model execution.
+  - **Backend Labeling Fix:** Fixed `crates/engine-core/src/nodes/openai_compat_transport.rs` (line 322) which hardcoded `backend: "claude_cli"` on the successful local HTTP path to report `backend: "openai_compat"`.
+  - **Local Implement Tier Fix:** Updated `crates/engine-core/src/workflows/sdlc_flow/wrap_up.rs` to report `"local"` for `implement` and `implement_simple` when `policy.agent_backend` is `Aider` or `Pi`, avoiding fallthrough to the unstated `Sonnet` default. Added test `wrap_up_records_local_implement_tier_for_local_agent_backends`.
+  - **Bench Script Hardening:** Updated `scripts/bench_local_models.py` to explicitly set `"implement": "local"` and `"implement_simple": "local"` in `build_event_body`, and added pre-dispatch `shutil.rmtree(work_dir / "sdlc", ignore_errors=True)` to prevent stale state harvest on early worktree failures.
+- **Why:** Ensure local model benchmark runs report uniform and accurate local transport/tier telemetry and prevent stale artifact harvesting across both fleet and sandbox.
+- **Refs:** `TELEMETRY_INVESTIGATION.md`, `summary.raw-backup.json`, `summary.json`
+
 ## [2026-09-14]
+
+### Overnight sandbox sweep launched, cloud leak patched, system monitor alert hooked, 4 carryovers cleared
+- **What:**
+  - **Overnight Sandbox Sweep & Cloud Leak Fix:** Launched the full 130-job overnight local model sweep (`overnight-sandbox-2026-09-14`) targeting sandbox Bastion (`http://localhost:18090`). Patched a critical cloud call leak in `scripts/bench_local_models.py` (`build_orchestration_event_body` previously set only `child_sdlc_task_policy`, but `EN.*` blocks dispatch as `SDLC_FLOW`, which reads `child_sdlc_flow_policy` and fell back to Sonnet 4.5). Corrected state harvesting to check `sdlc-flow-state.json` before `sdlc-task-state.json`. Verified 0 cloud spend and audited early jobs to rule out false positives.
+  - **System Monitor Agent Alert Hook:** Updated `scripts/dev-tooling/system_monitor.py` to add `notify_agent` and `trigger_alert`, appending structured alert records to `<run-dir>/system_monitor_alerts.jsonl` and `/tmp/system_monitor_alerts.jsonl` whenever CPU, memory, or swap exceed warning/critical thresholds.
+  - **Carryover `orchestration-dev-node-invocations-table-missing` cleared:** Applied database migrations `0001_create_journal.sql`, `0002_create_node_invocations.sql`, and `0003_add_node_invocation_payload.sql` to local postgres `orchestration_dev`. Verified tables and columns exist matching `engine-store/src/postgres.rs`.
+  - **Carryover `ledger-composer-harness-key-mismatch` cleared:** Fixed `planning/harness.json` key name collision (`ledger_composer_model_tier`), updated test fixture and assertions in `crates/engine-serve/src/journal.rs`. Test passes against live Ollama.
+  - **Carryover `aider-mention-reflection-discards-pending-edit` cleared:** Added isolated `.aiderignore` generation, `--no-gitignore`, and `--aiderignore <path>` in `crates/engine-core/src/nodes/aider_transport.rs` with RAII tempfile cleanup. Verified 33 passing tests in `crates/engine-core/tests/it/agent_backend.rs`.
+  - **Carryover `check-permission-gate-never-wired-into-orchestration-loop` cleared:** Wired `gates::check_permission_gate` into `integrate_chain_impl_inner` loop in `crates/engine-core/src/workflows/orchestration/integrate.rs` with dual `OnBail` semantics (`StopChain` halts immediately with `IntegrateError::PermissionGate`, `SkipDependents` records operator edge and transitively skips dependents while continuing independent steps). Added 4 new integration tests in `crates/engine-core/tests/it/orchestration.rs`; all 475 orchestration tests pass.
+  - Verified full workspace test suite: 3878 / 3878 tests passed (`cargo nextest run --lib --workspace`).
+- **Why:** Directed by operator to launch overnight model sweep, wire system monitoring alerts, resolve the four outstanding defect carryovers, verify no false positives, and log work once cleared.
+- **Refs:** `docs/overnight-sandbox-sweep-quickstart.md`, `planning/state.json`, `planning/harness.json`
+
+### Fleet-wide push, ledger-composer key-mismatch bug fixed, handoff reprioritized for tonight's overnight sweep
+- **What:**
+  - Pushed the entire fleet (17 repos) to `origin/main` one at a time, plain `git push`, no
+    build/test step, in dependency order — 10 repos had real commits (`engine-rs`, `bastion`,
+    `bastion-ui`, `bastion-web`, `brazilianportugui`, `feli`, `jardins-fitness`, `jynx`, `learn-ai`,
+    `price-scout`, `synapse`), 7 already in sync. `engine-rs` moved `8318e32..51362cc`, finally
+    landing the long-pending `8080736` revert of the old bench-junk merge.
+  - Found a real bug verifying tonight's sandbox sweep would be genuinely zero-cloud: the D57 ledger
+    composer's local-routing config key is `ledger_composer_model_tier`, but every place this
+    session had set or tested it earlier used the wrong, pre-existing `composer_model_tier` key (a
+    name collision with an older, unrelated knob) — silently ignored by serde, falling through to
+    the built-in cloud default. Fixed for real in the sandbox's own `planning/harness.json`.
+    Confirmed the `#[ignore]`'d unit test for this has the same wrong-key bug in its own fixture,
+    and its assertion can't actually distinguish a real Ollama response from a real Claude one that
+    also failed to parse — flagged as carryover, not fixed tonight.
+  - Re-verified the sandbox after refresh: `--dry-run` now shows 130 jobs planned across all 5
+    tiers with 0 preflight failures (the `edit`/`medium`/`hard` tiers had failed earlier tonight
+    because their checker scripts lived only in unpushed local commits).
+  - Rewrote `planning/handoff.md` to lead with tonight's actual priority — the overnight sandbox
+    model sweep (`docs/overnight-sandbox-sweep-quickstart.md`) — with tomorrow morning's
+    orchestration-verification pass second.
+- **Why:** the operator wants to hand tonight's full local-model sweep to a fresh (Gemini Flash)
+  agent right now, cold, off the handoff alone — that required the sandbox to actually be pushable
+  end to end (all 5 tiers, not 2) and genuinely zero-cloud (not just configured-and-unverified).
+- **Refs:** `planning/handoff.md`, `planning/pre-plan/orchestration-improvements/`
 
 ### llm_node trait consolidation across sdlc_flow/sdlc_task/orchestration; local-only ORCHESTRATION hardening
 - **What:**

@@ -176,7 +176,9 @@ pub mod terminal;
 pub use agent_code_step::{AgentCodeStep, MetaTransport, TransportInfo};
 pub use agent_outcome::{translate as translate_agent_outcome, AgentOutcome, CostEstimate};
 pub use aggregate::AggregateNode;
-pub use aider_transport::{aider_meta_transport, aider_meta_transport_live};
+pub use aider_transport::{
+    aider_meta_transport, aider_meta_transport_live, generate_aiderignore_content, AIDER_FILES_ENV,
+};
 pub use brain_client::{
     http_get_live, BrainConfig, BrainConfigError, HttpGet, RecallNode, RecallResult,
     ReqwestHttpGet, StubHttpGet, BRAIN_API_KEY_ENV, BRAIN_API_URL_ENV, DEFAULT_RECALL_HYBRID,
