@@ -78,7 +78,7 @@ alone — never by guessing at payload contents:
 
 ## The workflows
 
-Twenty-one registered types, grouped by what you'd use them for. The registration list in
+Twenty-two registered types, grouped by what you'd use them for. The registration list in
 `crates/engine-serve/src/workflows.rs` (`register_builtin_workflows`) is the source of truth; this
 table is a reader's copy.
 
@@ -91,6 +91,7 @@ table is a reader's copy.
 | `ORCHESTRATION` | Runs an ordered *chain* of the two above, across repos, checking dependencies and merging each block before the next starts. | [orchestration.md](orchestration.md) |
 | `DEBRIEF` | Renders a morning brief from one campaign's journal — every step, every bail named with its reason — readable on a phone. | [debrief.md](debrief.md) |
 | `RECALL` | Asks the Brain a question mid-run via Synapse's `GET /recall`, so a chain step can branch on what the corpus already knows instead of carrying it in the event payload. | [recall.md](recall.md) |
+| `PRE_PLAN` | Turns a short free-text idea into a researched `$BRAIN_ROOT/planning/open-work/pre-plan/<slug>/notes.md`, no human back-and-forth — the smallest usable slice of the pre-plan pipeline (`/capture` today), externally triggerable over HTTP. See below for its webhook contract and node list. | — |
 
 ### Winning and serving work
 
@@ -149,6 +150,7 @@ stable prompt a workflow sends, without grepping Rust for string literals:
 | `RESEARCH_AGENT` | `crates/engine-core/src/workflows/research_agent/prompts/` |
 | `DIAGNOSTIC_INTAKE` | `crates/engine-core/src/workflows/diagnostic_intake/prompts/` |
 | `CLAIM_REAFFIRM` | `crates/engine-core/src/workflows/claim_reaffirm/prompts/` |
+| `PRE_PLAN` | `crates/engine-core/src/workflows/pre_plan/prompts/` |
 
 Only the stable prefix lives in the file — per-run body construction (`build_prompt(...)`,
 interpolating `format!`s) stays in Rust, per CLAUDE.md standing rule 6. A regression guard,
@@ -325,6 +327,46 @@ contention that wait can occasionally lose the race, which is why `.config/nexte
 and its integration-suite counterpart (`agent_backend_pi_transport_kills_child_on_timeout`). A single
 retry clearing it is expected; the transport's own kill-on-timeout/kill-on-cancel behaviour is
 unaffected either way.
+
+## `PRE_PLAN` — turning an idea into a researched notes.md (`EN.19.A`)
+
+`PRE_PLAN` takes a short free-text idea, does read-only codebase research, and writes a real
+`$BRAIN_ROOT/planning/open-work/pre-plan/<slug>/notes.md` in the same shape a human running
+`.claude/commands/capture.md` would produce — no back-and-forth with whoever sent the idea. It is
+disabled by default (standing rule 12's kill switch, `pre_plan.policy.enabled` in
+`planning/harness.json`) and only becomes live once a deployed `bastion serve` process is rebuilt
+and restarted with this route compiled in — registering the route is a source change, not
+something a running process picks up on its own.
+
+**Node list** (`crates/engine-core/src/workflows/pre_plan/`):
+
+| Node | Model call? | What it does |
+|---|---|---|
+| `CheckExistingNotesNode` | No | Idempotency guard — `exists()`-checks the target `notes.md` before any research runs; short-circuits to `PrePlanNotesAlreadyExistsNode` unless `force_regenerate: true`. |
+| `IntakeIdeaNode` | No | Normalizes the dispatched event's `idea`/`slug`/optional `channel`/`sender` into `TaskContext`, failing loudly (naming the field) on a missing/empty `idea` or `slug`. |
+| `ResearchCodebaseNode` | Yes (`Sonnet` by default) | A read-only `AgentCodeStep` session scoped to `Read`/`Grep`/`Glob` only (`Write`/`Bash`/`Edit` disallowed) — gathers the same codebase context a human running `/capture` would gather by hand. |
+| `WriteNotesNode` | No | Renders the research findings into OKF frontmatter + sections matching `capture.md`'s output shape, tagging every claim `VERIFIED`/`ASSUMED`. |
+
+**Webhook contract** — `POST /webhooks/pre-plan/inbound` (`crates/engine-serve/src/
+pre_plan_webhook.rs`), gated by the same `X-API-Key` check every other mutating route uses:
+
+```bash
+curl -X POST $ENGINE/webhooks/pre-plan/inbound \
+  -H "X-API-Key: $ENGINE_EVENTS_API_KEY" \
+  -H 'Content-Type: application/json' \
+  -d '{"idea":"a short free-text idea","slug":"idea-slug"}'
+# -> 202 {"run_id":"...","event_id":"..."}
+```
+
+- Missing/invalid `X-API-Key` -> `401`, nothing dispatched.
+- Missing or empty `idea`/`slug` -> `400`, nothing dispatched.
+- A second dispatch naming a `slug` with an already-live (non-terminal) `PRE_PLAN` run -> `409`,
+  nothing dispatched — same-slug collisions only; unrelated concurrent slugs are unaffected.
+- Otherwise `202 {run_id, event_id}`, matching `POST /webhooks/email/inbound`'s response shape.
+
+A dispatch naming a `slug` whose `notes.md` already exists on disk short-circuits inside the
+workflow itself (`CheckExistingNotesNode`) rather than at the HTTP layer, reporting the existing
+path with no research session run — pass `"force_regenerate": true` in the body to overwrite it.
 
 ## See also
 
