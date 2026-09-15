@@ -5,7 +5,7 @@ description: Chronological log of work completed for engine-rs.
 doc_id: log
 layer: [factory]
 status: active
-timestamp: "2026-09-15T01:20:00Z"
+timestamp: "2026-09-15T02:00:36Z"
 keywords: [work log, session history, development log]
 related: [status, context]
 ---
@@ -14,7 +14,30 @@ related: [status, context]
 
 *Append-only working log. One dated entry per session. Newest entries at the top.*
 
+## [2026-09-15]
+
+### Overnight sweep telemetry investigation, data cleanup, and local reporting fixes across fleet & sandbox
+- **What:**
+  - **Telemetry Investigation:** Investigated appearance of `claude_cli` and `sonnet` in `summary.json`. Confirmed 0 cloud spend in reality (71/72 jobs cost $0.00; single job was reading stale state left over from manual testing). Backed up raw dataset to `summary.raw-backup.json` and documented full investigation in `TELEMETRY_INVESTIGATION.md`. Cleaned all 72 individual job JSON files and `summary.json` to accurately reflect local model execution.
+  - **Backend Labeling Fix:** Fixed `crates/engine-core/src/nodes/openai_compat_transport.rs` (line 322) which hardcoded `backend: "claude_cli"` on the successful local HTTP path to report `backend: "openai_compat"`.
+  - **Local Implement Tier Fix:** Updated `crates/engine-core/src/workflows/sdlc_flow/wrap_up.rs` to report `"local"` for `implement` and `implement_simple` when `policy.agent_backend` is `Aider` or `Pi`, avoiding fallthrough to the unstated `Sonnet` default. Added test `wrap_up_records_local_implement_tier_for_local_agent_backends`.
+  - **Bench Script Hardening:** Updated `scripts/bench_local_models.py` to explicitly set `"implement": "local"` and `"implement_simple": "local"` in `build_event_body`, and added pre-dispatch `shutil.rmtree(work_dir / "sdlc", ignore_errors=True)` to prevent stale state harvest on early worktree failures.
+- **Why:** Ensure local model benchmark runs report uniform and accurate local transport/tier telemetry and prevent stale artifact harvesting across both fleet and sandbox.
+- **Refs:** `TELEMETRY_INVESTIGATION.md`, `summary.raw-backup.json`, `summary.json`
+
 ## [2026-09-14]
+
+### Overnight sandbox sweep launched, cloud leak patched, system monitor alert hooked, 4 carryovers cleared
+- **What:**
+  - **Overnight Sandbox Sweep & Cloud Leak Fix:** Launched the full 130-job overnight local model sweep (`overnight-sandbox-2026-09-14`) targeting sandbox Bastion (`http://localhost:18090`). Patched a critical cloud call leak in `scripts/bench_local_models.py` (`build_orchestration_event_body` previously set only `child_sdlc_task_policy`, but `EN.*` blocks dispatch as `SDLC_FLOW`, which reads `child_sdlc_flow_policy` and fell back to Sonnet 4.5). Corrected state harvesting to check `sdlc-flow-state.json` before `sdlc-task-state.json`. Verified 0 cloud spend and audited early jobs to rule out false positives.
+  - **System Monitor Agent Alert Hook:** Updated `scripts/dev-tooling/system_monitor.py` to add `notify_agent` and `trigger_alert`, appending structured alert records to `<run-dir>/system_monitor_alerts.jsonl` and `/tmp/system_monitor_alerts.jsonl` whenever CPU, memory, or swap exceed warning/critical thresholds.
+  - **Carryover `orchestration-dev-node-invocations-table-missing` cleared:** Applied database migrations `0001_create_journal.sql`, `0002_create_node_invocations.sql`, and `0003_add_node_invocation_payload.sql` to local postgres `orchestration_dev`. Verified tables and columns exist matching `engine-store/src/postgres.rs`.
+  - **Carryover `ledger-composer-harness-key-mismatch` cleared:** Fixed `planning/harness.json` key name collision (`ledger_composer_model_tier`), updated test fixture and assertions in `crates/engine-serve/src/journal.rs`. Test passes against live Ollama.
+  - **Carryover `aider-mention-reflection-discards-pending-edit` cleared:** Added isolated `.aiderignore` generation, `--no-gitignore`, and `--aiderignore <path>` in `crates/engine-core/src/nodes/aider_transport.rs` with RAII tempfile cleanup. Verified 33 passing tests in `crates/engine-core/tests/it/agent_backend.rs`.
+  - **Carryover `check-permission-gate-never-wired-into-orchestration-loop` cleared:** Wired `gates::check_permission_gate` into `integrate_chain_impl_inner` loop in `crates/engine-core/src/workflows/orchestration/integrate.rs` with dual `OnBail` semantics (`StopChain` halts immediately with `IntegrateError::PermissionGate`, `SkipDependents` records operator edge and transitively skips dependents while continuing independent steps). Added 4 new integration tests in `crates/engine-core/tests/it/orchestration.rs`; all 475 orchestration tests pass.
+  - Verified full workspace test suite: 3878 / 3878 tests passed (`cargo nextest run --lib --workspace`).
+- **Why:** Directed by operator to launch overnight model sweep, wire system monitoring alerts, resolve the four outstanding defect carryovers, verify no false positives, and log work once cleared.
+- **Refs:** `docs/overnight-sandbox-sweep-quickstart.md`, `planning/state.json`, `planning/harness.json`
 
 ### Fleet-wide push, ledger-composer key-mismatch bug fixed, handoff reprioritized for tonight's overnight sweep
 - **What:**

@@ -337,11 +337,11 @@ bailed/skipped set stays empty whenever the chain would already have returned `E
 returns from the chain. Under `skip_dependents`, the step is `Skipped` with `blocked_by` set to
 the unmet `DependencyEdge` in its authored shape (`block`, `operator`, `approval` or `external`),
 and the chain continues to the next step. Under `stop_chain` this is unchanged: the first unmet
-edge still returns `Err` immediately. `gates::check_permission_gate` is NOT currently called from
-this loop (`EN.15.J`'s scope was the HOLD/operator-edge path via `wait_for_clearance`, not this
-gate) — wiring it in, and deciding how a refusal should interact with `skip_dependents`, is tracked
-as carryover `check-permission-gate-never-wired-into-orchestration-loop`, not implemented by this
-block.
+edge still returns `Err` immediately. `gates::check_permission_gate` is evaluated at the per-step
+boundary alongside `check_dependencies`: under `stop_chain`, a permission denial halts the chain
+and returns `Err(IntegrateError::PermissionGate)`; under `skip_dependents`, the denied step authors
+the operator gate, is recorded as `Skipped` with `blocked_by: {"type": "operator", "slug": ...}`, and its
+dependents are transitively skipped while independent steps proceed.
 
 **`blocked_by`.** `LaneLogEntry` gains an additive, optional `blocked_by: Option<serde_json::Value>`
 field (omitted, never `null`, on every status but `Skipped`) — see "The lane-log contract" above

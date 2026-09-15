@@ -28,6 +28,7 @@ use serde_json::json;
 
 use crate::node::{Node, NodeError};
 use crate::policy::telemetry::RunTelemetryInputs;
+use crate::policy::AgentBackend;
 #[cfg(test)]
 use crate::policy::RESOLVED_POLICY_IDENTITY;
 
@@ -632,11 +633,19 @@ fn model_tier_used(policy: &SdlcPolicy) -> BTreeMap<String, String> {
             .and_then(|v| v.as_str().map(str::to_string))
             .unwrap_or_default()
     };
+    let implement_tier = match policy.agent_backend {
+        AgentBackend::Pi | AgentBackend::Aider => "local".to_string(),
+        AgentBackend::ClaudeCli => tier_str(tiers.implement),
+    };
+    let implement_simple_tier = match policy.agent_backend {
+        AgentBackend::Pi | AgentBackend::Aider => "local".to_string(),
+        AgentBackend::ClaudeCli => tier_str(tiers.implement_simple),
+    };
     BTreeMap::from([
-        ("implement".to_string(), tier_str(tiers.implement)),
+        ("implement".to_string(), implement_tier),
         (
             "implement_simple".to_string(),
-            tier_str(tiers.implement_simple),
+            implement_simple_tier,
         ),
         ("triage".to_string(), tier_str(tiers.triage)),
         ("review".to_string(), tier_str(tiers.review)),
@@ -1643,6 +1652,38 @@ mod tests {
             "sonnet"
         );
         assert_eq!(state_b.outcomes.unwrap().model_tier_used["review"], "local");
+    }
+
+    #[tokio::test]
+    async fn wrap_up_records_local_implement_tier_for_local_agent_backends() {
+        use crate::workflows::sdlc_flow::policy::SdlcPolicy;
+
+        let state = SDLCState::new("test-local-implement-tier");
+
+        for backend in [AgentBackend::Pi, AgentBackend::Aider] {
+            let mut ctx = ctx_with_state(&state);
+            let policy = SdlcPolicy {
+                agent_backend: backend,
+                ..SdlcPolicy::default()
+            };
+            ctx.nodes.insert(
+                RESOLVED_POLICY_IDENTITY.to_string(),
+                serde_json::to_value(&policy).unwrap(),
+            );
+
+            let out = WrapUpNode::new()
+                .with_clock(fixed_clock("2026-07-18"))
+                .process(ctx)
+                .await
+                .expect("process should succeed")
+                .nodes["WrapUpNode"]
+                .clone();
+
+            let state_out: SDLCState = serde_json::from_value(out["state"].clone()).unwrap();
+            let tiers = state_out.outcomes.unwrap().model_tier_used;
+            assert_eq!(tiers["implement"], "local");
+            assert_eq!(tiers["implement_simple"], "local");
+        }
     }
 
     fn temp_worktree() -> std::path::PathBuf {

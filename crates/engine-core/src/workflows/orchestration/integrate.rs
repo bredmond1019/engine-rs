@@ -88,12 +88,17 @@ use super::escalate::{
     EscalationOption, EscalationRecord, EscalationSeverity, NewBailEntry, NewEscalation,
 };
 use super::execute::{execute_step, EngineKind, ExecuteError, ExecutionOutcome, FlowRunner};
-use super::gates::{check_dependencies, AdmissionGate, DependencyEdge, GateError};
+use super::gates::{
+    check_dependencies, check_permission_gate, permission_gate_slug, AdmissionGate, DependencyEdge,
+    GateError, OperatorGateRequest, PermissionGateError,
+};
 use super::graph::{BailChannel, OnBail};
 use super::inbox_triage::{
     process_drained_message, EscalationContext, InboxTriageRunner, ProcessedMessage,
 };
+use super::operator_edge::{make_author_operator_edge, OperatorEdgeAuthorConfig};
 use super::preflight::{BlockPreflight, ClaimVerdict, PreflightOutcome};
+use crate::policy::permission::{resolve_permission_profile, GatedAction};
 use crate::coord::write::RegisterOutcome;
 use crate::nodes::brain_client::RECALL_NODE_NAME;
 use crate::workflows::get_result;
@@ -1121,6 +1126,8 @@ pub fn append_lane_log_line(
 pub enum IntegrateError {
     /// A dependency edge was unmet (from [`check_dependencies`]).
     Gate(GateError),
+    /// A gated action was refused or authoring its operator gate failed (from [`check_permission_gate`]).
+    PermissionGate(PermissionGateError),
     /// The block's `SDLC_FLOW` run itself failed (from [`execute_step`]).
     Execute(ExecuteError),
     /// The block's `sdlc-flow-state.json` could not be read at all.
@@ -1341,6 +1348,7 @@ impl fmt::Display for IntegrateError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             IntegrateError::Gate(err) => write!(f, "{err}"),
+            IntegrateError::PermissionGate(err) => write!(f, "{err}"),
             IntegrateError::Execute(err) => write!(f, "{err}"),
             IntegrateError::StateWriteUnreadable {
                 repo,
@@ -1514,6 +1522,7 @@ impl std::error::Error for IntegrateError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             IntegrateError::Gate(err) => Some(err),
+            IntegrateError::PermissionGate(err) => Some(err),
             IntegrateError::Execute(err) => Some(err),
             IntegrateError::StateWriteUnreadable { source, .. } => Some(source),
             IntegrateError::StateWriteMalformed { source, .. } => Some(source),
@@ -1541,6 +1550,12 @@ impl std::error::Error for IntegrateError {
 impl From<GateError> for IntegrateError {
     fn from(err: GateError) -> Self {
         IntegrateError::Gate(err)
+    }
+}
+
+impl From<PermissionGateError> for IntegrateError {
+    fn from(err: PermissionGateError) -> Self {
+        IntegrateError::PermissionGate(err)
     }
 }
 
@@ -2105,6 +2120,13 @@ fn default_preflight(_repo: &str, _block_id: &str) -> PreflightOutcome {
     PreflightOutcome::Disabled
 }
 
+/// The permissive default [`integrate_chain_impl_inner`]'s permission gate
+/// uses when a caller never wires a custom action resolver — every block reports `None`,
+/// so no permission gate check is required.
+fn default_resolve_action(_repo: &str, _block_id: &str) -> Option<GatedAction> {
+    None
+}
+
 /// `EN.17.D` task 3: what this loop does when the preflight judgment call
 /// itself failed ([`PreflightOutcome::Unjudged`]) — the call never even
 /// reached a claim, let alone verified one. `Proceed` (the built-in
@@ -2197,6 +2219,8 @@ pub async fn integrate_chain(
         false,
         None,
         &mut Vec::new(),
+        &default_resolve_action,
+        None,
     )
     .await
 }
@@ -2274,6 +2298,8 @@ pub async fn integrate_chain_with_journal(
         false,
         None,
         &mut Vec::new(),
+        &default_resolve_action,
+        None,
     )
     .await
 }
@@ -2351,6 +2377,8 @@ pub async fn integrate_chain_with_coord(
         false,
         None,
         &mut Vec::new(),
+        &default_resolve_action,
+        None,
     )
     .await
 }
@@ -2450,6 +2478,8 @@ pub async fn integrate_chain_with_coord_and_policy(
         false,
         None,
         &mut Vec::new(),
+        &default_resolve_action,
+        None,
     )
     .await
 }
@@ -2539,6 +2569,8 @@ pub async fn integrate_chain_with_preflight(
         false,
         None,
         &mut Vec::new(),
+        &default_resolve_action,
+        None,
     )
     .await
 }
@@ -2630,6 +2662,94 @@ pub async fn integrate_chain_with_inbox_triage(
         inbox_triage_enabled,
         inbox_triage_runner,
         inbox_report,
+        &default_resolve_action,
+        None,
+    )
+    .await
+}
+
+/// Identical to [`integrate_chain_with_inbox_triage`], plus:
+/// - `resolve_action`: resolves what [`GatedAction`] a step intends to perform, if any.
+/// - `author_operator_edge`: custom closure to author an operator gate when an action is denied.
+///   If `None`, falls back to [`make_author_operator_edge`].
+#[allow(clippy::too_many_arguments)]
+pub async fn integrate_chain_with_permission_gate(
+    chain: &[ChainStep],
+    resolve_depends_on: &dyn Fn(&str, &str) -> Vec<DependencyEdge>,
+    is_edge_met: &dyn Fn(&str, &str) -> bool,
+    admission: &AdmissionGate,
+    hold_source: &dyn HoldSource,
+    poll_interval: Duration,
+    hold_deadline: Option<Duration>,
+    cancellation_token: Option<&crate::cancellation::CancellationToken>,
+    campaign_budget: Option<&Budget>,
+    resolve_engine: &dyn Fn(&str, &str) -> EngineKind,
+    registry: &RepoRegistry,
+    run_flow: &FlowRunner,
+    roadmap_dir: &Path,
+    lane: Option<&str>,
+    step_observer: &StepObserverFn,
+    default_use_worktree: bool,
+    default_auto_pr: bool,
+    merge_push_policy: MergePushPolicy,
+    campaign_id: uuid::Uuid,
+    close_block: &CloseBlockFn,
+    coord: Option<&CoordHandle>,
+    child_sdlc_flow_policy: Option<&serde_json::Value>,
+    child_sdlc_task_policy: Option<&serde_json::Value>,
+    on_bail: OnBail,
+    bail_channel: BailChannel,
+    block_status: &dyn Fn(&str, &str) -> BlockPresence,
+    report: &mut ChainReport,
+    preflight: &dyn Fn(&str, &str) -> PreflightOutcome,
+    on_unjudged: OnUnjudged,
+    preflight_report: &mut Vec<BlockPreflight>,
+    inbox_triage_enabled: bool,
+    inbox_triage_runner: Option<&InboxTriageRunner>,
+    inbox_report: &mut Vec<ProcessedMessage>,
+    resolve_action: &dyn Fn(&str, &str) -> Option<GatedAction>,
+    author_operator_edge: Option<&dyn Fn(&OperatorGateRequest) -> Result<(), String>>,
+) -> Result<Vec<ExecutionOutcome>, IntegrateError> {
+    integrate_chain_impl(
+        chain,
+        resolve_depends_on,
+        is_edge_met,
+        admission,
+        hold_source,
+        poll_interval,
+        hold_deadline,
+        cancellation_token,
+        campaign_budget,
+        resolve_engine,
+        registry,
+        run_flow,
+        roadmap_dir,
+        lane,
+        step_observer,
+        default_use_worktree,
+        default_auto_pr,
+        merge_push_policy,
+        campaign_id,
+        close_block,
+        None,
+        None,
+        coord,
+        None,
+        None,
+        child_sdlc_flow_policy,
+        child_sdlc_task_policy,
+        on_bail,
+        bail_channel,
+        block_status,
+        report,
+        preflight,
+        on_unjudged,
+        preflight_report,
+        inbox_triage_enabled,
+        inbox_triage_runner,
+        inbox_report,
+        resolve_action,
+        author_operator_edge,
     )
     .await
 }
@@ -2710,6 +2830,8 @@ pub async fn integrate_chain_with_dispatch(
         false,
         None,
         &mut Vec::new(),
+        &default_resolve_action,
+        None,
     )
     .await
 }
@@ -2794,6 +2916,8 @@ pub async fn integrate_chain_with_run_record(
         false,
         None,
         &mut Vec::new(),
+        &default_resolve_action,
+        None,
     )
     .await
 }
@@ -2882,6 +3006,8 @@ async fn integrate_chain_impl(
     inbox_triage_enabled: bool,
     inbox_triage_runner: Option<&InboxTriageRunner>,
     inbox_report: &mut Vec<ProcessedMessage>,
+    resolve_action: &dyn Fn(&str, &str) -> Option<GatedAction>,
+    author_operator_edge: Option<&dyn Fn(&OperatorGateRequest) -> Result<(), String>>,
 ) -> Result<Vec<ExecutionOutcome>, IntegrateError> {
     if let Some(sink) = run_record_sink {
         sink(RunRecordLifecycle::Started);
@@ -2923,6 +3049,8 @@ async fn integrate_chain_impl(
         inbox_triage_enabled,
         inbox_triage_runner,
         inbox_report,
+        resolve_action,
+        author_operator_edge,
     )
     .await;
     if let Some(sink) = run_record_sink {
@@ -3037,6 +3165,8 @@ async fn integrate_chain_impl_inner(
     // contract as `preflight_report` above, so it is populated on both the
     // success and the error return path.
     inbox_report: &mut Vec<ProcessedMessage>,
+    resolve_action: &dyn Fn(&str, &str) -> Option<GatedAction>,
+    author_operator_edge: Option<&dyn Fn(&OperatorGateRequest) -> Result<(), String>>,
 ) -> Result<Vec<ExecutionOutcome>, IntegrateError> {
     let total_steps = chain.len();
     let mut outcomes = Vec::with_capacity(chain.len());
@@ -3477,6 +3607,81 @@ async fn integrate_chain_impl_inner(
             }
         }
 
+        if let Some(action) = resolve_action(&step.repo, &step.block_id) {
+            let (profile, _profile_err) = resolve_permission_profile(
+                &registry.brain_root().join("brain.toml"),
+            );
+            let default_author;
+            let author: &dyn Fn(&OperatorGateRequest) -> Result<(), String> = match author_operator_edge {
+                Some(custom) => custom,
+                None => {
+                    let repo_dir = registry
+                        .resolve(&step.repo)
+                        .unwrap_or_else(|_| registry.brain_root().to_path_buf());
+                    default_author = make_author_operator_edge(OperatorEdgeAuthorConfig {
+                        root: registry.brain_root().to_path_buf(),
+                        repo: step.repo.clone(),
+                        block_id: step.block_id.clone(),
+                        dir: repo_dir,
+                        agent: coord.map(|c| c.agent.clone()),
+                        lock_dir: coord.map(|c| c.lock_dir.clone()),
+                        roadmap: step.roadmap.clone(),
+                        lane: lane.map(str::to_string),
+                        roadmap_dir: Some(roadmap_dir.to_path_buf()),
+                    });
+                    &default_author
+                }
+            };
+
+            if let Err(err) = check_permission_gate(step, action, profile, author) {
+                let integrate_err = IntegrateError::from(err.clone());
+                emit_journal(
+                    journal_sink,
+                    campaign_id,
+                    journal_run_id(None),
+                    &step.block_id,
+                    engine_contract::JournalDecisionKind::GateRefused,
+                    integrate_err.to_string(),
+                    serde_json::json!({
+                        "action": action,
+                        "profile": profile,
+                    }),
+                );
+                match on_bail {
+                    OnBail::StopChain => return Err(integrate_err),
+                    OnBail::SkipDependents => {
+                        let slug = match &err {
+                            PermissionGateError::Denied { edge, .. } => edge.slug.clone(),
+                            PermissionGateError::EdgeAuthorFailed { action, .. } => {
+                                permission_gate_slug(*action)
+                            }
+                        };
+                        let blocked_by = dependency_edge_to_json(&DependencyEdge::Operator { slug });
+                        let skip_lane = lane.unwrap_or(step.repo.as_str());
+                        let entry = LaneLogEntry::skipped(
+                            step,
+                            skip_lane,
+                            integrate_err.to_string(),
+                            Some(blocked_by.clone()),
+                        )
+                        .with_identity(None)
+                        .with_permission_profile(Some(
+                            resolved_permission_profile_identifier(registry),
+                        ));
+                        let _ = append_lane_log_line(roadmap_dir, &entry);
+                        bailed_or_skipped.insert((step.repo.clone(), step.block_id.clone()));
+                        report.skipped.push(SkippedStep {
+                            block: format!("{}:{}", step.repo, step.block_id),
+                            reason: integrate_err.to_string(),
+                            blocked_by: Some(blocked_by),
+                        });
+                        skipped_steps.push(step.clone());
+                        continue;
+                    }
+                }
+            }
+        }
+
         // Wait out any operator hold BEFORE touching admission at all —
         // EN.11.L Task 1. The admission permit must be scoped to the
         // EXECUTION window only, never held across an unbounded hold: a
@@ -3878,12 +4083,8 @@ async fn integrate_chain_impl_inner(
         // `execute::resolve_isolation`'s table. Rows 1/2 (base-template
         // always worktree, the brain root never) are resolved inside
         // `execute_step` itself and are unreachable from this value.
-        // Cancellation/budget wiring at this call site is `EN.11.F` task
-        // 4's job (the block-boundary check that decides whether to keep
-        // dispatching steps at all); this task (task 3) only makes
-        // `execute_step`'s signature able to carry them. `None, None` here
-        // is mechanical — behavior-identical to before this task, since
-        // `RunOptions::default()` was always the child's config.
+        // Thread the chain-level cancellation token down to the child run
+        // so that an abort request halts running child workflows cleanly.
         // `EN.12.C` task 4: the chain's parent profile is the same
         // fail-closed `resolve_permission_profile` read `resolved_
         // permission_profile_identifier` above already performs against
@@ -3904,7 +4105,7 @@ async fn integrate_chain_impl_inner(
             default_use_worktree,
             default_auto_pr,
             campaign_id,
-            None,
+            cancellation_token.cloned(),
             None,
             parent_permission_profile,
             None,

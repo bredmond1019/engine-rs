@@ -25,10 +25,10 @@ toml = { workspace = true }
 term-core = { path = "../term-core", features = ["tokio"] }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+tempfile = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true }
-tempfile = { workspace = true }
 # Test-only: EN.11.I task 2's instrumentation tests capture emitted tracing
 # events via `tracing_subscriber`'s `Layer`/`Registry` machinery, asserting
 # span-field propagation (`run_id`/`campaign_id`) rather than parsing a real

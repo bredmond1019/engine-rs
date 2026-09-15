@@ -37,13 +37,15 @@ use engine_core::workflows::orchestration::gates::{
     check_permission_gate, check_step_with_frontier_advice, load_frontier, AdmissionGate,
     DependencyEdge, FrontierError, GateError, OperatorGateRequest, PermissionGateError,
 };
+use engine_core::workflows::orchestration::corpus_gates::BlockPresence;
 use engine_core::workflows::orchestration::graph::{
-    debrief_registry, debrief_schema, OrchestrationRunNode, NODE_NAME,
+    debrief_registry, debrief_schema, BailChannel, OnBail, OrchestrationRunNode, NODE_NAME,
 };
 use engine_core::workflows::orchestration::integrate::{
-    integrate_chain, integrate_chain_with_dispatch, HoldSource, IntegrateError, MergePushPolicy,
-    NeverHeld, StepProgress,
+    integrate_chain, integrate_chain_with_dispatch, integrate_chain_with_permission_gate,
+    ChainReport, HoldSource, IntegrateError, MergePushPolicy, NeverHeld, OnUnjudged, StepProgress,
 };
+use engine_core::workflows::orchestration::preflight::PreflightOutcome;
 use engine_core::{
     Dispatcher, Node, NodeConfig, NodeError, NodeRegistry, Workflow, WorkflowSchema,
 };
@@ -2713,4 +2715,326 @@ async fn path_d_a_locked_parent_cannot_produce_an_unrestricted_child() {
         0,
         "the rejected widening must never invoke the flow runner — no child ran"
     );
+}
+
+/// EN.17.B / EN.15.J wiring: a step refused by `check_permission_gate` under `OnBail::StopChain`
+/// authors the operator-gate edge and immediately halts the chain, returning
+/// `IntegrateError::PermissionGate`.
+#[tokio::test]
+async fn permission_gate_refusal_under_stop_chain_authors_edge_and_stops_chain() {
+    let (_repos_dir, registry) = two_repo_registry_with_profile("locked");
+    let (_planning_root, roadmap_dir) = fixture_roadmap_dir("permission-stop-chain");
+    let runner = RecordingRunner::new();
+    let flow_runner = runner.clone().into_runner();
+    let admission = AdmissionGate::with_default_policy();
+    let chain = resolve_explicit_chain(vec![
+        ("repo-a".to_string(), "A.1".to_string()),
+        ("repo-b".to_string(), "B.1".to_string()),
+    ]);
+
+    let edge_calls: Arc<Mutex<Vec<OperatorGateRequest>>> = Arc::new(Mutex::new(Vec::new()));
+    let recorder = edge_calls.clone();
+    let author_operator_edge = move |edge: &OperatorGateRequest| {
+        recorder.lock().unwrap().push(edge.clone());
+        Ok(())
+    };
+
+    let resolve_action = |_repo: &str, block_id: &str| {
+        if block_id == "A.1" {
+            Some(GatedAction::InstallOnMini)
+        } else {
+            None
+        }
+    };
+
+    let mut report = ChainReport::default();
+    let err = integrate_chain_with_permission_gate(
+        &chain,
+        &no_deps,
+        &always_met,
+        &admission,
+        &NeverHeld,
+        Duration::from_millis(5),
+        None,
+        None,
+        None,
+        &always_flow,
+        &registry,
+        &flow_runner,
+        &roadmap_dir,
+        None,
+        &|_: &StepProgress| {},
+        false,
+        true,
+        MergePushPolicy::default(),
+        Uuid::new_v4(),
+        &|_repo: &str, _id: &str| {},
+        None,
+        None,
+        None,
+        OnBail::StopChain,
+        BailChannel::Session,
+        &|_repo, _id| BlockPresence::Row("open".to_string()),
+        &mut report,
+        &|_repo, _id| PreflightOutcome::Disabled,
+        OnUnjudged::Proceed,
+        &mut Vec::new(),
+        false,
+        None,
+        &mut Vec::new(),
+        &resolve_action,
+        Some(&author_operator_edge),
+    )
+    .await
+    .expect_err("locked profile must deny InstallOnMini and stop chain");
+
+    match err {
+        IntegrateError::PermissionGate(PermissionGateError::Denied {
+            repo,
+            block_id,
+            action,
+            edge,
+            ..
+        }) => {
+            assert_eq!(repo, "repo-a");
+            assert_eq!(block_id, "A.1");
+            assert_eq!(action, GatedAction::InstallOnMini);
+            assert_eq!(edge.slug, "permission-install_on_mini");
+        }
+        other => panic!("expected IntegrateError::PermissionGate, got {other:?}"),
+    }
+
+    let recorded = edge_calls.lock().unwrap();
+    assert_eq!(recorded.len(), 1);
+    assert_eq!(recorded[0].slug, "permission-install_on_mini");
+    assert_eq!(runner.call_count(), 0, "no step may run after permission denial");
+}
+
+/// EN.17.B: under `OnBail::SkipDependents`, a step refused by `check_permission_gate`
+/// authors the operator-gate edge, is recorded as skipped with `blocked_by` operator edge,
+/// transitively skips dependent steps, and allows independent steps to execute and close.
+#[tokio::test]
+async fn permission_gate_refusal_under_skip_dependents_skips_step_and_transitively_skips_dependents() {
+    let (_repos_dir, registry) = two_repo_registry_with_profile("locked");
+    let (_planning_root, roadmap_dir) = fixture_roadmap_dir("permission-skip-dependents");
+    let runner = RecordingRunner::new();
+    let flow_runner = runner.clone().into_runner();
+    let admission = AdmissionGate::with_default_policy();
+    let chain = resolve_explicit_chain(vec![
+        ("repo-a".to_string(), "A.1".to_string()), // denied
+        ("repo-a".to_string(), "A.2".to_string()), // depends on A.1
+        ("repo-b".to_string(), "B.1".to_string()), // independent
+    ]);
+
+    let edge_calls: Arc<Mutex<Vec<OperatorGateRequest>>> = Arc::new(Mutex::new(Vec::new()));
+    let recorder = edge_calls.clone();
+    let author_operator_edge = move |edge: &OperatorGateRequest| {
+        recorder.lock().unwrap().push(edge.clone());
+        Ok(())
+    };
+
+    let resolve_action = |_repo: &str, block_id: &str| {
+        if block_id == "A.1" {
+            Some(GatedAction::InstallOnMini)
+        } else {
+            None
+        }
+    };
+
+    let resolve_depends = |_repo: &str, block_id: &str| {
+        if block_id == "A.2" {
+            vec![DependencyEdge::Block {
+                repo: "repo-a".to_string(),
+                block_id: "A.1".to_string(),
+            }]
+        } else {
+            Vec::new()
+        }
+    };
+
+    let mut report = ChainReport::default();
+    let outcomes = integrate_chain_with_permission_gate(
+        &chain,
+        &resolve_depends,
+        &always_met,
+        &admission,
+        &NeverHeld,
+        Duration::from_millis(5),
+        None,
+        None,
+        None,
+        &always_flow,
+        &registry,
+        &flow_runner,
+        &roadmap_dir,
+        None,
+        &|_: &StepProgress| {},
+        false,
+        true,
+        MergePushPolicy::default(),
+        Uuid::new_v4(),
+        &|_repo: &str, _id: &str| {},
+        None,
+        None,
+        None,
+        OnBail::SkipDependents,
+        BailChannel::Session,
+        &|_repo, _id| BlockPresence::Row("open".to_string()),
+        &mut report,
+        &|_repo, _id| PreflightOutcome::Disabled,
+        OnUnjudged::Proceed,
+        &mut Vec::new(),
+        false,
+        None,
+        &mut Vec::new(),
+        &resolve_action,
+        Some(&author_operator_edge),
+    )
+    .await
+    .expect("skip_dependents must allow independent steps to finish the chain");
+
+    assert_eq!(outcomes.len(), 1);
+    assert_eq!(runner.call_count(), 1, "only independent step B.1 must execute");
+
+    let recorded = edge_calls.lock().unwrap();
+    assert_eq!(recorded.len(), 1);
+    assert_eq!(recorded[0].slug, "permission-install_on_mini");
+
+    assert_eq!(report.closed, vec!["repo-b:B.1"]);
+    assert_eq!(report.skipped.len(), 2);
+    assert_eq!(report.skipped[0].block, "repo-a:A.1");
+    assert_eq!(
+        report.skipped[0].blocked_by,
+        Some(serde_json::json!({
+            "type": "operator",
+            "slug": "permission-install_on_mini"
+        }))
+    );
+    assert_eq!(report.skipped[1].block, "repo-a:A.2");
+
+    let lines = lane_log_lines(&roadmap_dir);
+    assert_eq!(lines.len(), 3);
+    assert_eq!(lines[0]["block"], "A.1");
+    assert_eq!(lines[0]["status"], "skipped");
+    assert_eq!(lines[0]["blocked_by"]["type"], "operator");
+    assert_eq!(lines[0]["blocked_by"]["slug"], "permission-install_on_mini");
+
+    assert_eq!(lines[1]["block"], "A.2");
+    assert_eq!(lines[1]["status"], "skipped");
+
+    assert_eq!(lines[2]["block"], "B.1");
+    assert_eq!(lines[2]["status"], "closed");
+}
+
+/// Permitted action under unrestricted profile executes the step and never calls author_operator_edge.
+#[tokio::test]
+async fn permission_gate_permitted_action_proceeds_without_authoring_edge() {
+    let (_repos_dir, registry) = two_repo_registry_with_profile("unrestricted");
+    let (_planning_root, roadmap_dir) = fixture_roadmap_dir("permission-permitted");
+    let runner = RecordingRunner::new();
+    let flow_runner = runner.clone().into_runner();
+    let admission = AdmissionGate::with_default_policy();
+    let chain = resolve_explicit_chain(vec![
+        ("repo-a".to_string(), "A.1".to_string()),
+    ]);
+
+    let edge_calls: Arc<Mutex<Vec<OperatorGateRequest>>> = Arc::new(Mutex::new(Vec::new()));
+    let recorder = edge_calls.clone();
+    let author_operator_edge = move |edge: &OperatorGateRequest| {
+        recorder.lock().unwrap().push(edge.clone());
+        Ok(())
+    };
+
+    let resolve_action = |_repo: &str, _block_id: &str| Some(GatedAction::InstallOnMini);
+
+    let mut report = ChainReport::default();
+    let outcomes = integrate_chain_with_permission_gate(
+        &chain,
+        &no_deps,
+        &always_met,
+        &admission,
+        &NeverHeld,
+        Duration::from_millis(5),
+        None,
+        None,
+        None,
+        &always_flow,
+        &registry,
+        &flow_runner,
+        &roadmap_dir,
+        None,
+        &|_: &StepProgress| {},
+        false,
+        true,
+        MergePushPolicy::default(),
+        Uuid::new_v4(),
+        &|_repo: &str, _id: &str| {},
+        None,
+        None,
+        None,
+        OnBail::StopChain,
+        BailChannel::Session,
+        &|_repo, _id| BlockPresence::Row("open".to_string()),
+        &mut report,
+        &|_repo, _id| PreflightOutcome::Disabled,
+        OnUnjudged::Proceed,
+        &mut Vec::new(),
+        false,
+        None,
+        &mut Vec::new(),
+        &resolve_action,
+        Some(&author_operator_edge),
+    )
+    .await
+    .expect("permitted action must succeed");
+
+    assert_eq!(outcomes.len(), 1);
+    assert_eq!(runner.call_count(), 1);
+    assert!(edge_calls.lock().unwrap().is_empty(), "no edge must be authored for permitted action");
+    assert_eq!(report.closed, vec!["repo-a:A.1"]);
+}
+
+/// Proves that `OrchestrationRunNode` forwards `with_resolve_action` and `with_author_operator_edge`
+/// end to end into `integrate_chain_with_permission_gate`.
+#[tokio::test]
+async fn orchestration_run_node_permission_gate_wired() {
+    let (repos_dir, _registry) = two_repo_registry_with_profile("locked");
+    std::fs::create_dir_all(repos_dir.path().join("planning/roadmaps/node-permission-test")).unwrap();
+    let runner = RecordingRunner::new();
+    let flow_runner = runner.clone().into_runner();
+
+    let edge_calls: Arc<Mutex<Vec<OperatorGateRequest>>> = Arc::new(Mutex::new(Vec::new()));
+    let recorder = edge_calls.clone();
+    let author_operator_edge = move |edge: &OperatorGateRequest| {
+        recorder.lock().unwrap().push(edge.clone());
+        Ok(())
+    };
+
+    let resolve_action = |_repo: &str, _block_id: &str| Some(GatedAction::InstallOnMini);
+
+    let node = OrchestrationRunNode::new()
+        .with_run_flow(flow_runner)
+        .with_resolve_action(Arc::new(resolve_action))
+        .with_author_operator_edge(Arc::new(author_operator_edge));
+
+    let event = serde_json::json!({
+        "brain_root": repos_dir.path().to_string_lossy(),
+        "blocks": [{ "repo": "repo-a", "block_id": "A.1" }],
+        "roadmap_slug": "node-permission-test",
+    });
+    let ctx = TaskContext {
+        event,
+        nodes: std::collections::HashMap::new(),
+        metadata: serde_json::json!({}),
+        node_runs: std::collections::HashMap::new(),
+    };
+
+    let err = node.process(ctx).await.expect_err("locked profile must deny action through node");
+    assert!(
+        err.message.contains("permission-install_on_mini"),
+        "error message should cite raised operator gate: {}",
+        err.message
+    );
+    assert_eq!(edge_calls.lock().unwrap().len(), 1);
+    assert_eq!(runner.call_count(), 0);
 }

@@ -646,6 +646,7 @@ def build_orchestration_event_body(spec: JobSpec, cfg: SweepConfig, sandbox_root
             # real HQ's.
             "roadmap_slug": ORCHESTRATION_ROADMAP_SLUG,
             "policy": {
+                "child_sdlc_flow_policy": child_policy,
                 "child_sdlc_task_policy": child_policy,
                 "local": child_policy["local"],
                 # Anything ORCHESTRATION's OWN nodes touch at block boundaries
@@ -792,14 +793,11 @@ class SweepConfig:
 def build_event_body(spec: JobSpec, cfg: SweepConfig) -> dict:
     policy: dict = {
         "agent_backend": spec.backend,
-        # Every non-agentic SDLC_FLOW model stage this bench dispatches must
-        # resolve to the local model under test — "triage"/"review" alone
-        # left `PatchDocsNode`/`GenerateTasksNode` silently calling the real
-        # `claude` CLI with sonnet/opus (measured 2026-09-14; see
-        # `docs/local-model-bench.md` § Pitfalls). `implement` is
-        # deliberately absent: the agentic implement stage routes through
-        # `agent_backend` (aider/pi), not a bare model-tier swap.
+        # Every non-agentic and agentic SDLC_FLOW model stage this bench dispatches must
+        # resolve to the local model under test.
         "model_tiers": {
+            "implement": "local",
+            "implement_simple": "local",
             "triage": "local",
             "review": "local",
             "docs": "local",
@@ -1152,6 +1150,7 @@ def run_one_job_orchestration(spec: JobSpec, cfg: SweepConfig, sandbox_root: Pat
     try:
         block_id = ensure_sandbox_bench_block(sandbox_root)
         work_dir.mkdir(parents=True, exist_ok=True)
+        shutil.rmtree(work_dir / "sdlc", ignore_errors=True)
         tasks = json.loads((TIERS_DIR / spec.tier / "tasks.json").read_text())
         (work_dir / "tasks.json").write_text(json.dumps(tasks, indent=2) + "\n")
         (work_dir / "harness.json").write_text(json.dumps(build_harness_from_tasks(tasks), indent=2) + "\n")
@@ -1187,11 +1186,12 @@ def run_one_job_orchestration(spec: JobSpec, cfg: SweepConfig, sandbox_root: Pat
         except Exception:  # noqa: BLE001
             orch_event = {}
 
-        # sdlc_workflow: "task" -> the child's own state file is sdlc-task-state.json,
-        # not sdlc-flow-state.json (see docs/workflows/orchestration.md, "Each engine
-        # writes ... its own state file"). harvest_state's key set (outcomes/tasks/
-        # bail_reason/engine_build_sha) is schema-compatible with both.
-        harvest_state(record, work_dir / "sdlc" / "sdlc-task-state.json")
+        # Check for sdlc-flow-state.json (if block ran as Flow) or sdlc-task-state.json
+        # (if block ran as Task). harvest_state is schema-compatible with both.
+        state_file = work_dir / "sdlc" / "sdlc-flow-state.json"
+        if not state_file.is_file():
+            state_file = work_dir / "sdlc" / "sdlc-task-state.json"
+        harvest_state(record, state_file)
         record.final_checks = run_final_checks(tasks, worktree)
         record.changed_paths = changed_paths(worktree)
         declared = {f for t in tasks for f in t.get("files") or []}

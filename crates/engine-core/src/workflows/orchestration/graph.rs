@@ -125,13 +125,14 @@ use super::chain::{resolve_explicit_chain, resolve_lane_chain, ChainStep};
 use super::conductor::{ConductorProposalError, DroppedCandidate, ProposalOutcome};
 use super::coord_lane::CoordHandle;
 use super::execute::{default_flow_runner, EngineKind, ExecutionOutcome, FlowRunner};
-use super::gates::{AdmissionGate, DependencyEdge};
+use super::gates::{AdmissionGate, DependencyEdge, OperatorGateRequest};
 use super::inbox_triage::{InboxTriageRunner, ProcessedMessage};
 use super::integrate::{
-    integrate_chain_with_inbox_triage, resolve_roadmap_dir, ChainReport, CloseBlockFn, HoldSource,
+    integrate_chain_with_permission_gate, resolve_roadmap_dir, ChainReport, CloseBlockFn, HoldSource,
     JournalSinkFn, NeverHeld, OnUnjudged, StepProgress,
 };
 use super::preflight::{BlockPreflight, PreflightOutcome};
+use crate::policy::permission::GatedAction;
 
 /// The registered workflow type string, used both to register the workflow
 /// (`engine-serve`, this task) and as `WorkflowSchema::workflow_type`.
@@ -1053,6 +1054,11 @@ type BlockStatusFn = Arc<dyn Fn(&str, &str) -> super::corpus_gates::BlockPresenc
 /// `EN.17.D` Task 4: `(repo, block_id) -> PreflightOutcome` — see
 /// [`OrchestrationRunNode::with_preflight`].
 type PreflightFn = Arc<dyn Fn(&str, &str) -> PreflightOutcome + Send + Sync>;
+/// Seam to resolve what [`GatedAction`] a step intends to perform, if any.
+pub type ResolveActionFn = Arc<dyn Fn(&str, &str) -> Option<GatedAction> + Send + Sync>;
+/// Seam to author an operator-gate request when an action is denied.
+pub type AuthorOperatorEdgeFn =
+    Arc<dyn Fn(&OperatorGateRequest) -> Result<(), String> + Send + Sync>;
 /// A per-step observer, called once per completed step — see
 /// [`OrchestrationRunNode::with_step_observer`] and
 /// [`integrate::StepProgress`].
@@ -1182,6 +1188,10 @@ pub struct OrchestrationRunNode {
     /// always supplies a real one when that switch is on, mirroring
     /// `preflight`'s own default-to-no-op contract.
     inbox_triage_runner: Option<Arc<InboxTriageRunner>>,
+    /// Seam to resolve what [`GatedAction`] a step intends to perform, if any.
+    resolve_action: ResolveActionFn,
+    /// Optional closure to author an operator gate when an action is denied.
+    author_operator_edge: Option<AuthorOperatorEdgeFn>,
 }
 
 impl fmt::Debug for OrchestrationRunNode {
@@ -1220,6 +1230,8 @@ impl OrchestrationRunNode {
             operator_transport: Arc::new(NoopOperatorTransport),
             preflight: Arc::new(|_repo, _block_id| PreflightOutcome::Disabled),
             inbox_triage_runner: None,
+            resolve_action: Arc::new(|_repo, _block_id| None),
+            author_operator_edge: None,
         }
     }
 
@@ -1413,6 +1425,22 @@ impl OrchestrationRunNode {
     #[must_use]
     pub fn with_inbox_triage_runner(mut self, runner: Arc<InboxTriageRunner>) -> Self {
         self.inbox_triage_runner = Some(runner);
+        self
+    }
+
+    /// Install the action resolver seam that determines which [`GatedAction`]
+    /// a step intends to perform, if any.
+    #[must_use]
+    pub fn with_resolve_action(mut self, f: ResolveActionFn) -> Self {
+        self.resolve_action = f;
+        self
+    }
+
+    /// Install a custom operator-gate authoring closure for when a step's action is denied.
+    /// If not provided, defaults to `make_author_operator_edge`.
+    #[must_use]
+    pub fn with_author_operator_edge(mut self, f: AuthorOperatorEdgeFn) -> Self {
+        self.author_operator_edge = Some(f);
         self
     }
 }
@@ -1738,6 +1766,8 @@ impl Node for OrchestrationRunNode {
         // `inbox_triage_enabled` is `Copy` (crosses by value).
         let inbox_triage_runner = self.inbox_triage_runner.clone();
         let inbox_triage_enabled = policy.inbox_triage_enabled;
+        let resolve_action = self.resolve_action.clone();
+        let author_operator_edge = self.author_operator_edge.clone();
         // `NodeError` now carries an optional `node_result` payload (the
         // `chain_report`-past-revert seam below), which pushes this
         // closure's `Err` variant past clippy's `result_large_err`
@@ -1790,7 +1820,10 @@ impl Node for OrchestrationRunNode {
                 // `chain_report`/`preflight_report` above, for the same
                 // reason (survives the `Err` arm below).
                 let mut inbox_report: Vec<ProcessedMessage> = Vec::new();
-                let result = rt.block_on(integrate_chain_with_inbox_triage(
+                let author_fn = author_operator_edge.as_ref().map(|f| {
+                    f.as_ref() as &dyn Fn(&OperatorGateRequest) -> Result<(), String>
+                });
+                let result = rt.block_on(integrate_chain_with_permission_gate(
                     &chain,
                     &move |repo, block_id| resolve_depends_on(repo, block_id),
                     &move |repo, block_id| is_edge_met(repo, block_id),
@@ -1862,6 +1895,8 @@ impl Node for OrchestrationRunNode {
                     inbox_triage_enabled,
                     inbox_triage_runner.as_deref(),
                     &mut inbox_report,
+                    &move |repo, block_id| resolve_action(repo, block_id),
+                    author_fn,
                 ));
                 match result {
                     Ok(outcomes) => Ok((outcomes, chain_report, preflight_report, inbox_report)),

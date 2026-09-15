@@ -93,7 +93,7 @@ class TestMissingFixturePaths(unittest.TestCase):
         self.assertEqual(len(missing), 2, missing)
 
     def test_positive_control_existing_paths_are_not_flagged(self) -> None:
-        tasks = [{"validation_commands": ["python3 scripts/bench_verify_medium.py"], "description": "edit planning/local-model-bench/index.md"}]
+        tasks = [{"validation_commands": ["python3 scripts/dev-tooling/bench_verify_medium.py"], "description": "edit planning/local-model-bench/index.md"}]
         self.assertEqual(blm.missing_fixture_paths(tasks), [])
 
 

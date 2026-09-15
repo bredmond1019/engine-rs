@@ -24,6 +24,22 @@
 //! attribution trailer this fleet otherwise refuses to write, regardless of
 //! which repo it lands in.
 //!
+//! **DECISION: `--no-gitignore`.** By default, `aider` checks whether `.aider*`
+//! patterns are present in `.gitignore` on startup and, under `--yes-always`,
+//! silently modifies `.gitignore`. Passing `--no-gitignore` suppresses this
+//! check and avoids unwanted working-tree mutations.
+//!
+//! **DECISION: isolated `--aiderignore` (`aider-mention-reflection-discards-pending-edit`).**
+//! When an aider model reply mentions any tracked repo file (e.g. `.gitignore`
+//! in a comment or script), aider's `check_for_file_mentions` under `--yes-always`
+//! auto-confirms adding that file to the chat and returns early before
+//! completing the reply, discarding the pending edit and prompting the model
+//! again. We pass `--aiderignore` with a generated temporary ignore file that
+//! ignores all repository files (`*`) except the task's declared files (`!{file}`).
+//! This keeps aider's addable files set empty, preventing mentioned files from
+//! being auto-added and preventing edits from being discarded.
+
+//!
 //! `Config.cwd` (the scoped git worktree) becomes the child's `current_dir`;
 //! `Config.timeout` (default [`DEFAULT_AIDER_TIMEOUT`], sized identically to
 //! `pi_transport`'s — a shared local Ollama server can queue concurrent
@@ -64,6 +80,7 @@
 //! sees "no cost information was ever offered" rather than "a cost estimate
 //! exists whose dollar figure happens to be unknown".
 
+use std::io::Write;
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
@@ -105,6 +122,37 @@ fn is_safe_task_path(path: &str) -> bool {
         && !candidate
             .components()
             .any(|c| matches!(c, std::path::Component::ParentDir))
+}
+
+/// Generate the contents of an isolated `.aiderignore` file for an `aider` invocation.
+///
+/// Under `--yes-always`, whenever an aider model reply mentions any tracked repo file
+/// (even casually in a comment, code sample, or script), aider's `check_for_file_mentions`
+/// auto-confirms adding that file to the chat and returns early before completing the reply,
+/// discarding the pending edit and prompting the model again (`aider-mention-reflection-discards-pending-edit`).
+///
+/// In aider's `repo.py`, candidate tracked files are filtered by `self.ignored_file(fname)`
+/// via `.aiderignore`. By ignoring all repository files (`*`) except the task's declared
+/// safe files (`!{file}`), aider's set of addable files remains empty, preventing
+/// mentioned files from being auto-added and preventing edits from being discarded.
+#[must_use]
+pub fn generate_aiderignore_content<'a, I>(task_files: I) -> String
+where
+    I: IntoIterator<Item = &'a str>,
+{
+    let mut content = String::from("*\n");
+    for path in task_files {
+        let trimmed = path.trim();
+        let normalized = trimmed.replace('\\', "/");
+        let stripped = normalized.strip_prefix("./").unwrap_or(&normalized);
+        let clean = stripped.strip_prefix('/').unwrap_or(stripped);
+        if !clean.is_empty() {
+            content.push('!');
+            content.push_str(clean);
+            content.push('\n');
+        }
+    }
+    content
 }
 
 /// Whole-call wall-clock ceiling applied when `Config.timeout` carries no
@@ -156,20 +204,6 @@ async fn run_aider(
 ) -> ClaudeResult<(Outcome, TransportInfo)> {
     let binary = std::env::var(AIDER_BINARY_ENV).unwrap_or_else(|_| AIDER_BINARY.to_string());
 
-    let mut command = Command::new(&binary);
-    command
-        .arg("--model")
-        .arg(format!("ollama_chat/{}", local.model))
-        .arg("--yes-always")
-        .arg("--no-show-model-warnings")
-        .arg("--no-attribute-co-authored-by")
-        .arg("--message")
-        .arg(&prompt)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
-
     let task_files: Vec<&str> = config
         .env
         .iter()
@@ -177,6 +211,34 @@ async fn run_aider(
         .flat_map(|(_, v)| v.lines().map(str::trim))
         .filter(|path| is_safe_task_path(path))
         .collect();
+
+    let ignore_content = generate_aiderignore_content(task_files.iter().copied());
+    let mut ignore_file = tempfile::Builder::new()
+        .prefix(".engine_aiderignore_")
+        .tempfile()
+        .map_err(ClaudeError::Spawn)?;
+    ignore_file
+        .write_all(ignore_content.as_bytes())
+        .map_err(ClaudeError::Spawn)?;
+    ignore_file.flush().map_err(ClaudeError::Spawn)?;
+
+    let mut command = Command::new(&binary);
+    command
+        .arg("--model")
+        .arg(format!("ollama_chat/{}", local.model))
+        .arg("--yes-always")
+        .arg("--no-show-model-warnings")
+        .arg("--no-attribute-co-authored-by")
+        .arg("--no-gitignore")
+        .arg("--aiderignore")
+        .arg(ignore_file.path())
+        .arg("--message")
+        .arg(&prompt)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+
     command.args(&task_files);
 
     if let Some(cwd) = &config.cwd {
@@ -625,8 +687,81 @@ printf 'other_env:%s\n' "${OTHER:-unset}"
         assert!(!text.contains("arg:../escape.md"), "{text}");
         assert!(!text.contains("arg:/abs/path.md"), "{text}");
         assert!(!text.contains("arg:-rf"), "{text}");
+        assert!(text.contains("arg:--no-gitignore"), "{text}");
+        assert!(text.contains("arg:--aiderignore"), "{text}");
         assert!(text.contains("files_env:unset"), "{text}");
         assert!(text.contains("other_env:kept"), "{text}");
+    }
+
+    #[test]
+    fn generate_aiderignore_content_ignores_all_when_empty() {
+        let content = generate_aiderignore_content(std::iter::empty::<&str>());
+        assert_eq!(content, "*\n");
+    }
+
+    #[test]
+    fn generate_aiderignore_content_unignores_declared_files_with_normalized_paths() {
+        let content = generate_aiderignore_content([
+            "foo.txt",
+            "./src/lib.rs",
+            "crates\\engine-core\\Cargo.toml",
+            "   /leading/slash.rs  ",
+        ]);
+        assert_eq!(
+            content,
+            "*\n!foo.txt\n!src/lib.rs\n!crates/engine-core/Cargo.toml\n!leading/slash.rs\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn aider_passes_isolated_aiderignore_preventing_file_mentions_reflection() {
+        let _guard = AIDER_BINARY_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        let (_script_dir, script) = write_fake_binary(
+            r#"prev=""
+for a in "$@"; do
+    if [ "$prev" = "--aiderignore" ]; then
+        printf 'ignore_file_path:%s\n' "$a"
+        printf 'ignore_content:\n%s\n' "$(cat "$a")"
+    fi
+    prev="$a"
+done
+printf 'Applied edit to LOCAL_ORCH_1.md\n'
+"#,
+        );
+        set_aider_binary(&script);
+
+        let config = Config {
+            env: vec![(
+                AIDER_FILES_ENV.to_string(),
+                "LOCAL_ORCH_1.md\nsrc/lib.rs\n".to_string(),
+            )],
+            ..Config::default()
+        };
+
+        let transport = aider_meta_transport(test_local_config(), None);
+        let result = transport(config, "prompt".to_string()).await;
+        clear_aider_binary();
+
+        let (outcome, _info) = result.expect("fake aider script run must succeed");
+        let text = outcome.text;
+        assert!(
+            text.contains("ignore_content:\n*\n!LOCAL_ORCH_1.md\n!src/lib.rs"),
+            "{text}"
+        );
+
+        let path_line = text
+            .lines()
+            .find(|l| l.starts_with("ignore_file_path:"))
+            .expect("must report ignore file path");
+        let ignore_path = path_line.strip_prefix("ignore_file_path:").unwrap().trim();
+        assert!(
+            !std::path::Path::new(ignore_path).exists(),
+            "temp ignore file must be cleaned up on drop: {ignore_path}"
+        );
     }
 
     #[cfg(unix)]

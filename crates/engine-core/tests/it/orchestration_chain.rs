@@ -287,6 +287,7 @@ struct RecordingRunner {
     // the value reached the child rather than merely that the policy
     // struct was right.
     use_worktree_calls: Arc<Mutex<Vec<(String, bool)>>>,
+    cancellation_token_calls: Arc<Mutex<Vec<(String, bool)>>>,
 }
 
 impl RecordingRunner {
@@ -296,7 +297,19 @@ impl RecordingRunner {
             status_overrides: Arc::new(Mutex::new(HashMap::new())),
             cost_overrides: Arc::new(Mutex::new(HashMap::new())),
             use_worktree_calls: Arc::new(Mutex::new(Vec::new())),
+            cancellation_token_calls: Arc::new(Mutex::new(Vec::new())),
         }
+    }
+
+    /// Whether the captured [`FlowInvocation`] for `block_id` carried a
+    /// cancellation token, or `None` if never invoked for that block.
+    fn has_cancellation_token_for(&self, block_id: &str) -> Option<bool> {
+        self.cancellation_token_calls
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(id, _)| id == block_id)
+            .map(|(_, has_token)| *has_token)
     }
 
     /// The `use_worktree` the captured [`FlowInvocation`] for `block_id`
@@ -371,6 +384,13 @@ impl RecordingRunner {
                     .lock()
                     .unwrap()
                     .push((invocation.block_id.clone(), invocation.use_worktree));
+                this.cancellation_token_calls
+                    .lock()
+                    .unwrap()
+                    .push((
+                        invocation.block_id.clone(),
+                        invocation.cancellation_token.is_some(),
+                    ));
 
                 // Real `SDLC_FLOW` branch discipline: cut fresh from
                 // `origin/main`, never from a sibling block's branch tip.
@@ -1288,6 +1308,55 @@ async fn abort_between_blocks_leaves_block_one_committed_and_block_two_unstarted
     assert_eq!(lines[0]["status"], "closed");
     assert_eq!(lines[1]["block"], "TF.2");
     assert_eq!(lines[1]["status"], "cancelled");
+}
+
+#[tokio::test]
+async fn child_flow_receives_parent_cancellation_token() {
+    let (_brain_root, _bare_root, registry, _repo_path) = single_repo_fixture("smoke-repo");
+    let (_planning_root, roadmap_dir) = fixture_roadmap_dir("cancellation-propagation");
+    let admission = AdmissionGate::with_default_policy();
+
+    let runner = RecordingRunner::new();
+    let flow_runner = runner.clone().into_runner();
+    let token = CancellationToken::new();
+
+    let chain = resolve_explicit_chain(vec![
+        ("smoke-repo".to_string(), "TF.1".to_string()),
+    ]);
+
+    let outcomes = integrate_chain(
+        &chain,
+        &no_deps,
+        &always_met,
+        &admission,
+        &NeverHeld,
+        Duration::from_millis(5),
+        None,
+        Some(&token),
+        None,
+        &always_flow,
+        &registry,
+        &flow_runner,
+        &roadmap_dir,
+        Some("cancellation-lane"),
+        &|_: &StepProgress| {},
+        false,
+        true,
+        MergePushPolicy::default(),
+        Uuid::new_v4(),
+        &|_repo: &str, _id: &str| {},
+        None,
+        None,
+    )
+    .await
+    .expect("integrate_chain succeeds");
+
+    assert_eq!(outcomes.len(), 1);
+    assert_eq!(
+        runner.has_cancellation_token_for("TF.1"),
+        Some(true),
+        "child flow invocation must receive the parent cancellation token"
+    );
 }
 
 /// AC: "A campaign ceiling set BELOW one block's cost halts the chain at
