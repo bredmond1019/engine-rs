@@ -105,7 +105,7 @@ use engine_core::workflows::orchestration::gates::{AdmissionGate, DependencyEdge
 use engine_core::workflows::orchestration::graph::resolve_policy_for_run_from;
 use engine_core::workflows::orchestration::integrate::{
     integrate_chain, integrate_chain_with_dispatch, verify_state_write, IntegrateError,
-    LaneLogStatus, NeverHeld, StepProgress,
+    LaneLogStatus, MergePushPolicy, NeverHeld, StepProgress,
 };
 use engine_core::workflows::recall::RECALL_WORKFLOW_TYPE;
 use engine_core::{BrainConfig, Dispatcher, HttpGet, NodeRegistry, Workflow};
@@ -576,6 +576,18 @@ async fn block_n_plus_1s_tree_contains_block_ns_work() {
         &|_: &StepProgress| {},
         false,
         true,
+        // This test's whole point is proving multi-block continuity: B2's
+        // worktree/branch is cut fresh from `origin/main` (per-step branch
+        // discipline, unchanged by the auto_push fix), so B1's work must
+        // actually reach `origin/main` — not merely local `main` — for B2
+        // to see it. `auto_push: false` (the new built-in default) would
+        // break exactly this guarantee, so this test opts in explicitly.
+        // See `OrchestrationPolicy::default_auto_push`'s doc comment for
+        // this same correctness trade-off, spelled out for real chain use.
+        MergePushPolicy {
+            auto_merge: true,
+            auto_push: true,
+        },
         Uuid::new_v4(),
         &|_repo: &str, _id: &str| {},
         None,
@@ -814,6 +826,7 @@ async fn a_failed_setup_worktree_step_stops_the_chain_via_execute_step() {
         &|_: &StepProgress| {},
         false,
         true,
+        MergePushPolicy::default(),
         Uuid::new_v4(),
         &|_repo: &str, _id: &str| {},
         None,
@@ -1001,6 +1014,7 @@ async fn lane_log_lines_use_the_fixed_ts_lane_repo_block_status_note_shape() {
         &|_: &StepProgress| {},
         false,
         true,
+        MergePushPolicy::default(),
         Uuid::new_v4(),
         &|_repo: &str, _id: &str| {},
         None,
@@ -1032,6 +1046,7 @@ async fn lane_log_lines_use_the_fixed_ts_lane_repo_block_status_note_shape() {
         &|_: &StepProgress| {},
         false,
         true,
+        MergePushPolicy::default(),
         Uuid::new_v4(),
         &|_repo: &str, _id: &str| {},
         None,
@@ -1210,6 +1225,7 @@ async fn abort_between_blocks_leaves_block_one_committed_and_block_two_unstarted
         &|_: &StepProgress| {},
         false,
         true,
+        MergePushPolicy::default(),
         Uuid::new_v4(),
         &|_repo: &str, _id: &str| {},
         None,
@@ -1328,6 +1344,7 @@ async fn campaign_ceiling_below_one_blocks_cost_halts_at_first_boundary() {
         &|_: &StepProgress| {},
         false,
         true,
+        MergePushPolicy::default(),
         Uuid::new_v4(),
         &|_repo: &str, _id: &str| {},
         None,
@@ -1450,6 +1467,7 @@ async fn an_unmergeable_step_fails_the_step_and_never_closes_it() {
         &|_: &StepProgress| {},
         false,
         true,
+        MergePushPolicy::default(),
         Uuid::new_v4(),
         &|_repo: &str, _id: &str| {},
         None,
@@ -1546,6 +1564,7 @@ async fn planning_symlink_still_resolves_into_its_vault_after_the_merge_stage() 
         &|_: &StepProgress| {},
         false,
         true,
+        MergePushPolicy::default(),
         Uuid::new_v4(),
         &|_repo: &str, _id: &str| {},
         None,
@@ -1737,6 +1756,7 @@ async fn run_recall_then_block_chain(
         &|_: &StepProgress| {},
         false,
         true,
+        MergePushPolicy::default(),
         Uuid::new_v4(),
         &|_repo: &str, _id: &str| {},
         Some(&move |row: JournalRow| sink_fn(row)),
@@ -1898,6 +1918,7 @@ async fn unstated_policy_event_resolves_to_use_worktree_true_on_the_invocation()
         &|_: &StepProgress| {},
         policy.default_use_worktree,
         policy.default_auto_pr,
+        MergePushPolicy::default(),
         Uuid::new_v4(),
         &|_repo: &str, _id: &str| {},
         None,
@@ -1960,6 +1981,7 @@ async fn explicit_false_policy_event_resolves_to_use_worktree_false_on_the_invoc
         &|_: &StepProgress| {},
         policy.default_use_worktree,
         policy.default_auto_pr,
+        MergePushPolicy::default(),
         Uuid::new_v4(),
         &|_repo: &str, _id: &str| {},
         None,

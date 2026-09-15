@@ -37,7 +37,8 @@ use engine_core::workflows::orchestration::chain::resolve_explicit_chain;
 use engine_core::workflows::orchestration::execute::{EngineKind, ExecutionOutcome, FlowRunner};
 use engine_core::workflows::orchestration::gates::AdmissionGate;
 use engine_core::workflows::orchestration::integrate::{
-    integrate_chain_with_run_record, ComposeLedgerEntriesFn, NeverHeld, StepProgress,
+    integrate_chain_with_run_record, ComposeLedgerEntriesFn, MergePushPolicy, NeverHeld,
+    StepProgress,
 };
 use engine_core::workflows::orchestration::ledger::{Coverage, NewLedgerEntry};
 
@@ -247,6 +248,7 @@ async fn second_steps_bail_still_leaves_first_steps_ledger_entries_on_disk() {
         &|_: &StepProgress| {},
         false,
         true,
+        MergePushPolicy::default(),
         Uuid::new_v4(),
         &noop_close_block,
         None,
@@ -317,6 +319,7 @@ async fn two_block_happy_path_leaves_ledger_entries_for_both() {
         },
         false,
         true,
+        MergePushPolicy::default(),
         Uuid::new_v4(),
         &noop_close_block,
         None,
@@ -381,6 +384,7 @@ async fn chain_creates_ledger_with_header_and_md_wrapper_when_absent() {
         &|_: &StepProgress| {},
         false,
         true,
+        MergePushPolicy::default(),
         Uuid::new_v4(),
         &noop_close_block,
         None,
@@ -488,6 +492,7 @@ async fn merging_into_an_existing_ledger_keeps_prior_entries_and_skips_duplicate
         &|_: &StepProgress| {},
         false,
         true,
+        MergePushPolicy::default(),
         Uuid::new_v4(),
         &noop_close_block,
         None,
@@ -578,6 +583,7 @@ async fn validation_refusals_are_enforced_through_the_full_chain() {
         &|_: &StepProgress| {},
         false,
         true,
+        MergePushPolicy::default(),
         Uuid::new_v4(),
         &noop_close_block,
         Some(journal_sink.as_ref()),
@@ -658,6 +664,7 @@ async fn a_composer_error_never_fails_the_chain_and_is_recorded_as_a_journal_gap
         &|_: &StepProgress| {},
         false,
         true,
+        MergePushPolicy::default(),
         Uuid::new_v4(),
         &noop_close_block,
         Some(journal_sink.as_ref()),

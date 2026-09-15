@@ -38,7 +38,7 @@ use engine_core::workflows::orchestration::graph::{
     resolve_policy_for_run_from, OnBail, OrchestrationRunNode, NODE_NAME,
 };
 use engine_core::workflows::orchestration::integrate::{
-    integrate_chain_with_coord_and_policy, ChainReport, NeverHeld, StepProgress,
+    integrate_chain_with_coord_and_policy, ChainReport, MergePushPolicy, NeverHeld, StepProgress,
 };
 use engine_core::WorkflowError;
 
@@ -940,6 +940,7 @@ async fn hq_orchestration_policy_real_hq_file_sets_the_switches() {
         &|_: &StepProgress| {},
         false,
         true,
+        MergePushPolicy::default(),
         uuid::Uuid::new_v4(),
         &|_repo: &str, _id: &str| {},
         None,

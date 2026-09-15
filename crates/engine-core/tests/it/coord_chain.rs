@@ -35,7 +35,7 @@ use engine_core::workflows::orchestration::gates::{
     PermissionGateError,
 };
 use engine_core::workflows::orchestration::integrate::{
-    integrate_chain_with_coord, CoordOp, IntegrateError, NeverHeld, StepProgress,
+    integrate_chain_with_coord, CoordOp, IntegrateError, MergePushPolicy, NeverHeld, StepProgress,
 };
 
 // ── Shared fixture helpers — mirrors `orchestration::integrate`'s own `mod tests` helpers
@@ -178,6 +178,7 @@ async fn run_chain(
         &|_: &StepProgress| {},
         false,
         true,
+        MergePushPolicy::default(),
         uuid::Uuid::new_v4(),
         &|_repo: &str, _id: &str| {},
         coord,
@@ -939,6 +940,7 @@ async fn run_chain_fallible(
         &|_: &StepProgress| {},
         false,
         true,
+        MergePushPolicy::default(),
         uuid::Uuid::new_v4(),
         &|_repo: &str, _id: &str| {},
         coord,

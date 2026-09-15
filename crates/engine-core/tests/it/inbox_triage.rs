@@ -38,8 +38,8 @@ use engine_core::workflows::orchestration::inbox_triage::{
     Action, InboxTriageConfig, InboxTriageRunner, ProcessedMessage, Verdict,
 };
 use engine_core::workflows::orchestration::integrate::{
-    integrate_chain_with_inbox_triage, ChainReport, IntegrateError, NeverHeld, OnUnjudged,
-    StepProgress,
+    integrate_chain_with_inbox_triage, ChainReport, IntegrateError, MergePushPolicy, NeverHeld,
+    OnUnjudged, StepProgress,
 };
 use engine_core::workflows::orchestration::preflight::{BlockPreflight, PreflightOutcome};
 use engine_core::workflows::ModelTransport;
@@ -302,6 +302,7 @@ async fn run_chain(
         &|_: &StepProgress| {},
         false,
         true,
+        MergePushPolicy::default(),
         uuid::Uuid::new_v4(),
         &|_repo: &str, _id: &str| {},
         coord,

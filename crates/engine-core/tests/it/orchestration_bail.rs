@@ -82,8 +82,8 @@ use engine_core::workflows::orchestration::graph::{
     resolve_policy_for_run_from, OnBail, OrchestrationRunNode,
 };
 use engine_core::workflows::orchestration::integrate::{
-    integrate_chain_with_coord, integrate_chain_with_coord_and_policy, ChainReport, NeverHeld,
-    StepProgress,
+    integrate_chain_with_coord, integrate_chain_with_coord_and_policy, ChainReport,
+    MergePushPolicy, NeverHeld, StepProgress,
 };
 use engine_core::WorkflowError;
 
@@ -230,6 +230,7 @@ async fn run_chain(
         step_observer,
         false,
         true,
+        MergePushPolicy::default(),
         uuid::Uuid::new_v4(),
         &|_repo: &str, _id: &str| {},
         None,
@@ -755,6 +756,7 @@ async fn orchestration_bail_stop_chain_default_is_unchanged() {
         &|_: &StepProgress| {},
         false,
         true,
+        MergePushPolicy::default(),
         uuid::Uuid::new_v4(),
         &|_repo: &str, _id: &str| {},
         None,

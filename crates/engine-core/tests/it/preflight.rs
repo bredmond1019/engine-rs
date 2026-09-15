@@ -27,8 +27,8 @@ use engine_core::workflows::orchestration::execute::{EngineKind, FlowRunner};
 use engine_core::workflows::orchestration::gates::{AdmissionGate, DependencyEdge};
 use engine_core::workflows::orchestration::graph::{BailChannel, OnBail};
 use engine_core::workflows::orchestration::integrate::{
-    integrate_chain_with_preflight, ChainReport, IntegrateError, NeverHeld, OnUnjudged,
-    StepProgress,
+    integrate_chain_with_preflight, ChainReport, IntegrateError, MergePushPolicy, NeverHeld,
+    OnUnjudged, StepProgress,
 };
 use engine_core::workflows::orchestration::preflight::{
     test_support, BlockPreflight, ClaimResult, ClaimVerdict, PreflightConfig, PreflightOutcome,
@@ -573,6 +573,7 @@ async fn run_seam_chain(
         &|_: &StepProgress| {},
         false,
         true,
+        MergePushPolicy::default(),
         uuid::Uuid::new_v4(),
         &|_repo: &str, _id: &str| {},
         None,

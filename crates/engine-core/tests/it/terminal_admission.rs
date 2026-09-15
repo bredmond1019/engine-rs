@@ -27,7 +27,8 @@ use engine_core::workflows::orchestration::chain::resolve_explicit_chain;
 use engine_core::workflows::orchestration::execute::{EngineKind, FlowRunner};
 use engine_core::workflows::orchestration::gates::{AdmissionGate, DependencyEdge};
 use engine_core::workflows::orchestration::integrate::{
-    integrate_chain, wait_for_clearance, HoldSource, IntegrateError, NeverHeld, StepProgress,
+    integrate_chain, wait_for_clearance, HoldSource, IntegrateError, MergePushPolicy, NeverHeld,
+    StepProgress,
 };
 
 fn write_manifest(
@@ -430,6 +431,7 @@ async fn a_held_step_consumes_no_permit_while_a_second_lane_proceeds_at_the_ceil
             &|_: &StepProgress| {},
             false,
             true,
+            MergePushPolicy::default(),
             Uuid::new_v4(),
             &|_repo: &str, _id: &str| {},
             None,
@@ -472,6 +474,7 @@ async fn a_held_step_consumes_no_permit_while_a_second_lane_proceeds_at_the_ceil
             &|_: &StepProgress| {},
             false,
             true,
+            MergePushPolicy::default(),
             Uuid::new_v4(),
             &|_repo: &str, _id: &str| {},
             None,
@@ -525,6 +528,7 @@ async fn an_unanswered_hold_exceeding_its_deadline_fails_loudly_and_names_the_bl
         &|_: &StepProgress| {},
         false,
         true,
+        MergePushPolicy::default(),
         Uuid::new_v4(),
         &|_repo: &str, _id: &str| {},
         None,
