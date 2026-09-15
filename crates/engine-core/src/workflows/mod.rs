@@ -39,6 +39,7 @@ pub mod linkedin_post;
 pub mod llm_node;
 pub mod opportunity_edit;
 pub mod orchestration;
+pub mod pre_plan;
 pub mod proposal_generator;
 pub mod queue_park;
 pub mod recall;
@@ -481,7 +482,10 @@ mod normalize_pass_fail_partial_synonym_tests {
         assert_eq!(normalize_pass_fail_partial_synonym("MET"), "PASS");
         assert_eq!(normalize_pass_fail_partial_synonym("NOT_MET"), "FAIL");
         assert_eq!(normalize_pass_fail_partial_synonym("UNMET"), "FAIL");
-        assert_eq!(normalize_pass_fail_partial_synonym("PARTIAL_MET"), "PARTIAL");
+        assert_eq!(
+            normalize_pass_fail_partial_synonym("PARTIAL_MET"),
+            "PARTIAL"
+        );
         assert_eq!(
             normalize_pass_fail_partial_synonym("PARTIALLY_MET"),
             "PARTIAL"
