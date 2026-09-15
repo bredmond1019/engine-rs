@@ -16,6 +16,35 @@ related: [status, context]
 
 ## [run: 2026-09-15]
 
+`/sdlc-flow` on branch `EN.19.A-flow` resumed `EN.19.A` past the earlier task-7 pre-existing-defect
+bail, re-ran the consolidated review, and BAILED with verdict FAIL. All 7 tasks passed with
+confirmed `workAssertionPassed` outcomes (module scaffold, `ResearchCodebaseNode`, `WriteNotesNode`,
+`PRE_PLAN` graph assembly + registration, the inbound webhook, the hermetic integration suite, and
+the deploy-boundary doc note), but the consolidated review found two unmet acceptance criteria: AC6
+(secret-path denial) assumes `claude_code_rs::Config` can enforce path-scoped denial, but it cannot
+— verified `core/claude-code-rs/src/config.rs` has no path/permission-hook mechanism, only
+`ToolConfig` allow/deny by tool name and a `dangerously_skip_permissions` bool, so the required
+"enforced denial + planted-secret-file integration test" cannot be built without new upstream SDK
+capability (a permission callback / PreToolUse-style hook); and AC9 (PR description states the
+deploy-boundary obligation) was NOT_MET because PR #95's body was never refreshed past task 1's
+stale draft. AC6 is a missing upstream dependency, not a fixable bug in this repo's node — it needs
+a human decision: build the SDK hook first, accept a narrower enforcement mechanism (e.g. intercept
+tool results in-process before they reach the transcript), or descope AC6. Next: operator decision
+on AC6's enforcement mechanism, then refresh PR #95's description and re-run review.
+
+```
+67c3b9a Merge branch 'main' into EN.19.A-flow
+615ae6c fix: consolidate.rs hermetic_hq fixture uses stale flat sandbox layout
+1b53704 docs: build the Node/Molecule Library (docs/nodes/atoms, docs/nodes/molecules) and cross-link workflows
+6feae0c docs(log): record planning-command-nodes lane -- fmt/clippy baseline repair, EN.19.A paused
+95587d8 docs: restructure architecture.md into scannable tables, extract node catalog, add PRE_PLAN workflow doc
+6f0dfa4 chore: wrap up EN.19.A
+8ab34fa feat: implement EN.19.A-task7
+f49c1e3 feat: implement EN.19.A-task6
+```
+
+## [run: 2026-09-15]
+
 `/sdlc-flow` on branch `EN.19.A-flow` (resumed from the earlier task-1 bail) ran tasks 1-7 and
 BAILED after task 7. Tasks 1-6 all passed with confirmed `workAssertionPassed` outcomes: the
 `pre_plan` module scaffold (`CheckExistingNotesNode`, `IntakeIdeaNode`), `ResearchCodebaseNode`
