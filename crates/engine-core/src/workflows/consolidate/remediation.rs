@@ -627,29 +627,31 @@ mod tests {
         assert_eq!(rem_id, "REM-001");
         assert_eq!(finding, 1);
 
-        let rem_doc: Value = serde_json::from_str(
-            &fs::read_to_string(hq.path().join(REMEDIATION_REL)).unwrap(),
-        )
-        .unwrap();
+        let rem_doc: Value =
+            serde_json::from_str(&fs::read_to_string(hq.path().join(REMEDIATION_REL)).unwrap())
+                .unwrap();
         let rems = rem_doc["remediations"].as_array().unwrap();
         assert_eq!(rems.len(), 1);
         assert_eq!(rems[0]["status"], "filed");
         assert_eq!(rems[0]["finding"], 1);
 
-        let findings_doc: Value = serde_json::from_str(
-            &fs::read_to_string(hq.path().join(FINDINGS_REL)).unwrap(),
-        )
-        .unwrap();
+        let findings_doc: Value =
+            serde_json::from_str(&fs::read_to_string(hq.path().join(FINDINGS_REL)).unwrap())
+                .unwrap();
         let findings = findings_doc["findings"].as_array().unwrap();
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0]["remediation"], "REM-001");
 
         assert!(
-            hq.path().join("docs/sandbox/findings/remediation.md").is_file(),
+            hq.path()
+                .join("docs/sandbox/findings/remediation.md")
+                .is_file(),
             "render_remediation.py should have regenerated remediation.md"
         );
         assert!(
-            hq.path().join("docs/sandbox/findings/findings.md").is_file(),
+            hq.path()
+                .join("docs/sandbox/findings/findings.md")
+                .is_file(),
             "render_findings.py should have regenerated findings.md"
         );
     }
@@ -671,10 +673,9 @@ mod tests {
         let outcome = promote_remediation(hq.path(), &entry).expect("promotion succeeds");
         assert!(matches!(outcome, PromoteOutcome::Promoted { .. }));
 
-        let rem_doc: Value = serde_json::from_str(
-            &fs::read_to_string(hq.path().join(REMEDIATION_REL)).unwrap(),
-        )
-        .unwrap();
+        let rem_doc: Value =
+            serde_json::from_str(&fs::read_to_string(hq.path().join(REMEDIATION_REL)).unwrap())
+                .unwrap();
         assert_eq!(rem_doc["remediations"][0]["status"], "fixed");
     }
 
@@ -715,10 +716,9 @@ mod tests {
             "an already-promoted entry must not rewrite remediation.json"
         );
 
-        let rem_doc: Value = serde_json::from_str(
-            &fs::read_to_string(hq.path().join(REMEDIATION_REL)).unwrap(),
-        )
-        .unwrap();
+        let rem_doc: Value =
+            serde_json::from_str(&fs::read_to_string(hq.path().join(REMEDIATION_REL)).unwrap())
+                .unwrap();
         assert_eq!(
             rem_doc["remediations"].as_array().unwrap().len(),
             1,

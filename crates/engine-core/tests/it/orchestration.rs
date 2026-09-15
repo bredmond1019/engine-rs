@@ -28,6 +28,7 @@ use engine_core::repo_registry::RepoRegistry;
 use engine_core::workflows::orchestration::chain::{
     resolve_explicit_chain, resolve_lane_chain, ChainError, ChainStep, StepKind,
 };
+use engine_core::workflows::orchestration::corpus_gates::BlockPresence;
 use engine_core::workflows::orchestration::debrief::{brief_names_every_bail, StubJournalReader};
 use engine_core::workflows::orchestration::dispatch::DispatchStepError;
 use engine_core::workflows::orchestration::execute::{
@@ -37,7 +38,6 @@ use engine_core::workflows::orchestration::gates::{
     check_permission_gate, check_step_with_frontier_advice, load_frontier, AdmissionGate,
     DependencyEdge, FrontierError, GateError, OperatorGateRequest, PermissionGateError,
 };
-use engine_core::workflows::orchestration::corpus_gates::BlockPresence;
 use engine_core::workflows::orchestration::graph::{
     debrief_registry, debrief_schema, BailChannel, OnBail, OrchestrationRunNode, NODE_NAME,
 };
@@ -2807,14 +2807,19 @@ async fn permission_gate_refusal_under_stop_chain_authors_edge_and_stops_chain()
     let recorded = edge_calls.lock().unwrap();
     assert_eq!(recorded.len(), 1);
     assert_eq!(recorded[0].slug, "permission-install_on_mini");
-    assert_eq!(runner.call_count(), 0, "no step may run after permission denial");
+    assert_eq!(
+        runner.call_count(),
+        0,
+        "no step may run after permission denial"
+    );
 }
 
 /// EN.17.B: under `OnBail::SkipDependents`, a step refused by `check_permission_gate`
 /// authors the operator-gate edge, is recorded as skipped with `blocked_by` operator edge,
 /// transitively skips dependent steps, and allows independent steps to execute and close.
 #[tokio::test]
-async fn permission_gate_refusal_under_skip_dependents_skips_step_and_transitively_skips_dependents() {
+async fn permission_gate_refusal_under_skip_dependents_skips_step_and_transitively_skips_dependents(
+) {
     let (_repos_dir, registry) = two_repo_registry_with_profile("locked");
     let (_planning_root, roadmap_dir) = fixture_roadmap_dir("permission-skip-dependents");
     let runner = RecordingRunner::new();
@@ -2894,7 +2899,11 @@ async fn permission_gate_refusal_under_skip_dependents_skips_step_and_transitive
     .expect("skip_dependents must allow independent steps to finish the chain");
 
     assert_eq!(outcomes.len(), 1);
-    assert_eq!(runner.call_count(), 1, "only independent step B.1 must execute");
+    assert_eq!(
+        runner.call_count(),
+        1,
+        "only independent step B.1 must execute"
+    );
 
     let recorded = edge_calls.lock().unwrap();
     assert_eq!(recorded.len(), 1);
@@ -2934,9 +2943,7 @@ async fn permission_gate_permitted_action_proceeds_without_authoring_edge() {
     let runner = RecordingRunner::new();
     let flow_runner = runner.clone().into_runner();
     let admission = AdmissionGate::with_default_policy();
-    let chain = resolve_explicit_chain(vec![
-        ("repo-a".to_string(), "A.1".to_string()),
-    ]);
+    let chain = resolve_explicit_chain(vec![("repo-a".to_string(), "A.1".to_string())]);
 
     let edge_calls: Arc<Mutex<Vec<OperatorGateRequest>>> = Arc::new(Mutex::new(Vec::new()));
     let recorder = edge_calls.clone();
@@ -2990,7 +2997,10 @@ async fn permission_gate_permitted_action_proceeds_without_authoring_edge() {
 
     assert_eq!(outcomes.len(), 1);
     assert_eq!(runner.call_count(), 1);
-    assert!(edge_calls.lock().unwrap().is_empty(), "no edge must be authored for permitted action");
+    assert!(
+        edge_calls.lock().unwrap().is_empty(),
+        "no edge must be authored for permitted action"
+    );
     assert_eq!(report.closed, vec!["repo-a:A.1"]);
 }
 
@@ -2999,7 +3009,12 @@ async fn permission_gate_permitted_action_proceeds_without_authoring_edge() {
 #[tokio::test]
 async fn orchestration_run_node_permission_gate_wired() {
     let (repos_dir, _registry) = two_repo_registry_with_profile("locked");
-    std::fs::create_dir_all(repos_dir.path().join("planning/roadmaps/node-permission-test")).unwrap();
+    std::fs::create_dir_all(
+        repos_dir
+            .path()
+            .join("planning/roadmaps/node-permission-test"),
+    )
+    .unwrap();
     let runner = RecordingRunner::new();
     let flow_runner = runner.clone().into_runner();
 
@@ -3029,7 +3044,10 @@ async fn orchestration_run_node_permission_gate_wired() {
         node_runs: std::collections::HashMap::new(),
     };
 
-    let err = node.process(ctx).await.expect_err("locked profile must deny action through node");
+    let err = node
+        .process(ctx)
+        .await
+        .expect_err("locked profile must deny action through node");
     assert!(
         err.message.contains("permission-install_on_mini"),
         "error message should cite raised operator gate: {}",

@@ -1055,14 +1055,8 @@ mod tests {
                 "GenerateTasksNode",
                 drive_generate_tasks_node_for_billing().await,
             ),
-            (
-                "EndReviewNode",
-                drive_end_review_node_for_billing().await,
-            ),
-            (
-                "PatchDocsNode",
-                drive_patch_docs_node_for_billing().await,
-            ),
+            ("EndReviewNode", drive_end_review_node_for_billing().await),
+            ("PatchDocsNode", drive_patch_docs_node_for_billing().await),
         ] {
             let entry = ctx
                 .nodes

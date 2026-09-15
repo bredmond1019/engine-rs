@@ -384,13 +384,10 @@ impl RecordingRunner {
                     .lock()
                     .unwrap()
                     .push((invocation.block_id.clone(), invocation.use_worktree));
-                this.cancellation_token_calls
-                    .lock()
-                    .unwrap()
-                    .push((
-                        invocation.block_id.clone(),
-                        invocation.cancellation_token.is_some(),
-                    ));
+                this.cancellation_token_calls.lock().unwrap().push((
+                    invocation.block_id.clone(),
+                    invocation.cancellation_token.is_some(),
+                ));
 
                 // Real `SDLC_FLOW` branch discipline: cut fresh from
                 // `origin/main`, never from a sibling block's branch tip.
@@ -1320,9 +1317,7 @@ async fn child_flow_receives_parent_cancellation_token() {
     let flow_runner = runner.clone().into_runner();
     let token = CancellationToken::new();
 
-    let chain = resolve_explicit_chain(vec![
-        ("smoke-repo".to_string(), "TF.1".to_string()),
-    ]);
+    let chain = resolve_explicit_chain(vec![("smoke-repo".to_string(), "TF.1".to_string())]);
 
     let outcomes = integrate_chain(
         &chain,

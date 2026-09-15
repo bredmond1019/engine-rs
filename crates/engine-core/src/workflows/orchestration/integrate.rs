@@ -98,9 +98,9 @@ use super::inbox_triage::{
 };
 use super::operator_edge::{make_author_operator_edge, OperatorEdgeAuthorConfig};
 use super::preflight::{BlockPreflight, ClaimVerdict, PreflightOutcome};
-use crate::policy::permission::{resolve_permission_profile, GatedAction};
 use crate::coord::write::RegisterOutcome;
 use crate::nodes::brain_client::RECALL_NODE_NAME;
+use crate::policy::permission::{resolve_permission_profile, GatedAction};
 use crate::workflows::get_result;
 use crate::workflows::recall::RECALL_WORKFLOW_TYPE;
 
@@ -3608,30 +3608,30 @@ async fn integrate_chain_impl_inner(
         }
 
         if let Some(action) = resolve_action(&step.repo, &step.block_id) {
-            let (profile, _profile_err) = resolve_permission_profile(
-                &registry.brain_root().join("brain.toml"),
-            );
+            let (profile, _profile_err) =
+                resolve_permission_profile(&registry.brain_root().join("brain.toml"));
             let default_author;
-            let author: &dyn Fn(&OperatorGateRequest) -> Result<(), String> = match author_operator_edge {
-                Some(custom) => custom,
-                None => {
-                    let repo_dir = registry
-                        .resolve(&step.repo)
-                        .unwrap_or_else(|_| registry.brain_root().to_path_buf());
-                    default_author = make_author_operator_edge(OperatorEdgeAuthorConfig {
-                        root: registry.brain_root().to_path_buf(),
-                        repo: step.repo.clone(),
-                        block_id: step.block_id.clone(),
-                        dir: repo_dir,
-                        agent: coord.map(|c| c.agent.clone()),
-                        lock_dir: coord.map(|c| c.lock_dir.clone()),
-                        roadmap: step.roadmap.clone(),
-                        lane: lane.map(str::to_string),
-                        roadmap_dir: Some(roadmap_dir.to_path_buf()),
-                    });
-                    &default_author
-                }
-            };
+            let author: &dyn Fn(&OperatorGateRequest) -> Result<(), String> =
+                match author_operator_edge {
+                    Some(custom) => custom,
+                    None => {
+                        let repo_dir = registry
+                            .resolve(&step.repo)
+                            .unwrap_or_else(|_| registry.brain_root().to_path_buf());
+                        default_author = make_author_operator_edge(OperatorEdgeAuthorConfig {
+                            root: registry.brain_root().to_path_buf(),
+                            repo: step.repo.clone(),
+                            block_id: step.block_id.clone(),
+                            dir: repo_dir,
+                            agent: coord.map(|c| c.agent.clone()),
+                            lock_dir: coord.map(|c| c.lock_dir.clone()),
+                            roadmap: step.roadmap.clone(),
+                            lane: lane.map(str::to_string),
+                            roadmap_dir: Some(roadmap_dir.to_path_buf()),
+                        });
+                        &default_author
+                    }
+                };
 
             if let Err(err) = check_permission_gate(step, action, profile, author) {
                 let integrate_err = IntegrateError::from(err.clone());
@@ -3656,7 +3656,8 @@ async fn integrate_chain_impl_inner(
                                 permission_gate_slug(*action)
                             }
                         };
-                        let blocked_by = dependency_edge_to_json(&DependencyEdge::Operator { slug });
+                        let blocked_by =
+                            dependency_edge_to_json(&DependencyEdge::Operator { slug });
                         let skip_lane = lane.unwrap_or(step.repo.as_str());
                         let entry = LaneLogEntry::skipped(
                             step,

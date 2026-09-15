@@ -481,7 +481,10 @@ mod normalize_pass_fail_partial_synonym_tests {
         assert_eq!(normalize_pass_fail_partial_synonym("MET"), "PASS");
         assert_eq!(normalize_pass_fail_partial_synonym("NOT_MET"), "FAIL");
         assert_eq!(normalize_pass_fail_partial_synonym("UNMET"), "FAIL");
-        assert_eq!(normalize_pass_fail_partial_synonym("PARTIAL_MET"), "PARTIAL");
+        assert_eq!(
+            normalize_pass_fail_partial_synonym("PARTIAL_MET"),
+            "PARTIAL"
+        );
         assert_eq!(
             normalize_pass_fail_partial_synonym("PARTIALLY_MET"),
             "PARTIAL"

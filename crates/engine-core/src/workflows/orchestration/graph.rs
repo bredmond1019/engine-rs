@@ -128,8 +128,8 @@ use super::execute::{default_flow_runner, EngineKind, ExecutionOutcome, FlowRunn
 use super::gates::{AdmissionGate, DependencyEdge, OperatorGateRequest};
 use super::inbox_triage::{InboxTriageRunner, ProcessedMessage};
 use super::integrate::{
-    integrate_chain_with_permission_gate, resolve_roadmap_dir, ChainReport, CloseBlockFn, HoldSource,
-    JournalSinkFn, NeverHeld, OnUnjudged, StepProgress,
+    integrate_chain_with_permission_gate, resolve_roadmap_dir, ChainReport, CloseBlockFn,
+    HoldSource, JournalSinkFn, NeverHeld, OnUnjudged, StepProgress,
 };
 use super::preflight::{BlockPreflight, PreflightOutcome};
 use crate::policy::permission::GatedAction;
@@ -1820,9 +1820,9 @@ impl Node for OrchestrationRunNode {
                 // `chain_report`/`preflight_report` above, for the same
                 // reason (survives the `Err` arm below).
                 let mut inbox_report: Vec<ProcessedMessage> = Vec::new();
-                let author_fn = author_operator_edge.as_ref().map(|f| {
-                    f.as_ref() as &dyn Fn(&OperatorGateRequest) -> Result<(), String>
-                });
+                let author_fn = author_operator_edge
+                    .as_ref()
+                    .map(|f| f.as_ref() as &dyn Fn(&OperatorGateRequest) -> Result<(), String>);
                 let result = rt.block_on(integrate_chain_with_permission_gate(
                     &chain,
                     &move |repo, block_id| resolve_depends_on(repo, block_id),
