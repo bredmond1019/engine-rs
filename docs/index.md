@@ -38,6 +38,7 @@ the engine can do, and [architecture.md](architecture.md) for how it's built.
 | [cron-primitive.md](cron-primitive.md) | The durable scheduling primitive: calendar vs. interval schedules, and the restart-durable store |
 | [local-model-bench.md](local-model-bench.md) | Runbook for comparing local Ollama models and the aider/pi backends on real `SDLC_FLOW` runs, unattended — quickstart, reading the leaderboard, and every pitfall found building it |
 | [sandbox-orchestration-quickstart.md](sandbox-orchestration-quickstart.md) | **Open this first** before running anything against the sandbox — one command per situation, the five hard rules, and where to look next. For a fresh agent picking up sandbox local-model testing |
+| [overnight-sandbox-sweep-quickstart.md](overnight-sandbox-sweep-quickstart.md) | One command to kick off a full overnight local-model sweep against the sandbox, why that exact command, and how to check on/resume it without interrupting it |
 
 ## Deploying and testing
 
