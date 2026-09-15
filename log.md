@@ -14,6 +14,35 @@ related: [status, context]
 
 *Append-only working log. One dated entry per session. Newest entries at the top.*
 
+## [run: 2026-09-15]
+
+`/sdlc-flow` on branch `EN.19.A-flow` BAILED after task 1. Task 1 landed the `pre_plan` module
+scaffold — `CheckExistingNotesNode` (router, exists()-checks the brain-root-resolved
+`notes.md`, short-circuits unless `force_regenerate`) and `IntakeIdeaNode` (validates
+`idea`/`slug`), registered via `pub mod pre_plan;` in `workflows/mod.rs` (commit `ac38793`).
+Tasks 2-7 did not run. The run bailed on `cargo fmt --check`/`cargo clippy -p engine-core
+--all-features` failures that were verified pre-existing rather than introduced by task 1: a
+worktree built at `base_sha` `d1dd79e` (the commit immediately before task 1's) already shows
+`cargo fmt --check` reporting 29 file diffs (none in the files task 1 touched —
+`workflows/mod.rs`, `pre_plan/mod.rs`, `check_existing.rs`, `intake.rs`) and `cargo clippy -p
+engine-core --all-features` already emitting the same 8 warnings (5x `result_large_err`, 3x
+`type_complexity`, all in `workflows/orchestration/integrate.rs`) at that base commit. Fixing
+either requires touching modules well outside task 1's declared scope. Notable decisions
+carried in task 1: `route()` returns explicit `Some(EXISTS_ROUTE)`/`Some(CONTINUE_ROUTE)`
+rather than `None`, since a router returning `None` ends the graph walk rather than falling
+through to declared connections; `EXISTS_ROUTE` is a placeholder identity task 4 must register
+a node under; `notes_path()` was made `pub` for task 3's reuse. Next: get task 1's baseline
+failures fixed as a separate housekeeping pass (outside EN.19.A's scope), then resume
+`EN.19.A` at task 2 (`ResearchCodebaseNode`).
+
+```
+ac38793 feat: implement EN.19.A-task1
+d1dd79e docs(log): record local-model-bench root-cause pass (worktree reuse, ORCHESTRATION attribution, review fixes, pi tool-call gap)
+a13569c fix(bench): capture_evidence must locate sdlc/ state in the repo the job actually ran in
+629de87 fix(orchestration): surface the real reason instead of <unknown> for an attempts-exhausted child
+fea8a83 fix(bench): harden job-boundary cleanup, add model/backend selection, retire weak models
+```
+
 ## [2026-09-15]
 
 ### Local-model-bench root-cause pass: worktree-slot reuse, ORCHESTRATION error attribution, review-verdict/prompt fixes, model retirement, and the real pi-vs-aider gap
