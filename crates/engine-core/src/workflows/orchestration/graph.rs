@@ -255,6 +255,51 @@ pub struct OrchestrationPolicy {
     /// `auto_pr_false_short_circuits_without_calling_runner`) without
     /// shelling out to `gh` at all.
     pub default_auto_pr: bool,
+    /// Whether a passing chain step's branch merges into local `main` at
+    /// all (`integrate::merge_step_branch`). `true` is the built-in
+    /// default and matches the pre-existing, unconditional behavior for
+    /// the ordinary single-lane case: block N+1's worktree is cut from
+    /// `origin/main`, so it needs block N's work already merged locally to
+    /// see it. Set `false` only for a genuinely disposable/benchmark chain
+    /// that must never touch this repo's real `main` at all (see the
+    /// local-model bench) — a step still closes, but block N+1 will NOT
+    /// see this step's work.
+    pub default_auto_merge: bool,
+    /// Whether a locally-merged branch is also pushed to `origin main`
+    /// (`git push origin main`, inside `integrate::merge_step_branch`).
+    /// **`false` is the built-in default — a deliberate exception to
+    /// CLAUDE.md standing rule 6's behavior-stability clause**, the same
+    /// class of exception `default_use_worktree` documents above: this is
+    /// not a new knob being added behavior-stable, it is the FIX for
+    /// `orchestration-merge-step-pushes-main-directly` — before this
+    /// field existed, every passing step ran `git push origin main`
+    /// unconditionally, bypassing `agentic-portfolio/scripts/sync/
+    /// git_push.sh` (this repo's own `AGENTS.md` standing rule 10). A
+    /// 2026-09-14 local-model bench run dispatched through `ORCHESTRATION`
+    /// pushed real junk (`8318e32`) to `origin/main` with no way to
+    /// prevent it. Irrelevant when `default_auto_merge` is `false`
+    /// (nothing was merged to push). Set `true` only for an operator who
+    /// has deliberately decided this chain's pushes should reach the real
+    /// remote (e.g. a future multi-operator fleet) — the solo default is,
+    /// and should stay, `false`.
+    ///
+    /// **Real correctness trade-off, not a free lunch — read before
+    /// dispatching a multi-block chain.** `SetupWorktreeNode` cuts every
+    /// step's branch fresh from `origin/main` (per-step branch discipline,
+    /// unchanged by this fix — see `EN.11.C`/`block_n_plus_1s_tree_
+    /// contains_block_ns_work`). With `default_use_worktree: true` (the
+    /// built-in default) and `default_auto_push: false`, block N's local
+    /// `main` merge never reaches `origin/main`, so block N+1's worktree
+    /// — cut fresh from `origin/main` — will NOT contain block N's work.
+    /// A real multi-block chain that needs blocks to compose must either
+    /// (a) set `default_auto_push: true` for that run, accepting the real
+    /// push to `origin/main`, or (b) set `default_use_worktree: false` so
+    /// every step runs in the repo's primary checkout and sees the prior
+    /// step's local merge directly, with no push needed. A single-block
+    /// chain, or a disposable/benchmark chain where later blocks
+    /// deliberately don't need to see earlier ones (the local-model
+    /// bench), is unaffected either way.
+    pub default_auto_push: bool,
     /// `CONDUCTOR`-only (`EN.12.F` Task 5): the campaign-scoped cost
     /// ceiling for the FIRST autonomous (conductor-proposed) runs, in USD
     /// cents rather than `f64` so [`OrchestrationPolicy`] can still derive
@@ -429,6 +474,8 @@ impl Default for OrchestrationPolicy {
             default_use_worktree: true,
             hold_deadline_ms: None,
             default_auto_pr: true,
+            default_auto_merge: true,
+            default_auto_push: false,
             campaign_max_cost_usd_cents: Some(5_000),
             campaign_max_total_tokens: None,
             conductor_max_chain_blocks: Some(3),
@@ -471,6 +518,8 @@ pub struct PartialOrchestrationPolicy {
     pub default_use_worktree: Option<bool>,
     pub hold_deadline_ms: Option<Option<u64>>,
     pub default_auto_pr: Option<bool>,
+    pub default_auto_merge: Option<bool>,
+    pub default_auto_push: Option<bool>,
     pub campaign_max_cost_usd_cents: Option<Option<u64>>,
     pub campaign_max_total_tokens: Option<Option<u64>>,
     pub conductor_max_chain_blocks: Option<Option<usize>>,
@@ -513,6 +562,14 @@ impl crate::policy::Policy for OrchestrationPolicy {
                 over.hold_deadline_ms,
             ),
             default_auto_pr: crate::policy::merge_opt(self.default_auto_pr, over.default_auto_pr),
+            default_auto_merge: crate::policy::merge_opt(
+                self.default_auto_merge,
+                over.default_auto_merge,
+            ),
+            default_auto_push: crate::policy::merge_opt(
+                self.default_auto_push,
+                over.default_auto_push,
+            ),
             campaign_max_cost_usd_cents: crate::policy::merge_opt(
                 self.campaign_max_cost_usd_cents,
                 over.campaign_max_cost_usd_cents,
@@ -618,6 +675,11 @@ pub fn baseline() -> PartialOrchestrationPolicy {
         // Restates the built-in default verbatim — every dispatched block
         // opens its PR, baseline's no-op contract.
         default_auto_pr: Some(true),
+        // Restates the built-in defaults verbatim — baseline's no-op contract
+        // (orchestration-merge-step-pushes-main-directly fix): merge locally,
+        // never push.
+        default_auto_merge: Some(true),
+        default_auto_push: Some(false),
         // EN.12.F Task 5: restate the built-in defaults verbatim —
         // baseline's no-op contract extends to the conductor's caps too.
         campaign_max_cost_usd_cents: Some(Some(5_000)),
@@ -685,6 +747,13 @@ pub fn cheap_fast() -> PartialOrchestrationPolicy {
         // profile's longer poll interval and bounded hold deadline. A cost
         // floor has no business paying for either.
         default_auto_pr: Some(false),
+        // A cost floor has no business merging into a shared main at all when
+        // it doesn't even open a PR — but merging locally is still needed for
+        // ordinary chain semantics (block N+1 needs block N's work), so this
+        // stays the built-in default; push stays off, same reasoning as
+        // auto_pr immediately above.
+        default_auto_merge: Some(true),
+        default_auto_push: Some(false),
         // EN.12.F Task 5: the cost floor extends to the conductor's caps —
         // a tighter $25 ceiling and a 2-block chain, the low end of the
         // objective's "two or three" range. `conductor_single_repo_only`
@@ -734,6 +803,11 @@ pub fn thorough() -> PartialOrchestrationPolicy {
         default_use_worktree: Some(true),
         hold_deadline_ms: Some(Some(24 * 60 * 60 * 1_000)),
         default_auto_pr: Some(true),
+        // Restates the built-in defaults verbatim, same as baseline — even
+        // the highest-responsiveness profile does not push by default; an
+        // operator who wants that opts in per-run via an explicit override.
+        default_auto_merge: Some(true),
+        default_auto_push: Some(false),
         // EN.12.F Task 5: a more generous $100 ceiling and the full
         // 3-block end of the objective's "two or three" range, matching
         // this profile's higher quality ceiling elsewhere.
@@ -1513,6 +1587,14 @@ impl Node for OrchestrationRunNode {
         // `bool` is `Copy`, so this crosses the `spawn_blocking` closure
         // by value, no `Arc`/clone needed.
         let default_auto_pr = policy.default_auto_pr;
+        // `orchestration-merge-step-pushes-main-directly` fix: bundles the
+        // resolved `default_auto_merge`/`default_auto_push` knobs, `Copy`
+        // like `default_auto_pr`/`default_use_worktree` above, so it
+        // crosses the `spawn_blocking` closure by value with no `Arc`/clone.
+        let merge_push_policy = super::integrate::MergePushPolicy {
+            auto_merge: policy.default_auto_merge,
+            auto_push: policy.default_auto_push,
+        };
         // `EN.17.F` task 2: the resolved child policy overrides, cloned out
         // of `policy` (not `Copy`, unlike the two `bool` knobs above) so the
         // clones can move into the `spawn_blocking` closure below by value —
@@ -1733,6 +1815,7 @@ impl Node for OrchestrationRunNode {
                     step_observer.as_ref(),
                     default_use_worktree,
                     default_auto_pr,
+                    merge_push_policy,
                     // The resolved, event-overridable campaign id (EN.11.E
                     // task 3) — replaces task 2's freshly-minted placeholder.
                     campaign_id,

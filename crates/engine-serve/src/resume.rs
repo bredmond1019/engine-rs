@@ -1093,7 +1093,9 @@ mod campaign_resume_tests {
     use engine_core::repo_registry::RepoRegistry;
     use engine_core::workflows::orchestration::execute::{EngineKind, FlowRunner};
     use engine_core::workflows::orchestration::gates::AdmissionGate;
-    use engine_core::workflows::orchestration::integrate::{integrate_chain, NeverHeld};
+    use engine_core::workflows::orchestration::integrate::{
+        integrate_chain, MergePushPolicy, NeverHeld,
+    };
     use serde_json::json;
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
@@ -1382,6 +1384,7 @@ mod campaign_resume_tests {
             &|_| {},
             false,
             true,
+            MergePushPolicy::default(),
             campaign_id,
             &|_repo: &str, _id: &str| {},
             None,
@@ -1433,6 +1436,7 @@ mod campaign_resume_tests {
             &|_| {},
             false,
             true,
+            MergePushPolicy::default(),
             campaign_id,
             &|_repo: &str, _id: &str| {},
             None,

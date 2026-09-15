@@ -498,7 +498,53 @@ fn resolve_merge_branch(ctx: &engine_contract::TaskContext) -> Option<String> {
         .or_else(|| step_branch_name(ctx))
 }
 
-/// Merge `branch` into `main` and push, inside `repo_path` — the stage
+/// The resolved `OrchestrationPolicy::default_auto_merge`/`default_auto_push`
+/// pair, bundled into one `Copy` struct purely to cut the number of
+/// threading sites across the `integrate_chain*` wrapper chain (10 layers
+/// deep) in half versus two separate scalar parameters — mirrors
+/// `default_use_worktree`/`default_auto_pr`'s existing threading shape
+/// otherwise. See `OrchestrationPolicy::default_auto_merge`/
+/// `::default_auto_push` for the field-level documentation; this struct
+/// carries no meaning beyond bundling those two resolved values for the
+/// trip across the `spawn_blocking` boundary and down to
+/// [`merge_step_branch`], the sole call site that reads it.
+///
+/// **Deliberate exception to CLAUDE.md standing rule 6's behavior-stability
+/// clause** — same class of exception `default_use_worktree` already
+/// documents. `auto_push`'s default of `false` is not behavior-stable: it
+/// changes what an existing run does, on purpose, because the prior
+/// unconditional `git push origin main` is the bug being fixed here
+/// (`orchestration-merge-step-pushes-main-directly` — a 2026-09-14
+/// local-model bench run pushed real junk, `8318e32`, to `origin/main`
+/// with no way to prevent it). `auto_merge` stays `true` by default because
+/// the local `main` merge (not the push) is what makes block N+1's
+/// worktree see block N's work — turning that off by default would break
+/// ordinary single-lane chain semantics, not fix a bug.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MergePushPolicy {
+    /// Whether a passing step's branch merges into local `main` at all.
+    /// `false` skips the merge (and therefore the push) entirely — the
+    /// step still closes, but block N+1 will NOT see this step's work in
+    /// its worktree. Intended for genuinely disposable/benchmark chains
+    /// (see the local-model bench), not ordinary chain use.
+    pub auto_merge: bool,
+    /// Whether a merged branch is pushed to `origin main`. `false` (the
+    /// default) merges locally but never runs `git push` — the fix for
+    /// `orchestration-merge-step-pushes-main-directly`. Irrelevant when
+    /// `auto_merge` is `false` (nothing was merged to push).
+    pub auto_push: bool,
+}
+
+impl Default for MergePushPolicy {
+    fn default() -> Self {
+        Self {
+            auto_merge: true,
+            auto_push: false,
+        }
+    }
+}
+
+/// Merge `branch` into `main`, inside `repo_path` — the stage
 /// that makes block N+1's tree actually contain block N's work
 /// (`EN.11.C`, sequence.md's red-team finding G1: "no merge block, despite
 /// the smoke run saying so"). Lives in the chain's integrate stage rather
@@ -509,26 +555,44 @@ fn resolve_merge_branch(ctx: &engine_contract::TaskContext) -> Option<String> {
 /// integrating one block right after another with nobody in the loop
 /// between them, that has grounds to merge automatically.
 ///
-/// Runs three plain git commands via [`crate::workflows::default_command_runner`]
-/// (`checkout main`, `merge --no-ff <branch>`, `push origin main`) and fails
-/// the step on the FIRST non-zero exit — no conflict resolution is
-/// attempted (out of scope; a conflict is a step failure, never silently
-/// integrated). The failing command's stderr is carried on
-/// [`IntegrateError::StepMergeFailed`] so it reaches the run result rather
-/// than being swallowed — see that variant's doc for the incident this
-/// closes.
+/// **Gated by `policy`** (`orchestration-merge-step-pushes-main-directly`
+/// fix, 2026-09-14): `policy.auto_merge == false` skips this function's
+/// git work entirely (a clear log line names what was skipped and why); a
+/// merge that runs but `policy.auto_push == false` merges into local
+/// `main` and stops — no `git push` — also logged. Runs up to three plain
+/// git commands via [`crate::workflows::default_command_runner`]
+/// (`checkout main`, `merge --no-ff <branch>`, and conditionally
+/// `push origin main`) and fails the step on the FIRST non-zero exit — no
+/// conflict resolution is attempted (out of scope; a conflict is a step
+/// failure, never silently integrated). The failing command's stderr is
+/// carried on [`IntegrateError::StepMergeFailed`] so it reaches the run
+/// result rather than being swallowed — see that variant's doc for the
+/// incident this closes.
 fn merge_step_branch(
     repo_path: &Path,
     repo: &str,
     block_id: &str,
     branch: &str,
+    policy: MergePushPolicy,
 ) -> Result<(), IntegrateError> {
+    if !policy.auto_merge {
+        tracing::info!(
+            repo,
+            block_id,
+            branch,
+            "orchestration.merge_push_policy.auto_merge=false — skipping local merge \
+             of this step's branch into main; block N+1 will NOT see this step's work"
+        );
+        return Ok(());
+    }
     let runner = crate::workflows::default_command_runner();
-    let steps: [(&str, &[&str]); 3] = [
-        ("git", &["checkout", "main"]),
-        ("git", &["merge", "--no-ff", branch]),
-        ("git", &["push", "origin", "main"]),
-    ];
+    let checkout_args: [&str; 2] = ["checkout", "main"];
+    let merge_args: [&str; 3] = ["merge", "--no-ff", branch];
+    let push_args: [&str; 3] = ["push", "origin", "main"];
+    let mut steps: Vec<(&str, &[&str])> = vec![("git", &checkout_args), ("git", &merge_args)];
+    if policy.auto_push {
+        steps.push(("git", &push_args));
+    }
     for (program, args) in steps {
         let output =
             runner(program, args, repo_path).map_err(|source| IntegrateError::StepMergeFailed {
@@ -545,6 +609,15 @@ fn merge_step_branch(
                 stderr: output.stderr,
             });
         }
+    }
+    if !policy.auto_push {
+        tracing::info!(
+            repo,
+            block_id,
+            branch,
+            "orchestration.merge_push_policy.auto_push=false — merged locally into main \
+             but did NOT run `git push origin main`"
+        );
     }
     Ok(())
 }
@@ -2073,6 +2146,7 @@ pub async fn integrate_chain(
     step_observer: &StepObserverFn,
     default_use_worktree: bool,
     default_auto_pr: bool,
+    merge_push_policy: MergePushPolicy,
     campaign_id: uuid::Uuid,
     close_block: &CloseBlockFn,
     // `EN.17.F` task 2: the resolved `OrchestrationPolicy::child_sdlc_flow_policy` /
@@ -2100,6 +2174,7 @@ pub async fn integrate_chain(
         step_observer,
         default_use_worktree,
         default_auto_pr,
+        merge_push_policy,
         campaign_id,
         close_block,
         None,
@@ -2153,6 +2228,7 @@ pub async fn integrate_chain_with_journal(
     step_observer: &StepObserverFn,
     default_use_worktree: bool,
     default_auto_pr: bool,
+    merge_push_policy: MergePushPolicy,
     campaign_id: uuid::Uuid,
     close_block: &CloseBlockFn,
     journal_sink: &JournalSinkFn,
@@ -2175,6 +2251,7 @@ pub async fn integrate_chain_with_journal(
         step_observer,
         default_use_worktree,
         default_auto_pr,
+        merge_push_policy,
         campaign_id,
         close_block,
         Some(journal_sink),
@@ -2225,6 +2302,7 @@ pub async fn integrate_chain_with_coord(
     step_observer: &StepObserverFn,
     default_use_worktree: bool,
     default_auto_pr: bool,
+    merge_push_policy: MergePushPolicy,
     campaign_id: uuid::Uuid,
     close_block: &CloseBlockFn,
     coord: Option<&CoordHandle>,
@@ -2250,6 +2328,7 @@ pub async fn integrate_chain_with_coord(
         step_observer,
         default_use_worktree,
         default_auto_pr,
+        merge_push_policy,
         campaign_id,
         close_block,
         None,
@@ -2313,6 +2392,7 @@ pub async fn integrate_chain_with_coord_and_policy(
     step_observer: &StepObserverFn,
     default_use_worktree: bool,
     default_auto_pr: bool,
+    merge_push_policy: MergePushPolicy,
     campaign_id: uuid::Uuid,
     close_block: &CloseBlockFn,
     coord: Option<&CoordHandle>,
@@ -2347,6 +2427,7 @@ pub async fn integrate_chain_with_coord_and_policy(
         step_observer,
         default_use_worktree,
         default_auto_pr,
+        merge_push_policy,
         campaign_id,
         close_block,
         None,
@@ -2402,6 +2483,7 @@ pub async fn integrate_chain_with_preflight(
     step_observer: &StepObserverFn,
     default_use_worktree: bool,
     default_auto_pr: bool,
+    merge_push_policy: MergePushPolicy,
     campaign_id: uuid::Uuid,
     close_block: &CloseBlockFn,
     coord: Option<&CoordHandle>,
@@ -2433,6 +2515,7 @@ pub async fn integrate_chain_with_preflight(
         step_observer,
         default_use_worktree,
         default_auto_pr,
+        merge_push_policy,
         campaign_id,
         close_block,
         None,
@@ -2488,6 +2571,7 @@ pub async fn integrate_chain_with_inbox_triage(
     step_observer: &StepObserverFn,
     default_use_worktree: bool,
     default_auto_pr: bool,
+    merge_push_policy: MergePushPolicy,
     campaign_id: uuid::Uuid,
     close_block: &CloseBlockFn,
     coord: Option<&CoordHandle>,
@@ -2526,6 +2610,7 @@ pub async fn integrate_chain_with_inbox_triage(
         step_observer,
         default_use_worktree,
         default_auto_pr,
+        merge_push_policy,
         campaign_id,
         close_block,
         None,
@@ -2578,6 +2663,7 @@ pub async fn integrate_chain_with_dispatch(
     step_observer: &StepObserverFn,
     default_use_worktree: bool,
     default_auto_pr: bool,
+    merge_push_policy: MergePushPolicy,
     campaign_id: uuid::Uuid,
     close_block: &CloseBlockFn,
     journal_sink: Option<&JournalSinkFn>,
@@ -2601,6 +2687,7 @@ pub async fn integrate_chain_with_dispatch(
         step_observer,
         default_use_worktree,
         default_auto_pr,
+        merge_push_policy,
         campaign_id,
         close_block,
         journal_sink,
@@ -2658,6 +2745,7 @@ pub async fn integrate_chain_with_run_record(
     step_observer: &StepObserverFn,
     default_use_worktree: bool,
     default_auto_pr: bool,
+    merge_push_policy: MergePushPolicy,
     campaign_id: uuid::Uuid,
     close_block: &CloseBlockFn,
     journal_sink: Option<&JournalSinkFn>,
@@ -2683,6 +2771,7 @@ pub async fn integrate_chain_with_run_record(
         step_observer,
         default_use_worktree,
         default_auto_pr,
+        merge_push_policy,
         campaign_id,
         close_block,
         journal_sink,
@@ -2762,6 +2851,7 @@ async fn integrate_chain_impl(
     step_observer: &StepObserverFn,
     default_use_worktree: bool,
     default_auto_pr: bool,
+    merge_push_policy: MergePushPolicy,
     campaign_id: uuid::Uuid,
     close_block: &CloseBlockFn,
     journal_sink: Option<&JournalSinkFn>,
@@ -2814,6 +2904,7 @@ async fn integrate_chain_impl(
         step_observer,
         default_use_worktree,
         default_auto_pr,
+        merge_push_policy,
         campaign_id,
         close_block,
         journal_sink,
@@ -2859,6 +2950,7 @@ async fn integrate_chain_impl_inner(
     step_observer: &StepObserverFn,
     default_use_worktree: bool,
     default_auto_pr: bool,
+    merge_push_policy: MergePushPolicy,
     campaign_id: uuid::Uuid,
     close_block: &CloseBlockFn,
     journal_sink: Option<&JournalSinkFn>,
@@ -3905,9 +3997,13 @@ async fn integrate_chain_impl_inner(
         // (neither `PullRequestNode` nor `SetupWorktreeNode` ran) skips
         // silently — see `resolve_merge_branch`'s doc.
         if let Some(branch) = resolve_merge_branch(&outcome.ctx) {
-            if let Err(err) =
-                merge_step_branch(&outcome.repo_path, &step.repo, &step.block_id, &branch)
-            {
+            if let Err(err) = merge_step_branch(
+                &outcome.repo_path,
+                &step.repo,
+                &step.block_id,
+                &branch,
+                merge_push_policy,
+            ) {
                 let entry = LaneLogEntry::bailed(step, step_lane, err.to_string())
                     .with_identity(Some(step_run_id.to_string()))
                     .with_permission_profile(Some(resolved_permission_profile_identifier(
@@ -4829,6 +4925,7 @@ mod tests {
             &|_: &StepProgress| {},
             false,
             true,
+            MergePushPolicy::default(),
             uuid::Uuid::new_v4(),
             &|_repo: &str, _id: &str| {},
             None,
@@ -4913,6 +5010,7 @@ mod tests {
             &|_: &StepProgress| {},
             false,
             true,
+            MergePushPolicy::default(),
             uuid::Uuid::new_v4(),
             &|_repo: &str, _id: &str| {},
             None,
@@ -4951,6 +5049,7 @@ mod tests {
                     &|_: &StepProgress| {},
                     false,
                     true,
+                    MergePushPolicy::default(),
                     uuid::Uuid::new_v4(),
                     &|_repo: &str, _id: &str| {},
                     None,
@@ -5068,6 +5167,7 @@ mod tests {
             &|_: &StepProgress| {},
             false,
             true,
+            MergePushPolicy::default(),
             uuid::Uuid::new_v4(),
             &|_repo: &str, _id: &str| {},
             None,
@@ -5122,6 +5222,7 @@ mod tests {
             &|_: &StepProgress| {},
             false,
             false,
+            MergePushPolicy::default(),
             uuid::Uuid::new_v4(),
             &|_repo: &str, _id: &str| {},
             None,
@@ -5174,6 +5275,7 @@ mod tests {
             &|_: &StepProgress| {},
             false,
             true,
+            MergePushPolicy::default(),
             uuid::Uuid::new_v4(),
             &|_repo: &str, _id: &str| {},
             None,
@@ -5240,6 +5342,7 @@ mod tests {
             &|_: &StepProgress| {},
             false,
             true,
+            MergePushPolicy::default(),
             uuid::Uuid::new_v4(),
             &close_block,
             None,
@@ -5305,6 +5408,7 @@ mod tests {
             &|_: &StepProgress| {},
             false,
             true,
+            MergePushPolicy::default(),
             uuid::Uuid::new_v4(),
             &close_block,
             None,
@@ -5354,6 +5458,7 @@ mod tests {
             &|_: &StepProgress| {},
             false,
             true,
+            MergePushPolicy::default(),
             uuid::Uuid::new_v4(),
             &|_repo: &str, _id: &str| {},
             None,
@@ -5408,6 +5513,7 @@ mod tests {
             &|_: &StepProgress| {},
             false,
             true,
+            MergePushPolicy::default(),
             uuid::Uuid::new_v4(),
             &|_repo: &str, _id: &str| {},
             None,
@@ -5493,6 +5599,7 @@ mod tests {
             &|_: &StepProgress| {},
             false,
             true,
+            MergePushPolicy::default(),
             uuid::Uuid::new_v4(),
             &|_repo: &str, _id: &str| {},
             None,
@@ -5557,6 +5664,7 @@ mod tests {
             &|_: &StepProgress| {},
             false,
             true,
+            MergePushPolicy::default(),
             uuid::Uuid::new_v4(),
             &|_repo: &str, _id: &str| {},
             None,
@@ -5638,6 +5746,7 @@ mod tests {
             &|_: &StepProgress| {},
             false,
             true,
+            MergePushPolicy::default(),
             uuid::Uuid::new_v4(),
             &|_repo: &str, _id: &str| {},
             None,
@@ -5748,6 +5857,7 @@ mod tests {
             &|_: &StepProgress| {},
             false,
             true,
+            MergePushPolicy::default(),
             uuid::Uuid::new_v4(),
             &|_repo: &str, _id: &str| {},
             None,
@@ -5837,6 +5947,7 @@ mod tests {
             &|_: &StepProgress| {},
             false,
             true,
+            MergePushPolicy::default(),
             uuid::Uuid::new_v4(),
             &|_repo: &str, _id: &str| {},
             None,
@@ -5987,6 +6098,7 @@ mod tests {
             &|_: &StepProgress| {},
             false,
             true,
+            MergePushPolicy::default(),
             campaign_id,
             &|_repo: &str, _id: &str| {},
             None,
@@ -6069,6 +6181,7 @@ mod tests {
             &|_: &StepProgress| {},
             false,
             true,
+            MergePushPolicy::default(),
             campaign_id,
             &|_repo: &str, _id: &str| {},
             None,
@@ -6142,6 +6255,7 @@ mod tests {
             &|_: &StepProgress| {},
             false,
             true,
+            MergePushPolicy::default(),
             uuid::Uuid::new_v4(),
             &|_repo: &str, _id: &str| {},
             &move |row| sink_fn(row),
@@ -6203,6 +6317,7 @@ mod tests {
             &|_: &StepProgress| {},
             false,
             true,
+            MergePushPolicy::default(),
             uuid::Uuid::new_v4(),
             &|_repo: &str, _id: &str| {},
             &move |row| sink_fn(row),
@@ -6260,6 +6375,7 @@ mod tests {
             &|_: &StepProgress| {},
             false,
             true,
+            MergePushPolicy::default(),
             uuid::Uuid::new_v4(),
             &|_repo: &str, _id: &str| {},
             &move |row| sink_fn(row),
@@ -6311,6 +6427,7 @@ mod tests {
             &|_: &StepProgress| {},
             false,
             true,
+            MergePushPolicy::default(),
             uuid::Uuid::new_v4(),
             &|_repo: &str, _id: &str| {},
             &move |row| sink_fn(row),
@@ -6362,6 +6479,7 @@ mod tests {
             &|_: &StepProgress| {},
             false,
             true,
+            MergePushPolicy::default(),
             uuid::Uuid::new_v4(),
             &|_repo: &str, _id: &str| {},
             &move |row| sink_fn(row),
@@ -6487,6 +6605,7 @@ mod tests {
             &|_: &StepProgress| {},
             false,
             true,
+            MergePushPolicy::default(),
             uuid::Uuid::new_v4(),
             &|_repo: &str, _id: &str| {},
             Some(&move |row| sink_fn(row)),
@@ -6555,6 +6674,7 @@ mod tests {
             &|_: &StepProgress| {},
             false,
             true,
+            MergePushPolicy::default(),
             uuid::Uuid::new_v4(),
             &|_repo: &str, _id: &str| {},
             Some(&move |row| sink_fn(row)),
@@ -6686,6 +6806,7 @@ mod tests {
             &|_: &StepProgress| {},
             false,
             true,
+            MergePushPolicy::default(),
             uuid::Uuid::new_v4(),
             &|_repo: &str, _id: &str| {},
             Some(&move |row| sink_fn(row)),
@@ -6765,6 +6886,7 @@ mod tests {
             &|_: &StepProgress| {},
             false,
             true,
+            MergePushPolicy::default(),
             uuid::Uuid::new_v4(),
             &|_repo: &str, _id: &str| {},
             Some(&move |row| sink_fn(row)),
@@ -6829,6 +6951,7 @@ mod tests {
             &|_: &StepProgress| {},
             false,
             true,
+            MergePushPolicy::default(),
             uuid::Uuid::new_v4(),
             &|_repo: &str, _id: &str| {},
             None,
@@ -6881,6 +7004,7 @@ mod tests {
             &|_: &StepProgress| {},
             false,
             true,
+            MergePushPolicy::default(),
             uuid::Uuid::new_v4(),
             &|_repo: &str, _id: &str| {},
             Some(&move |row| sink_fn(row)),
@@ -6939,6 +7063,7 @@ mod tests {
             &|_: &StepProgress| {},
             false,
             true,
+            MergePushPolicy::default(),
             uuid::Uuid::new_v4(),
             &|_repo: &str, _id: &str| {},
             None,
@@ -7030,6 +7155,7 @@ mod tests {
             &|_: &StepProgress| {},
             false,
             true,
+            MergePushPolicy::default(),
             uuid::Uuid::new_v4(),
             &|_repo: &str, _id: &str| {},
             &move |row| sink_fn(row),
@@ -7092,6 +7218,7 @@ mod tests {
             &|_: &StepProgress| {},
             false,
             true,
+            MergePushPolicy::default(),
             uuid::Uuid::new_v4(),
             &|_repo: &str, _id: &str| {},
             None,
@@ -7150,6 +7277,7 @@ mod tests {
             &|_: &StepProgress| {},
             false,
             true,
+            MergePushPolicy::default(),
             uuid::Uuid::new_v4(),
             &|_repo: &str, _id: &str| {},
             Some(&coord),
@@ -7219,6 +7347,7 @@ mod tests {
             &|_: &StepProgress| {},
             false,
             true,
+            MergePushPolicy::default(),
             uuid::Uuid::new_v4(),
             &|_repo: &str, _id: &str| {},
             None,
@@ -7345,6 +7474,7 @@ mod tests {
             &|_: &StepProgress| {},
             false,
             true,
+            MergePushPolicy::default(),
             uuid::Uuid::new_v4(),
             &|_repo: &str, _id: &str| {},
             Some(&coord),
@@ -7428,6 +7558,7 @@ mod tests {
             &|_: &StepProgress| {},
             false,
             true,
+            MergePushPolicy::default(),
             uuid::Uuid::new_v4(),
             &|_repo: &str, _id: &str| {},
             Some(&coord),
@@ -7506,6 +7637,7 @@ mod tests {
             &|_: &StepProgress| {},
             false,
             true,
+            MergePushPolicy::default(),
             uuid::Uuid::new_v4(),
             &|_repo: &str, _id: &str| {},
             None,
@@ -7568,6 +7700,7 @@ mod tests {
             &|_: &StepProgress| {},
             false,
             true,
+            MergePushPolicy::default(),
             uuid::Uuid::new_v4(),
             &|_repo: &str, _id: &str| {},
             None,
@@ -7631,6 +7764,7 @@ mod tests {
             &|_: &StepProgress| {},
             false,
             true,
+            MergePushPolicy::default(),
             uuid::Uuid::new_v4(),
             &|_repo: &str, _id: &str| {},
             None,

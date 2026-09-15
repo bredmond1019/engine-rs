@@ -40,7 +40,8 @@ use engine_core::workflows::orchestration::execute::{EngineKind, ExecutionOutcom
 use engine_core::workflows::orchestration::gates::{AdmissionGate, DependencyEdge};
 use engine_core::workflows::orchestration::integrate::{
     integrate_chain_with_run_record, CloseBlockFn, ComposeLedgerEntriesFn, HoldSource,
-    IntegrateError, JournalSinkFn, RunRecordLifecycle, RunRecordSinkFn, StepObserverFn,
+    IntegrateError, JournalSinkFn, MergePushPolicy, RunRecordLifecycle, RunRecordSinkFn,
+    StepObserverFn,
 };
 use engine_core::workflows::orchestration::ledger::{
     Coverage, CrossRepo, CrossRepoE2e, LedgerStatus, NewLedgerEntry,
@@ -737,6 +738,7 @@ pub async fn drive_chain_with_run_record(
     step_observer: &StepObserverFn,
     default_use_worktree: bool,
     default_auto_pr: bool,
+    merge_push_policy: MergePushPolicy,
     campaign_id: Uuid,
     close_block: &CloseBlockFn,
     meta: RunRecordMeta,
@@ -763,6 +765,7 @@ pub async fn drive_chain_with_run_record(
         step_observer,
         default_use_worktree,
         default_auto_pr,
+        merge_push_policy,
         campaign_id,
         close_block,
         Some(journal_sink.as_ref()),
@@ -1281,7 +1284,7 @@ mod run_record_lifecycle_tests {
     use engine_core::repo_registry::RepoRegistry;
     use engine_core::workflows::orchestration::execute::{EngineKind, FlowRunner};
     use engine_core::workflows::orchestration::gates::AdmissionGate;
-    use engine_core::workflows::orchestration::integrate::NeverHeld;
+    use engine_core::workflows::orchestration::integrate::{MergePushPolicy, NeverHeld};
     use uuid::Uuid;
 
     use super::{drive_chain_with_run_record, ChainStep, RunRecordMeta};
@@ -1369,6 +1372,7 @@ mod run_record_lifecycle_tests {
             &|_| {},
             false,
             true,
+            MergePushPolicy::default(),
             campaign_id,
             &|_repo: &str, _id: &str| {},
             test_meta(),
@@ -1446,6 +1450,7 @@ mod run_record_lifecycle_tests {
                 &|_| {},
                 false,
                 true,
+                MergePushPolicy::default(),
                 campaign_id,
                 &|_repo: &str, _id: &str| {},
                 meta,
