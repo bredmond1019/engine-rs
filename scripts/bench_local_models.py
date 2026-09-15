@@ -1150,7 +1150,13 @@ def run_one_job_orchestration(spec: JobSpec, cfg: SweepConfig, sandbox_root: Pat
     try:
         block_id = ensure_sandbox_bench_block(sandbox_root)
         work_dir.mkdir(parents=True, exist_ok=True)
-        shutil.rmtree(work_dir / "sdlc", ignore_errors=True)
+        (work_dir / "sdlc-flow-state.json").unlink(missing_ok=True)
+        (work_dir / "sdlc-task-state.json").unlink(missing_ok=True)
+        wt_dir = engine_rs_dir / "trees" / "sdlc" / block_id
+        if wt_dir.exists():
+            shutil.rmtree(wt_dir, ignore_errors=True)
+            subprocess.run(["git", "-C", str(engine_rs_dir), "worktree", "prune"], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.run(["git", "-C", str(engine_rs_dir), "branch", "-D", f"sdlc/{block_id}"], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         tasks = json.loads((TIERS_DIR / spec.tier / "tasks.json").read_text())
         (work_dir / "tasks.json").write_text(json.dumps(tasks, indent=2) + "\n")
         (work_dir / "harness.json").write_text(json.dumps(build_harness_from_tasks(tasks), indent=2) + "\n")
