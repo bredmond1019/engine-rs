@@ -98,11 +98,17 @@ use super::inbox_triage::{
 };
 use super::operator_edge::{make_author_operator_edge, OperatorEdgeAuthorConfig};
 use super::preflight::{BlockPreflight, ClaimVerdict, PreflightOutcome};
-use crate::policy::permission::{resolve_permission_profile, GatedAction};
 use crate::coord::write::RegisterOutcome;
 use crate::nodes::brain_client::RECALL_NODE_NAME;
+use crate::policy::permission::{resolve_permission_profile, GatedAction};
 use crate::workflows::get_result;
 use crate::workflows::recall::RECALL_WORKFLOW_TYPE;
+
+/// Closure signature for authoring an operator gate when a gated action is
+/// denied — factored out so the parameter's type doesn't repeat verbatim
+/// (and trip `clippy::type_complexity`) at every call site that threads it
+/// through. See [`integrate_chain`]'s `author_operator_edge` doc.
+type AuthorOperatorEdge<'a> = &'a dyn Fn(&OperatorGateRequest) -> Result<(), String>;
 
 // ── Operator hold: pause-and-resume ─────────────────────────────────────
 
@@ -1127,7 +1133,7 @@ pub enum IntegrateError {
     /// A dependency edge was unmet (from [`check_dependencies`]).
     Gate(GateError),
     /// A gated action was refused or authoring its operator gate failed (from [`check_permission_gate`]).
-    PermissionGate(PermissionGateError),
+    PermissionGate(Box<PermissionGateError>),
     /// The block's `SDLC_FLOW` run itself failed (from [`execute_step`]).
     Execute(ExecuteError),
     /// The block's `sdlc-flow-state.json` could not be read at all.
@@ -1555,7 +1561,7 @@ impl From<GateError> for IntegrateError {
 
 impl From<PermissionGateError> for IntegrateError {
     fn from(err: PermissionGateError) -> Self {
-        IntegrateError::PermissionGate(err)
+        IntegrateError::PermissionGate(Box::new(err))
     }
 }
 
@@ -2708,7 +2714,7 @@ pub async fn integrate_chain_with_permission_gate(
     inbox_triage_runner: Option<&InboxTriageRunner>,
     inbox_report: &mut Vec<ProcessedMessage>,
     resolve_action: &dyn Fn(&str, &str) -> Option<GatedAction>,
-    author_operator_edge: Option<&dyn Fn(&OperatorGateRequest) -> Result<(), String>>,
+    author_operator_edge: Option<AuthorOperatorEdge<'_>>,
 ) -> Result<Vec<ExecutionOutcome>, IntegrateError> {
     integrate_chain_impl(
         chain,
@@ -3007,7 +3013,7 @@ async fn integrate_chain_impl(
     inbox_triage_runner: Option<&InboxTriageRunner>,
     inbox_report: &mut Vec<ProcessedMessage>,
     resolve_action: &dyn Fn(&str, &str) -> Option<GatedAction>,
-    author_operator_edge: Option<&dyn Fn(&OperatorGateRequest) -> Result<(), String>>,
+    author_operator_edge: Option<AuthorOperatorEdge<'_>>,
 ) -> Result<Vec<ExecutionOutcome>, IntegrateError> {
     if let Some(sink) = run_record_sink {
         sink(RunRecordLifecycle::Started);
@@ -3166,7 +3172,7 @@ async fn integrate_chain_impl_inner(
     // success and the error return path.
     inbox_report: &mut Vec<ProcessedMessage>,
     resolve_action: &dyn Fn(&str, &str) -> Option<GatedAction>,
-    author_operator_edge: Option<&dyn Fn(&OperatorGateRequest) -> Result<(), String>>,
+    author_operator_edge: Option<AuthorOperatorEdge<'_>>,
 ) -> Result<Vec<ExecutionOutcome>, IntegrateError> {
     let total_steps = chain.len();
     let mut outcomes = Vec::with_capacity(chain.len());
@@ -3608,30 +3614,30 @@ async fn integrate_chain_impl_inner(
         }
 
         if let Some(action) = resolve_action(&step.repo, &step.block_id) {
-            let (profile, _profile_err) = resolve_permission_profile(
-                &registry.brain_root().join("brain.toml"),
-            );
+            let (profile, _profile_err) =
+                resolve_permission_profile(&registry.brain_root().join("brain.toml"));
             let default_author;
-            let author: &dyn Fn(&OperatorGateRequest) -> Result<(), String> = match author_operator_edge {
-                Some(custom) => custom,
-                None => {
-                    let repo_dir = registry
-                        .resolve(&step.repo)
-                        .unwrap_or_else(|_| registry.brain_root().to_path_buf());
-                    default_author = make_author_operator_edge(OperatorEdgeAuthorConfig {
-                        root: registry.brain_root().to_path_buf(),
-                        repo: step.repo.clone(),
-                        block_id: step.block_id.clone(),
-                        dir: repo_dir,
-                        agent: coord.map(|c| c.agent.clone()),
-                        lock_dir: coord.map(|c| c.lock_dir.clone()),
-                        roadmap: step.roadmap.clone(),
-                        lane: lane.map(str::to_string),
-                        roadmap_dir: Some(roadmap_dir.to_path_buf()),
-                    });
-                    &default_author
-                }
-            };
+            let author: &dyn Fn(&OperatorGateRequest) -> Result<(), String> =
+                match author_operator_edge {
+                    Some(custom) => custom,
+                    None => {
+                        let repo_dir = registry
+                            .resolve(&step.repo)
+                            .unwrap_or_else(|_| registry.brain_root().to_path_buf());
+                        default_author = make_author_operator_edge(OperatorEdgeAuthorConfig {
+                            root: registry.brain_root().to_path_buf(),
+                            repo: step.repo.clone(),
+                            block_id: step.block_id.clone(),
+                            dir: repo_dir,
+                            agent: coord.map(|c| c.agent.clone()),
+                            lock_dir: coord.map(|c| c.lock_dir.clone()),
+                            roadmap: step.roadmap.clone(),
+                            lane: lane.map(str::to_string),
+                            roadmap_dir: Some(roadmap_dir.to_path_buf()),
+                        });
+                        &default_author
+                    }
+                };
 
             if let Err(err) = check_permission_gate(step, action, profile, author) {
                 let integrate_err = IntegrateError::from(err.clone());
@@ -3656,7 +3662,8 @@ async fn integrate_chain_impl_inner(
                                 permission_gate_slug(*action)
                             }
                         };
-                        let blocked_by = dependency_edge_to_json(&DependencyEdge::Operator { slug });
+                        let blocked_by =
+                            dependency_edge_to_json(&DependencyEdge::Operator { slug });
                         let skip_lane = lane.unwrap_or(step.repo.as_str());
                         let entry = LaneLogEntry::skipped(
                             step,

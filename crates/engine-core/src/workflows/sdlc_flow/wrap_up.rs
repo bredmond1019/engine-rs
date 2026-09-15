@@ -643,10 +643,7 @@ fn model_tier_used(policy: &SdlcPolicy) -> BTreeMap<String, String> {
     };
     BTreeMap::from([
         ("implement".to_string(), implement_tier),
-        (
-            "implement_simple".to_string(),
-            implement_simple_tier,
-        ),
+        ("implement_simple".to_string(), implement_simple_tier),
         ("triage".to_string(), tier_str(tiers.triage)),
         ("review".to_string(), tier_str(tiers.review)),
         ("generate".to_string(), tier_str(tiers.generate)),

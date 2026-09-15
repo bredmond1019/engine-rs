@@ -1031,8 +1031,7 @@ mod tests {
 
     #[test]
     fn git_log_dash_s_preflight_invokes_git_log_dash_s_through_the_injected_runner() {
-        let calls: RecordedConductorCalls =
-            Arc::new(Mutex::new(Vec::new()));
+        let calls: RecordedConductorCalls = Arc::new(Mutex::new(Vec::new()));
         let calls_clone = calls.clone();
         let runner: Runner<TestOutput> = Arc::new(move |program, args, cwd| {
             calls_clone.lock().unwrap().push((
