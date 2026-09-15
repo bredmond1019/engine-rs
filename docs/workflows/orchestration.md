@@ -135,25 +135,88 @@ the step.
 Readiness always comes from the graph, never from a roadmap's hand-written wave table. A roadmap is
 an authored snapshot and has been wrong; the `depends_on` edges are the fact.
 
-## Pitfall: a passing step merges into `main` and pushes it
+## Merge/push are now config-gated (`orchestration-merge-step-pushes-main-directly` fix, 2026-09-14)
 
-**Do not point ORCHESTRATION at a throwaway or benchmark block.** Its integrate step is built for
-real chains, so on a passing step it does three things a disposable run must never do:
+**History — what used to be true.** Until 2026-09-14, a passing step's integrate stage did three
+things unconditionally, with no way to prevent any of them:
 
-1. **Merges the step's branch into `main` in the repo's primary checkout** (`merge_step_branch`,
+1. **Merged the step's branch into `main` in the repo's primary checkout** (`merge_step_branch`,
    `crates/engine-core/src/workflows/orchestration/integrate.rs`).
-2. **Runs `git push origin main` itself.** This bypasses `agentic-portfolio/scripts/sync/git_push.sh`,
-   the fleet's dependency-ordered push with its `ci-blocked` gate (engine-rs `CLAUDE.md` standing rule
-   10). Tracked as carryover `orchestration-merge-step-pushes-main-directly`.
-3. **Closes the block in `planning/state.json`**, which re-runs a fleet-wide `emit-state --write`.
-   After that, every further dispatch of the same block is skipped as `block status is 'closed'`.
+2. **Ran `git push origin main` itself**, unconditionally. This bypassed
+   `agentic-portfolio/scripts/sync/git_push.sh`, the fleet's dependency-ordered push with its
+   `ci-blocked` gate (engine-rs `CLAUDE.md` standing rule 10).
+3. **Closed the block in `planning/state.json`**, which re-runs a fleet-wide `emit-state --write`.
 
 Measured 2026-09-14: a local-model benchmark dispatched through ORCHESTRATION pushed `8318e32` (bench
-output files) to engine-rs `origin/main`. Every worktree is cut from `origin/main`, and
-`LoadTaskStateNode` resumes tasks by commit title, so later benchmark tasks were silently skipped.
+output files) to engine-rs `origin/main`, unable to be prevented. `LoadTaskStateNode` resumes tasks
+by commit title, so later benchmark tasks were silently skipped once that landed.
 
-**For disposable runs, dispatch `SDLC_FLOW` directly with no `block_id`.** `CloseBlockNode` no-ops
-without one, and `PullRequestNode` never merges. The [local-model bench](../local-model-bench.md) does this.
+**Now.** `OrchestrationPolicy` carries two new knobs gating exactly this, resolved through the usual
+four-layer precedence and threaded down to `merge_step_branch` as `MergePushPolicy`:
+
+| Knob | Built-in default | What it gates |
+|---|---|---|
+| `default_auto_merge` | `true` | Whether a passing step's branch merges into **local** `main` at all. `false` skips the whole merge stage (and therefore any push) — the step still closes, but no later step's worktree will see this one's work. |
+| `default_auto_push` | **`false`** — a deliberate exception to CLAUDE.md standing rule 6, same class as `default_use_worktree`'s | Whether a locally-merged branch is also pushed to `origin main`. Irrelevant when `default_auto_merge` is `false`. |
+
+**Real correctness trade-off, not a free lunch.** `SetupWorktreeNode` cuts every step's branch fresh
+from `origin/main` — that per-step discipline is unchanged. With the built-in defaults
+(`default_use_worktree: true`, `default_auto_push: false`), block N's local `main` merge never
+reaches `origin/main`, so block N+1's worktree — cut fresh from `origin/main` — will **not** contain
+block N's work. A real multi-block chain that needs its blocks to compose must do one of:
+
+- Set `default_auto_push: true` for that run, accepting the real push to `origin/main` (this repo's
+  own solo-operator default stays `false` — the fix's whole point — but a future multi-operator fleet,
+  or a deliberate one-off, can opt in per-run via the event's `policy` override).
+- Set `default_use_worktree: false` so every step runs in the repo's primary checkout directly and
+  sees the prior step's local merge with no push needed at all.
+
+A single-block chain, or a disposable/benchmark chain where later blocks deliberately don't need to
+see earlier ones (the local-model bench), is unaffected either way — this is exactly the local-model
+bench's own use case, and why it can now dispatch through `ORCHESTRATION` at all (see
+[the local-model bench doc](../local-model-bench.md)'s `--dispatch orchestration` mode) instead of
+being told to avoid `ORCHESTRATION` entirely.
+
+**PR creation (`default_auto_pr`, pre-existing knob, unrelated field but same section)** is set to
+`false` at this repo's own `planning/harness.json` harness_defaults layer as of 2026-09-14, pending
+`gh auth login` in the fleet sandbox — a real ORCHESTRATION dispatch there got all the way through a
+local model's full `SDLC_TASK` chain and only failed at the final `PullRequestNode` step on missing
+GitHub auth, which is otherwise good evidence the PR path itself works. `baseline` still restates the
+Rust built-in default (`true`) verbatim, per this file's own no-op-profile convention — only the
+harness_defaults layer changed.
+
+## Concurrent same-repo dispatch — not yet supported, design note only
+
+The operator asked whether multiple `ORCHESTRATION` runs could target the **same repo** concurrently
+(e.g. several disposable bench blocks in parallel) with a deterministic "merge train" — a FIFO queue
+serializing merges into that repo's `main`, escalating to a small bounded judgment call (not a full
+coding agent) only on a real conflict. This was scoped for 2026-09-14's fix but **not built** —
+reasoning:
+
+- The merge/push gate above gives an operator a real lever (`default_auto_merge: false`/
+  `default_auto_push: false`) to keep a disposable/parallel-same-repo run from ever touching `main`
+  at all, which covers the local-model bench's actual near-term need (see its own `--dispatch
+  orchestration` mode, which explicitly refuses `--parallel > 1` and is sandbox-only).
+- A real merge-train needs to detect "is another lane holding a lease on this repo's checkout right
+  now" — the coordination layer (`coord_lane.rs`, lease registration, `EN.15.A-D`) has the primitives,
+  but wiring that detection into `merge_step_branch`'s call site, then building a deterministic FIFO
+  drain (likely reusing `coord::heavy_work::HeavyWorkQueue`'s shape — a `merge` job class, admitted
+  FIFO, one job per pending merge) plus the bounded conflict-judgment escalation, is genuinely new
+  infrastructure comparable in size to the `llm_node.rs` trait consolidation itself — not something
+  to half-build under an unrelated task's time budget, especially right after discovering the
+  worktree-cut-from-`origin/main` correctness trade-off above, which any merge-train design must also
+  respect (a queued merge that only updates local `main` still leaves later worktrees blind to it
+  without a push).
+- Open questions for whoever picks this up: does the FIFO admit per-repo or per-lane; does a queued
+  merge's eventual push happen per-merge or batched; what exactly the bounded judgment call should be
+  allowed to do on a real conflict (abort and escalate to the operator is the safe default — silently
+  resolving a conflict via LLM judgment is a different, larger trust decision); and whether this
+  belongs in `integrate.rs` at all or as a new pre-merge admission node in the chain, mirroring how
+  `TestTaskNode`/`FinalValidationNode` already admit through `HeavyWorkQueue` today.
+
+**Until this exists, do not run multiple `ORCHESTRATION` dispatches concurrently against the same
+repo's primary checkout** — `--dispatch orchestration` in the local-model bench enforces this by
+construction (`--parallel` is rejected outright in that mode).
 
 ## The lane-log contract
 
@@ -1036,7 +1099,9 @@ Resolved through the standard four layers (per-run event override > named profil
 | `hold_poll_interval_ms` | `2000` | How often a paused run checks whether an operator hold has cleared. Lower notices a clearance sooner at the cost of more wake-ups. |
 | `default_use_worktree` | `true` | Whether a block with no per-run policy override runs in its own worktree (isolated) or directly in the repo's shared checkout (in-place). **This is a correctness precondition, not a cost/quality knob** — see below. |
 | `hold_deadline_ms` | `None` (unbounded) | The total time a single operator hold may consume before the chain fails loudly with `IntegrateError::HoldDeadlineExceeded`, instead of waiting forever. |
-| `default_auto_pr` | `true` | Whether a `flow` step's `SDLC_FLOW` child event opens a real PR through `PullRequestNode`. `false` seeds `auto_pr: false` on the child event, which `PullRequestNode` short-circuits on — stamping `{"pr_url": null, "skipped": true, "branch_name": ...}` without ever shelling out to `gh`. **`SDLC_TASK` steps are unaffected**: `SdlcTaskEventSchema` drops the field entirely because `SDLC_TASK` ships no PR ceremony, so there is nothing to seed. |
+| `default_auto_pr` | `true` (Rust built-in); `false` at this repo's own `planning/harness.json` harness_defaults layer as of 2026-09-14 | Whether a `flow` step's `SDLC_FLOW` child event opens a real PR through `PullRequestNode`. `false` seeds `auto_pr: false` on the child event, which `PullRequestNode` short-circuits on — stamping `{"pr_url": null, "skipped": true, "branch_name": ...}` without ever shelling out to `gh`. **`SDLC_TASK` steps are unaffected**: `SdlcTaskEventSchema` drops the field entirely because `SDLC_TASK` ships no PR ceremony, so there is nothing to seed. |
+| `default_auto_merge` | `true` | Whether a passing step's branch merges into **local** `main` at all (`merge_step_branch`). See "Merge/push are now config-gated" above. |
+| `default_auto_push` | **`false`** — deliberate rule-6 exception | Whether a locally-merged branch also runs `git push origin main`. See "Merge/push are now config-gated" above for the real worktree-visibility trade-off this creates for multi-block chains. |
 | `conductor_max_chain_blocks` | `Some(3)` | `CONDUCTOR`-only (`EN.12.F` Task 5) — the most blocks a conductor proposal may dispatch. See "Constraints on the first autonomous runs" above. |
 | `conductor_single_repo_only` | `true` | `CONDUCTOR`-only — trims a proposal to its first block's repo. Never varies by profile. |
 | `campaign_max_cost_usd_cents` | `Some(5_000)` | `CONDUCTOR`-only — the campaign cost ceiling in USD cents, wired into `integrate_chain`'s `campaign_budget` and enforced via the `budget_halted` terminal state (`EN.11.F`). |
