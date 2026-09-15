@@ -48,4 +48,5 @@ English, and how to trigger one. This page is just the file listing.
 
 Docs for capabilities that are **not** workflows — the crate architecture, the CLI, the data
 contract, terminal internals, suspend/resume, the harvest gate — are one level up in
-[`../index.md`](../index.md).
+[`../index.md`](../index.md). The **Node/Molecule Library** — every reusable Node a workflow graph
+is built from — is at [`../nodes/index.md`](../nodes/index.md).

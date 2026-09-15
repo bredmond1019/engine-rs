@@ -1363,3 +1363,11 @@ Treat the first real cross-repo run as a test, not as routine — the same postu
 one drives other engines. A short **two-block, single-repo** chain where a failure is cheap to
 unwind was, and remains, the right first target before a cross-repo lane; the run above is that
 first target, exercised.
+
+## Node / molecule library
+
+- `DebriefNode` is a near-atom living in this workflow's directory — see
+  [`../nodes/atoms/workflow-embedded.md`](../nodes/atoms/workflow-embedded.md)
+- `HeldSessionNode` (the `HELD_SESSION` graph) is this repo's one production terminal-atom
+  registration — see [`../nodes/atoms/terminal.md`](../nodes/atoms/terminal.md)
+- Full node catalogue: [`../nodes/index.md`](../nodes/index.md)

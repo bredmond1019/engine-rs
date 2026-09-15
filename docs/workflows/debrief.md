@@ -104,3 +104,7 @@ for a policy layer to act on. Same no-op carve-out as `TERMINAL_PROBE` and `RECA
   read route) and the `DEBRIEF` module entry.
 - [orchestration.md](orchestration.md) — how a campaign and its journal rows come to exist in the
   first place.
+- [`../nodes/atoms/workflow-embedded.md`](../nodes/atoms/workflow-embedded.md) — `DebriefNode`'s
+  near-atom entry: what's already generic (injectable `JournalReader`/`ChannelTransport`) and the
+  named refactor to generalize it into any "campaign digest" workflow.
+- Full node catalogue: [`../nodes/index.md`](../nodes/index.md)

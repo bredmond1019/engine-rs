@@ -455,3 +455,16 @@ This workflow has no dedicated `content-pipeline-state.json` telemetry writer of
   dispatch (URL/payload/`X-API-Key` header), chain-depth-cap refusal, unwired-channel
   `delivered: false` naming, failing-transport resilience, `EventsRow` receipt round-tripping, and
   the Local-profile rewire leaving `ActionDispatchNode` untouched.
+
+## Node / molecule library
+
+- `FetchArticleNode`/`FetchTranscriptNode`/`NormalizeChannelContentNode` are one refactor away from
+  a generic `FetchContentNode<F>` — see [`fetch-content-trio`](../nodes/molecules/fetch-content-trio.md)
+- The self-critic loop hand-rolls its own `CriticRouterNode` instead of the generic
+  `loop_combinator::build_loop` that `PROPOSAL_GENERATOR` already proves out — see
+  [`critic-revise-loop`](../nodes/molecules/critic-revise-loop.md)
+- `PersistToBrainNode` here is a near-duplicate of `proposal_generator`'s node of the same name —
+  see [`persist-to-brain`](../nodes/molecules/persist-to-brain.md)
+- `ActionDispatchNode` is a near-duplicate of `research_agent::ResearchIngressDispatchNode` — see
+  [`research-dispatch-pair`](../nodes/molecules/research-dispatch-pair.md)
+- Full node catalogue: [`../nodes/index.md`](../nodes/index.md)
