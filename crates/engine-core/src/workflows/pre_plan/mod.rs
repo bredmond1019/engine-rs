@@ -26,3 +26,4 @@
 pub mod check_existing;
 pub mod intake;
 pub mod research;
+pub mod write_notes;
