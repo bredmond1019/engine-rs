@@ -1078,11 +1078,22 @@ def detect_stale_worktree_contamination(worktree: Path, changed: list[str], job_
     return detect_conflict_markers(worktree, changed) or detect_stale_worktree(worktree, job_started_at)
 
 
-def capture_evidence(dest: Path, worktree: Path, work_id: str, orch_event: dict, final_checks: list[dict]) -> Path:
+def capture_evidence(
+    dest: Path, worktree: Path, work_id: str, orch_event: dict, final_checks: list[dict], repo_dir: Path | None = None
+) -> Path:
+    """`repo_dir` is the repo the job actually ran against -- REPO_DIR (this
+    script's own live repo) for --dispatch direct, but the SANDBOX's own
+    engine-rs checkout for --dispatch orchestration. Resolved at call time
+    (None, not a REPO_DIR default) so it stays patchable in tests. A prior
+    version hardcoded REPO_DIR unconditionally, so orchestration-mode evidence
+    capture always looked for `sdlc/` state in the wrong repo and silently
+    copied nothing (confirmed 2026-09-15: pi-rerun-2026-09-15's artifacts had
+    no `sdlc/` subdir for any orchestration-mode job) -- the per-job JSON
+    record was unaffected, since harvest_state() was already sandbox-aware."""
     dest.mkdir(parents=True, exist_ok=True)
     (dest / "run-event.json").write_text(json.dumps(orch_event, indent=2) + "\n")
     (dest / "final-checks.json").write_text(json.dumps(final_checks, indent=2) + "\n")
-    sdlc_dir = REPO_DIR / "planning" / work_id / "sdlc"
+    sdlc_dir = (repo_dir or REPO_DIR) / "planning" / work_id / "sdlc"
     if sdlc_dir.is_dir():
         shutil.copytree(sdlc_dir, dest / "sdlc", dirs_exist_ok=True)
     if worktree.is_dir():
@@ -1344,7 +1355,9 @@ def run_one_job_orchestration(spec: JobSpec, cfg: SweepConfig, sandbox_root: Pat
         try:
             dest = cfg.run_dir / "artifacts" / spec.slug
             record.artifacts_dir = str(
-                capture_evidence(dest, worktree, SANDBOX_BENCH_BLOCK_ID, orch_event, record.final_checks)
+                capture_evidence(
+                    dest, worktree, SANDBOX_BENCH_BLOCK_ID, orch_event, record.final_checks, repo_dir=engine_rs_dir
+                )
             )
         except Exception as err:  # noqa: BLE001
             log(f"  !! evidence capture error (non-fatal): {err}")

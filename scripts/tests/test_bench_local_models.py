@@ -409,6 +409,35 @@ class TestDetectStaleWorktreeContamination(unittest.TestCase):
             self.assertIsNone(blm.detect_stale_worktree_contamination(worktree, [], past_start))
 
 
+class TestCaptureEvidence(unittest.TestCase):
+    def test_default_repo_dir_is_this_scripts_own_repo(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            base = Path(d)
+            dest = base / "artifacts" / "job1"
+            with mock.patch.object(blm, "REPO_DIR", base / "live"):
+                (base / "live" / "planning" / "work1" / "sdlc").mkdir(parents=True)
+                (base / "live" / "planning" / "work1" / "sdlc" / "sdlc-task-state.json").write_text("{}")
+                blm.capture_evidence(dest, base / "no-worktree", "work1", {}, [])
+            self.assertTrue((dest / "sdlc" / "sdlc-task-state.json").is_file())
+
+    def test_explicit_repo_dir_is_used_instead_of_the_default(self) -> None:
+        """Orchestration-mode dispatch runs against a SANDBOX repo, not this
+        script's own REPO_DIR -- a prior version hardcoded REPO_DIR here, so
+        evidence capture silently found nothing for every orchestration job
+        (confirmed 2026-09-15: pi-rerun-2026-09-15's artifacts had no `sdlc/`
+        subdir for any job, though harvest_state's own record was fine)."""
+        with tempfile.TemporaryDirectory() as d:
+            base = Path(d)
+            dest = base / "artifacts" / "job1"
+            sandbox_repo = base / "sandbox" / "engine-rs"
+            (sandbox_repo / "planning" / "work1" / "sdlc").mkdir(parents=True)
+            (sandbox_repo / "planning" / "work1" / "sdlc" / "sdlc-task-state.json").write_text("{}")
+            with mock.patch.object(blm, "REPO_DIR", base / "live"):
+                blm.capture_evidence(dest, base / "no-worktree", "work1", {}, [], repo_dir=sandbox_repo)
+            self.assertTrue((dest / "sdlc" / "sdlc-task-state.json").is_file())
+            self.assertFalse((base / "live").exists())
+
+
 class TestHarvestState(unittest.TestCase):
     def test_derives_pass_fail_from_dict_keyed_tasks(self) -> None:
         with tempfile.TemporaryDirectory() as d:
