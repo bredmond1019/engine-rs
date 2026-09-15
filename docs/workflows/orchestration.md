@@ -214,6 +214,10 @@ reasoning:
   belongs in `integrate.rs` at all or as a new pre-merge admission node in the chain, mirroring how
   `TestTaskNode`/`FinalValidationNode` already admit through `HeavyWorkQueue` today.
 
+Codified further, including a table of exactly which same-repo/cross-repo/knob combinations are
+already safe today without the merge-train at all:
+`planning/pre-plan/orchestration-improvements/end-of-chain-concurrency-cleanup/notes.md`.
+
 **Until this exists, do not run multiple `ORCHESTRATION` dispatches concurrently against the same
 repo's primary checkout** — `--dispatch orchestration` in the local-model bench enforces this by
 construction (`--parallel` is rejected outright in that mode).
@@ -909,7 +913,7 @@ field — the way `child_sdlc_task_policy` or any other `OrchestrationPolicy` kn
 choice, not a per-run one.
 
 **Why this seam is capped at 2 of the usual 4 policy layers, and what a real fix requires:**
-`planning/pre-plan/orchestration-harness-only-policy-gap/notes.md` — audited to be the only such
+`planning/pre-plan/orchestration-improvements/orchestration-harness-only-policy-gap/notes.md` — audited to be the only such
 gap in the codebase; the fix is architecturally straightforward (mirror `OrchestrationPolicy`'s
 `default_auto_pr` precedent) but mechanically wide (threads through 10 nested `integrate_chain*`
 wrapper functions and ~30 call sites), so it's captured as its own task rather than forced through
