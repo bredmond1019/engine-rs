@@ -190,11 +190,16 @@ unpiped first.
 
 ## Per-task validation in the SDLC loop
 
+<!-- updated by /update-docs -->
 `tasks.json` tasks that cannot break the build — docs-only, config-only — should declare their own
-`validation_commands`. `/sdlc-flow` and `/sdlc-task` run those instead of the project-wide gating
-checks for that task, so a markdown edit no longer triggers a Rust compile. The end review still
-re-runs the full gating suite over the integrated tree. Leave the array `[]` for any task touching
-`.rs` files.
+`validation_commands`. `/sdlc-flow` and `/sdlc-task` run those **in addition to** this project's
+`gates: true` harness checks (in their `fastCommand` form) — `validation_commands` augments the
+gating list, it does not replace it (`.claude/workflows/sdlc-task.js`'s
+`checks.filter(c => c.gates && c.perTask !== false)`). The only thing that removes a project check
+from per-task runs is `perTask: false` on that check in `planning/harness.json`; a task's own
+`validation_commands` can never suppress one. So a docs-only task still pays for whatever the
+harness gates unless those rows are `perTask: false`. The end review still re-runs the full gating
+suite over the integrated tree. Leave the array `[]` for any task touching `.rs` files.
 
 Full cross-project playbook:
 [`base-template/docs/rust-sdlc-iteration-speed.md`](file:///Users/brandon/Dev/agentic-portfolio/base-template/docs/rust-sdlc-iteration-speed.md).

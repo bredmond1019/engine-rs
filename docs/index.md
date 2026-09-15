@@ -7,7 +7,7 @@ layer: [meta]
 project: engine-rs
 status: active
 keywords: [documentation, index, navigation, engine-rs, reference]
-related: [core:engine-rs, workflows-index]
+related: [core:engine-rs, workflows-index, nodes-readme, nodes-index]
 ---
 
 # engine-rs — Documentation Index
@@ -23,6 +23,7 @@ the engine can do, and [architecture.md](architecture.md) for how it's built.
 | Doc | What it covers |
 |---|---|
 | **[workflows/](workflows/README.md)** | **"What can this thing do, and how do I run it."** Every registered workflow, what each does, and how to trigger one. Also holds every per-workflow reference doc — file listing at [workflows/index.md](workflows/index.md) |
+| **[nodes/](nodes/README.md)** | **The Node Library** — every reusable `Node` grouped by purpose (transport/LLM, control flow, Brain/content, channel IO, terminal, operator), with a one-line description and a link to its full doc. File listing at [nodes/index.md](nodes/index.md) |
 | [architecture.md](architecture.md) | How the engine is built: crate layout, core types, injectable seams, data flow |
 | [cli.md](cli.md) | Retired — engine-rs has no CLI; kept only so existing links resolve |
 | [coming-soon.md](coming-soon.md) | What is planned and **does not exist yet**, each with its block ID and what it waits on |
