@@ -28,7 +28,7 @@ catch-up (D42). It is a parallel-pilot rewrite of the Python `orchestrator` engi
   live state, the durable-write bridge, the actix-web HTTP surface → tables below
 - `term-core`/`term-attach` (`EN.9.A`) are tmux session-control, split so the blocking attach path
   can never reach `engine-core`/`engine-serve` by feature unification → [terminal-crates.md](terminal-crates.md)
-- **Every reusable `Node` is catalogued separately** in [nodes/README.md](nodes/README.md) (the
+- **Every reusable `Node` is catalogued separately** in [nodes/index.md](nodes/index.md) (the
   Node Library) — this section covers crate/module shape, not individual nodes
 
 ### Workspace crates
@@ -36,7 +36,7 @@ catch-up (D42). It is a parallel-pilot rewrite of the Python `orchestrator` engi
 | Crate | What it holds |
 |---|---|
 | `engine-contract` (`EN.0.B`) | Data-contract serde types — `events.rs` (`EventsRow`/`NodeRun`/`NodeRunStatus`/`Usage`), `task_context.rs` (`TaskContext`) — matching the orchestrator data-contract v1.1.0 byte-for-byte. Full pin: [data-contract.md](data-contract.md) |
-| `engine-core` (`EN.1.A`) | The runtime: `Node` trait, dispatch, graph validation, cancellation/budget, every workflow graph, every reusable node. See the two tables below and [nodes/README.md](nodes/README.md) |
+| `engine-core` (`EN.1.A`) | The runtime: `Node` trait, dispatch, graph validation, cancellation/budget, every workflow graph, every reusable node. See the two tables below and [nodes/index.md](nodes/index.md) |
 | `engine-store` (`EN.0.B`) | `postgres.rs` — `sqlx::PgPool` connect/insert/update/get for the durable `events` record |
 | `engine-serve` (`EN.1.C`) | The actix-web HTTP surface + in-memory live-run state — the crate a host process embeds. See the module table below |
 | `term-core` (`EN.9.A`) | tmux session-control + agent-detection, ported from `core/bastion`'s `src/sessions/`/`src/detect/`; no blocking attach. `tokio` feature is a real `engine-core` dependency (`EN.9.D`) — see [terminal-driver.md](terminal-driver.md) |
@@ -61,7 +61,7 @@ catch-up (D42). It is a parallel-pilot rewrite of the Python `orchestrator` engi
 | `locale.rs` | `Locale`/`Currency`/`MoneyRange`/`RateSheet`/`RateCard` — the two-sheet, firewalled rate card threaded through the diagnostic funnel — `EN.4.F` |
 | `evals/` | Pure, corpus-free eval scoring (generalized from Synapse's OR.K2 scorer library): `scorers.rs`, `case.rs`, `slice.rs`, `runner.rs` — `EN.5.B` |
 | `coord/` | Fleet coordination over `.fleet-locks/`: `mod.rs` (read-only `read_coordination_view`), `write.rs` (register/heartbeat/release/lease/send/drain — `EN.15.A`/`C`), `roadmap_status.rs` (typed `LaneResult` join reproducing base-template's `roadmap_status_discovery.py` in Rust — `EN.15.H`) |
-| `nodes/` | Every reusable `Node` implementation — catalogued in [nodes/README.md](nodes/README.md), not here |
+| `nodes/` | Every reusable `Node` implementation — catalogued in [nodes/index.md](nodes/index.md), not here |
 
 ### `engine-serve` top-level modules
 

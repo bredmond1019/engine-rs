@@ -331,6 +331,8 @@ unaffected either way.
 ## See also
 
 - [index.md](index.md) — navigation table for this directory.
+- [`../nodes/index.md`](../nodes/index.md) — the Node/Molecule Library: every reusable Node a
+  workflow graph is built from, and every proven or near-duplicate Node sequence.
 - [`../architecture.md`](../architecture.md) — crates, core types, data flow.
 - [`../cli.md`](../cli.md) — the command-line surface.
 - [`../coming-soon.md`](../coming-soon.md) — what is planned and does not exist yet.

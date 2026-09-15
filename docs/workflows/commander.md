@@ -122,3 +122,7 @@ never invoked with a permissions bypass, checked independently of the gate outco
   drain, a narrower mechanism than this workflow's fleet-wide pass.
 - [`architecture.md`](../architecture.md) — where `COMMANDER` sits in the module map.
 - `commander-retro` / `ping-agent` skills — the operator-facing procedures this workflow ports.
+- [`../nodes/gaps.md`](../nodes/gaps.md) §1 — `CommanderTriageNode` makes an LLM call with no
+  transport/cancellation seam and no local-vs-cloud policy surface at all — the one gap in this
+  audit worse than the known hand-rolled cases.
+- Full node catalogue: [`../nodes/index.md`](../nodes/index.md)

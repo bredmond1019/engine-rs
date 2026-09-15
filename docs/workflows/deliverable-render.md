@@ -189,5 +189,7 @@ files exist on disk at those paths under `event.output_dir`.
   resolution, profile bundles) this workflow's policy surface is built on.
 - [architecture.md](../architecture.md) — dispatch, `register_builtin_workflows`, and the
   `PolicyConfigSource::Builtin` vs. `Worktree` split.
+- [`../nodes/atoms/workflow-embedded.md`](../nodes/atoms/workflow-embedded.md) — `RenderPdfNode`'s atom entry.
+- Full node catalogue: [`../nodes/index.md`](../nodes/index.md)
 - [testing.md](../testing.md) — the single-integration-test-binary layout this workflow's e2e
   suite (`tests/it/deliverable_render_e2e.rs`) follows.

@@ -5,7 +5,7 @@ description: Chronological log of work completed for engine-rs.
 doc_id: log
 layer: [factory]
 status: active
-timestamp: "2026-09-15T02:00:36Z"
+timestamp: "2026-09-15T21:05:00Z"
 keywords: [work log, session history, development log]
 related: [status, context]
 ---
@@ -80,6 +80,40 @@ fea8a83 fix(bench): harden job-boundary cleanup, add model/backend selection, re
 ```
 
 ## [2026-09-15]
+
+### planning-command-nodes lane (EN.19.A-D): fmt/clippy baseline repair, EN.19.A paused on a pre-existing test defect
+- **What:**
+  - Ran `/begin-orchestration --roadmap planning-command-nodes --lane planning-command-nodes`. Before
+    generating tasks, re-derived `EN.19.A`/`B`/`C`'s block records' premises: all three named a stale
+    pre-plan output path (`planning/pre-plan/<slug>/`, superseded 2026-09-07 by D87's
+    `$BRAIN_ROOT/planning/open-work/pre-plan/<slug>/`) and `EN.19.A`/`B` named the wrong workflow_type
+    registration file (`http.rs` instead of `workflows.rs`). Amended all three records in place (D18).
+  - `/sdlc-flow EN.19.A` bailed task 1 on a repo-wide pre-existing failure: `cargo fmt --check` (29 diff
+    hunks, 12 files) and `cargo clippy --all-features -- -D warnings` (8 errors in
+    `orchestration/integrate.rs`) were already red on `main`, blocking every future SDLC task in this
+    repo. Filed and fixed as its own chore, `EN.chore.fmt-clippy-baseline-repair` (closed) — boxed
+    `IntegrateError::PermissionGate`'s payload, added a named `AuthorOperatorEdge` type alias, ran
+    `cargo fmt`. Also corrected `harness.json`'s stale `composer_model_tier` key to the
+    `ledger_composer_model_tier` key the code actually reads (a carried-forward defect from
+    2026-09-14's handoff).
+  - Merged the fix into `EN.19.A-flow` and resumed. 6 of 7 tasks landed (the `pre_plan` workflow
+    module, `PRE_PLAN` registration, the webhook route, integration tests, a doc-restructuring pass).
+    Task 7 (terminal Validate) bailed on `consolidate::remediation_promotion_through_the_full_graph_is_idempotent`,
+    traced precisely to commit `116d994` (EN.15.K, 2026-09-11) — a pre-existing defect, unrelated to
+    this initiative, that now blocks every future spec's terminal Validate task too. Filed as
+    `carryover[]` (`consolidate-remediation-promotion-test-missing-fixture-dir`, defect, priority 2),
+    along with the pre-existing `pi_transport`/`agent_backend` timeout-test flakiness both this session
+    and 2026-09-14's independently observed (`pi-transport-timeout-tests-flaky-under-parallel-nextest`,
+    deferred, priority 3).
+  - Per orchestrate's stop-on-fail rule, the chain stopped there — `EN.19.A` stays `open`, not closed;
+    PR #95 stays a draft. `EN.19.B`/`EN.19.C` specced (not run); `EN.19.D` not yet specced (composes
+    A/B/C's real code, needs it to exist first).
+- **Why:** Operator-directed run of the planning-command-nodes roadmap. The fmt/clippy and
+  `consolidate::` defects were both genuine, repo-wide blockers surfaced mid-run, not part of the
+  initiative itself — fixed/filed rather than worked around, since every future spec in this repo
+  would otherwise hit them too.
+- **Refs:** `planning/orchestration-run/planning-command-nodes/{notes.md,review.md,verification-ledger.md}`,
+  `planning/handoff.md`.
 
 ### Local-model-bench root-cause pass: worktree-slot reuse, ORCHESTRATION error attribution, review-verdict/prompt fixes, model retirement, and the real pi-vs-aider gap
 - **What:**

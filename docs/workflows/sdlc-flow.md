@@ -642,3 +642,12 @@ cumulative attempt/pass/fail counts; `policy`/`outcomes` are only present if the
   ticket's Amendment Log (`planning/ticket-implement-node-transport-retry/tasks.md`) for the full
   retryable/non-retryable classification and the reasoning for applying the retry to all five
   consumers rather than implement-only.
+
+## Node / molecule library
+
+- This graph's intake-through-triage prefix is the proven
+  [`sdlc-intake-prefix`](../nodes/molecules/sdlc-intake-prefix.md) molecule, shared literally with
+  `SDLC_TASK`
+- Its queue-drain shape (`TaskQueueRouterNode → SaveStateNode`) is documented as the
+  [`queue-drain-loop`](../nodes/molecules/queue-drain-loop.md) molecule — `CLAIM_REAFFIRM` hand-copied this idiom rather than importing it
+- Full node catalogue: [`../nodes/index.md`](../nodes/index.md)

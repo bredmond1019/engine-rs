@@ -197,3 +197,13 @@ This workflow has no dedicated `linkedin-post-state.json` telemetry writer of it
   `MaterializeDocNode`/`PersistToBrainNode` — a drafted post is not brain-persisted knowledge; it
   is a candidate for a human to actually post.
 - **`event.repos` full-fleet default is a known limitation** — see `WorkSourceNode` above.
+
+## Node / molecule library
+
+- `WorkSourceNode` is a fully generic atom (injectable `CommandRunner`/`FileReader`/`DirReader`) —
+  see [`../nodes/atoms/workflow-embedded.md`](../nodes/atoms/workflow-embedded.md)
+- `IncrementCriticIterationNode` is imported directly from `CONTENT_PIPELINE` — genuine cross-workflow
+  reuse; the router half of the same loop is hand-rolled independently — see
+  [`critic-revise-loop`](../nodes/molecules/critic-revise-loop.md)
+- `ReviseNode` here is the third independent implementation of the same shape — same molecule doc
+- Full node catalogue: [`../nodes/index.md`](../nodes/index.md)

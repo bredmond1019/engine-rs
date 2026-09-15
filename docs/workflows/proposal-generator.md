@@ -312,3 +312,17 @@ assembles a policy/telemetry/review_verdict/revised snapshot itself from the dri
   `registry_for_policy`'s Local rewiring (and that `research`/`writer` are never rewired), and
   dispatcher registration (`is_registered("PROPOSAL_GENERATOR")`); a `#[ignore]`-gated
   experiment harness aggregates a self-assembled `proposal-generator-state.json` snapshot.
+
+## Node / molecule library
+
+- This workflow's critic/revise loop already uses the generic
+  `loop_combinator::build_loop` — the reference implementation the
+  [`critic-revise-loop`](../nodes/molecules/critic-revise-loop.md) molecule doc names as the target
+  for `content_pipeline`/`linkedin_post` to migrate onto
+- `ProposalCompanyResearchNode` is a near-duplicate of `research_agent::CompanyResearchNode` — see
+  [`company-research-pair`](../nodes/molecules/company-research-pair.md)
+- `PersistToBrainNode` here is a near-duplicate of `content_pipeline`'s node of the same name — see
+  [`persist-to-brain`](../nodes/molecules/persist-to-brain.md)
+- `ProposalReviewRouterNode` is a clean atom-quality router — see
+  [`../nodes/atoms/control-flow.md`](../nodes/atoms/control-flow.md)
+- Full node catalogue: [`../nodes/index.md`](../nodes/index.md)
