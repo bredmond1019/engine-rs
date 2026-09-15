@@ -7,11 +7,17 @@
 //! path (`pub(crate)` there specifically so this module can reuse it rather
 //! than re-implementing dispatch/spawn).
 //!
-//! **Deploy boundary:** this route only becomes reachable once the running
-//! `bastion serve` process is rebuilt and restarted — registering the route
-//! (this file) and calling `register_pre_plan` (`crates/engine-serve/src/
-//! workflows.rs`) are source changes, not something a live process picks up
-//! on its own.
+//! **Deploy boundary (`EN.19.A` task 7):** this route only becomes reachable
+//! once the running `bastion serve` process is rebuilt and restarted —
+//! registering the route (this file) and calling `register_pre_plan`
+//! (`crates/engine-serve/src/workflows.rs`) are source changes, not
+//! something a live process picks up on its own. Landing this file on `main`
+//! does **not** make `POST /webhooks/pre-plan/inbound` live against any
+//! currently-running `bastion serve` — that process must be rebuilt
+//! (`cargo build --release`) and restarted (the launchd/systemd unit
+//! recycled) before the route answers anything but a 404. This block's PR
+//! description states the same obligation explicitly, per adversarial
+//! review, so the deploy step is not silently assumed to be automatic.
 //!
 //! **Same-slug in-flight conflict guard.** Before dispatching, this checks
 //! `state.live` for another live (non-terminal) `PRE_PLAN` run whose
