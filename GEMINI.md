@@ -146,10 +146,37 @@ housekeeping. There is no global scheduler.
    queued to fix it). Branching, committing, and opening/reviewing/merging PRs to `main` locally
    are all fine from inside this repo — only the final `git push` of `main` to `origin` must go
    through that script.
+11. **Every node/seam that makes an LLM call implements `crate::workflows::llm_node::
+   {TransportSlotted, Cancellable}` — never a hand-rolled transport field or a bespoke
+   model-tier-to-transport resolution.** `llm_node.rs`'s own doc comment is the authority on the
+   shape and the migration history (`EN.ticket.transport-slot-consolidation`). Concretely: expose
+   the node's transport override through one `TransportSlot` field + `impl TransportSlotted`
+   (the two builder methods come free); expose cancellation the same way through
+   `impl Cancellable`; at the call site that decides local-vs-cloud routing, resolve through
+   `resolve_meta_transport(tier, backend, &local_config, &pi_config)` and apply via `wire(...)` or
+   `step.with_meta_transport(...)`, never a hand-written `if tier == Local { ... }` per stage. This
+   is rule 11, not a skill, because a skill is opt-in and this repo already paid for the gap twice:
+   16+ node files independently hand-rolled the identical field/builder pair before the
+   consolidation landed, and — because nothing forced an audit against the pattern — a genuinely
+   new LLM call site (`journal.rs`'s D57 verification-ledger composer, `EN.15.L`) was built as a
+   plain function with no transport override at all, shipped, and sat making one real cloud API
+   call on every passing `ORCHESTRATION` chain step regardless of every other stage's tier being
+   `Local`, until a dedicated local-model-only audit caught it well after the fact. Before adding
+   any node/function that constructs an `AgentCodeStep` (or equivalent) and picks a model, read
+   `llm_node.rs`'s doc comment and follow it — don't design a new transport-selection shape.
 
 ## Known bugs
 
-None known at initialization.
+Measured 2026-09-14 while building the local-model bench; details and workarounds in
+[`docs/local-model-bench.md`](docs/local-model-bench.md) § Pitfalls. Each is a `carryover[]` entry in
+`planning/state.json`.
+
+- **Task checks have no timeout** — looping model code hangs the run and blocks abort
+  (`sdlc-task-command-checks-have-no-timeout`).
+- **aider discards an edit whose reply names another tracked file**
+  (`aider-mention-reflection-discards-pending-edit`).
+- **`LoadTaskStateNode` marks a task done if `feat(sdlc): <id> — <title>` is already in git history**
+  — reuse a task title only on purpose.
 
 ## Build / test / run
 
