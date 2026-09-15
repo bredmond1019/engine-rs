@@ -16,6 +16,42 @@ related: [status, context]
 
 ## [run: 2026-09-15]
 
+`/sdlc-flow` on branch `EN.19.A-flow` (resumed from the earlier task-1 bail) ran tasks 1-7 and
+BAILED after task 7. Tasks 1-6 all passed with confirmed `workAssertionPassed` outcomes: the
+`pre_plan` module scaffold (`CheckExistingNotesNode`, `IntakeIdeaNode`), `ResearchCodebaseNode`
+(a read-only `AgentCodeStep` session scoped to Read/Grep/Glob, `TransportSlotted`/`Cancellable`
+per standing rule 11, prompt externalized to `prompts/research_codebase.md` per D24),
+`WriteNotesNode` (renders research findings into a `capture.md`-shaped `notes.md`), the full
+`PRE_PLAN` graph assembly + `workflow_type` registration behind a standing-rule-12 kill switch
+with baseline/cheap-fast/thorough profiles, `POST /webhooks/pre-plan/inbound` (X-API-Key gate,
+400/409/202 responses, docs in `docs/workflows/README.md`), and a hermetic `pre_plan.rs`
+integration suite (idempotency short-circuit, `force_regenerate` overwrite, prompt-injection
+containment, read-only tool-scope verification). Task 7 (expanding the webhook module's
+deploy-boundary doc comment) landed a real, in-scope diff (commit `8ab34fa`) but the run BAILED
+on `task_validation_3` — `cargo nextest run --workspace --all-features`'s
+`consolidate::remediation_promotion_through_the_full_graph_is_idempotent` fails deterministically
+with `NodeError: I/O error on .../docs/sandbox/findings/remediation.json: No such file or
+directory`, unrelated to task 7's file (`pre_plan_webhook.rs`). Independently re-verified this
+wrap-up turn: checked out an isolated worktree at merge-base `41fb3be0a27b9e382dbee32b06713851f03970bd`
+and ran the identical test — it fails there with the same error signature, confirming the defect
+predates `EN.19.A` and originates at commit `116d994` (`EN.15.K`), which `git merge-base
+--is-ancestor` confirms is an ancestor of the branch's merge-base. Next: file/track the
+`consolidate::remediation_promotion_through_the_full_graph_is_idempotent` pre-existing defect as
+housekeeping outside `EN.19.A`'s scope, then resume `EN.19.A` to close out task 7's validation.
+
+```
+8ab34fa feat: implement EN.19.A-task7
+f49c1e3 feat: implement EN.19.A-task6
+aa79f4e feat: implement EN.19.A-task5
+4e82044 feat: implement EN.19.A-task4
+1ba1a8f feat: implement EN.19.A-task3
+eacdb70 feat: implement EN.19.A-task2
+1dd6276 Merge branch 'main' into EN.19.A-flow
+41fb3be feat: implement EN.chore.fmt-clippy-baseline-repair-task1
+```
+
+## [run: 2026-09-15]
+
 `/sdlc-flow` on branch `EN.19.A-flow` BAILED after task 1. Task 1 landed the `pre_plan` module
 scaffold — `CheckExistingNotesNode` (router, exists()-checks the brain-root-resolved
 `notes.md`, short-circuits unless `force_regenerate`) and `IntakeIdeaNode` (validates
