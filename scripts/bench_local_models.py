@@ -134,12 +134,36 @@ REVIEW_MODES = ("per_task", "trivial_skip", "end_only")
 TERMINAL_STATUSES = ("succeeded", "failed", "cancelled", "budget_halted")
 RETRYABLE_OUTCOMES = ("exception", "dispatch_error", "infra_error")
 ENGINE_ANOMALIES = ("engine_rejected_correct_work", "engine_accepted_failing_work", "abort_unconfirmed")
+# outcome=infra_error (already RETRYABLE) when a job's worktree slot is contaminated
+# by a PRIOR job's leftover state -- see detect_stale_worktree_contamination.
+STALE_WORKTREE_CONTAMINATION = "stale_worktree_contamination"
+CONFLICT_MARKER_RE = re.compile(r"^(?:<{7}(?: .*)?|={7}|>{7}(?: .*)?)$", re.MULTILINE)
 NOISE_PATH_PREFIXES = (".aider", ".gitignore")
 ARTIFACT_TEXT_CAP_BYTES = 200_000
 FINAL_CHECK_TIMEOUT_SECONDS = 180
 REPO_PATH_RE = re.compile(r"(?<![\w/.-])((?:scripts|crates|docs)/[\w./-]*\w)")
 PLANNING_PATH_RE = re.compile(r"(?<![\w/.-])(planning/[\w./-]*\w)")
 CTX_VARIANT_RE = re.compile(r"-ctx\d+$")
+
+# Retired from `--models all` after overnight-sandbox-2026-09-14 (72-job sweep,
+# planning/open-work/local-models/local-model-bench/results/overnight-sandbox-2026-09-14/):
+# both were the smallest models in the sweep and failed for reasons attributable to
+# model capacity, not the harness bugs that contaminated that run's pi-backend numbers
+# (see TELEMETRY_INVESTIGATION.md and the leaderboard's own per-job evidence).
+# Still pullable in Ollama; re-add via --include-retired for an easy-tier-only rerun
+# if a future task profile suits their size.
+RETIRED_MODELS: dict[str, str] = {
+    "qwen2.5:3b": (
+        "0/3 on both backends (aider and pi) in overnight-sandbox-2026-09-14 -- every non-easy "
+        "job scored `infra` (dispatch/process failure, not a graded miss), consistent with a "
+        "3B model failing to reliably emit valid tool calls under aider/pi's tool-calling protocol."
+    ),
+    "llama3.2:3b": (
+        "1/3 on both backends in overnight-sandbox-2026-09-14 -- passed only the trivial `easy` "
+        "tier and failed `edit`/`medium` with `check_failed`/`no_change`, i.e. genuine model-capacity "
+        "misses (confirmed on a clean, non-buggy job), not harness noise."
+    ),
+}
 
 
 def load_env_file(path: Path) -> None:
@@ -285,15 +309,25 @@ def resolve_required_capability(choice: str, backends: list[str]) -> str:
     return "tools" if any(b in CODING_AGENT_BACKENDS for b in backends) else "completion"
 
 
-def resolve_models(models_arg: str, endpoint: str) -> list[str]:
-    if models_arg.strip() == "all":
+def resolve_models(models_arg: str, endpoint: str, include_retired: bool = False) -> list[str]:
+    """Accepts `all`, a comma-separated list, or a JSON array (`["a","b"]`) --
+    the JSON form exists so a caller can hand this a generated/filtered model
+    list without hand-building a comma string. `all` excludes RETIRED_MODELS
+    unless include_retired is set; the two explicit forms never filter --
+    naming a retired model directly always runs it."""
+    stripped = models_arg.strip()
+    if stripped == "all":
         tags = http_get_json(f"{endpoint}/api/tags", None).get("models", [])
-        return [
+        names = [
             m["name"]
             for m in sorted(tags, key=lambda m: m.get("size", 0))
             if not CTX_VARIANT_RE.search(m["name"])
         ]
-    return [m.strip() for m in models_arg.split(",") if m.strip()]
+        return names if include_retired else [n for n in names if n not in RETIRED_MODELS]
+    if stripped.startswith("["):
+        parsed = json.loads(stripped)
+        return [str(m).strip() for m in parsed if str(m).strip()]
+    return [m.strip() for m in stripped.split(",") if m.strip()]
 
 
 def commit_subject_collisions(tier_tasks: dict[str, list[dict]]) -> list[str]:
@@ -384,9 +418,24 @@ def ensure_ctx_variant(model: str, num_ctx: int, endpoint: str, create: bool) ->
     return variant, False
 
 
+def unload_ollama_model(endpoint: str, ollama_model: str) -> None:
+    """Evict `ollama_model` from Ollama's runner pool (keep_alive: 0) at the end
+    of every job, regardless of which model/backend runs next. Overnight-sandbox-
+    2026-09-14 always ran a model's aider job immediately before its pi job on the
+    SAME reused worktree slot, and every one of pi's non-infra losses on that model
+    happened in that second slot -- consistent with (among other explanations) the
+    previous job's model still resident and contending for RAM/VRAM with the next
+    model load. This removes that variable; best-effort, never fails the job."""
+    try:
+        http_post_json(f"{endpoint}/api/generate", None, {"model": ollama_model, "keep_alive": 0}, timeout=30.0)
+    except Exception as e:  # noqa: BLE001 -- cleanup must never fail the job
+        log(f"  warning: could not unload {ollama_model} from ollama (non-fatal): {e}")
+
+
 def preflight(
     *, tiers: list[str], models_arg: str, backends: list[str], endpoint: str, bastion_addr: str, api_key: str,
     num_ctx: int = 0, create_variants: bool = False, require_capability: str = "completion",
+    include_retired: bool = False,
 ) -> tuple[list[str], list[str], list[dict], list[str], dict, list[dict]]:
     """Returns (problems, warnings, excluded, runnable_models, model_info, all_model_caps).
     Any problem blocks the sweep. `excluded` is models filtered by capability
@@ -431,7 +480,7 @@ def preflight(
 
     runnable: list[str] = []
     info: dict = {}
-    for model in resolve_models(models_arg, endpoint):
+    for model in resolve_models(models_arg, endpoint, include_retired=include_retired):
         try:
             # Capability comes from /api/show, NOT the /api/tags list used by
             # resolve_models(): measured 2026-09-14, /api/tags reports
@@ -976,6 +1025,59 @@ def classify(*, engine_tasks: list[dict], final_checks: list[dict], changed: lis
     return "check_failed"
 
 
+def detect_conflict_markers(worktree: Path, changed: list[str]) -> str | None:
+    """No tier's task ever asks a model to write conflict markers, so one found in
+    a changed/tracked file is conclusive evidence of a prior job's leftover merge
+    state in this reused worktree slot, not a model output (measured 2026-09-14:
+    medium/pi/qwen3-8b r1's harvested git.txt carried an unresolved `<<<<<<< HEAD`
+    committed by an earlier job entirely)."""
+    if not worktree.is_dir():
+        return None
+    for rel in changed:
+        path = worktree / rel
+        if not path.is_file():
+            continue
+        try:
+            text = path.read_text(errors="replace")
+        except OSError:
+            continue
+        m = CONFLICT_MARKER_RE.search(text)
+        if m:
+            return f"unresolved merge-conflict marker {m.group(0).strip()!r} in {rel}"
+    return None
+
+
+def detect_stale_worktree(worktree: Path, job_started_at: str) -> str | None:
+    """SetupWorktreeNode always touches the worktree directory itself (checkout,
+    or `git worktree add`) before a job can do anything else. If a job's own
+    SetupWorktreeNode never got that far (e.g. clean_block's prior `git worktree
+    remove` silently failed, per its capture_output=True/check=False), the
+    directory left behind is a DIFFERENT, earlier job's slot -- and its mtime
+    still predates this job's own start. Cheap and reliable because it needs no
+    new instrumentation: the filesystem already records this."""
+    if not worktree.is_dir():
+        return None
+    try:
+        started = datetime.fromisoformat(job_started_at.replace("Z", "+00:00"))
+        mtime = datetime.fromtimestamp(worktree.stat().st_mtime, tz=timezone.utc)
+    except (OSError, ValueError):
+        return None
+    if mtime < started - timedelta(seconds=5):
+        return (
+            f"worktree {worktree} last modified {mtime.isoformat()}, before this job "
+            f"started {started.isoformat()} -- a leftover slot from a previous job, "
+            "not this job's own run"
+        )
+    return None
+
+
+def detect_stale_worktree_contamination(worktree: Path, changed: list[str], job_started_at: str) -> str | None:
+    """Run BEFORE classify() ever sees final_checks/changed_paths: contaminated
+    evidence must never reach the classifier, or a prior job's leftover diff gets
+    scored as this job's model output (or lack of one)."""
+    return detect_conflict_markers(worktree, changed) or detect_stale_worktree(worktree, job_started_at)
+
+
 def capture_evidence(dest: Path, worktree: Path, work_id: str, orch_event: dict, final_checks: list[dict]) -> Path:
     dest.mkdir(parents=True, exist_ok=True)
     (dest / "run-event.json").write_text(json.dumps(orch_event, indent=2) + "\n")
@@ -1062,18 +1164,24 @@ def run_one_job(spec: JobSpec, cfg: SweepConfig) -> JobRecord:
         record.undeclared_paths = [p for p in record.changed_paths if p not in declared]
         record.tasks_total = len(tasks)
         record.tasks_passed_final = sum(1 for c in record.final_checks if c["passed"])
-        record.failure_category = classify(
-            engine_tasks=record.tasks,
-            final_checks=record.final_checks,
-            changed=record.changed_paths,
-            declared=declared,
-        )
-        if record.timed_out:
-            record.outcome = "timeout"
-        elif record.failure_category == "passed":
-            record.outcome = "passed"
+        contamination = detect_stale_worktree_contamination(worktree, record.changed_paths, record.started_at)
+        if contamination:
+            record.outcome = "infra_error"
+            record.failure_category = STALE_WORKTREE_CONTAMINATION
+            record.error = contamination
         else:
-            record.outcome = "task_failed"
+            record.failure_category = classify(
+                engine_tasks=record.tasks,
+                final_checks=record.final_checks,
+                changed=record.changed_paths,
+                declared=declared,
+            )
+            if record.timed_out:
+                record.outcome = "timeout"
+            elif record.failure_category == "passed":
+                record.outcome = "passed"
+            else:
+                record.outcome = "task_failed"
 
     except Exception as e:  # noqa: BLE001 -- deliberate: a job must never kill the sweep
         record.outcome = "exception"
@@ -1095,6 +1203,8 @@ def run_one_job(spec: JobSpec, cfg: SweepConfig) -> JobRecord:
                 clean_block(cfg.work_id)
             except Exception as err:  # noqa: BLE001
                 log(f"  !! cleanup error (non-fatal): {err}")
+        ollama_model = (cfg.model_info.get(spec.model) or {}).get("ollama_model") or spec.model
+        unload_ollama_model(cfg.endpoint, ollama_model)
 
     return record
 
@@ -1204,16 +1314,22 @@ def run_one_job_orchestration(spec: JobSpec, cfg: SweepConfig, sandbox_root: Pat
         record.undeclared_paths = [p for p in record.changed_paths if p not in declared]
         record.tasks_total = len(tasks)
         record.tasks_passed_final = sum(1 for c in record.final_checks if c["passed"])
-        record.failure_category = classify(
-            engine_tasks=record.tasks, final_checks=record.final_checks,
-            changed=record.changed_paths, declared=declared,
-        )
-        if record.timed_out:
-            record.outcome = "timeout"
-        elif record.failure_category == "passed":
-            record.outcome = "passed"
+        contamination = detect_stale_worktree_contamination(worktree, record.changed_paths, record.started_at)
+        if contamination:
+            record.outcome = "infra_error"
+            record.failure_category = STALE_WORKTREE_CONTAMINATION
+            record.error = contamination
         else:
-            record.outcome = "task_failed"
+            record.failure_category = classify(
+                engine_tasks=record.tasks, final_checks=record.final_checks,
+                changed=record.changed_paths, declared=declared,
+            )
+            if record.timed_out:
+                record.outcome = "timeout"
+            elif record.failure_category == "passed":
+                record.outcome = "passed"
+            else:
+                record.outcome = "task_failed"
 
     except Exception as e:  # noqa: BLE001 -- a job must never kill the sweep
         record.outcome = "exception"
@@ -1244,9 +1360,21 @@ def run_one_job_orchestration(spec: JobSpec, cfg: SweepConfig, sandbox_root: Pat
             git("worktree", "prune")
             git("branch", "-D", f"sdlc/{SANDBOX_BENCH_BLOCK_ID}")
             shutil.rmtree(work_dir / "sdlc", ignore_errors=True)
-            _run_mev(sandbox_root, "set-block-status", f"engine-rs:{SANDBOX_BENCH_BLOCK_ID}", "open", "--write")
+            reopen = _run_mev(sandbox_root, "set-block-status", f"engine-rs:{SANDBOX_BENCH_BLOCK_ID}", "open", "--write")
+            if reopen.returncode != 0:
+                # Non-fatal for THIS job (its own result is already decided), but
+                # silently swallowing this used to leave the block wrong for the
+                # NEXT job, which would then bail with a generic, unattributable
+                # error -- log it loudly against the job that actually caused it,
+                # and let the next job's ensure_sandbox_bench_block() retry+raise.
+                log(
+                    f"  !! reopening {SANDBOX_BENCH_BLOCK_ID} after this job failed "
+                    f"(rc={reopen.returncode}): {reopen.stdout.strip()} {reopen.stderr.strip()} "
+                    "-- the NEXT job may bail because of this"
+                )
         except Exception as err:  # noqa: BLE001
             log(f"  !! sandbox cleanup error (non-fatal): {err}")
+        unload_ollama_model(cfg.endpoint, (cfg.model_info.get(spec.model) or {}).get("ollama_model") or spec.model)
 
     return record
 
@@ -1509,7 +1637,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description="Dispatch local Ollama models through real SDLC_FLOW runs across fixed tiers.",
     )
-    p.add_argument("--models", required=True, help="Comma-separated Ollama model names, or `all` (every pulled model, smallest first, base variants only -- excluded by --require-capability, see that flag).")
+    p.add_argument("--models", required=True, help="Comma-separated Ollama model names, a JSON array of names (e.g. '[\"qwen3:14b\",\"gpt-oss:20b\"]'), or `all` (every pulled model, smallest first, base variants only, excluding RETIRED_MODELS unless --include-retired -- also subject to --require-capability, see that flag).")
+    p.add_argument("--include-retired", action="store_true", help=f"Include RETIRED_MODELS in `--models all` (currently: {', '.join(RETIRED_MODELS)}). No effect when --models names models explicitly -- an explicit name always runs regardless of retirement.")
     p.add_argument("--tiers", default=env("BENCH_LOCAL_MODELS_TIERS", DEFAULT_TIERS), help=f"Comma-separated tier directories under planning/local-model-bench/tiers/ (default: {DEFAULT_TIERS}).")
     p.add_argument("--agent-backends", default=env("BENCH_LOCAL_MODELS_AGENT_BACKENDS", "aider,pi"), help="Comma-separated local ImplementTaskNode transports to compare (aider, pi).")
     p.add_argument("--repeat", type=int, default=int(env("BENCH_LOCAL_MODELS_REPEAT", "1")), help="Repeats per (tier, model, backend); all of rep 1 runs before any of rep 2.")
@@ -1662,7 +1791,7 @@ def main(argv: list[str]) -> int:
         tiers=tiers, models_arg=args.models, backends=backends,
         endpoint=args.endpoint, bastion_addr=bastion_addr, api_key=api_key,
         num_ctx=args.ollama_num_ctx, create_variants=not args.dry_run,
-        require_capability=require_capability,
+        require_capability=require_capability, include_retired=args.include_retired,
     )
     render_capability_report(all_model_caps, excluded, require_capability, backends)
     for w in warnings:

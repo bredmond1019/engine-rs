@@ -181,11 +181,30 @@ class TestEventBody(unittest.TestCase):
         tags = {"models": [
             {"name": "qwen2.5:7b-instruct-ctx16384", "size": 5},
             {"name": "qwen2.5:7b-instruct", "size": 4},
-            {"name": "llama3.2:3b", "size": 2},
+            {"name": "gpt-oss:20b", "size": 2},
         ]}
         with mock.patch.object(blm, "http_get_json", return_value=tags):
             models = blm.resolve_models("all", "http://x")
-        self.assertEqual(models, ["llama3.2:3b", "qwen2.5:7b-instruct"])
+        self.assertEqual(models, ["gpt-oss:20b", "qwen2.5:7b-instruct"])
+
+    def test_all_models_excludes_retired_models_by_default(self) -> None:
+        tags = {"models": [
+            {"name": "qwen2.5:7b-instruct", "size": 4},
+            {"name": "llama3.2:3b", "size": 2},
+            {"name": "qwen2.5:3b", "size": 1},
+        ]}
+        with mock.patch.object(blm, "http_get_json", return_value=tags):
+            models = blm.resolve_models("all", "http://x")
+            self.assertEqual(models, ["qwen2.5:7b-instruct"])
+            with_retired = blm.resolve_models("all", "http://x", include_retired=True)
+        self.assertEqual(with_retired, ["qwen2.5:3b", "llama3.2:3b", "qwen2.5:7b-instruct"])
+
+    def test_explicitly_named_retired_model_still_runs(self) -> None:
+        self.assertEqual(blm.resolve_models("llama3.2:3b", "http://x"), ["llama3.2:3b"])
+
+    def test_resolve_models_accepts_a_json_array(self) -> None:
+        models = blm.resolve_models('["qwen3:14b", "gpt-oss:20b"]', "http://x")
+        self.assertEqual(models, ["qwen3:14b", "gpt-oss:20b"])
 
     def test_resolve_required_capability_auto_requires_tools_for_coding_agent_backends(self) -> None:
         self.assertEqual(blm.resolve_required_capability("auto", ["aider", "pi"]), "tools")
@@ -345,6 +364,51 @@ class TestClassify(unittest.TestCase):
         self.assertNotEqual(self._c(True, [], ["a.py"]), "passed")
 
 
+class TestDetectStaleWorktreeContamination(unittest.TestCase):
+    def test_clean_worktree_passes_through_unaffected(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            worktree = Path(d) / "wt"
+            worktree.mkdir()
+            (worktree / "a.py").write_text("print('hi')\n")
+            self.assertIsNone(blm.detect_stale_worktree_contamination(worktree, ["a.py"], blm.now_iso()))
+
+    def test_missing_worktree_is_not_contamination(self) -> None:
+        self.assertIsNone(blm.detect_stale_worktree_contamination(Path("/nonexistent/wt"), ["a.py"], blm.now_iso()))
+
+    def test_conflict_marker_in_a_changed_file_is_flagged(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            worktree = Path(d) / "wt"
+            worktree.mkdir()
+            (worktree / "a.py").write_text("<<<<<<< HEAD\nfoo\n=======\nbar\n>>>>>>> branch\n")
+            reason = blm.detect_stale_worktree_contamination(worktree, ["a.py"], blm.now_iso())
+        self.assertIsNotNone(reason)
+        self.assertIn("a.py", reason)
+        self.assertIn("<<<<<<<", reason)
+
+    def test_bare_equals_run_of_seven_is_also_a_marker(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            worktree = Path(d) / "wt"
+            worktree.mkdir()
+            (worktree / "a.py").write_text("before\n=======\nafter\n")
+            self.assertIsNotNone(blm.detect_conflict_markers(worktree, ["a.py"]))
+
+    def test_worktree_mtime_before_job_start_is_flagged_as_a_leftover_slot(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            worktree = Path(d) / "wt"
+            worktree.mkdir()
+            future_start = (datetime.now(blm.timezone.utc) + blm.timedelta(hours=1)).isoformat()
+            reason = blm.detect_stale_worktree_contamination(worktree, [], future_start)
+        self.assertIsNotNone(reason)
+        self.assertIn("leftover slot", reason)
+
+    def test_worktree_mtime_after_job_start_is_not_flagged(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            worktree = Path(d) / "wt"
+            worktree.mkdir()
+            past_start = (datetime.now(blm.timezone.utc) - blm.timedelta(hours=1)).isoformat()
+            self.assertIsNone(blm.detect_stale_worktree_contamination(worktree, [], past_start))
+
+
 class TestHarvestState(unittest.TestCase):
     def test_derives_pass_fail_from_dict_keyed_tasks(self) -> None:
         with tempfile.TemporaryDirectory() as d:
@@ -454,6 +518,34 @@ class TestRunOneJob(unittest.TestCase):
         self.assertEqual(record.run_status, "failed")
         self.assertEqual(record.failure_category, "engine_rejected_correct_work")
         self.assertEqual(record.outcome, "task_failed")
+
+    def test_a_contaminated_worktree_is_flagged_infra_not_scored_as_a_model_miss(self) -> None:
+        """The 2026-09-14 smoke: medium/pi/qwen3-8b r1 bailed at SetupWorktreeNode
+        in 1.8s, yet harvested final-checks.json/git.txt from a stale worktree
+        with an unresolved merge-conflict commit left by a different job entirely.
+        classify() must never see this evidence."""
+        with tempfile.TemporaryDirectory() as d:
+            run_dir = Path(d) / "run"
+            repo_dir = Path(d) / "repo"
+            worktree = repo_dir / "trees" / "sdlc" / "bench-test-fixture"
+            worktree.mkdir(parents=True)
+            (worktree / "LOCAL_ORCH_1.md").write_text("<<<<<<< HEAD\nfoo\n=======\nbar\n>>>>>>> branch\n")
+            defaults = {
+                "clean_block": mock.MagicMock(return_value=None),
+                "capture_evidence": mock.MagicMock(return_value=run_dir / "artifacts" / "x"),
+                "run_final_checks": mock.MagicMock(return_value=[{"task_id": 1, "passed": True, "output": ""}]),
+                "changed_paths": mock.MagicMock(return_value=["LOCAL_ORCH_1.md"]),
+                "http_get_json": mock.MagicMock(return_value={}),
+                "http_post_json": mock.MagicMock(return_value={"run_id": "r-9"}),
+                "poll_run": mock.MagicMock(return_value=("succeeded", 1.0)),
+                "classify": mock.MagicMock(side_effect=AssertionError("classify() must not run on contaminated evidence")),
+            }
+            with mock.patch.multiple(blm, **defaults), mock.patch.object(blm, "REPO_DIR", repo_dir):
+                record = blm.run_one_job(blm.JobSpec("easy", "m", "aider", 1), make_cfg(run_dir))
+        self.assertEqual(record.outcome, "infra_error")
+        self.assertEqual(record.failure_category, "stale_worktree_contamination")
+        self.assertIn("LOCAL_ORCH_1.md", record.error or "")
+        self.assertIn(record.outcome, blm.RETRYABLE_OUTCOMES)
 
 
 class TestRenderReports(unittest.TestCase):
