@@ -32,6 +32,12 @@ python3 scripts/bench_local_models.py \
 **You can stop reading now if that command is running and logging `== [n/N] ... ==` lines.**
 Everything below is what to do if something looks wrong, not required reading.
 
+**Verified 2026-09-14** with `--dry-run`: 130 jobs planned (13 tool-capable models × 5 tiers × 2
+backends, `phi3.5`/`codestral`/the two embedding models auto-excluded), 0 preflight failures across
+all five tiers. Sandbox was on `HEAD` `5b09008` at verification time — if `curl -s
+localhost:18090/health` reports a different `engine_build_sha`, re-run Action 1 in
+`sandbox-orchestration-quickstart.md` first.
+
 ## Before you run it — read `docs/sandbox-orchestration-quickstart.md` first
 
 That doc has the five hard rules (never target `:4317`, never `--parallel` with this dispatch
