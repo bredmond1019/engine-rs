@@ -58,8 +58,8 @@ use super::task_loop::{
 #[cfg(test)]
 use super::ModelTransport;
 use super::{
-    carry_forward_billing, get_result, parse_model_verdict, put_result, session_baseline,
-    sessions_since, CommandRunner, ModelVerdict, TransportSlot,
+    carry_forward_billing, get_result, normalize_pass_fail_partial_synonym, parse_model_verdict,
+    put_result, session_baseline, sessions_since, CommandRunner, ModelVerdict, TransportSlot,
 };
 
 /// The result-node name [`EndReviewNode`] stamps under, and the name
@@ -279,7 +279,9 @@ impl Node for EndReviewNode {
         let (normalized_verdict, mut result) =
             match parse_model_verdict::<ReviewOutput>(&ctx, NODE_NAME, &content) {
                 ModelVerdict::Parsed(parsed) => {
-                    let normalized_verdict = parsed.verdict.trim().to_uppercase();
+                    let normalized_verdict = normalize_pass_fail_partial_synonym(
+                        parsed.verdict.trim().to_uppercase().as_str(),
+                    );
                     let result = json!({
                         "verdict": normalized_verdict,
                         "summary": parsed.summary,
@@ -640,6 +642,37 @@ mod tests {
         assert!(
             result.get("unrecognized_verdict").is_none(),
             "a recovered PASS must not be flagged unrecognized"
+        );
+    }
+
+    /// Local-model bench false negative, reproduced (overnight-sandbox
+    /// 2026-09-14, `edit/aider/qwen2.5-coder:32b`): a reviewer echoed the
+    /// rendered Acceptance Criteria's own MET/NOT_MET per-criterion
+    /// vocabulary into the top-level `"verdict"` field instead of the
+    /// instructed PASS/FAIL/PARTIAL word. Before the fix this landed
+    /// `unrecognized_verdict: "NOT_MET"` and bailed the whole run via
+    /// `wrap_up::derive_terminal_signal`'s fallback arm even though the
+    /// model's intent (this failed) was perfectly legible.
+    #[tokio::test]
+    async fn end_only_mode_normalizes_not_met_synonym_to_fail() {
+        let state = state_with_tasks(vec![SDLCTask::new(1, "t1", "d1")]);
+        let ctx = ctx_with_policy(ReviewMode::EndOnly, &state);
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let runner = make_runner(calls.clone(), "diff content");
+        let transport = model_transport_returning(
+            "{\"verdict\":\"NOT_MET\",\"summary\":\"criterion unmet\",\"issues\":[\"missing test\"]}",
+        );
+
+        let node = EndReviewNode::new()
+            .with_runner(runner)
+            .with_transport(transport);
+        let out = node.process(ctx).await.expect("process should succeed");
+
+        let result = &out.nodes[NODE_NAME];
+        assert_eq!(result["verdict"], json!("FAIL"));
+        assert!(
+            result.get("unrecognized_verdict").is_none(),
+            "a NOT_MET synonym must normalize to FAIL, not bail as unrecognized"
         );
     }
 
