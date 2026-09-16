@@ -30,8 +30,8 @@
 //! - `gather_context` — [`gather_context::GatherPlanContextNode`], reads
 //!   `CLAUDE.md`/`planning/context.md`/`planning/state.json` plus the
 //!   pre-plan folder (task 1).
-//! - `decompose` — `DecomposePlanNode`, the one model-calling stage
-//!   (task 2, not yet implemented).
+//! - `decompose` — [`decompose::DecomposePlanNode`], the one model-calling
+//!   stage (task 2).
 //! - `stage_candidate_blocks` — `StageCandidateBlocksNode` (task 3, not
 //!   yet implemented).
 //! - `write_narrative` — `WritePlanNarrativeNode` (task 4, not yet
@@ -59,4 +59,5 @@
 //! the tree.
 
 pub mod check_existing;
+pub mod decompose;
 pub mod gather_context;
