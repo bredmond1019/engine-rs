@@ -5,7 +5,7 @@ description: Chronological log of work completed for engine-rs.
 doc_id: log
 layer: [factory]
 status: active
-timestamp: "2026-09-15T21:05:00Z"
+timestamp: "2026-09-16T02:16:40Z"
 keywords: [work log, session history, development log]
 related: [status, context]
 ---
@@ -138,6 +138,34 @@ fea8a83 fix(bench): harden job-boundary cleanup, add model/backend selection, re
 ```
 
 ## [2026-09-15]
+
+### planning-command-nodes lane resumed: EN.19.A closed, EN.19.B done, companion claude-code-rs ticket authored
+- **What:**
+  - Fixed the `hermetic_hq` fixture bug blocking every spec's terminal Validate task
+    (`consolidate.rs`), then resumed `EN.19.A-flow`, merging a real conflict against `main`'s newer
+    Node/Molecule Library restructure.
+  - Ran `EN.19.B` (`PLAN_AUTHORING`) to completion — PASS, PR #96.
+  - Resumed `EN.19.A`: review found AC6 (secret-path denial) unmet. Discussed with the operator,
+    who chose to pursue both a claude-code-rs read-time fix (ticketed there,
+    `CC.ticket.enforced-secret-path-denial-hook`, backend-specific) and a backend-agnostic
+    in-process mitigation here — surfacing along the way that `ResearchCodebaseNode`'s
+    `AgentBackend` was hardcoded to `ClaudeCli` (standing rule 6/12 violation), which would have
+    made the claude-code-rs fix silently stop covering Pi/Aider deployments. Added tasks 8-10 to
+    `EN.19.A`'s own spec: task 8 replaced the hardcode with `PrePlanPolicy.research_backend`; tasks
+    9-10 added `SecretGuardNode`, a pre-scan guard that blocks a secret-shaped file's content from
+    reaching `notes.md` regardless of which backend ran the research. All 10 tasks passed, review
+    PASS. Closed the `en19a-ac6-secret-path-denial-mechanism` operator gate and `EN.19.A` itself;
+    marked PR #95 ready for review.
+  - Along the way, fixed an unrelated `E_STATE_MALFORMED_JSON` in HQ's own `planning/state.json`
+    (a `file_contains` predicate using `text` instead of the schema's `pattern` field) that was
+    blocking every `close-operator-gate`/`emit-state --write` call fleet-wide.
+  - Added a global `~/.claude/hooks/deny-secret-paths.py` `PreToolUse` hook, live in
+    `~/.claude/settings.json` for every session on this machine.
+- **Why:** The operator wanted both defenses pursued in parallel rather than waiting on one; the
+  backend-hardcode discovery came directly out of that discussion and changed which mitigation
+  actually matters as the durable fix.
+- **Refs:** `planning/orchestration-run/planning-command-nodes/{notes.md,review.md}`, PR #95, PR
+  #96, `CC.ticket.enforced-secret-path-denial-hook` (claude-code-rs).
 
 ### planning-command-nodes lane (EN.19.A-D): fmt/clippy baseline repair, EN.19.A paused on a pre-existing test defect
 - **What:**
