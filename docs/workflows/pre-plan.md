@@ -6,7 +6,7 @@ doc_id: pre-plan-workflow
 layer: [engine]
 project: engine-rs
 status: active
-keywords: [pre-plan, workflow, capture, idempotency, read-only research, policy, prompt injection, notes.md]
+keywords: [pre-plan, workflow, capture, idempotency, read-only research, policy, prompt injection, secret guard, notes.md]
 related: [workflows-readme, workflows-index, research-agent-workflow, policy-and-profiles, architecture]
 ---
 
@@ -23,7 +23,7 @@ related: [workflows-readme, workflows-index, research-agent-workflow, policy-and
   text itself → [§Prompt-injection defense](#prompt-injection-defense)
 
 Source: `crates/engine-core/src/workflows/pre_plan/` (`mod.rs`, `check_existing.rs`, `intake.rs`,
-`research.rs`, `write_notes.rs`, `prompts/research_codebase.md`), registered from
+`research.rs`, `secret_guard.rs`, `write_notes.rs`, `prompts/research_codebase.md`), registered from
 `crates/engine-serve/src/workflows.rs`'s
 [`register_pre_plan`](../../crates/engine-serve/src/workflows.rs) →
 `register_builtin_workflows`. HTTP route:
@@ -60,15 +60,16 @@ flowchart TD
     A[CheckExistingNotesNode] -->|exists, no force_regenerate| B[PrePlanNotesAlreadyExistsNode]
     A -->|absent, or force_regenerate| C[IntakeIdeaNode]
     C --> D[ResearchCodebaseNode]
-    D --> E[WriteNotesNode]
+    D --> F[SecretGuardNode]
+    F --> E[WriteNotesNode]
 ```
 
 1. `CheckExistingNotesNode` — the start node — checks whether the target `notes.md` already exists.
 2. Exists and no `force_regenerate` → `PrePlanNotesAlreadyExistsNode`, a terminal that reports the
    existing path. Nothing else runs.
-3. Otherwise → `IntakeIdeaNode` → `ResearchCodebaseNode` → `WriteNotesNode` (both terminal
-   identities are declared with zero outgoing connections — `write_notes::NODE_NAME` and
-   `check_existing::EXISTS_ROUTE`).
+3. Otherwise → `IntakeIdeaNode` → `ResearchCodebaseNode` → `SecretGuardNode` → `WriteNotesNode`
+   (both terminal identities are declared with zero outgoing connections —
+   `write_notes::NODE_NAME` and `check_existing::EXISTS_ROUTE`).
 
 | Node | Model call? | What it does |
 |---|---|---|
@@ -76,6 +77,7 @@ flowchart TD
 | `PrePlanNotesAlreadyExistsNode` | No | Short-circuit terminal. Re-reports `CheckExistingNotesNode`'s stamped `notes_path` under its own identity (`check_existing::EXISTS_ROUTE`). |
 | `IntakeIdeaNode` | No | Validates `idea`/`slug` are non-empty strings; carries through optional `channel`/`sender`. Fails loudly, naming the missing field. |
 | `ResearchCodebaseNode` | Yes (`Sonnet` by default, policy-tunable) | A read-only [`AgentCodeStep`](../../crates/engine-core/src/nodes/agent_code_step.rs) scoped to `Read`/`Grep`/`Glob` only. Stable prompt: [`prompts/research_codebase.md`](../../crates/engine-core/src/workflows/pre_plan/prompts/research_codebase.md). |
+| `SecretGuardNode` | No | Backend-agnostic persistence guard (task 9/10) — scans `ResearchCodebaseNode`'s output for a verbatim line lifted from a secret-shaped file under the scan root and errors *before* `WriteNotesNode` runs on a match, so a leak never reaches `notes.md` regardless of which `AgentBackend` produced the research output. See [§Secret-guard persistence net](#secret-guard-persistence-net). |
 | `WriteNotesNode` | No | Renders the research findings into OKF frontmatter + sections matching `capture.md`'s output shape, and writes `notes.md`. Does not re-check existence — the graph already routed around that case. |
 
 No node here assumes it is the first node of a run — this is deliberate, so a future composing
@@ -107,10 +109,12 @@ the standalone `PRE_PLAN` `workflow_type`.
 
 ## Policy: `PrePlanPolicy`
 
-- Two knobs: `enabled` (the kill switch) and `research_model_tier` (`ResearchCodebaseNode`'s cloud
-  model tier, resolved through the shared
+- Knobs: `enabled` (the kill switch), `research_model_tier` and `research_backend`
+  (`ResearchCodebaseNode`'s cloud model tier and `AgentBackend`, resolved through the shared
   [`llm_node::resolve_meta_transport`/`wire`](../../crates/engine-core/src/workflows/llm_node.rs)
-  seam per CLAUDE.md standing rule 11 — never a hand-rolled transport field).
+  seam per CLAUDE.md standing rule 11 — never a hand-rolled transport field), and
+  `secret_guard_patterns`/`secret_guard_scan_root` (`SecretGuardNode`'s configuration — see
+  [§Secret-guard persistence net](#secret-guard-persistence-net)).
 - **Built-in default is `enabled: false`.** Every canonical profile below flips it `true` — a run
   reaches `PRE_PLAN` at all only by naming one of them, or by an inline `policy.enabled: true`.
 - Same four-layer precedence as every other policy-bearing workflow (see
@@ -168,6 +172,44 @@ Exercised end-to-end by
 [`crates/engine-core/tests/it/pre_plan.rs`](../../crates/engine-core/tests/it/pre_plan.rs)'s
 `prompt_injected_idea_produces_no_file_outside_notes_md` — asserts the only file written under the
 brain root is the target `notes.md` itself.
+
+## Secret-guard persistence net
+
+`SecretGuardNode` ([`secret_guard.rs`](../../crates/engine-core/src/workflows/pre_plan/secret_guard.rs))
+is the **honest, backend-agnostic** scope of the revised AC6 (`EN.19.A`, D18 amendment,
+2026-09-15). Two claims, deliberately kept separate:
+
+- **What this node does guarantee:** if `ResearchCodebaseNode`'s output carries a verbatim line
+  (≥12 chars, after trimming) lifted from a secret-shaped file under the resolved scan root, the
+  walk errors *before* `WriteNotesNode` ever runs — so a leak never persists into `notes.md`,
+  regardless of which `AgentBackend` (`claude_cli`/`pi`/`aider`) produced the research output. The
+  error names only the matched pattern/filename, never the leaked text.
+- **What this node does NOT guarantee:** it does not prevent the research session from *reading*
+  a secret-shaped file in the first place. That guarantee is backend-specific — only
+  `claude-code-rs`'s own `PreToolUse` hook mechanism can enforce it, and only for the `claude_cli`
+  backend — and is ticketed separately in that repo as
+  `CC.ticket.enforced-secret-path-denial-hook`. `research.rs`'s `disallowed_tools` (`Write`/
+  `Bash`/`Edit`) already blocks the session from *acting* on anything it reads; `SecretGuardNode`
+  is the independent net over the one artifact (`notes.md`) that must never carry a leak, so a gap
+  in the tool-scoping layer doesn't silently become a leaked secret in the corpus.
+
+Configuration (`PrePlanPolicy`):
+
+| Field | Built-in default | Notes |
+|---|---|---|
+| `secret_guard_patterns` | [`secret_guard::DEFAULT_SECRET_GUARD_PATTERNS`](../../crates/engine-core/src/workflows/pre_plan/secret_guard.rs) | Byte-identical to the global `~/.claude/hooks/deny-secret-paths.py` deny-list, so "secret-shaped" doesn't diverge from the fleet's existing notion. |
+| `secret_guard_scan_root` | `None` | Resolves via `resolve_brain_root()` at run time, matching every other path-resolving knob in this policy. |
+
+`registry_for_policy` re-registers `SecretGuardNode` with the resolved policy on every call, so
+these knobs actually take effect — the node SET stays invariant (standing rule 6); only its
+configuration and `ResearchCodebaseNode`'s transport vary by policy.
+
+Exercised by
+[`crates/engine-core/tests/it/pre_plan.rs`](../../crates/engine-core/tests/it/pre_plan.rs)'s
+`leak_detected_by_secret_guard_blocks_notes_persistence` (a planted fixture secret file, a stub
+transport that leaks its content, asserts the walk errors and `notes.md` is never written) and its
+positive-control sibling
+`clean_research_output_passes_secret_guard_and_notes_md_is_written`.
 
 ## Deploy boundary
 

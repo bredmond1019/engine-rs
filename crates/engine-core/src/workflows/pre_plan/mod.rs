@@ -19,17 +19,25 @@
 //! - `write_notes` — `WriteNotesNode`, renders the research findings into
 //!   `notes.md` matching `.claude/commands/capture.md`'s output shape
 //!   (task 3).
+//! - `secret_guard` — `SecretGuardNode`, a backend-agnostic persistence
+//!   guard: scans `ResearchCodebaseNode`'s output for a verbatim line
+//!   lifted from a secret-shaped file under the scan root and, on a match,
+//!   errors *before* `WriteNotesNode` ever runs (task 9/10). This is the
+//!   artifact-side guarantee behind the revised AC6 — see
+//!   `secret_guard`'s own module doc for why the original read-time
+//!   guarantee is backend-specific and out of scope here.
 //!
 //! Graph assembly, `PrePlanNotesAlreadyExistsNode`'s short-circuit terminal,
 //! the `PrePlanPolicy`/`PartialPrePlanPolicy` run-policy surface (research
-//! node model tier + the PRE_PLAN kill switch, standing rule 12), and the
+//! node model tier + backend + the PRE_PLAN kill switch + the secret-guard
+//! knobs, standing rule 12), and the
 //! `WORKFLOW_TYPE`/`schema`/`registry`/`registry_for_policy` assembly land
-//! here (task 4).
+//! here (task 4, extended task 10).
 //!
 //! Declared graph shape:
 //!
 //! ```text
-//! CheckExistingNotesNode -> { PrePlanNotesAlreadyExistsNode | IntakeIdeaNode -> ResearchCodebaseNode -> WriteNotesNode }
+//! CheckExistingNotesNode -> { PrePlanNotesAlreadyExistsNode | IntakeIdeaNode -> ResearchCodebaseNode -> SecretGuardNode -> WriteNotesNode }
 //! ```
 //!
 //! `CheckExistingNotesNode` is the start node and a `Router` (see
@@ -372,6 +380,13 @@ pub fn schema() -> WorkflowSchema {
         research::NODE_NAME.to_string(),
         NodeConfig::new(
             research::NODE_NAME,
+            vec![secret_guard::NODE_NAME.to_string()],
+        ),
+    );
+    nodes.insert(
+        secret_guard::NODE_NAME.to_string(),
+        NodeConfig::new(
+            secret_guard::NODE_NAME,
             vec![write_notes::NODE_NAME.to_string()],
         ),
     );
@@ -394,6 +409,9 @@ pub fn registry() -> NodeRegistry {
     registry.register(Box::new(PrePlanNotesAlreadyExistsNode::new()));
     registry.register(Box::new(intake::IntakeIdeaNode::new()));
     registry.register(Box::new(research::ResearchCodebaseNode::new()));
+    registry.register(Box::new(secret_guard::SecretGuardNode::new(
+        PrePlanPolicy::default(),
+    )));
     registry.register(Box::new(write_notes::WriteNotesNode::new()));
     registry
 }
@@ -405,9 +423,12 @@ pub fn registry() -> NodeRegistry {
 /// per-node model field — `policy.research_backend` at its `ClaudeCli`
 /// default and any non-`Local` tier is a documented no-op (the node keeps
 /// its own default cloud transport); `Pi`/`Aider` always route local
-/// regardless of tier. The node SET is INVARIANT across every policy setting (standing
-/// rule 6) — this never swaps which identities are registered, only
-/// `ResearchCodebaseNode`'s own transport.
+/// regardless of tier. `SecretGuardNode` is re-registered with the same
+/// resolved `policy` so its `secret_guard_patterns`/`secret_guard_scan_root`
+/// knobs actually take effect. The node SET is INVARIANT across every
+/// policy setting (standing rule 6) — this never swaps which identities are
+/// registered, only `ResearchCodebaseNode`'s transport and
+/// `SecretGuardNode`'s configuration.
 #[must_use]
 pub fn registry_for_policy(policy: &PrePlanPolicy) -> NodeRegistry {
     let mut registry = registry();
@@ -422,6 +443,7 @@ pub fn registry_for_policy(policy: &PrePlanPolicy) -> NodeRegistry {
         transport,
         None,
     )));
+    registry.register(Box::new(secret_guard::SecretGuardNode::new(policy.clone())));
     registry
 }
 
@@ -509,7 +531,7 @@ mod tests {
     }
 
     #[test]
-    fn registry_contains_all_five_nodes() {
+    fn registry_contains_all_six_nodes() {
         let registry = registry();
 
         let expected = [
@@ -517,6 +539,7 @@ mod tests {
             check_existing::EXISTS_ROUTE,
             intake::NODE_NAME,
             research::NODE_NAME,
+            secret_guard::NODE_NAME,
             write_notes::NODE_NAME,
         ];
 
@@ -568,6 +591,29 @@ mod tests {
     }
 
     #[test]
+    fn research_connects_to_secret_guard_which_connects_to_write_notes() {
+        let schema = schema();
+
+        let research_config = schema
+            .nodes
+            .get(research::NODE_NAME)
+            .expect("schema should declare ResearchCodebaseNode");
+        assert_eq!(
+            research_config.connections,
+            vec![secret_guard::NODE_NAME.to_string()]
+        );
+
+        let secret_guard_config = schema
+            .nodes
+            .get(secret_guard::NODE_NAME)
+            .expect("schema should declare SecretGuardNode");
+        assert_eq!(
+            secret_guard_config.connections,
+            vec![write_notes::NODE_NAME.to_string()]
+        );
+    }
+
+    #[test]
     fn declared_graph_has_no_dangling_or_unregistered_identity() {
         let schema = schema();
         let registry = registry();
@@ -602,6 +648,7 @@ mod tests {
             check_existing::EXISTS_ROUTE,
             intake::NODE_NAME,
             research::NODE_NAME,
+            secret_guard::NODE_NAME,
             write_notes::NODE_NAME,
         ] {
             assert!(policy_registry.contains(identity));

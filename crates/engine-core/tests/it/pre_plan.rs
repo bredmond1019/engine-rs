@@ -32,7 +32,8 @@ use engine_core::node::NodeRegistry;
 use engine_core::workflow::Workflow;
 use engine_core::workflows::llm_node::TransportSlotted;
 use engine_core::workflows::pre_plan::{
-    check_existing, intake, research, schema, write_notes, PrePlanNotesAlreadyExistsNode,
+    check_existing, intake, research, schema, secret_guard, write_notes,
+    PrePlanNotesAlreadyExistsNode, PrePlanPolicy,
 };
 use engine_core::workflows::ModelTransport;
 use futures::FutureExt;
@@ -108,7 +109,18 @@ fn recording_stub_transport(
 /// Build the real `PRE_PLAN` node set, with `ResearchCodebaseNode`'s
 /// transport swapped for `transport` — the only substitution this suite
 /// makes; every other node is the real, production node.
+/// `SecretGuardNode` is registered with `PrePlanPolicy::default()`, whose
+/// `secret_guard_scan_root: None` resolves against `ENGINE_BRAIN_ROOT` at
+/// run time — the same tempdir every test in this suite already points
+/// `BrainRootGuard` at, so a clean fixture naturally passes the guard.
 fn registry_with_stub(transport: ModelTransport) -> NodeRegistry {
+    registry_with_stub_and_policy(transport, PrePlanPolicy::default())
+}
+
+/// Same as [`registry_with_stub`], but with an explicit `SecretGuardNode`
+/// policy — used by the secret-guard-specific tests below to pin the scan
+/// root to a fixture directory distinct from the run's brain root.
+fn registry_with_stub_and_policy(transport: ModelTransport, policy: PrePlanPolicy) -> NodeRegistry {
     let mut registry = NodeRegistry::new();
     registry.register(Box::new(check_existing::CheckExistingNotesNode::new()));
     registry.register(Box::new(PrePlanNotesAlreadyExistsNode::new()));
@@ -116,6 +128,7 @@ fn registry_with_stub(transport: ModelTransport) -> NodeRegistry {
     registry.register(Box::new(
         research::ResearchCodebaseNode::new().with_transport(transport),
     ));
+    registry.register(Box::new(secret_guard::SecretGuardNode::new(policy)));
     registry.register(Box::new(write_notes::WriteNotesNode::new()));
     registry
 }
@@ -342,6 +355,103 @@ async fn constructed_research_config_carries_read_only_tool_scope() {
             config.disallowed_tools
         );
     }
+}
+
+#[tokio::test]
+async fn leak_detected_by_secret_guard_blocks_notes_persistence() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let slug = "leaky-idea";
+
+    // Plant a secret-shaped fixture file with a distinctive, long-enough
+    // marker line under the brain root's scan target.
+    std::fs::write(dir.path().join(".env"), "SUPER_SECRET_TOKEN=abcdef123456\n")
+        .expect("write fixture secret file");
+
+    let _guard = BrainRootGuard::set(dir.path());
+
+    let call_count = Arc::new(AtomicUsize::new(0));
+    let seen_configs = Arc::new(Mutex::new(Vec::new()));
+    // The stub research transport "leaks" the planted secret's content
+    // verbatim, simulating a backend that narrated file content it read
+    // via an allowed `Read` tool.
+    let registry = registry_with_stub_and_policy(
+        recording_stub_transport(
+            "the config apparently has SUPER_SECRET_TOKEN=abcdef123456 in it",
+            Arc::clone(&call_count),
+            Arc::clone(&seen_configs),
+        ),
+        PrePlanPolicy::default(),
+    );
+
+    let workflow = Workflow::new_validated(registry, schema())
+        .expect("PRE_PLAN declared graph should validate");
+    let ctx = workflow
+        .run(
+            json!({"idea": "build a widget", "slug": slug}),
+            Box::new(|_ctx: &TaskContext| {}),
+        )
+        .await
+        .expect("run() itself returns Ok even when a node fails -- the failure lives in node_runs");
+
+    let secret_guard_run = ctx
+        .node_runs
+        .get(secret_guard::NODE_NAME)
+        .expect("SecretGuardNode should have run");
+    assert_eq!(
+        secret_guard_run.status,
+        engine_contract::NodeRunStatus::Failed,
+        "SecretGuardNode must fail the walk on a detected leak"
+    );
+    assert!(
+        ctx.nodes.get(write_notes::NODE_NAME).is_none(),
+        "WriteNotesNode must not have run when SecretGuardNode blocks the walk"
+    );
+
+    let expected = check_existing::notes_path(dir.path(), slug);
+    assert!(
+        !expected.exists(),
+        "notes.md must never be written when SecretGuardNode blocks the walk"
+    );
+}
+
+#[tokio::test]
+async fn clean_research_output_passes_secret_guard_and_notes_md_is_written() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let slug = "clean-idea";
+
+    std::fs::write(dir.path().join(".env"), "SUPER_SECRET_TOKEN=abcdef123456\n")
+        .expect("write fixture secret file");
+
+    let _guard = BrainRootGuard::set(dir.path());
+
+    let call_count = Arc::new(AtomicUsize::new(0));
+    let seen_configs = Arc::new(Mutex::new(Vec::new()));
+    let registry = registry_with_stub_and_policy(
+        recording_stub_transport(
+            "VERIFIED — the widget module already exists in crates/foo.",
+            Arc::clone(&call_count),
+            Arc::clone(&seen_configs),
+        ),
+        PrePlanPolicy::default(),
+    );
+
+    let ctx = run_pre_plan(registry, json!({"idea": "build a widget", "slug": slug})).await;
+
+    let written = ctx
+        .nodes
+        .get(write_notes::NODE_NAME)
+        .expect("WriteNotesNode should have run and stamped a result");
+    let notes_path = written
+        .get("notes_path")
+        .and_then(Value::as_str)
+        .expect("notes_path stamped");
+
+    let expected = check_existing::notes_path(dir.path(), slug);
+    assert_eq!(notes_path, expected.display().to_string());
+    assert!(expected.exists(), "notes.md should have been written");
+
+    let contents = std::fs::read_to_string(&expected).expect("read written notes.md");
+    assert!(!contents.contains("SUPER_SECRET_TOKEN=abcdef123456"));
 }
 
 #[test]
