@@ -44,8 +44,13 @@ description: >
      straight to wrap-up (draft PR) — it does NOT burn three attempts.
 
    End-review: ONE review over the integrated tree, fed state.json as the index but
-   reading `git diff <prBase>..HEAD` + tasks.md criteria directly + re-running the
-   FULL gating suite (authoritative). PASS → docs; FAIL/PARTIAL → triage findings:
+   reading `git diff <prBase>..HEAD` + tasks.md criteria directly + the AGGREGATED
+   gate_results already recorded by every task's own fast-test stage (latest entry
+   per check_id wins) instead of re-running the full gating suite from scratch — a
+   check with no recorded entry is run directly, and on the FINAL review pass every
+   still-failing check is re-run fresh as the authoritative last word before a bail.
+   PASS → docs; FAIL/PARTIAL → a `gapKind` of 'design'/'operator' stops the loop
+   immediately (no further review/suite pass); otherwise triage findings:
    small/localized → bounded fix→test→review (≤2, Opus last); broad → bail.
 
  COMMIT STRATEGY (crash recovery — everything lands on the branch)
@@ -186,7 +191,12 @@ When the user asks you to run `/sdlc-flow <spec-slug> [range]`, do NOT run `sdlc
    - For each task in the specified range (or all if not specified):
      - Run `/update-task` to flip status to `In progress` in the worklog and local files.
      - Implement the task following instructions.
-     - Run fast validation tests.
+     - Run fast validation tests. **Record `gate_results`** — one entry per check actually run
+       this turn (same set, same order as the checklist): `{check_id, status: 'pass'|'fail',
+       failing_ids}`, deriving `failing_ids` from structured runner output (nextest JUnit XML,
+       pytest `--junitxml`/`-rf`) where available, else a single-element array holding `check_id`.
+       This is what drives triage-only-on-red (triage is called ONLY from the failure branch — a
+       green task spawns no triage agent) and the end-review stage's aggregated read below.
      - **Also re-stamp this lane's claim+lease heartbeat now** (best-effort, NEVER gating —
        `BT.ticket.lane-heartbeat-goes-stale-mid-block`, task 4; mirrors `/sdlc-task`'s identical
        per-task step, see `.agents/skills/sdlc-task/SKILL.md`): from the repo root, run
@@ -197,15 +207,59 @@ When the user asks you to run `/sdlc-flow <spec-slug> [range]`, do NOT run `sdlc
        re-stamp such a lane gets between block boundaries. If this lane holds no live claim or
        lease, the call fails harmlessly (`|| true`) — its exit code must never affect the task's
        own pass/fail verdict.
-     - Fix failures (up to 3 triage/fix attempts).
+     - **Removed-literal scan (BT.ticket.failure-attribution-and-gate-cache, task 4)** — after the
+       commit (and any vault commit) lands, before deciding whether to fix/retry: this task's own
+       commit(s) may have REMOVED a string literal or identifier a test OUTSIDE this task's own
+       `files[]` still references. Diff this task's commit range against `HEAD` (`--unified=0`),
+       collect REMOVED lines, extract candidate literals — quoted strings ≥8 chars (config knob
+       `minLiteralLen`) and bare identifiers (any with an underscore, or ≥12 chars underscore-free;
+       config knob `identifierMinLen`) — then search every file matching the test-file convention
+       regex (config knob `testGlobRegex`; all three via `planning/harness.json`'s optional
+       `removedLiteralScan` object). No candidate test file at all → the scan is inconclusive
+       (never read as "no hits"); proceed normally. A hit inside this task's own `files[]` is never
+       reported. A hit outside `files[]` is **IN-SPEC DEBT, `failure_class: fixable`** — run it
+       through the same triage/fix loop as any other failure, with the next fix pass's writable set
+       WIDENED to include the hit file(s) in addition to this task's own `files[]`.
+     - **Attribution look-back (BT.ticket.failure-attribution-and-gate-cache, task 3)** — before
+       triaging a red gating check, ONLY when exactly one check is red this attempt and a real
+       `check_id` resolved off this attempt's own `gate_results` (a mixed multi-check failure falls
+       straight through to ordinary triage, the safe default): look back through this RUN's own
+       recorded `gate_results` for the earliest earlier task that already ran this `check_id`. Green
+       there → `ownership: self, failure_class: fixable` (introduced after that task — today's
+       ordinary fix loop, UNCHANGED; the regression control). Red there (never fixed) → **IN-SPEC
+       DEBT**: `ownership: self, failure_class: fixable`, declared by that earlier task; widen the
+       next fix pass's writable set to that check's `failing_ids` plus this task's own `files[]`. No
+       record in this run yet → consult the lazy cross-lane gate cache,
+       `.claude/workflows/bin/gate_cache.py lookup --repo <slug> --base-sha <baseSha> --check-ids
+       <check_id>`: a cache hit answers directly; a miss with a known command re-runs ONLY that one
+       check id at `base_sha` in an isolated, throwaway `git worktree add --detach` (removed again
+       immediately — never touches this run's own branch/tree), then `warm`s the cache with the
+       result. Red at `base_sha` → `ownership: foreign` — **carried and recorded, no attempt burned,
+       no bail**; treat this task's gating as clean and skip triage/fix entirely for this check.
+       Green at `base_sha` (no history record either) → in-spec debt, `declaredByTask` unknown.
+       Nothing decides (no history, cache unreachable) → fall straight through to ordinary triage,
+       unchanged. Verdict vocabulary is `.claude/workflows/sdlc-state-vocab.json`'s `ownership`
+       (`self`|`foreign`) / `failure_class` (`fixable`|`escalate` — debt still open at terminal
+       review escalates) — never a third spelling.
+     - Fix failures (up to 3 triage/fix attempts) — skipped entirely for a `foreign` verdict above
+       (the check is already treated as clean); for an in-spec-debt verdict, the fix agent's
+       writable set is the widened one from the attribution step.
      - Run the COMMIT-SAFETY GUARD above, `&&`-joined with the commit itself, then commit the task
        state on the branch (`feat: implement <slug> task N`). If a vault commit is also needed
        (D46), run the same guard against `git -C <vault path>` before that commit too.
      - **If this task's fix loop ended in a triage MAJOR or an exhausted-attempts bail
        (BT.ticket.bails-must-be-append-only):** append one fully-populated entry to the committed
-       `state.json`'s top-level `bails` array — `{occurred_at, task_id, check_id, failing_artifact,
-       ownership, bail_class, reason, resolution: null}` — never overwrite or truncate the array; a
-       second bail in the same run appends a second entry, the first stays byte-identical.
+       `state.json`'s top-level `bails` array — `{occurred_at, task_id, check_id, check_id_raw,
+       failing_artifact, ownership, bail_class, reason, resolution: null}` — never overwrite or
+       truncate the array; a second bail in the same run appends a second entry, the first stays
+       byte-identical. **`check_id`** is resolved, not copied verbatim: take the last `status:
+       'fail'` entry from this task's own recorded `gate_results` (falling back to this task's
+       last `issues[]` entry only when no `gate_results` entry exists at all), then validate that
+       candidate against `planning/harness.json`'s check names — a match is stored verbatim; a
+       non-match stores `check_id: null` with the raw candidate preserved in `check_id_raw`, never
+       silently dropped. The end-review bail site follows the identical rule but always candidates
+       the literal `'review'` (its own pipeline-stage name, never a real harness check), so it
+       always resolves to `check_id: null, check_id_raw: 'review'` by construction.
        `bail_reason` is still set too, as a plain mirror of the newest entry's `reason`. On
        `--resume`, read `state.json`'s prior `bails` array and carry it forward verbatim before
        appending anything new — re-initialising it instead of merging silently deletes a bail that
@@ -214,9 +268,25 @@ When the user asks you to run `/sdlc-flow <spec-slug> [range]`, do NOT run `sdlc
        the commit). A `WORK_ASSERTION_ABORT` means the commit did not actually contain the task's
        declared work — treat the task as failed and fix/re-commit before proceeding.
 4. **Consolidated End-Review**:
-   - Once all tasks are complete, run the full validation/test suite.
+   - Once all tasks are complete, read the aggregated `gate_results` already recorded by every
+     task's own fast-test stage (latest entry per `check_id` wins) instead of re-running the full
+     suite from scratch; run directly any check with no recorded entry, and on the FINAL review
+     pass re-run every still-failing check fresh as the authoritative last word.
    - Run the acceptance criteria check.
-   - If PASS -> proceed to docs. If FAIL/PARTIAL -> run targeted fix loop.
+   - If PASS -> proceed to docs. If FAIL/PARTIAL: a `gapKind` of 'design' or 'operator' stops the
+     loop immediately (no further review/suite pass); otherwise run a targeted fix loop
+     (capped at 2 review passes total, Opus on the last).
+   - **`baseline-diff` checks fail CLOSED here** (BT.ticket.failure-attribution-and-gate-cache, task
+     5 — D64: by delta, never path-scoped) — this end-review's aggregated read (and the FINAL
+     review's fresh re-run of any still-failing check) is where a `perTask:false` baseline-diff
+     check gets its one authoritative run. Net-new items absent from the baseline FAIL, naming them;
+     pre-existing items never fail. Every one of the following ALSO fails, naming its own specific
+     cause rather than being silently treated as zero items or skipped: the check's command output
+     is empty, unparseable, or not a JSON array; the baseline file is missing; the baseline's sidecar
+     `<baselinePath>.sha` is missing (`"baseline predates base-SHA stamping"`); or the sidecar's SHA
+     disagrees with this run's own `state.base_sha` (names both SHAs). The sidecar is written
+     alongside a NEWLY-created baseline snapshot only (never backfilled onto an existing one) at
+     setup time, stamped with this run's own `base_sha`.
 5. **Docs & Wrap-up**:
    - If PASS, run `/update-docs --patch` to update documentation, running the COMMIT-SAFETY GUARD
      `&&`-joined before the docs commit (and its vault counterpart, if any patched/created doc lives

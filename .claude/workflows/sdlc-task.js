@@ -313,7 +313,13 @@ async function detectPlanningVault(repoRoot) {
 // cheap Haiku agent turn instead of resolving the path in-process. Returns null on failure (unlike
 // detectPlanningVault's safe fallback) — a wrong repoRoot silently accepted here is exactly the
 // defect this ticket exists to remove, so the caller must abort rather than guess.
-// <<shared:RESOLVE_REPO_ROOT_SCHEMA>>
+// RESOLVE_REPO_ROOT_SCHEMA: engine-local, not shared -- BT.chore.fix-pre-existing-test-defects.
+// Left over from before BT.ticket.prepare-run-replaces-setup-agents (task 6) moved
+// resolveRepoRoot() onto the runPrepareRun() cache; the function below no longer makes its own
+// agent() call and never references this schema, and sdlc-flow.js never carried a copy at all.
+// Marking it <<shared:...>> falsely claimed both engines used it, which is what
+// test_build_engines.py::test_both_engines_carry_the_same_shared_region_names caught. Kept
+// in place (unused) rather than deleted, to keep this fix scoped to the marker mismatch.
 const RESOLVE_REPO_ROOT_SCHEMA = {
   type: 'object',
   required: ['repoRoot', 'gitCommonDir', 'tierPrefix', 'brainTomlAtRoot'],
@@ -324,7 +330,6 @@ const RESOLVE_REPO_ROOT_SCHEMA = {
     brainTomlAtRoot: { type: 'boolean', description: 'true iff the BRAIN_TOML: line reads "yes" — a brain.toml exists at repoRoot' }
   }
 }
-// <</shared:RESOLVE_REPO_ROOT_SCHEMA>>
 // <<shared:resolveRepoRoot>>
 // BT.ticket.prepare-run-replaces-setup-agents, task 6: the FIRST caller of runPrepareRun() on a
 // fresh (non-resumed) run — Setup calls this before anything else (see the engine body below), so
@@ -1033,11 +1038,21 @@ ${renderEmojiGate({ runRoot, baseSha: diffBase, stateFile, recordedCommitsJson }
   commit on a shared branch, does not.
 
 For each check record: name, passed (true iff exit code 0), the command, and failure output.
+
+ALSO populate \`gate_results\` — one entry per check you ran above (same set, same order), each
+\`{check_id, status, failing_ids}\`: check_id is the check's own name exactly as it appears in its
+"CHECK N — <name>" header (or the harness.json check name, when the checklist is driven by one);
+status is \`"pass"\` or \`"fail"\`; failing_ids is an array of the specific ids that failed FOR THAT
+CHECK — derive it from the check's own structured runner output where one exists (nextest's JUnit
+XML, pytest's \`--junitxml\` or \`-rf\` flag output: use the individual failing test/case ids), and
+when the check produces no such structured per-item output, fall back to a single-element array
+holding the check's own check_id as the one failing id. A passing check still gets an entry (status
+\`"pass"\`, failing_ids \`[]\`).
 ${heartbeatRecipe || ''}
 ${onPassRecipe}
 Return via StructuredOutput: allPassed (true only if EVERY gating check passed and the emoji gate is
 clean), passCount, failCount, failedTests (names), failBlob (compact: failing check names + the tail of
-their output; empty when allPassed)${stateWrittenNote}.`
+their output; empty when allPassed), gate_results (the per-check array described above)${stateWrittenNote}.`
 }
 // <</shared:renderTestPrompt>>
 
@@ -1379,6 +1394,23 @@ const TEST_SCHEMA = {
     failedTests: { type: 'array', items: { type: 'string' } },
     failBlob:    { type: 'string', description: 'Compact failure output (failing check names + the tail of their output) for triage; empty when allPassed' },
     stateWritten: { type: 'boolean', description: 'true if the agent ALSO persisted sdlc-task-state.json this same turn (the per-task pass-path state-write fold); false/omitted when it did not (no onPass instructions given, a check failed, or the write was not attempted/completed)' },
+    // BT.ticket.gate-results-and-failure-attribution (task 1): per-check structured output, one
+    // entry per gating check run this turn, driving triage-only-on-red and (in sdlc-flow) review's
+    // gate_results-based pass loop instead of a suite re-run.
+    gate_results: {
+      type: 'array',
+      description: 'One entry per check run this turn, from the rendered checklist',
+      items: {
+        type: 'object',
+        required: ['check_id', 'status', 'failing_ids'],
+        properties: {
+          check_id:    { type: 'string', description: "The check's own name, as it appeared in its CHECK N header (or the harness.json check name)" },
+          status:      { type: 'string', enum: ['pass', 'fail'] },
+          failing_ids: { type: 'array', items: { type: 'string' }, description: 'Specific failing ids from structured runner output (nextest JUnit, pytest --junitxml/-rf) where available; otherwise a single-element array holding check_id' }
+        }
+      }
+    },
+    check_id_raw: { type: 'string', description: 'Raw agent-reported check identifier when check_id validation could not match it to a real planning/harness.json check name' },
     notes:       { type: 'string' }
   }
 }
@@ -1769,7 +1801,7 @@ function acceptanceCriteriaVerdicts(acceptanceCriteria, evidenceByCriterion) {
 // When the config is absent (or carries no checks), fall back to the spec's `## Validation Commands` —
 // the engine ships NO stack defaults. Handles all D6 check kinds. `engineFiles` (this task's
 // .claude/workflows/ paths, if any) is additive on top of everything below — see renderEngineParseChecks.
-function renderCheckList(cfg, { gatingOnly = false, cwd, engineFiles = [] } = {}) {
+function renderCheckList(cfg, { gatingOnly = false, cwd, engineFiles = [], baseSha = '' } = {}) {
   let checks = cfg?.validation?.checks ?? []
   if (gatingOnly) checks = checks.filter(c => c.gates && c.perTask !== false)
   const cd = cwd ? `cd ${cwd} && ` : ''
@@ -1793,32 +1825,9 @@ function renderCheckList(cfg, { gatingOnly = false, cwd, engineFiles = [] } = {}
     const header = `CHECK ${n} — ${c.name} (${c.purpose}) [${gate}]`
 
     if (kind === 'baseline-diff') {
-      const baselinePath = `${reportsDir}/${slug}-baseline.json`
+      const baselinePath = `${cwd ? cwd + '/' : ''}${reportsDir}/${slug}-baseline.json`
       const currentPath = `/tmp/${blockId}-task-${slug}-current.json`
-      const keysLiteral = JSON.stringify(c.compareKeys || [])
-      return `${header} — baseline-diff (fail ONLY on net-new items vs the baseline snapshotted before the run):
-  ${cd}${c.command} > ${currentPath} 2>/dev/null; true
-  python3 << 'PYEOF'
-import json, sys
-try:
-    b = json.load(open('${cwd ? cwd + '/' : ''}${baselinePath}', encoding='utf-8'))
-except Exception as e:
-    print(f'WARNING: could not load baseline ({e}) — treating all current items as pre-existing'); b = []
-try:
-    c = json.load(open('${currentPath}', encoding='utf-8'))
-except Exception:
-    c = []
-keys = ${keysLiteral}
-def k(v): return tuple(str(v.get(x, '')) for x in keys) if isinstance(v, dict) else (str(v),)
-seen = set(k(v) for v in b)
-new = [v for v in c if k(v) not in seen]
-if new:
-    print(f'NET-NEW ({len(new)} introduced by this run, absent from baseline):')
-    for v in new[:20]: print('  ' + json.dumps(v)[:200])
-    sys.exit(1)
-print(f'CHECK ${n} PASSED: no net-new items (baseline {len(b)}, current {len(c)})'); sys.exit(0)
-PYEOF
-  echo "CHECK${n}_EXIT:$?"`
+      return renderBaselineDiffCheck({ header, n, cd, command: c.command, currentPath, baselinePath, baseSha, compareKeys: c.compareKeys })
     }
 
     if (kind === 'skip-count-regression') {
@@ -1882,23 +1891,35 @@ ${ruleLines}
 // Resume-safe: only writes a baseline that does not already exist. No-op when no such checks are
 // configured. skip-count-regression writes a bare-integer count file (not JSON) at a sibling path.
 // <<shared:snapshotBaselines>>
-async function snapshotBaselines(cfg, cwd) {
+// `baseSha` (BT.ticket.failure-attribution-and-gate-cache, task 5): stamped alongside every NEWLY
+// written baseline-diff snapshot as `<path>.sha`, so the fail-closed reconcile-time check
+// (renderBaselineDiffCheck below) can tell a baseline taken against THIS run's base commit from a
+// stale one taken against some earlier base. An EXISTING baseline is kept as-is (resume-safe) and
+// is deliberately NOT backfilled with a sidecar it never had -- a baseline that predates base-SHA
+// stamping must surface as its own named failure at reconcile time, not be silently repaired here.
+async function snapshotBaselines(cfg, cwd, baseSha) {
   const checks = (cfg?.validation?.checks || [])
     .filter(c => (c.kind === 'baseline-diff' || c.kind === 'skip-count-regression') && c.baselineCommand)
   if (!checks.length) return
   const steps = checks.map(c => {
     const slug = (c.name || 'check').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '')
-    const path = c.kind === 'skip-count-regression'
-      ? `${reportsDir}/${slug}-skip-baseline.txt`
-      : `${reportsDir}/${slug}-baseline.json`
-    return `Baseline "${c.name}" -> ${path}:
+    if (c.kind === 'skip-count-regression') {
+      const path = `${reportsDir}/${slug}-skip-baseline.txt`
+      return `Baseline "${c.name}" -> ${path}:
   cd ${cwd} && mkdir -p ${reportsDir}
   cd ${cwd} && { [ -f ${path} ] && echo "BASELINE EXISTS (kept): ${path}" || { ${c.baselineCommand} > ${path} 2>/dev/null; echo "BASELINE WRITTEN: ${path}"; } ; }`
+    }
+    const path = `${reportsDir}/${slug}-baseline.json`
+    const shaPath = `${path}.sha`
+    return `Baseline "${c.name}" -> ${path} (base-SHA sidecar: ${shaPath}):
+  cd ${cwd} && mkdir -p ${reportsDir}
+  cd ${cwd} && { [ -f ${path} ] && echo "BASELINE EXISTS (kept): ${path}" || { ${c.baselineCommand} > ${path} 2>/dev/null; printf '%s' '${baseSha}' > ${shaPath}; echo "BASELINE WRITTEN: ${path} (base_sha ${baseSha})"; } ; }`
   }).join('\n\n')
   await agent(`
 You are the baseline-snapshot agent for the SDLC pipeline. Capture the pre-run baseline for each
 baseline-diff / skip-count-regression validation check BEFORE any implementation runs. Run each block
-exactly as written. Do NOT modify source. Existing baselines are kept (resume-safe).
+exactly as written. Do NOT modify source. Existing baselines are kept (resume-safe) -- including
+their SHA sidecar, if any; never (re)write a sidecar for a baseline you did not just create.
 
 ${steps}
 
@@ -1906,6 +1927,86 @@ Return using StructuredOutput: done=true, and note which baselines were written 
 `, { label: 'baseline-snapshot', schema: { type: 'object', required: ['done'], properties: { done: { type: 'boolean' }, notes: { type: 'string' } } }, model: 'haiku' })
 }
 // <</shared:snapshotBaselines>>
+
+// <<shared:renderBaselineDiffCheck>>
+// BT.ticket.failure-attribution-and-gate-cache, task 5: the baseline-diff check kind, fail-CLOSED,
+// for the terminal reconcile / end-review stage (D64 -- by delta, never path-scoped; one check per
+// flag, flags never compose). Every failure names its own specific cause; nothing here is silently
+// treated as zero items or skipped. `baselinePath`'s sidecar `<baselinePath>.sha` is stamped by
+// snapshotBaselines with the run's base_sha at the moment a baseline is first written -- a baseline
+// with no sidecar predates that stamping and fails closed rather than being assumed compatible.
+function renderBaselineDiffCheck({ header, n, cd, command, currentPath, baselinePath, baseSha, compareKeys }) {
+  const shaPath = `${baselinePath}.sha`
+  const keysLiteral = JSON.stringify(compareKeys || [])
+  return `${header} — baseline-diff (fails CLOSED: net-new items vs the baseline FAIL naming them; a
+non-array/empty/unparseable current output, a missing baseline, a base-SHA mismatch, or a baseline
+with no .sha sidecar all FAIL naming the specific cause -- D64: by delta, never path-scoped):
+  ${cd}${command} > ${currentPath} 2>/dev/null; true
+  python3 << 'PYEOF'
+import json, sys
+
+def fail(msg):
+    print(f'BASELINE-DIFF FAILED: {msg}')
+    sys.exit(1)
+
+BASELINE_PATH = '${baselinePath}'
+BASELINE_SHA_PATH = '${shaPath}'
+RUN_BASE_SHA = '${baseSha}'
+
+try:
+    with open(BASELINE_PATH, encoding='utf-8') as f:
+        baseline_raw = f.read()
+except FileNotFoundError:
+    fail(f'missing baseline at {BASELINE_PATH}')
+except Exception as e:
+    fail(f'could not read baseline at {BASELINE_PATH}: {e}')
+
+try:
+    with open(BASELINE_SHA_PATH, encoding='utf-8') as f:
+        baseline_sha = f.read().strip()
+except FileNotFoundError:
+    fail('baseline predates base-SHA stamping')
+except Exception as e:
+    fail(f'could not read baseline SHA sidecar at {BASELINE_SHA_PATH}: {e}')
+
+if baseline_sha != RUN_BASE_SHA:
+    fail(f'base-SHA mismatch: baseline={baseline_sha} run={RUN_BASE_SHA}')
+
+try:
+    baseline_items = json.loads(baseline_raw)
+except Exception as e:
+    fail(f'baseline at {BASELINE_PATH} is not valid JSON: {e}')
+if not isinstance(baseline_items, list):
+    fail(f'baseline at {BASELINE_PATH} is not a JSON array (got {type(baseline_items).__name__})')
+
+try:
+    with open('${currentPath}', encoding='utf-8') as f:
+        current_raw = f.read()
+except Exception as e:
+    fail(f'could not read current output at ${currentPath}: {e}')
+if not current_raw.strip():
+    fail('current output is empty')
+try:
+    current_items = json.loads(current_raw)
+except Exception as e:
+    fail(f'current output is not valid JSON ({e}) -- unparseable output fails closed, never treated as zero items')
+if not isinstance(current_items, list):
+    fail(f'current output is not a JSON array (got {type(current_items).__name__}) -- non-array output fails closed')
+
+keys = ${keysLiteral}
+def k(v): return tuple(str(v.get(x, '')) for x in keys) if isinstance(v, dict) else (str(v),)
+seen = set(k(v) for v in baseline_items)
+new = [v for v in current_items if k(v) not in seen]
+if new:
+    print(f'NET-NEW ({len(new)} introduced by this run, absent from baseline):')
+    for v in new[:20]: print('  ' + json.dumps(v)[:200])
+    sys.exit(1)
+print(f'CHECK ${n} PASSED: no net-new items (baseline {len(baseline_items)}, current {len(current_items)}, base_sha {RUN_BASE_SHA})')
+sys.exit(0)
+PYEOF
+  echo "CHECK${n}_EXIT:$?"`
+}
+// <</shared:renderBaselineDiffCheck>>
 
 // ----------------------------------------------------------------
 // COMMITTED AUTHORITATIVE STATE (Block A)
@@ -2748,7 +2849,7 @@ const extraBailReasons = Array.isArray(flowCfg.bailReasons) ? flowCfg.bailReason
 log(`Policy: testDepth=${testDepth}`)
 
 // Snapshot baselines once (resume-safe; no-op without baseline-diff checks).
-await snapshotBaselines(harnessCfg, runDir)
+await snapshotBaselines(harnessCfg, runDir, baseSha)
 
 // The immediate-bail reason set the triage agent enforces. "When unsure, prefer bail."
 // <<shared:BAIL_REASONS>>
@@ -2819,10 +2920,13 @@ STEP W1 — run this as ONE Bash call, exactly as written. Do not split it into 
   when there is none. If that file exists and has a "started_at" value, REUSE it verbatim for
   started_at below. Otherwise started_at = NOW.
 
-STEP W2 — write ${onPass.stateFile} with EXACTLY this JSON, but inserting two extra top-level keys
-  "started_at" (preserved or NOW, per STEP W1) and "updated_at" (NOW) right after "branch". Valid
-  JSON only (double quotes, no trailing commas, no markdown fences). The object to write (verbatim
-  except for adding those two timestamp keys):
+STEP W2 — write ${onPass.stateFile} with EXACTLY this JSON, but: (a) inserting two extra top-level
+  keys "started_at" (preserved or NOW, per STEP W1) and "updated_at" (NOW) right after "branch",
+  and (b) replacing the quoted placeholder value "__GATE_RESULTS__" (this task's own "gate_results"
+  field under "tasks") with the JSON ARRAY you populated as your own gate_results field in this
+  StructuredOutput, inserted verbatim as a JSON array (never re-quoted as a string) — or \`[]\` if
+  you populated none. Valid JSON only (double quotes, no trailing commas, no markdown fences). The
+  object to write (verbatim except for those substitutions):
 ${onPass.stateJson}
 
 STEP W3 — use the Write tool for the file. Do NOT run \`git add\`, \`git commit\`, \`git checkout\`,
@@ -2883,9 +2987,51 @@ STEP W3 — use the Write tool for the file. Do NOT run \`git add\`, \`git commi
 // CANDIDATE outcome.
 function buildPassPayload(taskNum, t, validatedLabel) {
   const snapshot = JSON.parse(JSON.stringify(state))
-  snapshot.tasks[String(taskNum)] = { ...t, status: 'passed', validated: validatedLabel }
+  // BT.ticket.gate-results-and-failure-attribution (task 2): this snapshot is built BEFORE the
+  // test call runs (see the caller), so the real gate_results array isn't known yet — carry a
+  // sentinel the SAME test agent (which computes both the checks AND, per onPassRecipe, this
+  // write) substitutes with its own gate_results field in the same turn. See
+  // renderOnPassStateWriteRecipe's STEP W2.
+  snapshot.tasks[String(taskNum)] = { ...t, status: 'passed', validated: validatedLabel, gate_results: '__GATE_RESULTS__' }
   snapshot.tokens = buildTokensBlock()
   return { stateFile, stateJson: JSON.stringify(snapshot, null, 2) }
+}
+
+// BT.ticket.gate-results-and-failure-attribution (task 2): single shared lookup so the three
+// bail-fold sites below agree on how a candidate check_id resolves against
+// planning/harness.json's real check names, rather than three hand-rolled comparisons drifting
+// apart. A candidate that matches a real check name is used verbatim; anything else (unmatched,
+// or absent entirely) resolves to check_id: null with the raw candidate preserved in
+// check_id_raw (never silently dropped).
+function resolveCheckId(candidate, cfg) {
+  const names = new Set((cfg?.validation?.checks || []).map(c => c.name).filter(Boolean))
+  if (candidate && names.has(candidate)) return { check_id: candidate, check_id_raw: null }
+  return { check_id: null, check_id_raw: candidate || null }
+}
+
+// Most-recent-first: the last 'fail' entry in a gate_results array is the best-effort attribution
+// candidate (mirrors the existing t.issues[t.issues.length - 1] "most recent" convention this
+// replaces at the per-task bail site).
+function lastFailingCheckId(gateResults) {
+  const fails = (gateResults || []).filter(g => g && g.status === 'fail' && g.check_id)
+  return fails.length ? fails[fails.length - 1].check_id : null
+}
+
+// The reconcile and acceptance-criteria bail sites fire AFTER every task already passed its own
+// test stage (D56 / BT.ticket.sdlc-task-must-verify-its-blocks-acceptance-criteria) — there is no
+// live testResult in scope at either site, so fall back to the most recently recorded gate_results
+// anywhere in state.tasks (highest task number carrying a non-empty gate_results array).
+function mostRecentRecordedGateResults(tasksState) {
+  const nums = Object.keys(tasksState || {})
+    .filter(k => k !== '__pendingBails')
+    .map(Number)
+    .filter(n => Number.isFinite(n))
+    .sort((a, b) => a - b)
+  for (let i = nums.length - 1; i >= 0; i--) {
+    const entry = tasksState[String(nums[i])]
+    if (entry && Array.isArray(entry.gate_results) && entry.gate_results.length) return entry.gate_results
+  }
+  return []
 }
 
 // Precompute the exact state.json content for the case where THIS triage call turns out to be
@@ -2907,14 +3053,22 @@ function buildBailPayload(taskNum, t, majorFallback, exhaustionFallback = null) 
   // not-mint-time-in-the-engine) — a JS-side clock call is illegal under the Workflow runtime
   // shim, so the writing agent substitutes NOW (already obtained via STEP W1's `date -u` call)
   // for this sentinel in the SAME turn it substitutes __BAIL_REASON__; see (c) in
-  // renderBailStateWriteRecipe's STEP W2 below. check_id best-effort from
-  // the task's own recorded issues (the harness check name already on `t`, never reimplemented);
-  // failing_artifact/ownership/bail_class stay null here — not yet derivable at this call site
-  // (see out_of_scope: checks-must-name-their-failing-artifact is separate work).
+  // renderBailStateWriteRecipe's STEP W2 below. check_id (task 2, resolveCheckId): the last
+  // 'fail' entry in `t.gate_results` (folded onto `t` by the caller alongside t.issues, from
+  // this attempt's testResult when one exists), validated against planning/harness.json's real
+  // check names — falls back to the task's own recorded issues (the old best-effort source) only
+  // when no gate_results entry exists at all (e.g. a non-test bail, such as NULL_RESULT). A
+  // candidate that does not match a real check name resolves to null with the raw value kept in
+  // check_id_raw, never silently dropped. failing_artifact/ownership/bail_class stay null here —
+  // not yet derivable at this call site (see out_of_scope: checks-must-name-their-failing-
+  // artifact is separate work).
+  const bailCheckIdCandidate = lastFailingCheckId(t.gate_results) || ((t.issues && t.issues.length) ? t.issues[t.issues.length - 1] : null)
+  const bailResolvedCheckId = resolveCheckId(bailCheckIdCandidate, harnessCfg)
   snapshot.bails = [...(snapshot.bails || []), {
     occurred_at: '__BAIL_OCCURRED_AT__',
     task_id: taskNum,
-    check_id: (t.issues && t.issues.length) ? t.issues[t.issues.length - 1] : null,
+    check_id: bailResolvedCheckId.check_id,
+    check_id_raw: bailResolvedCheckId.check_id_raw,
     failing_artifact: null,
     ownership: null,
     bail_class: null,
@@ -2951,7 +3105,7 @@ async function runTests(label, { gatingOnly, taskCommands = null, expectRedSet =
   let overrideNote
   if (usingOverride) {
     const harnessPart = harnessGatingCheckCount > 0
-      ? renderCheckList(harnessCfg, { gatingOnly: true, cwd: runDir, engineFiles: [] })
+      ? renderCheckList(harnessCfg, { gatingOnly: true, cwd: runDir, engineFiles: [], baseSha })
       : ''
     const taskPart = renderTaskCheckList(taskCommands, runDir, harnessGatingCheckCount + 1, expectRedSet)
     const engineChecks = renderEngineParseChecks(engineFiles, cd, harnessGatingCheckCount + taskCommands.length + 1)
@@ -2960,7 +3114,7 @@ async function runTests(label, { gatingOnly, taskCommands = null, expectRedSet =
       ? 'this task ALSO declares its OWN validation_commands in tasks.json — per D63 these AUGMENT the project gates:true harness checks below, they do NOT replace them'
       : 'this task declares its OWN validation_commands in tasks.json; this project configures zero gates:true harness checks, so only the task-declared commands below run (D63 — reported, not silent)'
   } else {
-    checklistBody = renderCheckList(harnessCfg, { gatingOnly, cwd: runDir, engineFiles })
+    checklistBody = renderCheckList(harnessCfg, { gatingOnly, cwd: runDir, engineFiles, baseSha })
     overrideNote = 'from planning/harness.json + the spec'
   }
 
@@ -3128,6 +3282,43 @@ ${renderImplementPrompt({ roleIntro, runRootLabel: 'run root', runRoot: runDir, 
       }
     }
 
+    // Removed-literal scan (BT.ticket.failure-attribution-and-gate-cache, task 4) — after every
+    // task's commit, before the fast test loop: catches a string literal/identifier this task's
+    // own commit REMOVED that still survives in a test OUTSIDE this task's own files[], a silent
+    // breakage the fast tripwire below would not otherwise surface on its own. A hit inside the
+    // task's own files[] is never reported (filtered by the script itself). instrumentOk=false
+    // (no candidate test files found, or an incomplete transcription) is treated as inconclusive,
+    // never as "no hits" — the task proceeds normally rather than blocking on a broken instrument.
+    const scanResult = await removedLiteralScan({ runRoot: runDir, taskNum, tasksJsonPath: tasksJsonFile, prevSha, harnessCfg })
+    if (!scanResult.instrumentOk) {
+      log(`Task ${taskNum}: removed-literal scan inconclusive — ${scanResult.note || 'no reason given'}. Proceeding without it.`)
+    } else if (scanResult.hits.length) {
+      const hitList = scanResult.hits.map(h => `${h.file}:${h.line ?? '?'} (${h.literal})`).join(', ')
+      log(`Task ${taskNum}: removed-literal scan found ${scanResult.hits.length} hit(s) outside files[] — ${hitList}.`)
+      const scanFailBlob = `REMOVED_LITERAL_SURVIVES (BT.ticket.failure-attribution-and-gate-cache, task 4) — this task's own commit removed a literal/identifier still referenced by a test outside this task's files[]: ${hitList}. This is IN-SPEC DEBT, failure_class=fixable: fix the surviving reference (update or remove it) as part of this task's fix pass. Your writable set for the next fix pass is WIDENED to include the hit file(s) in addition to this task's own files[].`
+      t.issues = [...(t.issues || []), 'removed literal survives outside files[]']
+      const scanBailPayload = buildBailPayload(taskNum, t, `Task ${taskNum}: removed literal survives outside files[] — ${hitList}`)
+      const tr = await triage(`task ${taskNum} removed-literal`, attempt, MAX_TASK_ATTEMPTS, scanFailBlob, prevFailBlob, scanBailPayload)
+      prevFailBlob = scanFailBlob
+      if (tr && tr.class === 'MAJOR') {
+        bailed = true
+        bailReason = tr.bailReason || tr.reason || scanFailBlob
+        if (tr.stateWritten) taskStateWritten = true
+        log(`Task ${taskNum}: triage → MAJOR on removed-literal scan — bailing immediately.`)
+        break
+      }
+      if (attempt === MAX_TASK_ATTEMPTS) {
+        bailed = true
+        bailReason = `Task ${taskNum} still leaving a removed literal outside files[] after ${MAX_TASK_ATTEMPTS} attempts: ${hitList}`
+        if (tr && tr.stateWritten) taskStateWritten = true
+        log(`Task ${taskNum}: exhausted ${MAX_TASK_ATTEMPTS} attempts on a removed-literal scan hit — bailing.`)
+        break
+      }
+      if (tr) t.fixes = [...(t.fixes || []), tr.reason]
+      log(`Task ${taskNum}: triage → RETRYABLE on removed-literal scan hit — fix pass ${attempt}/${MAX_TASK_ATTEMPTS - 1}. ${tr?.reason || ''}`)
+      continue
+    }
+
     // Fast test (tripwire) — gating checks only unless testDepth=full. A task declaring its own
     // `validation_commands` in tasks.json AUGMENTS those gating checks rather than replacing them
     // (D63). passValidatedLabel is always one of the shared VALIDATED_LABEL trichotomy.
@@ -3137,6 +3328,12 @@ ${renderImplementPrompt({ roleIntro, runRootLabel: 'run root', runRoot: runDir, 
       : (harnessGatingCheckCount > 0 ? VALIDATED_LABEL.substitutedSubset : VALIDATED_LABEL.ranNoneOfHarnessList)
     const passPayload = buildPassPayload(taskNum, t, passValidatedLabel)
     const testResult = await runTests(`test-${taskNum}-${attempt}`, { gatingOnly: testDepth === 'fast', taskCommands: taskCommandsFor(taskNum), expectRedSet: expectRedFor(taskNum), onPass: passPayload, engineFiles: engineFilesFor(taskNum) })
+    // BT.ticket.gate-results-and-failure-attribution (task 2): fold into the IN-MEMORY task entry
+    // regardless of outcome — mirrors t.issues/t.fixes below. This is what lets a later dedicated
+    // writeTaskState() call (the taskStateWritten=false fallback) and the reconcile/acceptance-
+    // criteria bail sites (which read state.tasks after this loop, in-memory, never off disk) see
+    // this attempt's gate_results even when the folded onPass/onBail disk write already happened.
+    t.gate_results = (testResult && testResult.gate_results) || t.gate_results || []
     if (testResult && testResult.allPassed) {
       t.validated = passValidatedLabel
       // D63 — a task that ran ZERO harness.json gating checks must be VISIBLE in terminal output,
@@ -3157,8 +3354,32 @@ ${renderImplementPrompt({ roleIntro, runRootLabel: 'run root', runRoot: runDir, 
     }
 
     // Failure → triage.
-    const failBlob = (testResult && testResult.failBlob) || `Test stage failed or returned null (failCount=${testResult?.failCount ?? '?'}, failed=${(testResult?.failedTests || []).join(', ')}).`
+    let failBlob = (testResult && testResult.failBlob) || `Test stage failed or returned null (failCount=${testResult?.failCount ?? '?'}, failed=${(testResult?.failedTests || []).join(', ')}).`
     t.issues = [...(t.issues || []), ...((testResult?.failedTests) || [])]
+
+    // BT.ticket.failure-attribution-and-gate-cache (task 3): attribute this failure BEFORE burning
+    // a fix attempt or a bail on it. Only meaningful when exactly ONE check is red (a mixed-failure
+    // attempt falls straight through to the unchanged triage flow below, the safe default) and a
+    // real check_id resolved off THIS attempt's own gate_results.
+    const failingCheckIds = ((testResult && testResult.gate_results) || []).filter(g => g && g.status === 'fail' && g.check_id).map(g => g.check_id)
+    let attribution = null
+    if (failingCheckIds.length === 1) {
+      attribution = await attributionLookback({ checkId: failingCheckIds[0], state, taskNum, runRoot: runDir, baseSha, harnessCfg, GIT })
+      if (attribution) {
+        t.attribution = attribution
+        log(`Task ${taskNum}: attribution → ownership=${attribution.ownership}${attribution.failure_class ? `, failure_class=${attribution.failure_class}` : ''} for check ${failingCheckIds[0]}. ${attribution.reason}`)
+      }
+    }
+    if (attribution && attribution.ownership === 'foreign') {
+      log(`Task ${taskNum}: sole failing check "${failingCheckIds[0]}" is foreign (already red at base_sha) — carried, no attempt burned, no bail; treating this task's gating as clean.`)
+      t.validated = passValidatedLabel
+      taskPassed = true
+      break
+    }
+    if (attribution && attribution.inSpecDebt) {
+      failBlob += `\n\nATTRIBUTION (BT.ticket.failure-attribution-and-gate-cache): check "${failingCheckIds[0]}" is IN-SPEC DEBT -- ${attribution.reason} Your writable set for the next fix pass is WIDENED: in addition to this task's own files[], you may also edit the failing artifact(s) ${JSON.stringify(attribution.writableSet)}, since this debt was declared by an earlier task in this spec, not introduced by you.`
+    }
+
     // This call site DOES have an attempt-exhaustion bail path (below), with its own fallback text
     // that ignores the triage agent's own bailReason/reason entirely — pass both fallbacks through
     // so the folded write mirrors whichever terminal path actually fires, exactly.
@@ -3195,7 +3416,10 @@ ${renderImplementPrompt({ roleIntro, runRootLabel: 'run root', runRoot: runDir, 
   // resume merge below can recover this run's bail even on the rare path where the dedicated
   // `bails` read comes back empty; the merge deletes it the moment it is consumed, so it is
   // transient scaffolding, never load-bearing on its own.
-  if (bailed && !taskPassed) { state.status = 'blocked'; state.bail_reason = bailReason }; if (bailed && !taskPassed) { const bailEntry = { occurred_at: '__BAIL_OCCURRED_AT__', task_id: state.current_task, check_id: null, failing_artifact: null, ownership: null, bail_class: null, reason: bailReason, resolution: null }; state.bails = [...state.bails, bailEntry]; state.tasks.__pendingBails = [...(state.tasks.__pendingBails || []), bailEntry] }
+  // BT.ticket.gate-results-and-failure-attribution (task 2): check_id resolved from this task's
+  // own gate_results (folded onto `t` above) via the shared resolveCheckId/lastFailingCheckId
+  // lookup, falling back to t.issues only when no gate_results entry exists at all.
+  if (bailed && !taskPassed) { state.status = 'blocked'; state.bail_reason = bailReason }; if (bailed && !taskPassed) { const terminalCheckIdCandidate = lastFailingCheckId(t.gate_results) || ((t.issues && t.issues.length) ? t.issues[t.issues.length - 1] : null); const terminalResolvedCheckId = resolveCheckId(terminalCheckIdCandidate, harnessCfg); const bailEntry = { occurred_at: '__BAIL_OCCURRED_AT__', task_id: state.current_task, check_id: terminalResolvedCheckId.check_id, check_id_raw: terminalResolvedCheckId.check_id_raw, failing_artifact: null, ownership: null, bail_class: null, reason: bailReason, resolution: null }; state.bails = [...state.bails, bailEntry]; state.tasks.__pendingBails = [...(state.tasks.__pendingBails || []), bailEntry] }
   // Reliability net: either the pass-path fold (runTests' onPass) or the terminal-bail fold
   // (triage's onBail) already wrote sdlc-task-state.json in the SAME turn as the resolving
   // test/triage call when taskStateWritten is true — skip the dedicated writer in that case.
@@ -3294,7 +3518,7 @@ entirely. This is the ONE point in the run where their real, authoritative form 
 before the block can be reported done. All Bash calls run from the run root (prefix each with:
 cd ${runDir} &&).
 
-${renderCheckList(reconcileCfg, { gatingOnly: false, cwd: runDir, engineFiles: [] })}
+${renderCheckList(reconcileCfg, { gatingOnly: false, cwd: runDir, engineFiles: [], baseSha })}
 
 For each check record: name, passed (true iff exit code 0), the command, and failure output.
 Return via StructuredOutput: allPassed (true only if EVERY check above passed), passCount,
@@ -3318,7 +3542,15 @@ if (reconcileFailed) {
   const reconcileBailReason = `Terminal reconcile failed (D56): ${reconcileFailBlob}`
   // APPEND-ONLY (BT.ticket.bails-must-be-append-only) — no task to attribute this to (D56: it
   // fires after every task already passed its own tripwire), so task_id stays null.
-  state.bails = [...state.bails, { occurred_at: '__BAIL_OCCURRED_AT__', task_id: null, check_id: 'terminal-reconcile', failing_artifact: null, ownership: null, bail_class: null, reason: reconcileBailReason, resolution: null }]
+  // BT.ticket.gate-results-and-failure-attribution (task 2): no live testResult in scope at this
+  // call site (the reconcile agent's own result isn't gate_results-shaped) — fall back to the
+  // most recently recorded gate_results anywhere in state.tasks, same shared resolveCheckId
+  // lookup as the per-task bail site. The old literal 'terminal-reconcile' was never a real
+  // planning/harness.json check name; under the new rule it would only ever have resolved to
+  // check_id: null with check_id_raw holding it, so it is dropped as a candidate entirely.
+  const reconcileCheckIdCandidate = lastFailingCheckId(mostRecentRecordedGateResults(state.tasks))
+  const reconcileResolvedCheckId = resolveCheckId(reconcileCheckIdCandidate, harnessCfg)
+  state.bails = [...state.bails, { occurred_at: '__BAIL_OCCURRED_AT__', task_id: null, check_id: reconcileResolvedCheckId.check_id, check_id_raw: reconcileResolvedCheckId.check_id_raw, failing_artifact: null, ownership: null, bail_class: null, reason: reconcileBailReason, resolution: null }]
   state.bail_reason = reconcileBailReason
 }
 
@@ -3508,7 +3740,11 @@ if (criteriaRefuse) {
   // APPEND-ONLY (BT.ticket.bails-must-be-append-only) — no task to attribute this to (it fires
   // after every task already passed its own tripwire, exactly like the reconcile bail above), so
   // task_id stays null.
-  state.bails = [...state.bails, { occurred_at: '__BAIL_OCCURRED_AT__', task_id: null, check_id: 'acceptance-criteria', failing_artifact: null, ownership: null, bail_class: null, reason: state.bail_reason, resolution: null }]
+  // BT.ticket.gate-results-and-failure-attribution (task 2): same fallback as the reconcile bail
+  // — the most recently recorded gate_results in state.tasks, through the shared lookup.
+  const criteriaCheckIdCandidate = lastFailingCheckId(mostRecentRecordedGateResults(state.tasks))
+  const criteriaResolvedCheckId = resolveCheckId(criteriaCheckIdCandidate, harnessCfg)
+  state.bails = [...state.bails, { occurred_at: '__BAIL_OCCURRED_AT__', task_id: null, check_id: criteriaResolvedCheckId.check_id, check_id_raw: criteriaResolvedCheckId.check_id_raw, failing_artifact: null, ownership: null, bail_class: null, reason: state.bail_reason, resolution: null }]
 }
 // BT.ticket.bookkeep-leaves-derived-output-uncommitted (task 4): OPTIONAL post-emit commit hook,
 // project policy only (mechanism: run it if configured; never a default, never a fact about where
@@ -3863,3 +4099,366 @@ above, which is why it is suffixed \` || true\`):
 `
 }
 // <</shared:renderLaneHeartbeatRecipe>>
+
+// <<shared:buildTaskGateHistory>>
+// BT.ticket.failure-attribution-and-gate-cache, task 3: a PURE helper -- no agent call, no I/O --
+// that reads this run's own `state.tasks` (already in memory; every task's gate_results is folded
+// onto it right after its own test stage, see the `t.gate_results = ...` fold at each engine's
+// per-task test-failure call site) into the ordered history decideAttribution() needs: one entry
+// per EARLIER task (task_id < beforeTaskNum) that actually recorded a gate_results array, oldest
+// first. A task with no recorded gate_results (never reached its test stage this run, e.g. a
+// resumed run's still-pending task) is simply absent from the result -- not a zero-length entry --
+// so decideAttribution's lookback naturally skips it.
+function buildTaskGateHistory(stateTasks, beforeTaskNum) {
+  return Object.keys(stateTasks || {})
+    .filter(k => k !== '__pendingBails')
+    .map(Number)
+    .filter(n => Number.isFinite(n) && n < beforeTaskNum)
+    .sort((a, b) => a - b)
+    .map(n => ({ taskId: n, gateResults: (stateTasks[String(n)] || {}).gate_results || [] }))
+    .filter(entry => entry.gateResults.length > 0)
+}
+// <</shared:buildTaskGateHistory>>
+
+// <<shared:decideAttribution>>
+// BT.ticket.failure-attribution-and-gate-cache, task 3: the attribution decision itself -- PURE,
+// deterministic, and callable over already-recorded inputs with NO agent call and NO engine launch
+// (task 6 replays fixtures through this exact function). Verdict vocabulary is
+// .claude/workflows/sdlc-state-vocab.json's `ownership` (self|foreign) and `failure_class`
+// (fixable|escalate) -- never a third spelling.
+//
+// Decision order (the block record's own `what`, reproduced here so the two live side by side):
+//   1. Look back through THIS RUN's own recorded gate_results (`taskGateHistory`, most-recent-first)
+//      for an earlier task that already ran this same check_id:
+//        - that task recorded it PASS  -> the breakage was introduced strictly after that task's
+//          commit -> ownership=self, failure_class=fixable (today's ordinary fix loop, UNCHANGED --
+//          this is the regression control, including the plain "green at N-1, red at N" case).
+//        - that task recorded it FAIL  -> it was ALREADY red at that earlier task and never fixed
+//          -> in-spec debt: failure_class=fixable, ownership=self (declared by that earlier task,
+//          not introduced by the current one), writable set widened to the failing artifact plus
+//          the current task's own files[]. Carries forward (failure_class=escalate) if it reaches
+//          the task that declared it, or terminal reconcile, still unresolved -- that escalation is
+//          the CALLER's responsibility (it owns "which task is that" and "have we reached it"); this
+//          function only reports the debt and who declared it.
+//   2. No record in this run's own history at all (first time this check has been evaluated this
+//      run) -> consult the gate cache at base_sha (`cacheStatus`, resolved by the caller via
+//      attributionLookback() below -- a cache MISS re-runs ONLY this check id, never the suite):
+//        - red at base_sha  -> ownership=foreign, carried and recorded, NO attempt burned, no bail.
+//        - green at base_sha -> in-spec debt, same shape as above, but declaredByTask is unknown
+//          (the cache has no per-task resolution) -- the caller decides where it carries forward to.
+//   3. Nothing decides (no history record AND cacheStatus is null/unknown, e.g. the cache could not
+//      be consulted) -> returns null. The caller's existing, unchanged triage flow is the correct
+//      fallback for a null verdict -- this function never guesses.
+//
+// `currentTaskFiles` is caller-supplied (the current task's own tasks.json files[]) purely so the
+// returned writableSet is complete without a second call; this function does no file-system I/O of
+// its own to obtain it.
+function decideAttribution({ checkId, taskGateHistory, cacheStatus = null, currentTaskFiles = [] }) {
+  const history = [...(taskGateHistory || [])].sort((a, b) => b.taskId - a.taskId)
+  for (const entry of history) {
+    const found = (entry.gateResults || []).find(g => g && g.check_id === checkId)
+    if (!found) continue
+    if (found.status === 'pass') {
+      return {
+        ownership: 'self',
+        failure_class: 'fixable',
+        inSpecDebt: false,
+        declaredByTask: null,
+        introducedAfterTask: entry.taskId,
+        writableSet: [...currentTaskFiles],
+        reason: `check ${checkId} was green at task ${entry.taskId}'s own recorded gate_results -- introduced after that, ordinary fix loop (regression control).`,
+      }
+    }
+    const failingIds = Array.isArray(found.failing_ids) ? found.failing_ids : []
+    return {
+      ownership: 'self',
+      failure_class: 'fixable',
+      inSpecDebt: true,
+      declaredByTask: entry.taskId,
+      introducedAfterTask: null,
+      writableSet: [...new Set([...failingIds, ...currentTaskFiles])],
+      reason: `check ${checkId} was already red at task ${entry.taskId} in this run's own gate_results (never fixed) -- in-spec debt declared by task ${entry.taskId}, carries forward.`,
+    }
+  }
+  if (cacheStatus === 'fail') {
+    return {
+      ownership: 'foreign',
+      failure_class: null,
+      inSpecDebt: false,
+      declaredByTask: null,
+      introducedAfterTask: null,
+      writableSet: [],
+      reason: `check ${checkId} was already red at base_sha per the gate cache -- carried and recorded, no attempt burned, no bail.`,
+    }
+  }
+  if (cacheStatus === 'pass') {
+    return {
+      ownership: 'self',
+      failure_class: 'fixable',
+      inSpecDebt: true,
+      declaredByTask: null,
+      introducedAfterTask: null,
+      writableSet: [...currentTaskFiles],
+      reason: `check ${checkId} was green at base_sha per the gate cache but has no recorded pass in this run's own history -- introduced by an earlier task in this spec, never caught until now.`,
+    }
+  }
+  return null
+}
+// <</shared:decideAttribution>>
+
+// <<shared:ATTRIBUTION_CACHE_SCHEMA>>
+const ATTRIBUTION_CACHE_SCHEMA = {
+  type: 'object',
+  required: ['cacheStatus'],
+  properties: {
+    cacheStatus: { type: 'string', enum: ['pass', 'fail', 'unknown'], description: 'the check\'s status at base_sha per the gate cache -- "pass" or "fail" from a cache hit or a safe re-run, "unknown" only when neither was possible' },
+    notes: { type: 'string' }
+  }
+}
+// <</shared:ATTRIBUTION_CACHE_SCHEMA>>
+
+// <<shared:renderAttributionCacheLookup>>
+// The read-only gate-cache consult for decideAttribution()'s step 2 -- an agent turn because the
+// engine script itself has no filesystem/subprocess access (base-template CLAUDE.md's "stamp-
+// workflow-run-id" note: the same reason runPrepareRun() exists). A cache MISS re-runs ONLY this
+// one check id, and NEVER on this run's own branch/tree -- an isolated, throwaway `git worktree add
+// --detach` at base_sha, removed again immediately, so a concurrent sibling session sharing this
+// same working tree is never touched (this repo's own commit-in-this-fleet discipline).
+function renderAttributionCacheLookup({ runRoot, checkId, baseSha, repoSlug, checkCommand, GIT }) {
+  const repoArg = repoSlug || 'unknown-repo'
+  const checkIdJson = JSON.stringify(checkId)
+  return `You are the attribution-cache-lookup agent (BT.ticket.failure-attribution-and-gate-cache,
+task 3). Determine whether check ${checkIdJson} was ALREADY red at base_sha ${baseSha}, using the
+lazy cross-lane gate cache -- read-only by default, never touching this run's own branch or tree.
+
+Run exactly this ONE Bash call from ${runRoot}:
+  cd ${runRoot} && python3 .claude/workflows/bin/gate_cache.py lookup --repo ${repoArg} --base-sha ${baseSha} --check-ids ${checkIdJson}
+
+Parse its JSON stdout. If ${checkIdJson} appears under "hits", that recorded status ("pass"/"fail")
+IS the answer -- report it as cacheStatus directly, do NOT re-run anything.
+
+${checkCommand ? `If ${checkIdJson} appears under "misses" instead (a cache miss), re-run ONLY this
+one check id at base_sha -- never the whole suite, and NEVER against this run's own branch/tree. Use
+an isolated git worktree (throwaway, removed again immediately) so nothing here touches the shared branch:
+  cd ${runRoot} && WT=$(mktemp -d) && ${GIT} worktree add --detach "$WT" ${baseSha} >/dev/null 2>&1 && (cd "$WT" && ${checkCommand}); CHECK_EXIT=$?; ${GIT} worktree remove --force "$WT" >/dev/null 2>&1
+CHECK_EXIT 0 means the check PASSED at base_sha; non-zero means it FAILED. Then warm the cache with
+exactly what you found (a manual verb, never scheduled -- out_of_scope):
+  cd ${runRoot} && python3 .claude/workflows/bin/gate_cache.py warm --repo ${repoArg} --base-sha ${baseSha} --result "${checkId}=<pass or fail, from CHECK_EXIT>"
+Report the status you just determined as cacheStatus.` : `If ${checkIdJson} appears under "misses"
+instead, this run has no known command to safely re-run it against base_sha (it is not one of
+planning/harness.json's named checks) -- report cacheStatus "unknown" rather than guessing.`}
+
+Return via StructuredOutput: cacheStatus ("pass" | "fail" | "unknown" -- "unknown" only when neither
+a cache hit nor a safe re-run was possible), notes (what you actually observed, quoting the cache
+lookup's JSON or the re-run's exit code).`
+}
+// <</shared:renderAttributionCacheLookup>>
+
+// <<shared:attributionLookback>>
+// The full orchestration for one failing check_id: PURE history lookback first (no agent call --
+// decideAttribution() alone answers it whenever this run's own gate_results already saw this check
+// at an earlier task), falling back to ONE cheap gate-cache-lookup agent turn only when this run's
+// history has nothing to say. Returns decideAttribution()'s verdict object, or null when nothing
+// decides (the caller's existing, unchanged triage flow is the correct fallback for null).
+async function attributionLookback({ checkId, state, taskNum, runRoot, baseSha, harnessCfg, GIT, currentTaskFiles = [] }) {
+  const history = buildTaskGateHistory(state.tasks, taskNum)
+  const fromHistory = decideAttribution({ checkId, taskGateHistory: history, cacheStatus: null, currentTaskFiles })
+  if (fromHistory) return fromHistory
+  if (!baseSha) return null
+  const scopeFlagRaw = await renderScopeFlag()
+  const scopeMatch = scopeFlagRaw.match(/--scope\s+(\S+)/)
+  const repoSlug = scopeMatch ? scopeMatch[1] : null
+  const checkCfg = (harnessCfg?.validation?.checks || []).find(c => c.name === checkId)
+  const checkCommand = checkCfg ? (checkCfg.command || null) : null
+  const result = await tracedAgent(`
+${renderAttributionCacheLookup({ runRoot, checkId, baseSha, repoSlug, checkCommand, GIT })}
+`, { label: `attribution-cache:${checkId}`, schema: ATTRIBUTION_CACHE_SCHEMA, model: 'haiku' })
+  if (!result || result.cacheStatus === 'unknown') return null
+  return decideAttribution({ checkId, taskGateHistory: history, cacheStatus: result.cacheStatus, currentTaskFiles })
+}
+// <</shared:attributionLookback>>
+
+// <<shared:REMOVED_LITERAL_SCAN_CONFIG>>
+// BT.ticket.failure-attribution-and-gate-cache, task 4: defaults for the post-commit removed-
+// literal scan -- all three are config knobs (standing rule 12), never literals baked into the
+// scan script itself. A project overrides any of them via planning/harness.json's optional
+// `removedLiteralScan: { testGlobRegex, minLiteralLen, identifierMinLen }` object; absent-or-partial
+// falls back here. `identifierMinLen` exists SEPARATELY from `minLiteralLen` (quoted strings) because
+// a bare-identifier match at the same low threshold is noisy -- ordinary English words removed from
+// a comment or log message (e.g. "failed", "returned") are common at 6-8 chars and are not the
+// distinctive symbol names this scan exists to catch; an underscored identifier of any length (a
+// real snake_case/CONST_CASE symbol) is always reported regardless of identifierMinLen.
+const REMOVED_LITERAL_SCAN_CONFIG = {
+  // Matches this fleet's own test-naming conventions plus the common cross-language ones, so the
+  // harness ships one sane default without hardcoding a single project's directory layout.
+  testGlobRegex: '(^|/)test_[^/]+\\.py$|(^|/)[^/]+_test\\.py$|(^|/)tests?/.*|\\.test\\.[jt]sx?$|\\.spec\\.[jt]sx?$',
+  minLiteralLen: 8,
+  identifierMinLen: 12,
+}
+// <</shared:REMOVED_LITERAL_SCAN_CONFIG>>
+
+// <<shared:REMOVED_LITERAL_SCAN_SCHEMA>>
+const REMOVED_LITERAL_SCAN_SCHEMA = {
+  type: 'object',
+  required: ['rawOutput'],
+  properties: {
+    rawOutput: { type: 'string', description: 'Everything the removed-literal scan script printed to stdout, verbatim, unmodified, unsummarized' }
+  }
+}
+// <</shared:REMOVED_LITERAL_SCAN_SCHEMA>>
+
+// <<shared:parseRemovedLiteralScanOutput>>
+// Parses runRemovedLiteralScan()'s transcribed stdout -- never throws; a malformed/empty
+// transcription is reported as instrumentOk=false rather than silently read as "no hits" (the
+// task's own positive-control requirement: an empty result must be distinguishable from a broken
+// instrument, never asserted by an empty grep alone).
+function parseRemovedLiteralScanOutput(rawOutput) {
+  if (!rawOutput || typeof rawOutput !== 'string') return { hits: [], instrumentOk: false, note: 'no output transcribed' }
+  const lines = rawOutput.split('\n').map(l => l.trim()).filter(Boolean)
+  if (lines.some(l => l.startsWith('INSTRUMENT_BROKEN:'))) {
+    const broken = lines.find(l => l.startsWith('INSTRUMENT_BROKEN:'))
+    return { hits: [], instrumentOk: false, note: broken.slice('INSTRUMENT_BROKEN:'.length) }
+  }
+  if (!lines.some(l => l.startsWith('CANDIDATE_TEST_COUNT:'))) {
+    return { hits: [], instrumentOk: false, note: 'scan script never reported CANDIDATE_TEST_COUNT -- transcription incomplete or script did not run' }
+  }
+  const hits = []
+  for (const line of lines) {
+    if (!line.startsWith('HIT:')) continue
+    const rest = line.slice('HIT:'.length)
+    const parts = rest.split('|')
+    if (parts.length < 2) continue
+    const [literal, file, lineNo] = parts
+    hits.push({ literal, file, line: lineNo ? Number(lineNo) || null : null })
+  }
+  return { hits, instrumentOk: true, note: lines.find(l => l.startsWith('CANDIDATE_TEST_COUNT:')) || '' }
+}
+// <</shared:parseRemovedLiteralScanOutput>>
+
+// <<shared:renderRemovedLiteralScanScript>>
+// A mechanical, single Python invocation -- the agent's only job is to run it and transcribe stdout
+// (same "script decides, agent transcribes" discipline as runPrepareRun()/verifyVaultCommit()), so
+// no per-literal or per-file judgment is delegated to the model. `range` is the SAME prevSha-or-
+// HEAD~1 commit-range boundary renderWorkAssertion() already uses for this task, so the scan and the
+// work assertion agree on exactly what this task's own commit contains.
+function renderRemovedLiteralScanScript({ range, tasksJsonPath, taskNum, testGlobRegex, minLiteralLen, identifierMinLen }) {
+  return `cat > "$RLS_TMP" <<'PYEOF'
+import json, re, subprocess, sys
+
+def sh(cmd):
+    return subprocess.run(cmd, shell=True, capture_output=True, text=True).stdout
+
+TASK_NUM = ${JSON.stringify(taskNum)}
+TASKS_PATH = ${JSON.stringify(tasksJsonPath)}
+RANGE = ${JSON.stringify(range)}
+TEST_GLOB_REGEX = ${JSON.stringify(testGlobRegex)}
+MIN_LEN = ${JSON.stringify(minLiteralLen)}
+IDENT_MIN_LEN = ${JSON.stringify(identifierMinLen)}
+
+try:
+    data = json.load(open(TASKS_PATH))
+except (OSError, ValueError):
+    data = []
+matches = [x for x in data if isinstance(x, dict) and x.get('task_id') == TASK_NUM]
+task_files = matches[0].get('files', []) if matches else []
+
+def is_own(path):
+    for tf in task_files:
+        tf = tf.rstrip('/')
+        if path == tf or path.startswith(tf + '/'):
+            return True
+    return False
+
+test_re = re.compile(TEST_GLOB_REGEX)
+candidates = [l for l in sh('${GIT} ls-files').splitlines() if test_re.search(l)]
+if not candidates:
+    print('INSTRUMENT_BROKEN:no candidate test files matched TEST_GLOB_REGEX=%r under this repo' % TEST_GLOB_REGEX)
+    sys.exit(0)
+print('CANDIDATE_TEST_COUNT:%d' % len(candidates))
+
+diff = sh('${GIT} diff --unified=0 %s HEAD -- .' % RANGE)
+removed_lines = [l[1:] for l in diff.splitlines() if l.startswith('-') and not l.startswith('---')]
+# Quoted-string literals gate on MIN_LEN. Bare identifiers gate on EITHER containing an underscore
+# (a real snake_case/CONST_CASE symbol, reported at any length) OR being at least IDENT_MIN_LEN chars
+# with no underscore -- this is what keeps an ordinary removed English word ("failed", "returned")
+# out of the result: those are short and underscore-free, unlike a real removed symbol name.
+lit_re = re.compile(
+    r'"([^"]{%d,})"' % MIN_LEN
+    + r"|'([^']{%d,})'" % MIN_LEN
+    + r'|\\b([A-Za-z_][A-Za-z0-9]*_[A-Za-z0-9_]*)\\b'
+    + r'|\\b([A-Za-z][A-Za-z0-9]{%d,})\\b' % (IDENT_MIN_LEN - 1)
+)
+literals = set()
+for line in removed_lines:
+    for m in lit_re.finditer(line):
+        lit = m.group(1) or m.group(2) or m.group(3) or m.group(4)
+        if lit:
+            literals.add(lit)
+
+if not literals:
+    print('NO_LITERALS_REMOVED')
+    sys.exit(0)
+
+hits = []
+for lit in sorted(literals):
+    for f in candidates:
+        if is_own(f):
+            continue
+        try:
+            with open(f, encoding='utf-8', errors='ignore') as fh:
+                for i, line in enumerate(fh, 1):
+                    if lit in line:
+                        hits.append((lit, f, i))
+                        break
+        except OSError:
+            continue
+
+if not hits:
+    print('NO_HITS')
+else:
+    for lit, f, i in hits:
+        print('HIT:%s|%s|%d' % (lit, f, i))
+PYEOF
+python3 "$RLS_TMP"; RLS_EXIT=$?; rm -f "$RLS_TMP"; exit $RLS_EXIT`
+}
+// <</shared:renderRemovedLiteralScanScript>>
+
+// <<shared:renderRemovedLiteralScan>>
+function renderRemovedLiteralScan({ runRoot, taskNum, tasksJsonPath, range, testGlobRegex, minLiteralLen, identifierMinLen }) {
+  const script = renderRemovedLiteralScanScript({ range, tasksJsonPath, taskNum, testGlobRegex, minLiteralLen, identifierMinLen })
+  return `You are the removed-literal-scan agent (BT.ticket.failure-attribution-and-gate-cache, task
+4). Task ${taskNum}'s own commit(s) (range ${range}..HEAD) may have removed a string literal or
+identifier that a test OUTSIDE this task's own files[] still references -- a silent breakage the
+fast test tripwire does not otherwise catch. Do NOT reason about which literals matter yourself; the
+script below already decided it. Run exactly this ONE Bash call from ${runRoot}, verbatim:
+
+  cd ${runRoot} && RLS_TMP=$(mktemp) && ${script}
+
+Transcribe every line it prints to stdout, in order, exactly as printed -- do not summarize,
+reformat, or drop any line (including INSTRUMENT_BROKEN:, CANDIDATE_TEST_COUNT:, NO_LITERALS_REMOVED,
+NO_HITS, or any HIT: line).
+
+Return via StructuredOutput: rawOutput (everything printed above, verbatim, in order).`
+}
+// <</shared:renderRemovedLiteralScan>>
+
+// <<shared:removedLiteralScan>>
+// Orchestrates one post-commit removed-literal scan for the current task: resolves the config knobs
+// (project override via harnessCfg.removedLiteralScan, else REMOVED_LITERAL_SCAN_CONFIG's default),
+// renders and runs the mechanical script above, and returns { hits, instrumentOk, note }. A hit
+// inside the task's own files[] is filtered out BY THE SCRIPT ITSELF (never reported here at all) --
+// see renderRemovedLiteralScanScript's is_own() check. instrumentOk=false means the scan could not
+// positively confirm it ran (no candidate test files, or an incomplete transcription) -- callers
+// must treat that as "scan inconclusive", never as "no hits found".
+async function removedLiteralScan({ runRoot, taskNum, tasksJsonPath, prevSha, harnessCfg }) {
+  const cfg = harnessCfg?.removedLiteralScan || {}
+  const testGlobRegex = typeof cfg.testGlobRegex === 'string' && cfg.testGlobRegex ? cfg.testGlobRegex : REMOVED_LITERAL_SCAN_CONFIG.testGlobRegex
+  const minLiteralLen = Number.isInteger(cfg.minLiteralLen) && cfg.minLiteralLen > 0 ? cfg.minLiteralLen : REMOVED_LITERAL_SCAN_CONFIG.minLiteralLen
+  const identifierMinLen = Number.isInteger(cfg.identifierMinLen) && cfg.identifierMinLen > 0 ? cfg.identifierMinLen : REMOVED_LITERAL_SCAN_CONFIG.identifierMinLen
+  const range = prevSha || 'HEAD~1'
+  const result = await tracedAgent(`
+${renderRemovedLiteralScan({ runRoot, taskNum, tasksJsonPath, range, testGlobRegex, minLiteralLen, identifierMinLen })}
+`, { label: `removed-literal-scan-${taskNum}`, schema: REMOVED_LITERAL_SCAN_SCHEMA, model: 'haiku' })
+  return parseRemovedLiteralScanOutput(result && result.rawOutput)
+}
+// <</shared:removedLiteralScan>>

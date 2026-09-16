@@ -144,6 +144,27 @@
   },
   "required": ["validation", "uiTest"],
   "$defs": {
+    "gateResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "AUTHORING AID ONLY — documents the per-check `gate_results` record the engines (sdlc-task.js / sdlc-flow.js) write into the per-task state file (sdlc-task-state.json / sdlc-flow-state.json) at test-stage time, one entry per check run against this file's `validation.checks[]` list (BT.ticket.gate-results-and-failure-attribution, task 1). Nothing in planning/harness.json itself is shaped like this — the engines never validate against this $def at runtime, same as this file's own header comment says of the whole schema — it exists so an editor resolving $schema on a harness.json file can also see the shape of the data that file's `checks[].name` values flow into downstream.",
+      "properties": {
+        "check_id": {
+          "type": ["string", "null"],
+          "description": "The check's own name, matched verbatim against this file's `validation.checks[].name`. null when the agent-reported identifier could not be matched — the raw value is preserved in the sibling `check_id_raw` field instead of being silently dropped."
+        },
+        "status": {
+          "type": "string",
+          "enum": ["pass", "fail"]
+        },
+        "failing_ids": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Specific failing ids from structured runner output (e.g. nextest JUnit XML, pytest --junitxml/-rf) where the check's own command produces one; otherwise a single-element array holding check_id."
+        }
+      },
+      "required": ["check_id", "status", "failing_ids"]
+    },
     "check": {
       "type": "object",
       "additionalProperties": false,

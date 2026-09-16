@@ -38,5 +38,27 @@
   "wrapup": {
     "meaning": "sdlc-flow only: docs are patched and the run is in its final wrap-up/PR stage.",
     "emitters": ["sdlc-flow"]
+  },
+  "verdicts": {
+    "ownership": {
+      "self": {
+        "meaning": "The failing check was introduced by this run -- either green at an earlier task's own recorded gate_results or green at base_sha per the gate cache; routed into the ordinary fix loop.",
+        "emitters": ["sdlc-task", "sdlc-flow"]
+      },
+      "foreign": {
+        "meaning": "The failing check was already red at base_sha per the gate cache; carried and recorded, no attempt burned, no bail.",
+        "emitters": ["sdlc-task", "sdlc-flow"]
+      }
+    },
+    "failure_class": {
+      "fixable": {
+        "meaning": "The failure is routed into a fix loop -- either today's ordinary regression fix loop, or (for in-spec debt) a fix agent whose writable set is widened to the failing test file union this task's own files[].",
+        "emitters": ["sdlc-task", "sdlc-flow"]
+      },
+      "escalate": {
+        "meaning": "The failure is a hard stop -- in-spec debt that was never fixed by the task that declared the failing behaviour, surfaced at that task or at terminal reconcile.",
+        "emitters": ["sdlc-task", "sdlc-flow"]
+      }
+    }
   }
 }

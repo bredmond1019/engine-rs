@@ -442,7 +442,14 @@ not persist between calls.
 6. **Snapshot baselines** (resume-safe — never overwrite an existing baseline) for every
    `baseline-diff` / `skip-count-regression` check that declares a `baselineCommand`, BEFORE any task
    runs:
-   - `baseline-diff` → write `<reportsDir>/<slug>-baseline.json` (its `baselineCommand`'s stdout).
+   - `baseline-diff` → write `<reportsDir>/<slug>-baseline.json` (its `baselineCommand`'s stdout) AND,
+     ONLY when this baseline is newly written this run (BT.ticket.failure-attribution-and-gate-cache,
+     task 5), a sidecar `<reportsDir>/<slug>-baseline.json.sha` holding this run's own `baseSha`
+     verbatim — the fail-closed reconcile check below reads that sidecar to tell a baseline taken
+     against THIS run's base commit from a stale one taken against some earlier base. An EXISTING
+     baseline is kept as-is (resume-safe) and is deliberately NOT backfilled with a sidecar it never
+     had — a baseline that predates this stamping surfaces its own named failure at reconcile time,
+     never silently repaired here.
    - `skip-count-regression` → write `<reportsDir>/<slug>-skip-baseline.txt` (bare integer count).
    - `mkdir -p <reportsDir>` first; if the file already exists, keep it and log "BASELINE EXISTS
      (kept)" instead of overwriting.
@@ -532,6 +539,32 @@ For each `taskNum` in `taskList` (skip any already in the resume skip-set, loggi
      `BRAIN_ROOT_OK` paths are a legitimate cross-repo write, not a vault-commit defect. A vault-commit failure
      surfaces exactly like a test failure: the task is never marked passed on this attempt; triage decides whether
      to RETRYABLE (fix and try again, ≤3 times) or MAJOR (bail to a human right now).
+   - **Removed-literal scan (BT.ticket.failure-attribution-and-gate-cache, task 4)** — after the commit
+     (and any vault commit) lands, before the test step below: this task's own commit(s) may have
+     REMOVED a string literal or identifier that a test OUTSIDE this task's own `files[]` still
+     references — a silent breakage the test step's own fast tripwire would not otherwise catch. Do
+     not reason about which removed literals matter yourself; run the mechanical scan and transcribe
+     its output verbatim:
+     - Diff this task's own commit range (`prevSha`, or `HEAD~1` on the first task) against `HEAD`,
+       collect every REMOVED (`-`) line under `--unified=0`, and extract candidate literals: quoted
+       strings at least 8 characters (config knob `minLiteralLen`, `planning/harness.json`'s optional
+       `removedLiteralScan.minLiteralLen`), plus bare identifiers — any containing an underscore (a
+       real `snake_case`/`CONST_CASE` symbol, reported at any length) OR at least 12 characters with no
+       underscore (config knob `identifierMinLen`). This length floor is what keeps an ordinary removed
+       English word ("failed", "returned") out of the result.
+     - Search only files matching the test-file convention regex (config knob `testGlobRegex`,
+       `planning/harness.json`'s optional `removedLiteralScan.testGlobRegex`; defaults cover
+       `test_*.py`/`*_test.py`/`tests?/**`/`*.test.{js,jsx,ts,tsx}`/`*.spec.{js,jsx,ts,tsx}`), listed via
+       `git ls-files`. If NO file matches that regex at all, the scan is **inconclusive**
+       (`INSTRUMENT_BROKEN`) — proceed normally, never read this as "no hits".
+     - A hit **inside this task's own `files[]`** is never reported — those files are this task's to
+       change. A hit outside `files[]` is real: this is **IN-SPEC DEBT, `failure_class: fixable`** —
+       treat it as a test failure and run it through the SAME triage/fix loop as any other failure,
+       with the writable set for the next fix pass **WIDENED** to include the hit file(s) in addition to
+       this task's own `files[]`. Exhausting all attempts still on a surviving hit, or a triage MAJOR,
+       bails exactly like any other test failure.
+     - An inconclusive scan (`instrumentOk=false` — no candidate test files, or an incomplete
+       transcription) is never treated as "no hits"; the task proceeds normally.
    - **Test step** — run ONLY the applicable check set, never invent checks:
      - If this task declared its own `validation_commands` override (Step 2.1) — **D63,
        augment-gating-only**: run the project's `gates:true` harness checks (fast form —
@@ -563,8 +596,16 @@ For each `taskNum` in `taskList` (skip any already in the resume skip-set, loggi
        - `command` (default) / `count-delta`: run the command, check exit code; `fastCommand`
          replaces `command` when set and `testDepth == fast`.
        - `baseline-diff`: run `command`, diff its JSON output against the pre-run baseline snapshot
-         (Step 2.6) on the declared `compareKeys`; **fails ONLY on net-new items absent from the
-         baseline** — pre-existing items are never a failure.
+         (Step 2.6) on the declared `compareKeys`; **fails CLOSED**
+         (BT.ticket.failure-attribution-and-gate-cache, task 5 — D64: by delta, never path-scoped).
+         Net-new items absent from the baseline FAIL, naming them — pre-existing items are never a
+         failure. Every one of these ALSO fails, each naming its own specific cause rather than being
+         silently treated as zero items or skipped: `command`'s output is empty, unparseable JSON, or
+         not a JSON array; the baseline file itself is missing; the baseline's sidecar
+         `<baselinePath>.sha` is missing (`"baseline predates base-SHA stamping"`); or the sidecar's
+         SHA disagrees with this run's own `baseSha` (names both SHAs). This is the SAME check kind
+         used by this engine's Step 3.5 terminal reconcile below — a baseline-diff check re-run there
+         with the authoritative `command` fails closed identically.
        - `skip-count-regression`: run `command` to get the current skip count; **fails ONLY when the
          current count is GREATER than the pre-run baseline** (coverage silently switched off) —
          never fails on a merely-nonzero absolute count.
@@ -598,9 +639,76 @@ For each `taskNum` in `taskList` (skip any already in the resume skip-set, loggi
        downstream repo), the call fails harmlessly — its exit code (hence the trailing `|| true`)
        must NEVER affect this task's own pass/fail verdict.
      - The task PASSES this attempt only if every gating check passed AND the emoji gate is clean.
+     - **Record `gate_results`** — one entry per check actually run this turn (same set, same
+       order as the checklist above): `{check_id, status: 'pass'|'fail', failing_ids}`. Derive
+       `failing_ids` from structured runner output where the check's own command produces one
+       (nextest JUnit XML, pytest `--junitxml`/`-rf`); otherwise fall back to a single-element
+       array holding `check_id`. This array is what drives triage-only-on-red below and, in
+       `/sdlc-flow`, the end-review stage's aggregated read instead of a suite re-run.
    - **On pass**: mark the task `passed`, record which check set validated it, and stop the attempt
-     loop for this task (do not run further attempts).
-   - **On failure**: **triage** the failure before deciding whether to retry:
+     loop for this task (do not run further attempts). Triage is never invoked on this path — it is
+     called ONLY from the failure branch immediately below, so a green task spawns no triage agent.
+   - **On failure**: **before** deciding whether to retry, run the **attribution look-back**
+     (BT.ticket.failure-attribution-and-gate-cache, task 3) — ONLY when exactly ONE gating check is
+     red this attempt (a mixed multi-check failure falls straight through to ordinary triage below,
+     the safe default) and a real `check_id` resolved off this attempt's own `gate_results`:
+     - **Step 1 — this run's own history (no agent call, pure lookback).** Walk `state.tasks`,
+       most-recent-first, for the EARLIEST earlier task in THIS run that already recorded a
+       `gate_results` entry for this same `check_id`:
+       - That earlier task recorded it **PASS** → `ownership: self, failure_class: fixable` — the
+         breakage was introduced strictly after that task's own commit. This is the **regression
+         control**: today's ordinary fix loop, UNCHANGED.
+       - That earlier task recorded it **FAIL** (already red, never fixed) → **IN-SPEC DEBT**:
+         `ownership: self, failure_class: fixable`, declared by that earlier task, not introduced by
+         this one — the writable set for the next fix pass is WIDENED to that check's own
+         `failing_ids` plus this task's own `files[]`.
+     - **Step 2 — no record in this run's own history yet → consult the lazy cross-lane gate cache**
+       at `.claude/workflows/bin/gate_cache.py`, keyed `(repo, base_sha, lockfile hash)`:
+       ```
+       cd <runDir> && python3 .claude/workflows/bin/gate_cache.py lookup --repo <repo-slug> \
+         --base-sha <baseSha> --check-ids <check_id>
+       ```
+       - The check_id appears under `"hits"` → that recorded status ("pass"/"fail") IS the answer —
+         re-run nothing.
+       - The check_id appears under `"misses"` (a cache miss) AND this check's `command` is known
+         (a named `planning/harness.json` check) → re-run **ONLY this one check id** at `base_sha`,
+         NEVER the whole suite and NEVER on this run's own branch/tree — use an isolated, throwaway
+         `git worktree add --detach` at `base_sha`, removed again immediately, so a concurrent
+         sibling session sharing this working tree is never touched:
+         ```
+         cd <runDir> && WT=$(mktemp -d) && git worktree add --detach "$WT" <baseSha> \
+           && (cd "$WT" && <check's command>); CHECK_EXIT=$?; git worktree remove --force "$WT"
+         ```
+         Then **warm** the cache with exactly what you found (a manual verb, never scheduled — out
+         of scope for this block):
+         ```
+         cd <runDir> && python3 .claude/workflows/bin/gate_cache.py warm --repo <repo-slug> \
+           --base-sha <baseSha> --result "<check_id>=<pass or fail, from CHECK_EXIT>"
+         ```
+       - `CHECK_EXIT 0` at `base_sha` → **red at base_sha** was false, i.e. it was **green at
+         base_sha but has no recorded pass in this run's own history**: this is also **IN-SPEC
+         DEBT** — `ownership: self, failure_class: fixable`, introduced by an earlier task in this
+         spec and never caught until now (`declaredByTask` unknown — the cache has no per-task
+         resolution; you decide where it carries forward to).
+       - `CHECK_EXIT` non-zero at `base_sha` (or a cache hit reporting `"fail"`) → **already red at
+         base_sha**: `ownership: foreign` — **carried and recorded, NO attempt burned, no bail.**
+         Treat this task's gating as CLEAN (mark it passed, do not run triage, do not retry) and log
+         the check as foreign breakage.
+       - No command is known for this check (not a named `planning/harness.json` check) → report
+         `cacheStatus: unknown` rather than guessing — the lookback decides nothing, fall through to
+         ordinary triage below.
+     - Verdict vocabulary is `.claude/workflows/sdlc-state-vocab.json`'s `ownership` (`self`|`foreign`)
+       and `failure_class` (`fixable`|`escalate`) — never a third spelling. In-spec debt that reaches
+       the task that declared it (or terminal reconcile) still unresolved escalates
+       (`failure_class: escalate`) — that call belongs to the task tracking the debt forward, not
+       this lookback itself.
+     - If nothing decides (no history record AND the cache lookup could not be consulted), the
+       lookback resolves to nothing — fall straight through to ordinary triage below, unchanged.
+   - **On failure (ordinary triage)**: **triage** the failure before deciding whether to retry —
+     for a `foreign` verdict above, this step is skipped entirely (the task is already marked
+     passed); for an `in-spec debt` verdict, append the attribution's reason and the widened
+     writable set to the failure text handed to triage/fix below, then continue exactly as an
+     ordinary failure:
      - Classify **RETRYABLE** (transient/infra flake, OR the failure visibly changed from the previous
        attempt — evidence of progress, a bounded fix can plausibly close it) vs **MAJOR** (bail to a
        human right now). "When unsure, BAIL."
@@ -633,13 +741,19 @@ For each `taskNum` in `taskList` (skip any already in the resume skip-set, loggi
        record the bail reason, mark the run blocked, and stop the whole per-task loop (subsequent
        tasks in `taskList` do not run this pass). **Also append a fully-populated entry to
        `state.bails`** (append-only, never overwritten — BT.ticket.bails-must-be-append-only):
-       `{occurred_at, task_id, check_id, failing_artifact, ownership, bail_class, reason, resolution:
-       null}`. `reason` carries the same bail-reason text as `bail_reason`; `check_id` is the harness
-       check name already available from this task's recorded issues, best-effort; `failing_artifact`,
-       `ownership`, and `bail_class` are set when derivable at this call site and `null` otherwise
-       (deriving them from the check output is separate work, out of scope here). `bail_reason` stays
-       set too, as a plain mirror of this entry's `reason` — it is never independently authoritative
-       once `bails` is non-empty.
+       `{occurred_at, task_id, check_id, check_id_raw, failing_artifact, ownership, bail_class,
+       reason, resolution: null}`. `reason` carries the same bail-reason text as `bail_reason`.
+       **`check_id`** is resolved, not copied verbatim: take the last `status: 'fail'` entry from
+       this task's own recorded `gate_results` (falling back to the last entry of this task's
+       `issues[]` only when no `gate_results` entry exists at all, e.g. a non-test bail), then
+       validate that candidate against `planning/harness.json`'s `validation.checks[].name` list —
+       a match is stored in `check_id` verbatim; a non-match (or an absent/malformed
+       `planning/harness.json`) stores `check_id: null` with the raw candidate preserved in
+       `check_id_raw`, never silently dropped. `failing_artifact`, `ownership`, and `bail_class` are
+       set when derivable at this call site and `null` otherwise (deriving them from the check
+       output is separate work, out of scope here). `bail_reason` stays set too, as a plain mirror
+       of this entry's `reason` — it is never independently authoritative once `bails` is
+       non-empty.
      - If RETRYABLE and this is attempt 3 (the last one): the loop is naturally exhausted — bail
        anyway, with a fallback reason noting all 3 attempts failed, appending its own `bails` entry the
        same way. This is a different bail path from
@@ -686,7 +800,10 @@ check from the per-task list entirely.
    project), log that the reconcile is a no-op and skip straight to Step 4 — zero added cost.
 3. Otherwise, run exactly that check set with each check's real `command` (never `fastCommand`)
    and no `perTask` filtering — the same rendering Step 3 uses, but with gating set to run every
-   check's authoritative form unconditionally. All Bash calls run from `runDir`.
+   check's authoritative form unconditionally. All Bash calls run from `runDir`. A `baseline-diff`
+   check in this set renders with the SAME fail-CLOSED semantics as Step 3's own (see the
+   `baseline-diff` bullet above) — this is the terminal point where a `perTask:false` baseline-diff
+   check, never verified per-task, gets its one authoritative run.
 4. If every check in the set passes: log the reconcile passed and proceed to Step 4 normally.
 5. If any check fails: set `reconcileFailed = true` and the run's terminal status to
    `"reconcile_failed"` (a distinct terminal state — never folded into an ordinary `"blocked"`
@@ -902,7 +1019,13 @@ Skip this entire step if the run bailed OR Step 3.5 set `reconcileFailed = true`
   `"done"` (otherwise), capturing the final token roll-up. On `"reconcile_failed"`, also set
   `bail_reason` to the reconcile's failing check names + a tail of their output, and append a `bails[]`
   entry for it (`task_id: null` — D56: this fires after every task already passed its own tripwire, so
-  there is no single task to attribute it to; `check_id: "terminal-reconcile"`).
+  there is no single task to attribute it to). **`check_id`** here is resolved the same way as every
+  other bail-fold site: take the last `status: 'fail'` entry from the most recently recorded
+  `gate_results` anywhere in `state.tasks` (no live test result is in scope at this call site) and
+  validate it against `planning/harness.json`'s check names — a match is stored verbatim, a
+  non-match stores `check_id: null` with the raw candidate in `check_id_raw`. There is no hardcoded
+  `"terminal-reconcile"` literal — that string was never a real `planning/harness.json` check name
+  and would only ever have resolved to `null` under this rule anyway.
 - Report to the user:
   - Which tasks passed / bailed, and the final branch (plus the worktree path, under `--worktree`).
   - **On bail**: point the user at `<stateFile>` for the per-task detail, tell them to fix the
