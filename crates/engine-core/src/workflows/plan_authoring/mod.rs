@@ -19,6 +19,24 @@
 //! nothing here is allowed to write into `state.json` or `planning/blocks/`
 //! on its own.
 //!
+//! # Gaps a reader must know about
+//!
+//! Documented in full in [`docs/workflows/README.md`](../../../../../docs/workflows/README.md)'s
+//! `PLAN_AUTHORING` row and restated here at the source, not only in the docs, per
+//! `EN.19.B` task 7:
+//!
+//! - **No red-team pass.** `.claude/commands/plan.md`'s step 10 (spawning fresh reviewer
+//!   agents against the decomposition) has no node here — a single-model decomposition
+//!   with no adversarial review is a known, accepted quality gap for this workflow's
+//!   output.
+//! - **No initiative-wide consistency pass.** `block-registration.md`'s C1-C7
+//!   cross-block/cross-repo consistency checks do not run here — only the basic
+//!   `block.schema.json` shape/enum validation `stage_candidate_blocks` performs.
+//! - **No auto-registration.** Nothing in this workflow calls `mev create-block --write`
+//!   or writes `planning/blocks/`/`state.json`. Turning a staged candidate into a real,
+//!   registered block is a deliberate, separate, human-reviewed action this workflow
+//!   hands off to.
+//!
 //! # Module layout
 //!
 //! Each leaf module is owned by a task in `planning/EN.19.B/tasks.json`:
