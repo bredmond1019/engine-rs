@@ -279,3 +279,12 @@ flow's own). A suspended or failed `SDLC_TASK` run writes its terminal blocked s
 [orchestration-workflow.md](orchestration.md) for how `ORCHESTRATION` dispatches a chain
 that mixes `SDLC_TASK` and `SDLC_FLOW` blocks, and [suspend-resume.md](../suspend-resume.md) for the
 pause/resume routes both workflow types now share.
+
+## Node / molecule library
+
+- This graph's setup-through-triage prefix is the proven
+  [`sdlc-intake-prefix`](../nodes/molecules/sdlc-intake-prefix.md) molecule — every Node in it is
+  imported verbatim from `sdlc_flow`, not reimplemented
+- `TaskTriageRouterNode` is a near-atom candidate for a generic `VerdictRouter` — see
+  [`../nodes/atoms/control-flow.md`](../nodes/atoms/control-flow.md)
+- Full node catalogue: [`../nodes/index.md`](../nodes/index.md)

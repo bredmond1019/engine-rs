@@ -348,7 +348,8 @@ fn hermetic_hq(brain_root: &Path) -> tempfile::TempDir {
     let dir = tempfile::tempdir().expect("tempdir");
     let root = dir.path();
     fs::create_dir_all(root.join("scripts")).unwrap();
-    fs::create_dir_all(root.join("docs/sandbox/results")).unwrap();
+    fs::create_dir_all(root.join("docs/sandbox/findings")).unwrap();
+    fs::create_dir_all(root.join("docs/sandbox/testing/results")).unwrap();
     fs::create_dir_all(root.join("core/engine-rs/planning")).unwrap();
 
     for name in [
@@ -364,7 +365,7 @@ fn hermetic_hq(brain_root: &Path) -> tempfile::TempDir {
     }
 
     write(
-        &root.join("docs/sandbox/remediation.json"),
+        &root.join("docs/sandbox/findings/remediation.json"),
         &json!({
             "schema_version": 1,
             "updated": "2026-09-10",
@@ -379,7 +380,7 @@ fn hermetic_hq(brain_root: &Path) -> tempfile::TempDir {
         .to_string(),
     );
     write(
-        &root.join("docs/sandbox/findings.json"),
+        &root.join("docs/sandbox/findings/findings.json"),
         &json!({
             "schema_version": 1,
             "updated": "2026-09-10",
@@ -395,7 +396,7 @@ fn hermetic_hq(brain_root: &Path) -> tempfile::TempDir {
         .to_string(),
     );
     write(
-        &root.join("docs/sandbox/test-catalogue.json"),
+        &root.join("docs/sandbox/testing/test-catalogue.json"),
         &json!({"schema_version": 1, "tests": []}).to_string(),
     );
     write(
@@ -476,7 +477,7 @@ async fn remediation_promotion_through_the_full_graph_is_idempotent() {
     assert_eq!(promotions[0]["already_promoted"], json!(false));
 
     let rem_doc: Value = serde_json::from_str(
-        &fs::read_to_string(hq_root.join("docs/sandbox/remediation.json")).unwrap(),
+        &fs::read_to_string(hq_root.join("docs/sandbox/findings/remediation.json")).unwrap(),
     )
     .unwrap();
     assert_eq!(rem_doc["remediations"].as_array().unwrap().len(), 1);
@@ -493,7 +494,7 @@ async fn remediation_promotion_through_the_full_graph_is_idempotent() {
     assert_eq!(promotions2[0]["already_promoted"], json!(true));
 
     let rem_doc_after: Value = serde_json::from_str(
-        &fs::read_to_string(hq_root.join("docs/sandbox/remediation.json")).unwrap(),
+        &fs::read_to_string(hq_root.join("docs/sandbox/findings/remediation.json")).unwrap(),
     )
     .unwrap();
     assert_eq!(

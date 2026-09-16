@@ -89,3 +89,5 @@ directly — must treat the "Research Brief" section of a lead-sourced opportuni
 - [`../materialize-doc-node.md`](../materialize-doc-node.md) — the writer node and the
   `DocMaterializer` seam this workflow is built from.
 - [opportunity-edit.md](opportunity-edit.md) — the micro-workflows that edit the document afterwards.
+- [`../nodes/molecules/doc-plus-contacts-ingest.md`](../nodes/molecules/doc-plus-contacts-ingest.md) — this workflow's two-node sequence is a proven molecule, shared literally with `RESEARCH_AGENT`
+- Full node catalogue: [`../nodes/index.md`](../nodes/index.md)

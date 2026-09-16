@@ -616,3 +616,14 @@ has run; `GET /workflows/RESEARCH_AGENT/graph` returns the declared schema above
   deduped union to the sweep document's frontmatter with `validation_required: true`, while each
   lead's own list survives verbatim in the embedded `## Research Brief` JSON. Nothing is written
   outside the tempdir and no test spawns a real `claude`.
+
+## Node / molecule library
+
+- `MaterializeDocNode → MergeContactsNode` here is the proven
+  [`doc-plus-contacts-ingest`](../nodes/molecules/doc-plus-contacts-ingest.md) molecule, shared
+  literally with `LEAD_INGEST`
+- `CompanyResearchNode` is a near-duplicate of `proposal_generator::ProposalCompanyResearchNode` —
+  see [`company-research-pair`](../nodes/molecules/company-research-pair.md)
+- `ResearchIngressDispatchNode` is a near-duplicate of `content_pipeline::ActionDispatchNode` — see
+  [`research-dispatch-pair`](../nodes/molecules/research-dispatch-pair.md)
+- Full node catalogue: [`../nodes/index.md`](../nodes/index.md)

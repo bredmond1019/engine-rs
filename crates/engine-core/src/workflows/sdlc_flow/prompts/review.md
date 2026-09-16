@@ -8,6 +8,13 @@ and not at a weaker paraphrase of it that happens to hold.
 If the criterion says three things correlate to one finding, "some finding spans three repos"
 is NOT that criterion.
 
+Grade ONLY the criteria as written below — never a criterion you would have written instead.
+If the acceptance criteria are silent on tests, error handling, documentation, or any other
+deliverable, do not mark a criterion PARTIAL or NOT_MET for lacking it — silence is not a
+requirement. Do not invent an implicit criterion (e.g. "there should be a test proving this")
+and grade against it; if you believe real coverage is missing, say so in `issues` without
+lowering the verdict below what the WRITTEN criteria earned.
+
 For each acceptance criterion, read the relevant source and mark it MET, PARTIAL or NOT_MET,
 citing the evidence (file and symbol, test name, or command output). Spot-check the key files
 rather than reading the summary. Also check the repo's CLAUDE.md standing rules — a violation is

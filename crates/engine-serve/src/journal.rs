@@ -702,9 +702,20 @@ fn compose_ledger_entries_via_agent(
             .await
             .map_err(|err| format!("verification-ledger composer call failed: {err}"))?;
 
-        let content = ctx
-            .nodes
-            .get(LEDGER_COMPOSER_NODE_NAME)
+        let node_result = ctx.nodes.get(LEDGER_COMPOSER_NODE_NAME);
+        let transport_tier = node_result
+            .and_then(|value| value.get("transport"))
+            .and_then(|t| t.get("tier"))
+            .and_then(Value::as_str);
+
+        if model_tier == ModelTier::Local && transport_tier != Some("local") {
+            return Err(format!(
+                "verification-ledger composer fell back to {:?} transport despite Local tier requested",
+                transport_tier.unwrap_or("unknown")
+            ));
+        }
+
+        let content = node_result
             .and_then(|value| value.get("content"))
             .and_then(Value::as_str)
             .unwrap_or_default();
@@ -947,7 +958,7 @@ mod tests {
     use crate::live_state::LiveStateStore;
 
     /// `EN.ticket.transport-slot-consolidation` follow-up: the ledger composer's
-    /// `composer_model_tier: local` path, proven against a REAL local Ollama endpoint —
+    /// `ledger_composer_model_tier: local` path, proven against a REAL local Ollama endpoint —
     /// not just that the policy resolves, but that `compose_ledger_entries_via_agent`
     /// actually dispatches through `resolve_meta_transport`/`with_meta_transport` instead
     /// of silently falling back to a real Claude call. `#[ignore]`d like this repo's other
@@ -967,7 +978,7 @@ mod tests {
             serde_json::json!({
                 "orchestration": {
                     "policy": {
-                        "composer_model_tier": "local"
+                        "ledger_composer_model_tier": "local"
                     }
                 }
             })
@@ -993,20 +1004,40 @@ mod tests {
             total_tokens: 0,
         };
 
+        let policy = super::resolve_ledger_composer_policy(tmp.path());
+        assert_eq!(
+            policy.ledger_composer_model_tier,
+            engine_core::policy::ModelTier::Local,
+            "harness.json must resolve ledger_composer_model_tier to Local"
+        );
+
         let result = super::compose_ledger_entries_via_agent(&outcome).await;
 
         // A real Ollama call either parses cleanly (Ok) or fails with a composer-output
         // parse error (the model didn't return the expected JSON shape) -- both prove the
         // call actually reached Ollama. A transport-level failure (connection refused, CLI
-        // not found, or a Claude-auth error) proves the OPPOSITE -- that this still silently
-        // fell back to a real cloud call or hit no endpoint at all -- and must fail the test.
+        // not found, or a Claude-auth error) or a silent cloud fallback proves the OPPOSITE
+        // -- that this still silently fell back to a real cloud call or hit no endpoint at all
+        // -- and must fail the test.
         match result {
-            Ok(_) => {}
+            Ok(entries) => {
+                // Real Ollama call succeeded and returned a valid JSON array of entries.
+                for entry in entries {
+                    assert!(!entry.id.is_empty(), "candidate entry must have an id");
+                }
+            }
             Err(err) => {
                 assert!(
-                    err.contains("composer output"),
-                    "expected a real-Ollama parse-shape error, got a transport-level failure \
-                     instead (this means the local route was NOT actually taken): {err}"
+                    !err.contains("fell back to"),
+                    "verification-ledger composer silently fell back to cloud transport: {err}"
+                );
+                assert!(
+                    !err.contains("verification-ledger composer call failed"),
+                    "transport-level failure contacting local Ollama endpoint: {err}"
+                );
+                assert!(
+                    err.contains("composer output JSON"),
+                    "expected a real-Ollama parse-shape error, got: {err}"
                 );
             }
         }

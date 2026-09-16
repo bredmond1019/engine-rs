@@ -5,7 +5,7 @@ description: Chronological log of work completed for engine-rs.
 doc_id: log
 layer: [factory]
 status: active
-timestamp: "2026-09-15T00:42:55Z"
+timestamp: "2026-09-15T21:05:00Z"
 keywords: [work log, session history, development log]
 related: [status, context]
 ---
@@ -14,7 +14,131 @@ related: [status, context]
 
 *Append-only working log. One dated entry per session. Newest entries at the top.*
 
+## [run: 2026-09-15]
+
+`/sdlc-flow EN.19.B` — PLAN_AUTHORING workflow: a Node-composed `/plan` that turns a
+`notes.md`/`sequence.md` into `plan.md` + reviewable candidate block records. All 7 tasks passed,
+PASS review. Task 1 scaffolded the `plan_authoring` module (`CheckExistingPlanNode` short-circuits a
+repeat run unless `force_regenerate`, `GatherPlanContextNode` gathers CLAUDE.md/context.md/state.json
+wave + pre-plan folder context). Task 2 added `DecomposePlanNode`, the one model-calling stage
+(`TransportSlotted`+`Cancellable`, D24 colocated `prompts/decompose.md`), with `mark_incomplete`
+staging any candidate missing a required field rather than dropping it. Task 3 added
+`StageCandidateBlocksNode`, which mints a `<PREFIX>.<phase>.<letter>` id and hand-validates each
+candidate against `block.schema.json` — never touching `mev` or `state.json` (grep-verified). Task 4
+added `WritePlanNarrativeNode`, rendering `plan.md` from the staged candidate-block JSON files
+(OKF frontmatter, `related: [master-plan]`, one heading per block, Cut list, Sequence table). Task 5
+assembled the `PLAN_AUTHORING` workflow graph and registered it via `register_plan_authoring` in
+engine-serve, with `planning/harness.json` documenting the (currently doc-only) enable flag and
+decompose model-tier knob. Task 6 added the `plan_authoring` integration suite (dispatch/schema
+validity, idempotency, `force_regenerate`, and the no-mev/no-state.json grep). Task 7 documented
+`PLAN_AUTHORING` in `docs/workflows/README.md` and corrected its stale registered-workflow count;
+full workspace suite (4582 tests) and release build both pass. Closes `EN.19.B`. Next: `EN.19.C` —
+GenerateTasksNode reads a real block record, not just `planning/*.md`.
+
+```
+31568c2 feat: implement EN.19.B-task7
+aca4e6e feat: implement EN.19.B-task6
+ba672ac feat: implement EN.19.B-task5
+c48365a feat: implement EN.19.B-task4
+bb5a43c feat: implement EN.19.B-task3
+400f7c0 feat: implement EN.19.B-task2
+ae79646 feat: implement EN.19.B-task1
+```
+
+## [2026-09-15]
+
+### planning-command-nodes lane (EN.19.A-D): fmt/clippy baseline repair, EN.19.A paused on a pre-existing test defect
+- **What:**
+  - Ran `/begin-orchestration --roadmap planning-command-nodes --lane planning-command-nodes`. Before
+    generating tasks, re-derived `EN.19.A`/`B`/`C`'s block records' premises: all three named a stale
+    pre-plan output path (`planning/pre-plan/<slug>/`, superseded 2026-09-07 by D87's
+    `$BRAIN_ROOT/planning/open-work/pre-plan/<slug>/`) and `EN.19.A`/`B` named the wrong workflow_type
+    registration file (`http.rs` instead of `workflows.rs`). Amended all three records in place (D18).
+  - `/sdlc-flow EN.19.A` bailed task 1 on a repo-wide pre-existing failure: `cargo fmt --check` (29 diff
+    hunks, 12 files) and `cargo clippy --all-features -- -D warnings` (8 errors in
+    `orchestration/integrate.rs`) were already red on `main`, blocking every future SDLC task in this
+    repo. Filed and fixed as its own chore, `EN.chore.fmt-clippy-baseline-repair` (closed) — boxed
+    `IntegrateError::PermissionGate`'s payload, added a named `AuthorOperatorEdge` type alias, ran
+    `cargo fmt`. Also corrected `harness.json`'s stale `composer_model_tier` key to the
+    `ledger_composer_model_tier` key the code actually reads (a carried-forward defect from
+    2026-09-14's handoff).
+  - Merged the fix into `EN.19.A-flow` and resumed. 6 of 7 tasks landed (the `pre_plan` workflow
+    module, `PRE_PLAN` registration, the webhook route, integration tests, a doc-restructuring pass).
+    Task 7 (terminal Validate) bailed on `consolidate::remediation_promotion_through_the_full_graph_is_idempotent`,
+    traced precisely to commit `116d994` (EN.15.K, 2026-09-11) — a pre-existing defect, unrelated to
+    this initiative, that now blocks every future spec's terminal Validate task too. Filed as
+    `carryover[]` (`consolidate-remediation-promotion-test-missing-fixture-dir`, defect, priority 2),
+    along with the pre-existing `pi_transport`/`agent_backend` timeout-test flakiness both this session
+    and 2026-09-14's independently observed (`pi-transport-timeout-tests-flaky-under-parallel-nextest`,
+    deferred, priority 3).
+  - Per orchestrate's stop-on-fail rule, the chain stopped there — `EN.19.A` stays `open`, not closed;
+    PR #95 stays a draft. `EN.19.B`/`EN.19.C` specced (not run); `EN.19.D` not yet specced (composes
+    A/B/C's real code, needs it to exist first).
+- **Why:** Operator-directed run of the planning-command-nodes roadmap. The fmt/clippy and
+  `consolidate::` defects were both genuine, repo-wide blockers surfaced mid-run, not part of the
+  initiative itself — fixed/filed rather than worked around, since every future spec in this repo
+  would otherwise hit them too.
+- **Refs:** `planning/orchestration-run/planning-command-nodes/{notes.md,review.md,verification-ledger.md}`,
+  `planning/handoff.md`.
+
+### Local-model-bench root-cause pass: worktree-slot reuse, ORCHESTRATION error attribution, review-verdict/prompt fixes, model retirement, and the real pi-vs-aider gap
+- **What:**
+  - **Worktree/block-slot reuse hardened:** `run_one_job_orchestration`'s end-of-job block reopen (`mev set-block-status ... open --write`) was fire-and-forget, leaving the shared slot wrong for the next job on failure. Now checked and logged against the job that caused it. Added `unload_ollama_model()` (`keep_alive: 0`) after every job in both dispatch modes to remove model-switch resource contention. Retired `qwen2.5:3b`/`llama3.2:3b` from `--models all` (genuine model-capacity losses, not harness bugs); `--models` now also accepts a JSON array. `--include-retired` re-adds them. (`fea8a83`)
+  - **`capture_evidence()` fixed for orchestration mode:** hardcoded the module-level `REPO_DIR` instead of the sandbox's own checkout, so orchestration-mode jobs never had their `sdlc/` state captured into artifacts (scored results were unaffected — `harvest_state()` was already sandbox-aware). Now takes an explicit `repo_dir`, resolved at call time. (`a13569c`)
+  - **ORCHESTRATION misattribution fixed:** an attempts-exhausted run (`WrapUpNode`→`CloseBlockNode`→`PullRequestNode`→`EmitStateNode` all succeed as nodes on this path) was reported as the opaque `node '<unknown>' did not succeed`, indistinguishable from a real crash. `execute_step`'s `ChildFailed` attribution now falls back to `metadata.failure.error` before the placeholder. (`629de87`, 3239/3239 `cargo nextest run -p engine-core --lib`)
+  - **Review verdict/prompt fixes:** `unrecognized end-review verdict: NOT_MET` (model echoing per-criterion vocabulary into the top-level verdict field) fixed via `normalize_pass_fail_partial_synonym` in `EndReviewNode`/`ConsolidatedReviewNode` (`a323bab`). Review prompt was penalizing runs for requirements never in the stated AC (e.g. demanding a test the AC didn't ask for) — added explicit scope-discipline instruction (`c40fb90`).
+  - **Root-caused the real pi-vs-aider gap:** a `pi`-only rerun (no aider ordering confound) still scored `qwen2.5-coder:14b`/`deepseek-r1:14b` 0/3, with real 4-attempt runs (3200+ output tokens each) but zero file changes — confirmed via direct `curl` to local Ollama that its OpenAI-compat endpoint doesn't populate `tool_calls` for these models' chat templates (`gpt-oss:20b` does, cleanly). Matches `pi_agent_rust` upstream issue #148; a fallback tool-call-recovery patch is in progress in `core/pi_agent_rust`. `aider` never hits this — it doesn't use `tools`/`tool_calls` at all.
+- **Why:** Operator-directed deep dive into the overnight sandbox sweep's failure patterns, to separate real model-quality misses from harness/engine bugs before trusting any aider-vs-pi comparison.
+- **Refs:** `planning/open-work/local-models/local-model-bench/findings-log.md` (full root-cause writeups), `docs/local-model-bench.md` pitfalls #21-25.
+
+### Overnight sweep telemetry investigation, data cleanup, and local reporting fixes across fleet & sandbox
+- **What:**
+  - **Telemetry Investigation:** Investigated appearance of `claude_cli` and `sonnet` in `summary.json`. Confirmed 0 cloud spend in reality (71/72 jobs cost $0.00; single job was reading stale state left over from manual testing). Backed up raw dataset to `summary.raw-backup.json` and documented full investigation in `TELEMETRY_INVESTIGATION.md`. Cleaned all 72 individual job JSON files and `summary.json` to accurately reflect local model execution.
+  - **Backend Labeling Fix:** Fixed `crates/engine-core/src/nodes/openai_compat_transport.rs` (line 322) which hardcoded `backend: "claude_cli"` on the successful local HTTP path to report `backend: "openai_compat"`.
+  - **Local Implement Tier Fix:** Updated `crates/engine-core/src/workflows/sdlc_flow/wrap_up.rs` to report `"local"` for `implement` and `implement_simple` when `policy.agent_backend` is `Aider` or `Pi`, avoiding fallthrough to the unstated `Sonnet` default. Added test `wrap_up_records_local_implement_tier_for_local_agent_backends`.
+  - **Bench Script Hardening:** Updated `scripts/bench_local_models.py` to explicitly set `"implement": "local"` and `"implement_simple": "local"` in `build_event_body`, and added pre-dispatch `shutil.rmtree(work_dir / "sdlc", ignore_errors=True)` to prevent stale state harvest on early worktree failures.
+- **Why:** Ensure local model benchmark runs report uniform and accurate local transport/tier telemetry and prevent stale artifact harvesting across both fleet and sandbox.
+- **Refs:** `TELEMETRY_INVESTIGATION.md`, `summary.raw-backup.json`, `summary.json`
+
 ## [2026-09-14]
+
+### Overnight sandbox sweep launched, cloud leak patched, system monitor alert hooked, 4 carryovers cleared
+- **What:**
+  - **Overnight Sandbox Sweep & Cloud Leak Fix:** Launched the full 130-job overnight local model sweep (`overnight-sandbox-2026-09-14`) targeting sandbox Bastion (`http://localhost:18090`). Patched a critical cloud call leak in `scripts/bench_local_models.py` (`build_orchestration_event_body` previously set only `child_sdlc_task_policy`, but `EN.*` blocks dispatch as `SDLC_FLOW`, which reads `child_sdlc_flow_policy` and fell back to Sonnet 4.5). Corrected state harvesting to check `sdlc-flow-state.json` before `sdlc-task-state.json`. Verified 0 cloud spend and audited early jobs to rule out false positives.
+  - **System Monitor Agent Alert Hook:** Updated `scripts/dev-tooling/system_monitor.py` to add `notify_agent` and `trigger_alert`, appending structured alert records to `<run-dir>/system_monitor_alerts.jsonl` and `/tmp/system_monitor_alerts.jsonl` whenever CPU, memory, or swap exceed warning/critical thresholds.
+  - **Carryover `orchestration-dev-node-invocations-table-missing` cleared:** Applied database migrations `0001_create_journal.sql`, `0002_create_node_invocations.sql`, and `0003_add_node_invocation_payload.sql` to local postgres `orchestration_dev`. Verified tables and columns exist matching `engine-store/src/postgres.rs`.
+  - **Carryover `ledger-composer-harness-key-mismatch` cleared:** Fixed `planning/harness.json` key name collision (`ledger_composer_model_tier`), updated test fixture and assertions in `crates/engine-serve/src/journal.rs`. Test passes against live Ollama.
+  - **Carryover `aider-mention-reflection-discards-pending-edit` cleared:** Added isolated `.aiderignore` generation, `--no-gitignore`, and `--aiderignore <path>` in `crates/engine-core/src/nodes/aider_transport.rs` with RAII tempfile cleanup. Verified 33 passing tests in `crates/engine-core/tests/it/agent_backend.rs`.
+  - **Carryover `check-permission-gate-never-wired-into-orchestration-loop` cleared:** Wired `gates::check_permission_gate` into `integrate_chain_impl_inner` loop in `crates/engine-core/src/workflows/orchestration/integrate.rs` with dual `OnBail` semantics (`StopChain` halts immediately with `IntegrateError::PermissionGate`, `SkipDependents` records operator edge and transitively skips dependents while continuing independent steps). Added 4 new integration tests in `crates/engine-core/tests/it/orchestration.rs`; all 475 orchestration tests pass.
+  - Verified full workspace test suite: 3878 / 3878 tests passed (`cargo nextest run --lib --workspace`).
+- **Why:** Directed by operator to launch overnight model sweep, wire system monitoring alerts, resolve the four outstanding defect carryovers, verify no false positives, and log work once cleared.
+- **Refs:** `docs/overnight-sandbox-sweep-quickstart.md`, `planning/state.json`, `planning/harness.json`
+
+### Fleet-wide push, ledger-composer key-mismatch bug fixed, handoff reprioritized for tonight's overnight sweep
+- **What:**
+  - Pushed the entire fleet (17 repos) to `origin/main` one at a time, plain `git push`, no
+    build/test step, in dependency order — 10 repos had real commits (`engine-rs`, `bastion`,
+    `bastion-ui`, `bastion-web`, `brazilianportugui`, `feli`, `jardins-fitness`, `jynx`, `learn-ai`,
+    `price-scout`, `synapse`), 7 already in sync. `engine-rs` moved `8318e32..51362cc`, finally
+    landing the long-pending `8080736` revert of the old bench-junk merge.
+  - Found a real bug verifying tonight's sandbox sweep would be genuinely zero-cloud: the D57 ledger
+    composer's local-routing config key is `ledger_composer_model_tier`, but every place this
+    session had set or tested it earlier used the wrong, pre-existing `composer_model_tier` key (a
+    name collision with an older, unrelated knob) — silently ignored by serde, falling through to
+    the built-in cloud default. Fixed for real in the sandbox's own `planning/harness.json`.
+    Confirmed the `#[ignore]`'d unit test for this has the same wrong-key bug in its own fixture,
+    and its assertion can't actually distinguish a real Ollama response from a real Claude one that
+    also failed to parse — flagged as carryover, not fixed tonight.
+  - Re-verified the sandbox after refresh: `--dry-run` now shows 130 jobs planned across all 5
+    tiers with 0 preflight failures (the `edit`/`medium`/`hard` tiers had failed earlier tonight
+    because their checker scripts lived only in unpushed local commits).
+  - Rewrote `planning/handoff.md` to lead with tonight's actual priority — the overnight sandbox
+    model sweep (`docs/overnight-sandbox-sweep-quickstart.md`) — with tomorrow morning's
+    orchestration-verification pass second.
+- **Why:** the operator wants to hand tonight's full local-model sweep to a fresh (Gemini Flash)
+  agent right now, cold, off the handoff alone — that required the sandbox to actually be pushable
+  end to end (all 5 tiers, not 2) and genuinely zero-cloud (not just configured-and-unverified).
+- **Refs:** `planning/handoff.md`, `planning/pre-plan/orchestration-improvements/`
 
 ### llm_node trait consolidation across sdlc_flow/sdlc_task/orchestration; local-only ORCHESTRATION hardening
 - **What:**

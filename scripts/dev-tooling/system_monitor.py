@@ -136,6 +136,43 @@ def send_telegram(text: str) -> None:
         print(f"[monitor] bastion notify send failed: {exc}", file=sys.stderr)
 
 
+def notify_agent(
+    severity: Severity,
+    reasons: list[str],
+    details: str,
+    alert_log_path: Path | None = None,
+) -> None:
+    """Notify the agent by appending a structured alert record for review."""
+    alert_record = {
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "severity": severity.name,
+        "reasons": reasons,
+        "details": details,
+        "reviewed": False,
+    }
+    targets = [Path("/tmp/system_monitor_alerts.jsonl")]
+    if alert_log_path:
+        targets.append(alert_log_path)
+    for p in targets:
+        try:
+            p.parent.mkdir(parents=True, exist_ok=True)
+            with p.open("a") as f:
+                f.write(json.dumps(alert_record) + "\n")
+        except Exception as exc:  # noqa: BLE001
+            print(f"[monitor] agent alert notification failed: {exc}", file=sys.stderr)
+
+
+def trigger_alert(
+    severity: Severity,
+    reasons: list[str],
+    text: str,
+    alert_log_path: Path | None = None,
+) -> None:
+    """Trigger alerts to both the operator (Telegram) and the agent."""
+    send_telegram(text)
+    notify_agent(severity, reasons, text, alert_log_path)
+
+
 def top_processes(n: int = 5) -> list[str]:
     out = subprocess.run(
         ["ps", "aux"], capture_output=True, text=True, timeout=15, check=True,
@@ -213,6 +250,8 @@ def main() -> None:
         recovered = severity is NONE and state is not NONE
         due_for_renotify = severity.order > 0 and (now - last_notify) >= args.renotify_minutes * 60
 
+        alert_log_path = args.log.parent / "system_monitor_alerts.jsonl"
+
         if severity.order > 0 and len(window) == window.maxlen and (escalated or due_for_renotify):
             procs = "\n".join(top_processes())
             text = (
@@ -220,13 +259,14 @@ def main() -> None:
                 f"\n(rolling avg over last {len(window)} samples)"
                 f"\nTop processes:\n{procs}"
             )
-            send_telegram(text)
+            trigger_alert(severity, reasons, text, alert_log_path)
             last_notify = now
         elif recovered and len(window) == window.maxlen:
-            send_telegram(
+            recovery_text = (
                 f"[bench-monitor] recovered: CPU {avg_cpu:.1f}%, mem free {avg_mem_free:.1f}%, "
                 f"swap {avg_swap:.2f}GB — back under warn thresholds"
             )
+            trigger_alert(NONE, ["recovered"], recovery_text, alert_log_path)
             last_notify = now
 
         state = severity

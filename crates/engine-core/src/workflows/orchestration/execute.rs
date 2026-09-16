@@ -703,11 +703,29 @@ pub async fn execute_step(
     // and stop the chain here rather than integrating a failed step as a
     // success.
     if derive_terminal_status(&ctx) == "failed" {
+        // A terminal-blocked or attempts-exhausted run reaches every remaining
+        // node NORMALLY (`WrapUpNode` stamps `metadata.failure` and returns
+        // `Ok`, per its own doc comment) -- so `derive_terminal_status` can
+        // report "failed" with NO `node_runs[..]` entry ever set to `Failed`.
+        // Falling back to a bare "<unknown>" in that case reads as an engine
+        // crash when it is actually the spec's own legitimate outcome (e.g.
+        // "Max attempts (3) reached without a passing run"), which sent a real
+        // bench triage down the wrong path (see `EN.local-model-bench` review
+        // notes: the generic message hid that the child ran to completion and
+        // simply did not pass). Prefer the human-readable reason
+        // `WrapUpNode`/`stamp_failure` already recorded over a placeholder.
         let failing_node = ctx
             .node_runs
             .iter()
             .find(|(_, run)| run.status == NodeRunStatus::Failed)
             .map(|(name, _)| name.clone())
+            .or_else(|| {
+                ctx.metadata
+                    .get(crate::completion::FAILURE_METADATA_KEY)
+                    .and_then(|v| v.get("error"))
+                    .and_then(|v| v.as_str())
+                    .map(|reason| format!("<no failing node -- {reason}>"))
+            })
             .unwrap_or_else(|| "<unknown>".to_string());
         return Err(ExecuteError::ChildFailed {
             repo: step.repo.clone(),
@@ -1583,6 +1601,67 @@ mod tests {
         assert!(
             msg.contains("SetupWorktreeNode"),
             "message should name the failing node: {msg}"
+        );
+    }
+
+    /// A `FlowRunner` test double mirroring the REAL attempts-exhausted shape
+    /// (`WrapUpNode`'s own doc comment): every node_run succeeds, but
+    /// `metadata.failure` is stamped with the human-readable reason, exactly
+    /// as `crate::completion::stamp_failure` does on a terminal-blocked run.
+    fn ok_but_metadata_failure_runner(reason: &'static str) -> FlowRunner {
+        Arc::new(move |_invocation: FlowInvocation| {
+            Box::pin(async move {
+                Ok(TaskContext {
+                    event: json!({}),
+                    nodes: std::collections::HashMap::new(),
+                    metadata: json!({"failure": {"failed": true, "error": reason}}),
+                    node_runs: std::collections::HashMap::new(),
+                })
+            })
+        })
+    }
+
+    #[tokio::test]
+    async fn a_child_with_no_failed_node_but_a_stamped_failure_names_the_reason_not_unknown() {
+        // Reproduces the overnight-sandbox-2026-09-14/pi-rerun-2026-09-15 bench
+        // symptom: a task that legitimately exhausts its attempts (max_attempts
+        // reached, no node crashed) reached WrapUpNode -> CloseBlockNode ->
+        // PullRequestNode -> EmitStateNode normally, yet `execute_step` reported
+        // `node '<unknown>' did not succeed` -- indistinguishable from a real
+        // engine crash and actively misleading triage.
+        let (_dir, registry) = two_repo_registry();
+        let resolve_engine = |_repo: &str, _id: &str| EngineKind::Flow;
+        let runner = ok_but_metadata_failure_runner(
+            "SDLC run ended blocked: Max attempts (3) reached without a passing run",
+        );
+
+        let s = step("repo-a", "A.1");
+        let err = execute_step(
+            &s,
+            &resolve_engine,
+            &registry,
+            &runner,
+            false,
+            true,
+            Uuid::new_v4(),
+            None,
+            None,
+            PermissionProfile::Standard,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect_err("a stamped metadata.failure with no failed node must still fail the step");
+
+        let msg = err.to_string();
+        assert!(
+            !msg.contains("<unknown>"),
+            "must not fall back to the uninformative placeholder when a real reason is on hand: {msg}"
+        );
+        assert!(
+            msg.contains("Max attempts (3) reached"),
+            "message should surface WrapUpNode's own recorded reason: {msg}"
         );
     }
 

@@ -143,3 +143,7 @@ necessarily carry the aborted run's spend forward byte-for-byte.
 - [`policy-and-profiles.md`](policy-and-profiles.md) — the general four-layer precedence mechanism.
 - [`workflows-readme`](README.md) — the full capability catalogue.
 - [`../architecture.md`](../architecture.md) — where this workflow's crates and seams fit.
+- [`../nodes/molecules/queue-drain-loop.md`](../nodes/molecules/queue-drain-loop.md) — this
+  workflow's `ClaimQueueRouterNode`/`SaveVerdictNode` is a hand-copied idiom of `sdlc_flow`'s queue-drain loop, not shared code
+- [`../nodes/atoms/workflow-embedded.md`](../nodes/atoms/workflow-embedded.md) — `ClaimRecallNode`/`RenderReportNode` near-atom entries
+- Full node catalogue: [`../nodes/index.md`](../nodes/index.md)

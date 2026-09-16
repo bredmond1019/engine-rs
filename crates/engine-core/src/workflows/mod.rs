@@ -39,6 +39,7 @@ pub mod linkedin_post;
 pub mod llm_node;
 pub mod opportunity_edit;
 pub mod orchestration;
+pub mod plan_authoring;
 pub mod proposal_generator;
 pub mod queue_park;
 pub mod recall;
@@ -449,6 +450,58 @@ pub(crate) fn parse_model_verdict<T: serde::de::DeserializeOwned>(
             raw_preview: truncate_for_diagnostics(content),
             reason: err.to_string(),
         },
+    }
+}
+
+/// Map a raw (already-uppercased) verdict string onto the shared
+/// `PASS`/`FAIL`/`PARTIAL` vocabulary `EndReviewNode` and
+/// `ConsolidatedReviewNode` both ask for in their prompt. Local-model bench
+/// (2026-09-14, `edit/aider/qwen2.5-coder:32b`) observed a real reviewer
+/// reply carrying `"NOT_MET"` — the per-criterion MET/NOT_MET vocabulary the
+/// rendered Acceptance Criteria itself uses — instead of the instructed
+/// top-level verdict word, and the exact match sent an otherwise-legible
+/// review to `unrecognized_verdict`/`MajorBail`. This narrows that specific,
+/// observed synonym confusion; it is not a general fuzzy-matcher — an
+/// unrecognized string still falls through to the caller's existing
+/// `unrecognized_verdict` fallback unchanged.
+pub(crate) fn normalize_pass_fail_partial_synonym(verdict: &str) -> String {
+    match verdict {
+        "MET" => "PASS".to_string(),
+        "NOT_MET" | "UNMET" => "FAIL".to_string(),
+        "PARTIAL_MET" | "PARTIALLY_MET" => "PARTIAL".to_string(),
+        other => other.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod normalize_pass_fail_partial_synonym_tests {
+    use super::normalize_pass_fail_partial_synonym;
+
+    #[test]
+    fn maps_met_not_met_partial_met_synonyms() {
+        assert_eq!(normalize_pass_fail_partial_synonym("MET"), "PASS");
+        assert_eq!(normalize_pass_fail_partial_synonym("NOT_MET"), "FAIL");
+        assert_eq!(normalize_pass_fail_partial_synonym("UNMET"), "FAIL");
+        assert_eq!(
+            normalize_pass_fail_partial_synonym("PARTIAL_MET"),
+            "PARTIAL"
+        );
+        assert_eq!(
+            normalize_pass_fail_partial_synonym("PARTIALLY_MET"),
+            "PARTIAL"
+        );
+    }
+
+    #[test]
+    fn leaves_canonical_and_unknown_values_untouched() {
+        assert_eq!(normalize_pass_fail_partial_synonym("PASS"), "PASS");
+        assert_eq!(normalize_pass_fail_partial_synonym("FAIL"), "FAIL");
+        assert_eq!(normalize_pass_fail_partial_synonym("PARTIAL"), "PARTIAL");
+        assert_eq!(normalize_pass_fail_partial_synonym("WAT"), "WAT");
+        assert_eq!(
+            normalize_pass_fail_partial_synonym("UNPARSEABLE"),
+            "UNPARSEABLE"
+        );
     }
 }
 
