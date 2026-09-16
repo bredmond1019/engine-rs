@@ -393,7 +393,7 @@ upstream) — see pitfalls 17/18 above and the callout on the patched `pi` binar
 As of `65f102e` (2026-09-14), `OrchestrationPolicy.preflight_model_tier`/`inbox_triage_model_tier:
 local` actually dispatch to a local model — before, the tier resolved through policy but no
 production call site forwarded it, so `local` silently did nothing (see [orchestration.md
-§ preflight_model_tier](orchestration.md), [policy-and-profiles.md](policy-and-profiles.md)). **This
+§ preflight_model_tier](workflows/orchestration.md), [policy-and-profiles.md](workflows/policy-and-profiles.md)). **This
 bench script does not exercise either stage** — every job here dispatches `SDLC_FLOW` only, and
 `ORCHESTRATION`'s preflight/inbox-triage runs are a separate workflow this bench has no job type
 for. No result in this runbook's leaderboards says anything about local-model quality on either
