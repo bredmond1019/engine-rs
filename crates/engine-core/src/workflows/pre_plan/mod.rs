@@ -76,6 +76,7 @@ use crate::workflows::{get_result, put_result};
 pub mod check_existing;
 pub mod intake;
 pub mod research;
+pub mod secret_guard;
 pub mod write_notes;
 
 /// The `PRE_PLAN` workflow's declared identity/type name, used both to
@@ -166,6 +167,21 @@ pub struct PrePlanPolicy {
     /// built-in [`AgentBackend`] default) matches today's only-ever-behavior,
     /// so introducing this field is behavior-stable.
     pub research_backend: AgentBackend,
+    /// `fnmatch`-style glob patterns (case-insensitive, basename-only) a
+    /// file must match to count as "secret-shaped" for
+    /// [`secret_guard::SecretGuardNode`] (task 9). Built-in default:
+    /// [`secret_guard::DEFAULT_SECRET_GUARD_PATTERNS`] — byte-identical to
+    /// the global `~/.claude/hooks/deny-secret-paths.py` deny-list already
+    /// validated this session, so this node's notion of "secret-shaped"
+    /// does not diverge from the fleet's existing one.
+    pub secret_guard_patterns: Vec<String>,
+    /// Where [`secret_guard::SecretGuardNode`] scans for secret-shaped
+    /// files. `None` (the built-in default) resolves via
+    /// `crate::brain_root::resolve_brain_root()` at run time, matching
+    /// every other path-resolving knob in this policy
+    /// (`registry_for_policy`'s doc comment, `MaterializeConfig::corpus_root`
+    /// elsewhere in this crate) rather than a policy-pinned root.
+    pub secret_guard_scan_root: Option<String>,
 }
 
 impl Default for PrePlanPolicy {
@@ -181,8 +197,25 @@ impl Default for PrePlanPolicy {
             research_model_tier: ModelTier::Sonnet,
             local: LocalConfig::default(),
             research_backend: AgentBackend::default(),
+            secret_guard_patterns: secret_guard::default_patterns(),
+            secret_guard_scan_root: None,
         }
     }
+}
+
+/// Deserialize a nested `Option<Option<T>>` so an explicit JSON `null`
+/// survives as `Some(None)` ("override to unset/resolve-at-runtime") rather
+/// than collapsing into `None` ("not overridden") — the same shape
+/// `content_pipeline::policy`'s `corpus_root` field uses for the identical
+/// "an `Option<String>` field, itself overridable" case. Paired with
+/// `#[serde(default)]` on the struct, an *absent* key still deserializes to
+/// `None`.
+fn double_option<'de, D, T>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer).map(Some)
 }
 
 /// All-optional mirror of [`PrePlanPolicy`] used by the override layers
@@ -196,6 +229,13 @@ pub struct PartialPrePlanPolicy {
     pub research_model_tier: Option<ModelTier>,
     pub local: Option<PartialLocalConfig>,
     pub research_backend: Option<AgentBackend>,
+    pub secret_guard_patterns: Option<Vec<String>>,
+    /// `None` = not overridden; `Some(None)` = override to
+    /// "resolve-at-runtime"; `Some(Some(root))` = pin this scan root. An
+    /// explicit JSON `null` deserializes to `Some(None)` — see
+    /// [`double_option`].
+    #[serde(deserialize_with = "double_option")]
+    pub secret_guard_scan_root: Option<Option<String>>,
 }
 
 impl Policy for PrePlanPolicy {
@@ -213,6 +253,14 @@ impl Policy for PrePlanPolicy {
                 None => base.local,
             },
             research_backend: merge_opt(base.research_backend, over.research_backend),
+            secret_guard_patterns: merge_opt(
+                base.secret_guard_patterns,
+                over.secret_guard_patterns.clone(),
+            ),
+            secret_guard_scan_root: match &over.secret_guard_scan_root {
+                Some(v) => v.clone(),
+                None => base.secret_guard_scan_root,
+            },
         }
     }
 }
@@ -227,6 +275,7 @@ pub fn baseline() -> PartialPrePlanPolicy {
         enabled: Some(true),
         research_model_tier: Some(ModelTier::Sonnet),
         research_backend: Some(AgentBackend::default()),
+        secret_guard_patterns: Some(secret_guard::default_patterns()),
         ..Default::default()
     }
 }
@@ -238,6 +287,7 @@ pub fn cheap_fast() -> PartialPrePlanPolicy {
         enabled: Some(true),
         research_model_tier: Some(ModelTier::Haiku),
         research_backend: Some(AgentBackend::default()),
+        secret_guard_patterns: Some(secret_guard::default_patterns()),
         ..Default::default()
     }
 }
@@ -249,6 +299,7 @@ pub fn thorough() -> PartialPrePlanPolicy {
         enabled: Some(true),
         research_model_tier: Some(ModelTier::Opus),
         research_backend: Some(AgentBackend::default()),
+        secret_guard_patterns: Some(secret_guard::default_patterns()),
         ..Default::default()
     }
 }
@@ -599,6 +650,29 @@ mod tests {
         assert!(!policy.enabled);
         assert_eq!(policy.research_model_tier, ModelTier::Sonnet);
         assert_eq!(policy.research_backend, AgentBackend::ClaudeCli);
+    }
+
+    #[test]
+    fn builtin_default_secret_guard_patterns_non_empty_and_scan_root_unset() {
+        let policy = PrePlanPolicy::default();
+        assert!(!policy.secret_guard_patterns.is_empty());
+        assert_eq!(policy.secret_guard_scan_root, None);
+    }
+
+    #[test]
+    fn apply_overrides_secret_guard_scan_root_and_patterns() {
+        let base = PrePlanPolicy::default();
+        let over = PartialPrePlanPolicy {
+            secret_guard_patterns: Some(vec!["*.secret".to_string()]),
+            secret_guard_scan_root: Some(Some("/tmp/some-root".to_string())),
+            ..Default::default()
+        };
+        let resolved = base.apply(&over);
+        assert_eq!(resolved.secret_guard_patterns, vec!["*.secret".to_string()]);
+        assert_eq!(
+            resolved.secret_guard_scan_root,
+            Some("/tmp/some-root".to_string())
+        );
     }
 
     #[test]
