@@ -5,7 +5,7 @@ description: Chronological log of work completed for engine-rs.
 doc_id: log
 layer: [factory]
 status: active
-timestamp: "2026-09-15T21:05:00Z"
+timestamp: "2026-09-16T02:16:40Z"
 keywords: [work log, session history, development log]
 related: [status, context]
 ---
@@ -13,6 +13,129 @@ related: [status, context]
 # Log — engine-rs
 
 *Append-only working log. One dated entry per session. Newest entries at the top.*
+
+## [run: 2026-09-15]
+
+`/sdlc-flow` on branch `EN.19.A-flow` resumed `EN.19.A` past the AC6 operator gate and ran tasks
+8-10 to completion, then re-ran the consolidated end review, which returned PASS. Task 8 replaced
+`ResearchCodebaseNode`'s hardcoded `AgentBackend::ClaudeCli` with `PrePlanPolicy.research_backend`,
+threaded through `registry_for_policy`'s `resolve_meta_transport` call. Tasks 9-10 added
+`SecretGuardNode` — backend-agnostic mitigation for the revised AC6 — plus
+`secret_guard_patterns`/`secret_guard_scan_root` policy knobs (defaulting to the fleet's existing
+`deny-secret-paths.py` pattern list), wired into the `PRE_PLAN` graph between research and write,
+with leak/clean-pass-through integration tests, `planning/harness.json` and
+`docs/workflows/pre-plan.md` updated, and the full workspace suite + release build green. AC6 was
+formally revised 2026-09-15 (D18 amendment, see `planning/blocks/EN.19.A.json`): `claude-code-rs`
+has no path/permission-hook mechanism to enforce denial of the read itself (that gap is now ticketed
+separately as `CC.ticket.enforced-secret-path-denial-hook`), so this block's guarantee targets the
+artifact that actually leaves the process — `notes.md` — which `SecretGuardNode` makes airtight
+regardless of backend. All 10 tasks passed with confirmed `workAssertionPassed` outcomes. Verdict:
+PASS. Closes `EN.19.A`. Next: `EN.19.C` — GenerateTasksNode reads a real block record.
+
+```
+4eadbf8 feat: implement EN.19.A-task10
+fbfc98d feat: implement EN.19.A-task9
+06401f2 feat: PrePlanPolicy.research_backend replaces hardcoded AgentBackend::ClaudeCli
+1ece5b7 chore: wrap up EN.19.A
+67c3b9a Merge branch 'main' into EN.19.A-flow
+615ae6c fix: consolidate.rs hermetic_hq fixture uses stale flat sandbox layout
+1b53704 docs: build the Node/Molecule Library (docs/nodes/atoms, docs/nodes/molecules) and cross-link workflows
+6feae0c docs(log): record planning-command-nodes lane -- fmt/clippy baseline repair, EN.19.A paused
+```
+
+## [run: 2026-09-15]
+
+`/sdlc-flow` on branch `EN.19.A-flow` resumed `EN.19.A` past the earlier task-7 pre-existing-defect
+bail, re-ran the consolidated review, and BAILED with verdict FAIL. All 7 tasks passed with
+confirmed `workAssertionPassed` outcomes (module scaffold, `ResearchCodebaseNode`, `WriteNotesNode`,
+`PRE_PLAN` graph assembly + registration, the inbound webhook, the hermetic integration suite, and
+the deploy-boundary doc note), but the consolidated review found two unmet acceptance criteria: AC6
+(secret-path denial) assumes `claude_code_rs::Config` can enforce path-scoped denial, but it cannot
+— verified `core/claude-code-rs/src/config.rs` has no path/permission-hook mechanism, only
+`ToolConfig` allow/deny by tool name and a `dangerously_skip_permissions` bool, so the required
+"enforced denial + planted-secret-file integration test" cannot be built without new upstream SDK
+capability (a permission callback / PreToolUse-style hook); and AC9 (PR description states the
+deploy-boundary obligation) was NOT_MET because PR #95's body was never refreshed past task 1's
+stale draft. AC6 is a missing upstream dependency, not a fixable bug in this repo's node — it needs
+a human decision: build the SDK hook first, accept a narrower enforcement mechanism (e.g. intercept
+tool results in-process before they reach the transcript), or descope AC6. Next: operator decision
+on AC6's enforcement mechanism, then refresh PR #95's description and re-run review.
+
+```
+67c3b9a Merge branch 'main' into EN.19.A-flow
+615ae6c fix: consolidate.rs hermetic_hq fixture uses stale flat sandbox layout
+1b53704 docs: build the Node/Molecule Library (docs/nodes/atoms, docs/nodes/molecules) and cross-link workflows
+6feae0c docs(log): record planning-command-nodes lane -- fmt/clippy baseline repair, EN.19.A paused
+95587d8 docs: restructure architecture.md into scannable tables, extract node catalog, add PRE_PLAN workflow doc
+6f0dfa4 chore: wrap up EN.19.A
+8ab34fa feat: implement EN.19.A-task7
+f49c1e3 feat: implement EN.19.A-task6
+```
+
+## [run: 2026-09-15]
+
+`/sdlc-flow` on branch `EN.19.A-flow` (resumed from the earlier task-1 bail) ran tasks 1-7 and
+BAILED after task 7. Tasks 1-6 all passed with confirmed `workAssertionPassed` outcomes: the
+`pre_plan` module scaffold (`CheckExistingNotesNode`, `IntakeIdeaNode`), `ResearchCodebaseNode`
+(a read-only `AgentCodeStep` session scoped to Read/Grep/Glob, `TransportSlotted`/`Cancellable`
+per standing rule 11, prompt externalized to `prompts/research_codebase.md` per D24),
+`WriteNotesNode` (renders research findings into a `capture.md`-shaped `notes.md`), the full
+`PRE_PLAN` graph assembly + `workflow_type` registration behind a standing-rule-12 kill switch
+with baseline/cheap-fast/thorough profiles, `POST /webhooks/pre-plan/inbound` (X-API-Key gate,
+400/409/202 responses, docs in `docs/workflows/README.md`), and a hermetic `pre_plan.rs`
+integration suite (idempotency short-circuit, `force_regenerate` overwrite, prompt-injection
+containment, read-only tool-scope verification). Task 7 (expanding the webhook module's
+deploy-boundary doc comment) landed a real, in-scope diff (commit `8ab34fa`) but the run BAILED
+on `task_validation_3` — `cargo nextest run --workspace --all-features`'s
+`consolidate::remediation_promotion_through_the_full_graph_is_idempotent` fails deterministically
+with `NodeError: I/O error on .../docs/sandbox/findings/remediation.json: No such file or
+directory`, unrelated to task 7's file (`pre_plan_webhook.rs`). Independently re-verified this
+wrap-up turn: checked out an isolated worktree at merge-base `41fb3be0a27b9e382dbee32b06713851f03970bd`
+and ran the identical test — it fails there with the same error signature, confirming the defect
+predates `EN.19.A` and originates at commit `116d994` (`EN.15.K`), which `git merge-base
+--is-ancestor` confirms is an ancestor of the branch's merge-base. Next: file/track the
+`consolidate::remediation_promotion_through_the_full_graph_is_idempotent` pre-existing defect as
+housekeeping outside `EN.19.A`'s scope, then resume `EN.19.A` to close out task 7's validation.
+
+```
+8ab34fa feat: implement EN.19.A-task7
+f49c1e3 feat: implement EN.19.A-task6
+aa79f4e feat: implement EN.19.A-task5
+4e82044 feat: implement EN.19.A-task4
+1ba1a8f feat: implement EN.19.A-task3
+eacdb70 feat: implement EN.19.A-task2
+1dd6276 Merge branch 'main' into EN.19.A-flow
+41fb3be feat: implement EN.chore.fmt-clippy-baseline-repair-task1
+```
+
+## [run: 2026-09-15]
+
+`/sdlc-flow` on branch `EN.19.A-flow` BAILED after task 1. Task 1 landed the `pre_plan` module
+scaffold — `CheckExistingNotesNode` (router, exists()-checks the brain-root-resolved
+`notes.md`, short-circuits unless `force_regenerate`) and `IntakeIdeaNode` (validates
+`idea`/`slug`), registered via `pub mod pre_plan;` in `workflows/mod.rs` (commit `ac38793`).
+Tasks 2-7 did not run. The run bailed on `cargo fmt --check`/`cargo clippy -p engine-core
+--all-features` failures that were verified pre-existing rather than introduced by task 1: a
+worktree built at `base_sha` `d1dd79e` (the commit immediately before task 1's) already shows
+`cargo fmt --check` reporting 29 file diffs (none in the files task 1 touched —
+`workflows/mod.rs`, `pre_plan/mod.rs`, `check_existing.rs`, `intake.rs`) and `cargo clippy -p
+engine-core --all-features` already emitting the same 8 warnings (5x `result_large_err`, 3x
+`type_complexity`, all in `workflows/orchestration/integrate.rs`) at that base commit. Fixing
+either requires touching modules well outside task 1's declared scope. Notable decisions
+carried in task 1: `route()` returns explicit `Some(EXISTS_ROUTE)`/`Some(CONTINUE_ROUTE)`
+rather than `None`, since a router returning `None` ends the graph walk rather than falling
+through to declared connections; `EXISTS_ROUTE` is a placeholder identity task 4 must register
+a node under; `notes_path()` was made `pub` for task 3's reuse. Next: get task 1's baseline
+failures fixed as a separate housekeeping pass (outside EN.19.A's scope), then resume
+`EN.19.A` at task 2 (`ResearchCodebaseNode`).
+
+```
+ac38793 feat: implement EN.19.A-task1
+d1dd79e docs(log): record local-model-bench root-cause pass (worktree reuse, ORCHESTRATION attribution, review fixes, pi tool-call gap)
+a13569c fix(bench): capture_evidence must locate sdlc/ state in the repo the job actually ran in
+629de87 fix(orchestration): surface the real reason instead of <unknown> for an attempts-exhausted child
+fea8a83 fix(bench): harden job-boundary cleanup, add model/backend selection, retire weak models
+```
 
 ## [run: 2026-09-15]
 
@@ -46,6 +169,34 @@ ae79646 feat: implement EN.19.B-task1
 ```
 
 ## [2026-09-15]
+
+### planning-command-nodes lane resumed: EN.19.A closed, EN.19.B done, companion claude-code-rs ticket authored
+- **What:**
+  - Fixed the `hermetic_hq` fixture bug blocking every spec's terminal Validate task
+    (`consolidate.rs`), then resumed `EN.19.A-flow`, merging a real conflict against `main`'s newer
+    Node/Molecule Library restructure.
+  - Ran `EN.19.B` (`PLAN_AUTHORING`) to completion — PASS, PR #96.
+  - Resumed `EN.19.A`: review found AC6 (secret-path denial) unmet. Discussed with the operator,
+    who chose to pursue both a claude-code-rs read-time fix (ticketed there,
+    `CC.ticket.enforced-secret-path-denial-hook`, backend-specific) and a backend-agnostic
+    in-process mitigation here — surfacing along the way that `ResearchCodebaseNode`'s
+    `AgentBackend` was hardcoded to `ClaudeCli` (standing rule 6/12 violation), which would have
+    made the claude-code-rs fix silently stop covering Pi/Aider deployments. Added tasks 8-10 to
+    `EN.19.A`'s own spec: task 8 replaced the hardcode with `PrePlanPolicy.research_backend`; tasks
+    9-10 added `SecretGuardNode`, a pre-scan guard that blocks a secret-shaped file's content from
+    reaching `notes.md` regardless of which backend ran the research. All 10 tasks passed, review
+    PASS. Closed the `en19a-ac6-secret-path-denial-mechanism` operator gate and `EN.19.A` itself;
+    marked PR #95 ready for review.
+  - Along the way, fixed an unrelated `E_STATE_MALFORMED_JSON` in HQ's own `planning/state.json`
+    (a `file_contains` predicate using `text` instead of the schema's `pattern` field) that was
+    blocking every `close-operator-gate`/`emit-state --write` call fleet-wide.
+  - Added a global `~/.claude/hooks/deny-secret-paths.py` `PreToolUse` hook, live in
+    `~/.claude/settings.json` for every session on this machine.
+- **Why:** The operator wanted both defenses pursued in parallel rather than waiting on one; the
+  backend-hardcode discovery came directly out of that discussion and changed which mitigation
+  actually matters as the durable fix.
+- **Refs:** `planning/orchestration-run/planning-command-nodes/{notes.md,review.md}`, PR #95, PR
+  #96, `CC.ticket.enforced-secret-path-denial-hook` (claude-code-rs).
 
 ### planning-command-nodes lane (EN.19.A-D): fmt/clippy baseline repair, EN.19.A paused on a pre-existing test defect
 - **What:**

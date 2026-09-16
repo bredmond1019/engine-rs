@@ -132,6 +132,14 @@ Plan one maintenance or housekeeping task — no behavior change, tests incident
    - **At least one acceptance criterion observes a difference**, not merely that the gates are
      still green.
 
+8a. **Run `check_tasks_json.py` and require it to exit 0 before this spec commits anywhere.**
+    Same lint-rule registry the engines' `prepare_run.py` setup stage runs before spending any
+    implement token (`BT.ticket.prepare-run-replaces-setup-agents`):
+    ```bash
+    python3 .claude/workflows/bin/check_tasks_json.py planning/<BlockID>/tasks.json
+    ```
+    A nonzero exit means step 8 missed something — fix the spec in place, then re-run this check.
+
 9. Report the paths created and the next step.
 
 ## Session boundary

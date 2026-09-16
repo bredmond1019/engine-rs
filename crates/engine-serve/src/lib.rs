@@ -15,6 +15,7 @@ pub mod journal;
 pub mod live_state;
 pub mod orphan;
 pub mod pending;
+pub mod pre_plan_webhook;
 pub mod resume;
 pub mod schedule;
 pub mod stream;

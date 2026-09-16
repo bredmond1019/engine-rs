@@ -47,31 +47,26 @@ wins — see the brain's `CLAUDE.md` on why prose gates nothing.
 
 ## Autonomy — the overnight loop
 
-The largest unbuilt cluster. Today a chain runs the blocks it is handed and reports what happened;
-none of the pieces below exist, so an operator still chooses the work and reads the results.
+<!-- updated by /update-docs -->
+`CONDUCTOR` (`EN.12.F`) has shipped — `crates/engine-core/src/workflows/orchestration/conductor.rs`
+reads the operator's weekly objective and mev's computed frontier slate and proposes a chain from
+it. What remains unbuilt is the pair below, both currently `parked` in `planning/state.json`:
 
 | Capability | Block | State | What it will do |
 |---|---|---|---|
-| `CONDUCTOR` | `EN.12.F` | Waiting on `OP.first-weekly-objective` | The run picks tonight's chain itself from a weekly objective, instead of being handed a block list. |
-| Research → action items | `EN.12.H` | **Ready** | A scheduled research chain files into the operator queue. |
-| Research → demo | `EN.12.I` | Waiting on `EN.12.F` | An overnight branded demo generated from a company name. |
-
-`CONDUCTOR` waits directly on `OP.first-weekly-objective` — an operator gate — and `Research →
-demo` waits on `CONDUCTOR`, so it is gated on the same objective transitively. The engine cannot
-pick a chain from an objective that nobody has written yet, and it may not invent one.
+| Research → action items | `EN.12.H` | Parked (dependency-clear, not blocked) | A scheduled research chain files into the operator queue. |
+| Research → demo | `EN.12.I` | Parked (dependency-clear, not blocked) | An overnight branded demo generated from a company name. |
 
 ## Brain integration
 
+<!-- updated by /update-docs -->
 The engine writes to the Brain today ([`materialize-doc-node.md`](materialize-doc-node.md),
-[`harvest-gate.md`](harvest-gate.md)). Reading back from it is ruled but unbuilt.
-
-| Capability | Block | State | What it will do |
-|---|---|---|---|
-| `CLAIM_REAFFIRM` | `EN.6.L` | **Ready** | Distilled-claim reaffirmation via queue-drain. |
-
-The read direction was gated on an operator ruling until 2026-08-23; it is now settled by
-`planning/decisions/D23-brain-read-seam.md` — the engine **may** read back from Synapse as a typed
-consumer that never re-ranks. The blocks above are the implementation of that ruling.
+[`harvest-gate.md`](harvest-gate.md)). The read direction was gated on an operator ruling until
+2026-08-23, settled by `planning/decisions/D23-brain-read-seam.md` (the engine **may** read back
+from Synapse as a typed consumer that never re-ranks) — and its implementation, `CLAIM_REAFFIRM`
+(`EN.6.L`, distilled-claim reaffirmation via queue-drain), has since shipped
+(`crates/engine-core/src/workflows/claim_reaffirm/`, registered as the `CLAIM_REAFFIRM` workflow).
+No further brain-read capability is currently planned.
 
 ## Artifacts and deliverables
 

@@ -23,313 +23,66 @@ catch-up (D42). It is a parallel-pilot rewrite of the Python `orchestrator` engi
 
 ## Module Map
 
-The Cargo workspace (EN.0.A) declares the member crates below. `engine-core` (EN.1.A),
-`engine-contract` (EN.0.B), `engine-store` (EN.0.B), and now `engine-serve` (EN.1.C) hold real
-types: dispatch, in-memory live state, the durable-write bridge, and the actix-web HTTP surface.
-`term-core` and `term-attach` (`EN.9.A`) are two more members — tmux session-control ported from
-`core/bastion`, split so the blocking attach path can never be pulled into `engine-core`/
-`engine-serve` by additive feature unification. `term-core` (`tokio` feature) is now a real
-`engine-core` dependency (`EN.9.D`) — see the `nodes/terminal/` entry below and
-[terminal-driver.md](terminal-driver.md); `term-attach` is still linked from neither binary. See
-[terminal-crates.md](terminal-crates.md).
+- Six-crate Cargo workspace (`EN.0.A`), resolver 2, shared `workspace.package`/`workspace.dependencies`
+- `engine-core`/`engine-contract`/`engine-store`/`engine-serve` hold real types: dispatch, in-memory
+  live state, the durable-write bridge, the actix-web HTTP surface → tables below
+- `term-core`/`term-attach` (`EN.9.A`) are tmux session-control, split so the blocking attach path
+  can never reach `engine-core`/`engine-serve` by feature unification → [terminal-crates.md](terminal-crates.md)
+- **Every reusable `Node` is catalogued separately** in [nodes/index.md](nodes/index.md) (the
+  Node Library) — this section covers crate/module shape, not individual nodes
 
-```
-engine-rs/
-├── Cargo.toml            (workspace root — resolver 2, workspace.package, workspace.dependencies)
-├── crates/
-│   ├── engine-core/       ← node.rs (Node trait + NodeRegistry + as_router() hook; now also
-│   │                         `Identified<N>`/`NodeExt::with_identity` for instance-backed node
-│   │                         identity and `InputBinding`/`WithInput<N>`/`NodeExt::with_input_from`
-│   │                         for declarative upstream-input bindings, EN.5.E task 1),
-│   │                         loop_combinator.rs (`build_loop(LoopSpec) -> LoopCluster` — the
-│   │                         reusable `{guard router, increment node, back-edge}` bounded-loop
-│   │                         builder, generalizing the hand-written `sdlc_flow` retry idiom,
-│   │                         EN.5.E task 2), dispatch.rs (Dispatcher — dual `workflow_registry` +
-│   │                         `schema_registry` lookup by `workflow_type`, `WorkflowFactory`,
-│   │                         `DispatchError::UnknownWorkflowType`/`PolicyResolutionFailed`; moved
-│   │                         here from `engine-serve` in EN.5.E task 3, which now re-exports it),
-│   │                         schema.rs
-│   │                         (WorkflowSchema/NodeConfig), workflow.rs (Workflow pointer-walk
-│   │                         runner + on_progress seam + Router-aware dispatch + new_validated() +
-│   │                         run_with() cancellation/budget-aware entry point, EN.2.B),
-│   │                         routing.rs (Router trait + dispatch_route()), parallel.rs
-│   │                         (ParallelNode fan-out/merge), validate.rs (WorkflowValidator graph
-│   │                         validator), cancellation.rs (CancellationToken, watch-backed,
-│   │                         + stamp_cancelled(), EN.2.B), budget.rs (Budget config + BudgetLedger
-│   │                         + pre-dispatch check() gate, EN.2.B), nodes/ (agent_code_step.rs —
-│   │                         AgentCodeStep, a reusable Node wrapping core/claude-code-rs's
-│   │                         execute(), EN.2.A; now cancellation-aware via
-│   │                         with_cancellation_token(), EN.2.B; http_post.rs — the injectable
-                         `HttpPost` trait seam + `reqwest`-backed live impl + `StubHttpPost` test
-                         double, EN.4.C, used by `proposal_generator::PersistToBrainNode` to POST
-                         a finished artifact to Synapse's brain-ingest endpoint; channel_transport.rs
-                         — the injectable `ChannelTransport` egress seam `ActionDispatchNode` (EN.6.A)
-                         and `research_agent::ResearchIngressDispatchNode` (EN.6.E) call to deliver
-                         outbound actions to the channel that originated them / self-feed
-                         `CONTENT_PIPELINE`;
-                         doc_materializer.rs — the injectable `DocMaterializer` seam
-                         `MaterializeDocNode` calls to plan + write a `BrainDocModel`-shaped
-                         artifact into the Brain corpus via `mev`/`okf-core` in-process, live impl
-                         + `StubDocMaterializer` test double, EN.7.A task 3 (extended EN.7.B task 2
-                         with `edit_opportunity`/`OpportunityEdit::{SetStage,AddAction}` over
-                         mev's `plan_set_stage`/`plan_add_action`); materialize_doc.rs —
-                         `MaterializeDocNode` itself, the generic writer node every future pipeline
-                         appends, EN.7.A task 4 (gains an ordered `with_source_nodes` upstream
-                         read-preference, EN.7.B task 1); opportunity_edit.rs —
-                         `OpportunityEditNode`, the generic node driving `edit_opportunity` for a
-                         configured `OpportunityEditOp` (`SetStage`/`AddAction`) read off
-                         `ctx.event`, EN.7.B task 3), terminal/ — `TerminalSessionNode`
-                         (`session.rs`: ensure/stamp/lease-acquire a tmux session via `term-core`'s
-                         `TerminalDriver`) + `TerminalObserveNode` (`observe.rs`: capture_pane +
-                         `term-core::detect`, then `pane.rs`'s `bound_pane_tail` bound/redact/hash),
-                         plus `identity.rs` (`session_name_for`, the `HasSessionInput` builder
-                         trait) and `pane.rs` (pure pane-bounding/redaction helpers), EN.9.D; plus
-                         `predicate.rs` (`AwaitPredicate` — `Marker`/`Detect`/`Regex`/`Silence`/
-                         `ExitCode` — and the pure `evaluate()` over a caller-collected
-                         `Observation`, with `marker_path(out, nonce)` the single source of truth
-                         for the `{out}.{nonce}.done` marker format), `send.rs`
-                         (`TerminalSendNode` — org-floor command refusal, `SessionLease::renew`
-                         re-verification, a per-session `tokio::sync::Mutex` held across the
-                         check+send, and `send_id` back-edge idempotency recorded in a tmux
-                         user-option), and `await_node.rs` (`TerminalAwaitNode` — a bounded,
-                         cancellable poll over `AwaitPredicate` with its own timeout and a
-                         four-layer-resolved `AwaitPolicy`/`poll_interval_ms`/`timeout_ms`, stamped
-                         into `ctx.nodes` on every non-cancelled return), EN.9.E), plus
-                         `hold_policy.rs` (`HoldPolicyNode` — the per-workflow operator-hold
-                         policy surface over the EN.9.B lease/hold: 60s default grace, a
-                         fail-closed `steal_after_ms` modeled as doubly-optional
-                         (`Option<Option<u64>>`, a custom serde module distinguishing "layer
-                         explicitly asserts fail-closed" from "layer untouched"), resolved through
-                         the same four-layer `resolve_for_workflow(workflow_key, ...)` plumbing as
-                         `AdmissionPolicy`, with three named profiles and its resolved values
-                         stamped into `ctx.nodes`; constructed per `workflow_key` so different
-                         workflows read distinct `harness.json` sections; does not itself touch
-                         `term_core::lease`/`hold` — wiring the actual guard is left to a
-                         downstream consumer, mirroring `admission.rs`'s precedent, EN.9.G task 1),
-                         plus `held_session.rs` (`HeldSessionNode` — acquires a tmux session once
-                         per run under the EN.9.B lease and carries it across node boundaries via
-                         a process-global `Mutex<HashMap<session_name, Arc<HeldSessionHandle>>>`
-                         registry keyed by `session_name_for(run_id, "HeldSessionNode")` so every
-                         `HeldSessionNode` call in a run shares one session; spawns a background
-                         tokio renewal loop with a four-layer-resolved
-                         `lease_ttl_ms`/`renew_interval_ms` policy (three named profiles), checks
-                         tmux liveness each renewal tick, and publishes a distinguishable
-                         `HeldSessionFailure` (`ExternallyKilled` vs `LeaseLost`) on a
-                         `tokio::sync::watch` channel that `process()` re-entry surfaces as a typed
-                         `NodeError` instead of hanging or silently succeeding, EN.10.A tasks 1-2)
-                         and `live_claude.rs` (`LiveClaudeSessionNode` — launches an interactive
-                         `claude` CLI session inside an already-held tmux session by typing the
-                         resolved command into the pane via `TerminalDriver::send_keys`, reusing
-                         `claude_code_rs::Config` for model/continue/resume but never calling
-                         `execute()` directly since a headless subprocess is never attached to a
-                         pty and so would be invisible to `bastion sessions`' tmux-surface listing,
-                         EN.10.A task 3),
-                         brain_root.rs (`resolve_brain_root`/
-                         `resolve_brain_root_from` — `ENGINE_BRAIN_ROOT` env var, else
-                         `mev::brain::config::find_brain_root` walking up from cwd for
-                         `brain.toml`, typed `BrainRootError`, EN.7.A task 2), locale.rs —
-                         `Locale`/`Currency`/`MoneyRange`/`RateSheet`/`RateCard`, the two-sheet,
-                         firewalled rate card + language directive threaded through the
-                         diagnostic funnel's event schemas, EN.4.F), suspend.rs —
-│   │                         `PauseSignal` (a clearable, watch-backed two-way flag,
-│   │                         deliberately not `CancellationToken`) + the
-│   │                         `metadata.suspension` marker (`stamp_suspended`/
-│   │                         `stamp_resumed`/`request_suspension`/`read_suspension`/
-│   │                         `is_suspended`), the convergence point for both
-│   │                         suspension origins (operator pause, `SuspendNode`),
-│   │                         EN.6.F task 1; `nodes/suspend.rs` — `SuspendNode`, the
-│   │                         workflow-authored half of suspend/resume (`enabled`/
-│   │                         `with_predicate`/`with_reason_label`, default-off
-│   │                         in-place no-op patterned on `MaterializeDocNode::
-│   │                         with_enabled`), only *requests* suspension via
-│   │                         `suspend::request_suspension` — finalizing the walk
-│   │                         stop belongs to `Workflow::walk`, EN.6.F task 5; `nodes/fan_out.rs`
-│   │                         — `FanOutNode` (`EN.6.G` task 1), builds N `with_identity`-wrapped
-│   │                         instances of one node type via a builder closure and runs them
-│   │                         through `ParallelNode`, plus an `impl Node for Box<dyn Node>` (added
-│   │                         here, not `node.rs`) so `NodeExt::with_identity` is callable on the
-│   │                         builder's boxed output; `FanOutNode::branch_identity(base_name, i)` is
-│   │                         the public `"{base_name}[{i}]"` helper `AggregateNode::for_fan_out`
-│   │                         reuses to derive matching identities; `nodes/aggregate.rs` —
-│   │                         `AggregateNode`, joins N `ctx.nodes` entries into one
-│   │                         deterministically-ordered array by declared identity order (not
-│   │                         `HashMap` iteration order); evals/ (`EN.5.B` tasks 1-3) — pure,
-│   │                         corpus-free eval scoring generalized from Synapse's OR.K2 scorer
-│   │                         library: scorers.rs (`score_deterministic`/`score_structural`/
-│   │                         `score_reference_based`, free functions over `serde_json::Value`/
-│   │                         `&str` returning `ScoreResult`), case.rs (`EvalCase` — `ScorerKind`
-│   │                         + dot-path selector + expected value), slice.rs (`EvalSlice` —
-│   │                         named `EvalCase` collection grouped by domain/model/profile
-│   │                         mirroring `PolicyAggregate`'s grouping shape; `EvalSlice::score`
-│   │                         produces per-case `CaseReport`s and an overall pass-rate in
-│   │                         `SliceReport`), runner.rs (`run_slice` — scores an `EvalSlice`
-│   │                         against real captured SDLC-flow telemetry by importing `EN.4.0`'s
-│   │                         `aggregate_state_files`/`extract_policy_telemetry` directly, no
-│   │                         second aggregation path; reduces the resulting `PolicyAggregate`
-│   │                         rows to one JSON record via a field-less `UnitPolicy` grouping
-│   │                         key; `coding_slice()` — a concrete slice scoring
-│   │                         `PolicyAggregate`'s own serialized fields)), coord/ (`EN.15.A` task
-│   │                         1 — `mod.rs`: `read_coordination_view(brain_root, lock_dir)` is a
-│   │                         read-only reader over the fleet's `.fleet-locks/` tree, parsing
-│   │                         registry claims, leases, fleet-concurrency slots, cross-lane
-│   │                         messages, commander heartbeats, per-roadmap escalations, and
-│   │                         `orchestration-run` run records (walked under `brain_root`) into
-│   │                         okf-core's coord types; returns a `CoordinationView { status:
-│   │                         Live|Degraded, degradation_reasons: Vec<String>, .. }` — a malformed
-│   │                         record is a named degradation reason, never a silent skip, while a
-│   │                         missing lock dir/subdirectory is a legitimate empty-fleet `Live`
-│   │                         state; fleet-concurrency slots are found by non-recursive listing at
-│   │                         the lock-dir root only, so a decoy subdirectory can never be read as
-│   │                         a slot), write.rs (`EN.15.C` — the coordination WRITE seam, paired
-│   │                         with `mod.rs`'s read-only view: `write_coord_json`/
-│   │                         `write_heartbeat_file` schema-validate via `okf_core::Coord<T>`'s
-│   │                         Typed/Legacy split, stamp `host`, snapshot any prior file to
-│   │                         `.fleet-locks/.prev/<relative path>`, then write; `register`/
-│   │                         `heartbeat`/`release` cover the lane-agent registry claim plus an
-│   │                         optional heavy-lane fleet-concurrency slot (capacity refusal proven
-│   │                         byte-identical to base-template's `fleet_concurrency_check.py`);
-│   │                         `lease`/`unlease` validate a per-block `window` against a lane's
-│   │                         declared blocks and are proven end-to-end against
-│   │                         `mev::set_block_status_as`; `send`/`drain`/`complete` write
-│   │                         `queue/<repo>/<lane>/{inbox,processing,done}` envelopes with a
-│   │                         recursive forbidden-key scan and gate-enforced `receipts.jsonl`
-│   │                         transitions, proven against base-template's `check_messages.py`;
-│   │                         `requeue_processing`/`requeue_all_processing` re-queue stranded
-│   │                         `processing/` files to `inbox/` on writer start, idempotently and
-│   │                         without a duplicate receipt), roadmap_status.rs (`EN.15.H` — a typed `LaneResult` join
-│   │                         reproducing base-template's Python `roadmap_status_discovery.py`
-│   │                         oracle in Rust: `lane-log.jsonl`, per-repo `orchestration-run`
-│   │                         records, per-spec `sdlc/sdlc-*state.json` liveness, each repo's
-│   │                         `state.json` operator gates/carryover, and `crate::coord`'s
-│   │                         registry/leases/message-queue depth, deduped by cached-parent
-│   │                         `realpath` and reporting a malformed lane-log line by byte offset;
-│   │                         task 2 extended the result with `validate_brain` (a real `bastion
-│   │                         validate-brain --state <root>` subprocess call), a `coverage_caveat`
-│   │                         string, and a dedicated `discover_queue_state()` mirroring the
-│   │                         Python's nested `<lock_dir>/queue/<repo>/<lane>/` layout — kept
-│   │                         separate from `crate::coord`'s own flat queue/inbox reader, since the
-│   │                         two answer different questions by design)
-│   ├── engine-contract/   ← data-contract serde types (events.rs: EventsRow/NodeRun/
-│   │                         NodeRunStatus/Usage; task_context.rs: TaskContext), matching
-│   │                         orchestrator data-contract.md v1.1.0 byte-for-byte (see
-│   │                         docs/data-contract.md for the full pin)
-│   ├── engine-store/      ← postgres.rs: sqlx::PgPool connect/insert_event/update_event/
-│   │                         get_event for the durable `events` record
-│   └── engine-serve/      ← bastion serve embedding (EN.1.C): dispatch.rs (a thin re-export of
-│   │                         `engine_core::dispatch` — Dispatcher/DispatchError/WorkflowFactory
-│   │                         moved to `engine-core` in EN.5.E task 3 so every existing
-│   │                         `engine_serve::dispatch::*` import site keeps resolving unchanged),
-│   │                         live_state.rs (LiveStateStore —
-│   │                         in-memory Arc<RwLock<HashMap<RunId, TaskContext>>> record/get/
-│   │                         list_active/remove, no-DB-poll read path for the local Console; now
-│   │                         also mark_terminal/get_record, EN.5.F — moves a finished run out of
-│   │                         the live map into a bounded 100-entry completed ring so a terminal
-│   │                         run's snapshot survives for HTTP readback),
-│   │                         durable.rs (DurableHandle/spawn_durable_writer/durable_on_progress —
-│   │                         mpsc-bridged async writer over a `DurableItem::{Snapshot,Journal}`
-│   │                         enum (EN.12.D, widened from a Snapshot-only channel): Snapshot items
-│   │                         map on_progress TaskContext snapshots to engine_contract::EventsRow
-│   │                         (inserting the first PENDING snapshot per run, updating subsequent
-│   │                         ones), Journal items carry a `JournalRow` written via
-│   │                         `engine_store::insert_journal_row`; both self-skip Postgres I/O when
-│   │                         no pool/DATABASE_URL is configured — see "Journal" below),
-│   │                         journal.rs (`JournalRow`/`JournalDecisionKind`-consuming
-│   │                         GET /campaigns/{id}/journal route plus the D57 notes.md/review.md
-│   │                         renderer, EN.12.D — see "Journal" below), http.rs
-│   │                         (actix-web surface: POST
-│   │                         /events/ with X-API-Key gating dispatch + live-state + durable-write
-│   │                         (now spawns the run and returns 202 {run_id, event_id} immediately,
-│   │                         EN.5.F), GET /health, GET /workflows, GET /workflows/{type}/graph,
-│   │                         GET /events/{event_id} (server-derived status readback, EN.5.F)),
-│   │                         GET /api/coordination (`EN.15.A` task 3 — no X-API-Key gate,
-│   │                         matching /workflows: always `200` with the joined
-│   │                         `engine_core::coord::read_coordination_view` JSON, including
-│   │                         when the view reports `Degraded`; only
-│   │                         `resolve_brain_root()` erroring, e.g. a bad
-│   │                         `ENGINE_BRAIN_ROOT`, returns `5xx`), POST
-│   │                         /api/coordination/{register,heartbeat,release,lease,unlease,send,
-│   │                         drain,complete} (`EN.15.C` task 6 — no X-API-Key gate, matching
-│   │                         `GET /api/coordination`; thin routes over `engine_core::coord::write`,
-│   │                         wired through the shared `configure()` route table; timestamps and
-│   │                         `pid` are stamped server-side, never trusted from the request body;
-│   │                         `host` is read from an optional `ENGINE_COORD_HOST` env var; an
-│   │                         HTTP-level parity test proves a tree built entirely through these
-│   │                         routes passes base-template's `check_lane_agents.py` and
-│   │                         `check_messages.py`),
-│   │                         stream.rs (GET /events/{event_id}/stream — per-run
-│   │                         tokio::sync::broadcast SSE tee with a terminal-frame cache for late
-│   │                         subscribers, EN.5.F), abort.rs
-│   │                         (POST /events/{run_id}/abort, X-API-Key gated, EN.2.B — backed by a
-│   │                         per-run CancellationToken RunRegistry minted/registered/deregistered
-│   │                         around each post_events run_with call), suspend.rs (process-global
-│   │                         pause-signal map + bounded FIFO suspended-run index behind
-│   │                         `OnceLock<RwLock<..>>`, `take_for_resume`/`clear_resuming`'s
-│   │                         atomic read-and-set double-resume guard, and `spawn_run` — the one
-│   │                         shared spawn/exit-fork every trigger AND resume handler calls so the
-│   │                         terminal-vs-suspended cleanup logic never drifts between the two
-│   │                         entry points, EN.6.F task 8/9/10), resume.rs (the run-control surface
-│   │                         is now pause/resume/abort rather than abort alone: POST
-│   │                         /events/{run_id}/pause, POST /events/{event_id}/resume — rehydrates
-│   │                         the Workflow from the ORIGINAL trigger payload via
-│   │                         `without_seeded_nodes()`, rebuilds the BudgetLedger from the
-│   │                         marker's snapshot, and continues from the stored `resume_at`
-│   │                         pointer — and GET /events/suspended (registered before
-│   │                         `{event_id}` so the literal path isn't swallowed by the uuid
-│   │                         extractor), EN.6.F task 11; the same file also carries
-│   │                         `plan_campaign_resume`/`reconcile_stale_branch` — campaign-level
-│   │                         crash recovery as pure functions with no new route or `AppState`
-│   │                         field, see [suspend-resume.md](suspend-resume.md#campaign-level-crash-recovery-en11h),
-│   │                         EN.11.H), schedule.rs (`EN.6.G` task 2 — `ScheduleEntry`/
-│   │                         `ScheduleRegistry`, a thin adapter over `engine_core::cron`'s `tick()`;
-│   │                         `load_schedule_entries` reads `planning/harness.json`'s
-│   │                         `schedule.entries[]`; `dispatch_scheduled_entry` builds a
-│   │                         `Schedule`-typed `IngressEnvelope` per fire and dispatches it in-process
-│   │                         via `dispatch_with_event` + `spawn_run` — no self-directed HTTP call;
-│   │                         see [§ Schedule Source](#schedule-source-en6g) below and
-│   │                         [cron-primitive.md](cron-primitive.md)), blocked_bridge.rs (`EN.9.G`
-│   │                         task 2 — the Blocked-edge bridge: a `LevelSource` +
-│   │                         `Notifier` injectable receiver that re-evaluates a live level
-│   │                         predicate (current state == Blocked) on every trigger before
-│   │                         delivering into an EN.8.B `OperatorQueue`, exiting silently on a
-│   │                         stale trigger; `OperatorQueue::with_level_predicate` plus a
-│   │                         deterministic `blocked-edge:<session>` item id give exactly-once-
-│   │                         per-tick delivery with no separate dedup/locking logic; not yet
-│   │                         wired into any HTTP route or `AppState` — self-contained until a
-│   │                         production `LevelSource` connects a live bastion sink)
-│   ├── term-core/          ← tmux session-control + agent-detection, ported verbatim from
-│   │                         `core/bastion`'s `src/sessions/{tmux,model,claude_state}.rs` and
-│   │                         `src/detect/` (`EN.9.A`) — no `attach_session`/`suspend_and_attach`,
-│   │                         no `anyhow`; not linked by `engine-core` or `engine-serve` in this
-│   │                         block (that wiring is `EN.9.B`). See
-│   │                         [terminal-crates.md](terminal-crates.md)
-│   └── term-attach/        ← `attach_session`/`suspend_and_attach` only — split from `term-core`
-│                              so no cargo feature-unification path can ever pull the blocking
-│                              attach code into the async `engine-core`/`engine-serve` binary
-│                              (`EN.9.A`). See [terminal-crates.md](terminal-crates.md)
-└── tests/                 ← round-trip + integration fixtures
-    (crates/engine-core/tests/workflow_runner.rs — fixture 3-node linear workflow integration test;
-    crates/engine-core/tests/parallel.rs — ParallelNode fan-out/merge integration tests;
-    crates/engine-core/tests/validator.rs — WorkflowValidator + router-aware Workflow::run
-    integration tests (valid/rejected schemas, router back-edge dispatch);
-    crates/engine-contract/tests/round_trip.rs — fixture byte-for-byte serde round-trip;
-    crates/engine-store/tests/postgres_round_trip.rs — `#[ignore]`d live Postgres round-trip (CI has
-    no Postgres, per EN.0.A); run explicitly with `cargo test -p engine-store -- --ignored` and
-    `DATABASE_URL` set — an unset `DATABASE_URL` at that point is a hard failure, not a silent skip;
-    crates/engine-serve/tests/dispatch_integration.rs — headline EN.1.C integration test: live-state
-    read with no DB query, byte-identical durable EventsRow mapping for a fixture 2-node workflow,
-    and 422 for an unregistered workflow_type;
-    crates/engine-core/tests/it/fan_out_aggregate.rs (module of the single `tests/it/main.rs`
-    binary, per CLAUDE.md rule 9) — `EN.6.G` task 3: a real `Workflow::new_validated` + `.run()`
-    graph (FanOut -> Aggregate -> a persist stub node) proving no last-write-wins collision across
-    same-type fan-out branches;
-    crates/engine-serve/tests/schedule.rs — `EN.6.G` task 3: a `ScheduleRegistry.tick()` fire
-    dispatching one persist-shaped payload and one outbound-action-shaped record through the
-    non-blocking `spawn_run` path, over a real tempdir-backed `FileCronStore`;
-    crates/engine-core/tests/it/evals_slice.rs (module of the single `tests/it/main.rs` binary,
-    per CLAUDE.md rule 9) — `EN.5.B` task 3: proves `run_slice` against a fixture
-    `tests/fixtures/eval_coding_state.json` SDLC-flow state file, scoring `coding_slice()`
-    through the real `aggregate_state_files` path end-to-end)
-```
+### Workspace crates
+
+| Crate | What it holds |
+|---|---|
+| `engine-contract` (`EN.0.B`) | Data-contract serde types — `events.rs` (`EventsRow`/`NodeRun`/`NodeRunStatus`/`Usage`), `task_context.rs` (`TaskContext`) — matching the orchestrator data-contract v1.1.0 byte-for-byte. Full pin: [data-contract.md](data-contract.md) |
+| `engine-core` (`EN.1.A`) | The runtime: `Node` trait, dispatch, graph validation, cancellation/budget, every workflow graph, every reusable node. See the two tables below and [nodes/index.md](nodes/index.md) |
+| `engine-store` (`EN.0.B`) | `postgres.rs` — `sqlx::PgPool` connect/insert/update/get for the durable `events` record |
+| `engine-serve` (`EN.1.C`) | The actix-web HTTP surface + in-memory live-run state — the crate a host process embeds. See the module table below |
+| `term-core` (`EN.9.A`) | tmux session-control + agent-detection, ported from `core/bastion`'s `src/sessions/`/`src/detect/`; no blocking attach. `tokio` feature is a real `engine-core` dependency (`EN.9.D`) — see [terminal-driver.md](terminal-driver.md) |
+| `term-attach` (`EN.9.A`) | `attach_session`/`suspend_and_attach` only — kept out of `term-core` so no feature-unification path pulls blocking code into the async binary. Linked by neither `engine-core` nor `engine-serve` |
+
+### `engine-core` top-level modules
+
+| Module | What it does |
+|---|---|
+| `node.rs` | `Node` trait + `NodeRegistry`; `NodeExt::with_identity` (instance identity so a node type can repeat in one graph); `InputBinding`/`NodeExt::with_input_from` (declarative upstream-input wiring) — `EN.5.E` task 1 |
+| `loop_combinator.rs` | `build_loop(LoopSpec) -> LoopCluster` — reusable bounded-loop builder (`{guard router, increment node, back-edge}`), generalizes the hand-written `sdlc_flow` retry idiom — `EN.5.E` task 2 |
+| `dispatch.rs` | `Dispatcher` — dual `workflow_registry`/`schema_registry` lookup by `workflow_type`, `WorkflowFactory`, typed `DispatchError` — moved here from `engine-serve` in `EN.5.E` task 3, which now re-exports it |
+| `schema.rs` | `WorkflowSchema`/`NodeConfig` |
+| `workflow.rs` | `Workflow` pointer-walk runner, `on_progress` seam, Router-aware dispatch, `new_validated()`, `run_with()` (cancellation/budget-aware entry point) — `EN.2.B` |
+| `routing.rs` | `Router` trait + `dispatch_route()` |
+| `parallel.rs` | `ParallelNode` fan-out/merge |
+| `validate.rs` | `WorkflowValidator` — the graph validator |
+| `cancellation.rs` | `CancellationToken` (watch-backed) + `stamp_cancelled()` — `EN.2.B` |
+| `budget.rs` | `Budget` config + `BudgetLedger` + pre-dispatch `check()` gate — `EN.2.B` |
+| `suspend.rs` | `PauseSignal` (clearable, watch-backed) + the `metadata.suspension` marker — convergence point for operator pause and `SuspendNode`. Full contract: [suspend-resume.md](suspend-resume.md) |
+| `brain_root.rs` | `resolve_brain_root[_from]` — `ENGINE_BRAIN_ROOT` env var, else `mev::brain::config::find_brain_root` walking up for `brain.toml` — `EN.7.A` task 2 |
+| `locale.rs` | `Locale`/`Currency`/`MoneyRange`/`RateSheet`/`RateCard` — the two-sheet, firewalled rate card threaded through the diagnostic funnel — `EN.4.F` |
+| `evals/` | Pure, corpus-free eval scoring (generalized from Synapse's OR.K2 scorer library): `scorers.rs`, `case.rs`, `slice.rs`, `runner.rs` — `EN.5.B` |
+| `coord/` | Fleet coordination over `.fleet-locks/`: `mod.rs` (read-only `read_coordination_view`), `write.rs` (register/heartbeat/release/lease/send/drain — `EN.15.A`/`C`), `roadmap_status.rs` (typed `LaneResult` join reproducing base-template's `roadmap_status_discovery.py` in Rust — `EN.15.H`) |
+| `nodes/` | Every reusable `Node` implementation — catalogued in [nodes/index.md](nodes/index.md), not here |
+
+### `engine-serve` top-level modules
+
+| Module | What it does |
+|---|---|
+| `dispatch.rs` | Thin re-export of `engine_core::dispatch` so existing `engine_serve::dispatch::*` imports keep resolving |
+| `live_state.rs` | `LiveStateStore` — in-memory run map, no-DB-poll read path; `mark_terminal`/`get_record` move a finished run into a bounded 100-entry completed ring — `EN.5.F` |
+| `durable.rs` | `DurableHandle`/`spawn_durable_writer` — mpsc-bridged async writer over `DurableItem::{Snapshot,Journal}`; self-skips Postgres I/O when unconfigured — `EN.12.D` |
+| `journal.rs` | `JournalRow`-consuming `GET /campaigns/{id}/journal` route + the D57 notes.md/review.md renderer — `EN.12.D` |
+| `http.rs` | actix-web surface: `POST /events/`, `GET /health`, `/workflows`, `/workflows/{type}/graph`, `/events/{event_id}`, plus the `GET`/`POST /api/coordination/*` routes over `engine_core::coord` — `EN.5.F`/`EN.15.A`/`C` |
+| `stream.rs` | `GET /events/{event_id}/stream` — per-run SSE tee with a terminal-frame cache for late subscribers — `EN.5.F` |
+| `abort.rs` | `POST /events/{run_id}/abort` — per-run `CancellationToken` registry — `EN.2.B` |
+| `resume.rs` | `POST /events/{run_id}/pause`, `/resume`, `GET /events/suspended`; campaign-level crash recovery (`plan_campaign_resume`/`reconcile_stale_branch`). Full contract: [suspend-resume.md](suspend-resume.md#campaign-level-crash-recovery-en11h) — `EN.6.F`/`EN.11.H` |
+| `schedule.rs` | `ScheduleEntry`/`ScheduleRegistry` — thin adapter over `engine_core::cron`, reads `harness.json`'s `schedule.entries[]`. Full contract: [cron-primitive.md](cron-primitive.md) — `EN.6.G` |
+| `blocked_bridge.rs` | `LevelSource`/`Notifier` — bridges a Blocked-edge into an `EN.8.B` `OperatorQueue`; not yet wired to a production `LevelSource` — `EN.9.G` |
+
+### Tests
+
+- One integration binary per crate (`tests/it/main.rs` + `mod <name>;`, per CLAUDE.md rule 9) — see [testing.md](testing.md)
+- Key fixtures: `engine-core/tests/{workflow_runner,parallel,validator}.rs` (runner/fan-out/validator round trips), `engine-contract/tests/round_trip.rs` (byte-for-byte serde), `engine-store/tests/postgres_round_trip.rs` (`#[ignore]`d live Postgres — needs `DATABASE_URL`), `engine-serve/tests/dispatch_integration.rs` (live-state + durable-write + 422 on unregistered type), `engine-core/tests/it/{fan_out_aggregate,evals_slice}.rs`, `engine-serve/tests/schedule.rs`
+
 
 ## `AppState` is builder-only
 

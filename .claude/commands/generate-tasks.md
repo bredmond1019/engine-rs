@@ -368,10 +368,22 @@ $ARGUMENTS — one of two input modes:
    isolation). If `breakdown.mode` is `auto` and any tasks were flagged in step 9, note that breakdown
    must run first and the recommendation applies to each resulting sub-spec, not this spec directly.
 
-11. **Commit the spec — after the self-check, the assessment and the recommendation, not before.**
-    Steps 8–10 can each require revising the spec in place, so committing earlier means committing
-    a draft and amending it. Leave the working tree clean so a downstream `/orchestrate` run never
-    trips its clean-tree merge guard (an uncommitted `tasks.md`/`tasks.json` blocks every merge):
+10a. **Run `check_tasks_json.py` and require it to exit 0 before committing.** This is the
+    `check_tasks_json.py` umbrella (`.claude/workflows/bin/check_tasks_json.py`,
+    `BT.ticket.prepare-run-replaces-setup-agents`) — the same lint-rule registry the engines'
+    `prepare_run.py` setup stage runs before spending any implement token, so a spec this command
+    would refuse never reaches an engine in the first place:
+    ```bash
+    python3 .claude/workflows/bin/check_tasks_json.py planning/<spec-slug>/tasks.json
+    ```
+    A nonzero exit means step 8's self-check missed something — fix the spec in place per whichever
+    rule the findings name, then re-run this check, before proceeding to commit.
+
+11. **Commit the spec — after the self-check, the assessment, the recommendation and 10a's lint
+    pass, not before.** Steps 8–10a can each require revising the spec in place, so committing
+    earlier means committing a draft and amending it. Leave the working tree clean so a downstream
+    `/orchestrate` run never trips its clean-tree merge guard (an uncommitted `tasks.md`/
+    `tasks.json` blocks every merge):
     ```bash
     git add planning/<spec-slug>/
     git commit -m "chore: add spec for <spec-slug>"

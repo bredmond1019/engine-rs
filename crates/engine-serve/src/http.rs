@@ -315,6 +315,11 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
             "/webhooks/email/events",
             web::post().to(crate::email_webhooks::email_delivery_events),
         )
+        // `EN.19.A` task 5 — mirrors `/webhooks/email/inbound`'s auth/dispatch shape exactly.
+        .route(
+            "/webhooks/pre-plan/inbound",
+            web::post().to(crate::pre_plan_webhook::inbound_pre_plan),
+        )
         // MUST be registered before `/approvals/ledger` -- actix-web
         // resolves routes first-registration-wins. Neither literal path
         // contains a dynamic segment today, so they cannot actually shadow

@@ -768,6 +768,57 @@ pub fn register_content_pipeline(dispatcher: &mut Dispatcher) {
     );
 }
 
+/// Register the `PRE_PLAN` workflow (`engine_core::workflows::pre_plan`,
+/// `EN.19.A`) with `dispatcher`, populating both the `workflow_registry`
+/// (via a policy-aware factory built on `pre_plan::registry_for_policy`)
+/// and the `schema_registry` (via `pre_plan::schema`).
+///
+/// Webhook-triggered (`POST /webhooks/pre-plan/inbound`, `EN.19.A` task 5)
+/// with no repo checkout at dispatch time, so the factory resolves policy
+/// against `PolicyConfigSource::Builtin` (builtin + profile + event layers
+/// only, no filesystem access), mirroring `RESEARCH_AGENT`/
+/// `DIAGNOSTIC_INTAKE`/`PROPOSAL_GENERATOR`/`CONTENT_PIPELINE`/
+/// `LINKEDIN_POST`.
+///
+/// **Standing rule 12 kill switch:** `pre_plan::PrePlanPolicy::enabled`
+/// defaults to `false` — since `PolicyConfigSource::Builtin` never reads
+/// this repo's own `planning/harness.json` `pre_plan.policy` defaults at
+/// dispatch time (only a named `profile` or an inline event `policy`
+/// override can reach it), a dispatched `PRE_PLAN` event that names neither
+/// resolves disabled and this factory returns an `Err` — nothing is
+/// spawned. This is the documented, intended behavior for a newly-shipped
+/// externally-triggerable route: `workflow_type` is always registered at
+/// startup (so `dispatcher.is_registered("PRE_PLAN")` is `true`
+/// unconditionally), but a caller must explicitly select
+/// `profile: "baseline"` (or another canonical profile, or an inline
+/// `policy.enabled: true` override) to actually get a run.
+pub fn register_pre_plan(dispatcher: &mut Dispatcher) {
+    dispatcher.register(
+        engine_core::workflows::pre_plan::schema(),
+        Box::new(|event: &serde_json::Value| {
+            let ctx = event_only_context(event);
+            let policy = engine_core::workflows::pre_plan::resolve_policy_for_run_from(
+                &ctx,
+                &PolicyConfigSource::Builtin,
+            )
+            .map_err(|err| err.to_string())?;
+            if !policy.enabled {
+                return Err(
+                    "PRE_PLAN is disabled by policy (standing rule 12 kill switch) — dispatch \
+                     with profile: \"baseline\" (or another canonical profile) or an inline \
+                     policy.enabled: true override to run it"
+                        .to_string(),
+                );
+            }
+            let registry = engine_core::workflows::pre_plan::registry_for_policy(&policy);
+            Ok(Workflow::new(
+                registry,
+                engine_core::workflows::pre_plan::schema(),
+            ))
+        }),
+    );
+}
+
 /// Register the `LINKEDIN_POST` workflow (`engine_core::workflows::linkedin_post`)
 /// with `dispatcher`, populating both the `workflow_registry` (via a
 /// policy-aware factory built on `linkedin_post::graph::registry_for_policy`)
@@ -1820,7 +1871,7 @@ pub fn register_commander(dispatcher: &mut Dispatcher) {
 
 /// Register every builtin workflow known to this crate: `SDLC_FLOW`,
 /// `SDLC_TASK`, `RESEARCH_AGENT`, `DIAGNOSTIC_INTAKE`, `PROPOSAL_GENERATOR`,
-/// `CONTENT_PIPELINE`, `LINKEDIN_POST`, `OPPORTUNITY_SET_STAGE`,
+/// `CONTENT_PIPELINE`, `LINKEDIN_POST`, `PRE_PLAN`, `OPPORTUNITY_SET_STAGE`,
 /// `OPPORTUNITY_ADD_ACTION`, `HARVEST_APPROVE`, `LEAD_INGEST`,
 /// `APPROVE_AND_RUN`, `TERMINAL_PROBE`, `RECALL`, `ORCHESTRATION`,
 /// `DEBRIEF`, `CLAIM_REAFFIRM`, `SWEEP`, and `COMMANDER`; future
@@ -1862,6 +1913,7 @@ pub fn register_builtin_workflows_with_registry(
     register_deliverable_render(dispatcher);
     register_content_pipeline(dispatcher);
     register_linkedin_post(dispatcher);
+    register_pre_plan(dispatcher);
     register_opportunity_set_stage(dispatcher);
     register_opportunity_add_action(dispatcher);
     register_harvest_approve(dispatcher);
@@ -3111,6 +3163,67 @@ mod tests {
     }
 
     #[test]
+    fn register_pre_plan_populates_both_registries() {
+        let mut dispatcher = Dispatcher::new();
+
+        register_pre_plan(&mut dispatcher);
+
+        assert!(dispatcher.is_registered("PRE_PLAN"));
+    }
+
+    #[test]
+    fn register_pre_plan_start_node_is_check_existing_notes() {
+        let mut dispatcher = Dispatcher::new();
+        register_pre_plan(&mut dispatcher);
+
+        let schema = dispatcher
+            .resolve_schema("PRE_PLAN")
+            .expect("PRE_PLAN schema should resolve");
+
+        assert_eq!(schema.start_node, "CheckExistingNotesNode");
+    }
+
+    #[test]
+    fn register_pre_plan_disabled_by_default_event_fails_to_resolve() {
+        let mut dispatcher = Dispatcher::new();
+        register_pre_plan(&mut dispatcher);
+
+        // No `profile`/`policy` override, so the standing-rule-12 kill
+        // switch's built-in default (`enabled: false`) applies and the
+        // factory refuses to build a runnable Workflow.
+        let result = dispatcher.dispatch_with_event(
+            "PRE_PLAN",
+            &serde_json::json!({"idea": "build a widget", "slug": "widget-idea"}),
+        );
+
+        match result {
+            Err(crate::dispatch::DispatchError::PolicyResolutionFailed(message)) => {
+                assert!(message.contains("disabled"));
+            }
+            Ok(_) => panic!("expected PolicyResolutionFailed, got Ok"),
+            Err(other) => panic!("expected PolicyResolutionFailed, got {other}"),
+        }
+    }
+
+    #[test]
+    fn register_pre_plan_baseline_profile_resolves_a_runnable_workflow() {
+        let mut dispatcher = Dispatcher::new();
+        register_pre_plan(&mut dispatcher);
+
+        let workflow = dispatcher
+            .dispatch_with_event(
+                "PRE_PLAN",
+                &serde_json::json!({
+                    "idea": "build a widget",
+                    "slug": "widget-idea",
+                    "profile": "baseline",
+                }),
+            )
+            .expect("baseline-profile PRE_PLAN should resolve a runnable Workflow");
+        let _ = workflow;
+    }
+
+    #[test]
     fn resolve_schema_returns_schema_with_source_router_start_node() {
         let mut dispatcher = Dispatcher::new();
         register_content_pipeline(&mut dispatcher);
@@ -3530,6 +3643,7 @@ mod tests {
             "DELIVERABLE_RENDER",
             "CONTENT_PIPELINE",
             "LINKEDIN_POST",
+            "PRE_PLAN",
             "OPPORTUNITY_SET_STAGE",
             "OPPORTUNITY_ADD_ACTION",
             "HARVEST_APPROVE",

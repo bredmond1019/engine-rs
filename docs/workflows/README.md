@@ -78,7 +78,7 @@ alone — never by guessing at payload contents:
 
 ## The workflows
 
-Twenty-three registered types, grouped by what you'd use them for. The registration list in
+Twenty-four registered types, grouped by what you'd use them for. The registration list in
 `crates/engine-serve/src/workflows.rs` (`register_builtin_workflows`) is the source of truth; this
 table is a reader's copy.
 
@@ -91,6 +91,7 @@ table is a reader's copy.
 | `ORCHESTRATION` | Runs an ordered *chain* of the two above, across repos, checking dependencies and merging each block before the next starts. | [orchestration.md](orchestration.md) |
 | `DEBRIEF` | Renders a morning brief from one campaign's journal — every step, every bail named with its reason — readable on a phone. | [debrief.md](debrief.md) |
 | `RECALL` | Asks the Brain a question mid-run via Synapse's `GET /recall`, so a chain step can branch on what the corpus already knows instead of carrying it in the event payload. | [recall.md](recall.md) |
+| `PRE_PLAN` | Turns a short free-text idea into a researched `$BRAIN_ROOT/planning/open-work/pre-plan/<slug>/notes.md`, no human back-and-forth — the smallest usable slice of the pre-plan pipeline (`/capture` today), externally triggerable over HTTP. Disabled by default (a kill switch). | [pre-plan.md](pre-plan.md) |
 
 ### Planning
 
@@ -155,6 +156,7 @@ stable prompt a workflow sends, without grepping Rust for string literals:
 | `RESEARCH_AGENT` | `crates/engine-core/src/workflows/research_agent/prompts/` |
 | `DIAGNOSTIC_INTAKE` | `crates/engine-core/src/workflows/diagnostic_intake/prompts/` |
 | `CLAIM_REAFFIRM` | `crates/engine-core/src/workflows/claim_reaffirm/prompts/` |
+| `PRE_PLAN` | `crates/engine-core/src/workflows/pre_plan/prompts/` |
 
 Only the stable prefix lives in the file — per-run body construction (`build_prompt(...)`,
 interpolating `format!`s) stays in Rust, per CLAUDE.md standing rule 6. A regression guard,

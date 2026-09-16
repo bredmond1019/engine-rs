@@ -127,6 +127,15 @@ $ARGUMENTS — the block ID to break down (e.g. `BT.ticket.some-slug`), or a pat
    Anything that does not resolve is either a symbol the sub-step **creates** — mark it explicitly
    as new — or a mistake. Fix it. Report the count checked and any that were corrected.
 
+7c. **Run `check_tasks_json.py` and require it to exit 0 before committing.** Same lint-rule
+   registry the engines' `prepare_run.py` setup stage runs before spending any implement token
+   (`BT.ticket.prepare-run-replaces-setup-agents`):
+   ```bash
+   python3 .claude/workflows/bin/check_tasks_json.py planning/<block-dir>/tasks.json
+   ```
+   A nonzero exit means the rewritten `tasks.json` regressed something 7a/7b didn't catch — fix it
+   in place, then re-run this check, before committing.
+
 8. Commit the breakdown. Leave the working tree clean:
    ```bash
    git add planning/<block-dir>/breakdown.md planning/<block-dir>/tasks.json

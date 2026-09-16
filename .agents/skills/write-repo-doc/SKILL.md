@@ -1,6 +1,6 @@
 ---
 name: write-repo-doc
-description: Write or rewrite an internal doc (docs/*.md, a guide, a README section) so a reader who does not know the system can actually use it — quickstart first, plain-English section openers, vocabulary explained or linked, every named command/script/schema linked inline, and a diagram when the shape is not obvious from prose. Use BEFORE writing any doc under docs/, before rewriting one that reads as dense or reference-only, and when someone says a doc assumes too much or they could not find how to run something.
+description: Write or rewrite an internal doc (docs/*.md, a guide, a README section) so a reader who does not know the system can actually use it — an at-a-glance bullet list first, then a quickstart, bullet section openers, keyword table cells and no long paragraphs, vocabulary explained or linked, every named command/script/schema linked inline, and a diagram when the shape is not obvious. Use BEFORE writing any doc under docs/, before rewriting one that reads as dense or reference-only, and when someone says a doc assumes too much, is hard to scan, or they could not find how to run something.
 ---
 
 # Writing an internal doc
@@ -21,6 +21,9 @@ A second reader matters just as much: **a fresh agent session with no context.**
 you write is an edge it can follow instead of guessing. Under-linking costs it a search; a wrong
 link costs it a false belief.
 
+**He scans; he does not read paragraphs.** In his words (2026-09-15): *"Long paragraphs make all
+these docs really hard to read and timely."* Fewer tokens is better for the agent reader too.
+
 > **The whole standard in one line:** a good teacher would never write the doc you are about to
 > write by default. Write the one they would.
 
@@ -28,23 +31,40 @@ link costs it a false belief.
 
 ## Quickstart
 
-1. **Read the doc as a newcomer.** Note every sentence you could not act on. That list is the work.
-2. **Put a Quickstart at the top** — the literal commands, in order, that get someone from nothing
-   to a result.
-3. **Open every section with one plain-English sentence** saying what it is and why it exists,
-   before any detail.
+1. **Open with an at-a-glance list** — 3–6 bullets directly under the title, each linking down
+   (`→ §2`). Never a paragraph. (Rule 1)
+2. **Then a Quickstart** — the literal commands, in order, that get someone from nothing to a result.
+3. **Open every `##` with 1–3 plain-English bullets** saying what the section holds and why it
+   exists. (Rule 3)
 4. **Link every command, script, schema and decision the first time you name it.**
 5. **Explain or link every term** a newcomer would not know.
-6. **Add a diagram** if the shape is not obvious from prose.
-7. **Run the checklist at the bottom**, then the gates.
+6. **Add a diagram** if the shape is not obvious.
+7. **No prose block over two lines; table cells are keywords, not sentences.** (Rule 7)
+8. **Run the checklist at the bottom**, then the gates.
 
 ---
 
 ## The seven rules
 
-### 1. Quickstart first, always
+### 1. At a glance first, then the Quickstart
 
-The first thing after the title is **how to get started**, not what the system is.
+The first thing under the title is **a bullet list of what the reader must know right away**.
+
+- 3–6 bullets, each one fact, ~15 words max.
+- Cover: what this is, the key facts or numbers, what the reader does, what's broken or pending.
+- Each bullet links to the section with the detail (`→ §4`).
+- **Never a paragraph** — not even a two-sentence one.
+
+```md
+# Deploying the worker
+
+- Deploys with one command: `scripts/release.sh` → §Quickstart
+- Backs up the database first; takes ~2 min
+- **Not safe mid-run** — drain workers first → §3
+- Rollback: restore the backup → §5
+```
+
+Then **how to get started**:
 
 - Real commands, copy-pasteable, in the order they are run.
 - Say **where** each is typed — a Claude Code slash command and a shell command look identical on
@@ -52,8 +72,8 @@ The first thing after the title is **how to get started**, not what the system i
   goes in a terminal. **Say which.**
 - Then a short table of what must exist first, and what to do if it does not.
 
-If the reader has to scroll past three paragraphs to find a command, the doc has failed regardless
-of how correct those paragraphs are.
+If the reader has to scroll past a paragraph to find a command, the doc has failed regardless of how
+correct that paragraph is.
 
 ### 2. Name the runnable thing
 
@@ -77,17 +97,17 @@ So, for anything runnable:
 - If two paths share an implementation, say that too — otherwise a reader assumes two things to
   keep in sync.
 
-### 3. Plain English before detail
+### 3. Plain English before detail — as bullets
 
-Every `##` opens with one or two sentences a newcomer can follow. Then the table, the flags, the
-policy.
+Every `##` opens with **1–3 bullets** a newcomer can follow: what this section is, and what the
+reader gets from it. Then the table, the flags, the policy.
 
 | Instead of | Write |
 |---|---|
-| "Heavy-gate repos register a slot with `fleet_concurrency_check.py`." | "Some repos are expensive to test — they launch browsers, or compile Rust. Running several at once will bury the machine. So those repos take a **slot** before starting and give it back when done, like a parking space." |
-| "`base-template` always runs `--worktree`." | "A **worktree** is a second copy of the repo in a separate folder. `base-template` always uses one, because a lane there edits the very files that are running it." |
+| "Heavy-gate repos register a slot with `fleet_concurrency_check.py`." | - Some repos are expensive to test (browsers, Rust builds)<br>- Several at once buries the machine<br>- So each takes a **slot** first, like a parking space |
+| "`base-template` always runs `--worktree`." | - A **worktree** = a second copy of the repo in another folder<br>- `base-template` always uses one: a lane there edits the files running it |
 
-The detail is not the problem. The *missing first sentence* is.
+The detail is not the problem. The *missing first bullet* is.
 
 ### 4. Explain the vocabulary, or link where it is explained
 
@@ -126,11 +146,11 @@ Three traps, all of which have fired here:
 ### 6. Give the reader the shape
 
 If the system has moving parts, prose alone will not convey how they fit. Add a **mermaid diagram**
-near the top, then **the same thing in numbered sentences underneath** — the diagram is for
-orientation, the sentences are what a screen reader and a grepping agent get.
+near the top, then **the same thing as a short numbered list underneath** — the diagram is for
+orientation, the list is what a screen reader and a grepping agent get.
 
 Then say plainly **which steps the reader personally does.** That single line is often the most
-useful sentence in the document.
+useful line in the document.
 
 ```mermaid
 flowchart TD
@@ -140,10 +160,12 @@ flowchart TD
 
 Diagrams render natively in this corpus. Keep them under ~12 nodes; past that, split the diagram.
 
-### 7. Bullets and short sentences
+### 7. Bullets and keywords, never paragraphs
 
-- Prefer a table to a paragraph. Prefer a bullet to a sentence. Prefer a short sentence to a long one.
-- One idea per bullet.
+- **No prose block longer than two lines.** Anything longer becomes bullets or a table.
+- **Table cells are keywords and fragments**, not sentences: `sending, warmup, deliverability`, not
+  "It keeps doing the sending and the warmup."
+- **One fact per bullet.** A bullet joined by "and", "which" or "so" is two bullets.
 - **Bold the thing being decided or warned about**, so scanning works.
 - Cut every clause that only tells the reader that what follows is important.
 - Cite an authority instead of restating it: "field table: `<file>`" beats reproducing the table and
@@ -155,33 +177,34 @@ Diagrams render natively in this corpus. Keep them under ~12 nodes; past that, s
 
 ```
 Title
-  One line: what this is. Link to the overview/vocabulary doc for newcomers.
-## What this page is for      <- plain English, who it's for, what they'll be able to do
+- 3–6 at-a-glance bullets, each → §N   <- what this is, key facts, what to do, what's pending
 ## Quickstart                 <- the commands, and what must exist first
-## <Overview / diagram>       <- if the shape is non-obvious
+## <Overview / diagram>       <- 1–3 bullet opener, diagram, numbered list
 ## The <N> phases at a glance <- a table with links down into detail
-## 1..N — the detail          <- each opening in plain English
+## 1..N — the detail          <- each opening with 1–3 plain-English bullets
 ## Troubleshooting            <- symptom -> likely cause -> what to check
 ## See also                   <- every related doc, command and decision
 ```
 
-Not every doc needs every section. Every doc needs the Quickstart and the plain-English openers.
+Not every doc needs every section. Every doc needs the at-a-glance list, the Quickstart, and the bullet
+openers.
 
 ---
 
 ## Before you commit
 
+- [ ] The first thing under the title is 3–6 at-a-glance bullets linking to sections — no paragraph.
 - [ ] A newcomer can run something correctly within the first screen.
 - [ ] Every runnable thing lists **all** the ways to run it, and says where each is typed.
 - [ ] The destructive path is labelled at the command, not later.
-- [ ] Every `##` opens with plain English before detail.
+- [ ] Every `##` opens with 1–3 plain-English bullets before detail.
+- [ ] No prose block runs past two lines; table cells are keywords, not sentences.
 - [ ] Every unfamiliar term is defined inline or linked.
 - [ ] Every command / script / schema / decision is linked on first mention.
 - [ ] Cross-repo references are **bare qualified paths**, never relative links.
 - [ ] Every named file was verified to exist (`ls` it — the gate will not catch a backticked path).
 - [ ] Decision numbers say which repo.
-- [ ] A diagram exists if the shape is non-obvious, with the same content in sentences beneath.
-- [ ] Tables and bullets carry the weight; no paragraph runs past ~4 lines.
+- [ ] A diagram exists if the shape is non-obvious, with the same content as a numbered list beneath.
 - [ ] OKF frontmatter is present and `keywords` has **3–7** entries — see `write-okf-markdown`.
 - [ ] `bastion validate-brain --links`, `--structure` and `--graph` all clean, **one flag per run**.
 
@@ -197,6 +220,7 @@ guessed at is the defect list. Do this for any doc someone will rely on without 
 ## Related
 
 - `write-okf-markdown` — frontmatter, `index.md` rows, and the `planning/` symlink link trap.
+- `write-operating-doc` — a doc read to act today; same at-a-glance and no-paragraph rules, one screen.
 - `base-template/docs/workflows/index.md` — a worked example: diagram, vocabulary table, and
   jump-links from every term.
 - `base-template/docs/workflows/orchestration.md` and `lane-coordination.md` — worked examples of
@@ -206,4 +230,5 @@ guessed at is the defect list. Do this for any doc someone will rely on without 
 - `base-template/docs/workflows/roadmap-sweep.md` — a worked example of rule 2's danger labelling:
   the safe `--dry-run` path is shown first and the live side effects are called out at the command.
 - For **published** writing (blog posts, learning modules), the fuller voice standard is
-  `learn-ai/content/blog/CLAUDE.md` § "Voice and tone" — same teacher identity, higher bar.
+  `learn-ai/content/blog/CLAUDE.md` § "Voice and tone" — same teacher identity, higher bar. Its
+  long-sentence rhythm applies to published prose only, never to these docs.

@@ -35,6 +35,7 @@ English, and how to trigger one. This page is just the file listing.
 | [linkedin-post.md](linkedin-post.md) | The `LINKEDIN_POST` graph — drafting from real fleet work, the traceability invariant, and the brand-rubric critic loop |
 | [lead-ingest.md](lead-ingest.md) | The `LEAD_INGEST` graph — the two-node inbound-lead write, its idempotency, and the untrusted-input boundary |
 | [opportunity-edit.md](opportunity-edit.md) | The `OPPORTUNITY_SET_STAGE` / `OPPORTUNITY_ADD_ACTION` micro-workflows — payloads, the seam operation, and the error surface |
+| [pre-plan.md](pre-plan.md) | The `PRE_PLAN` graph — turning a short free-text idea into a researched `notes.md` with no human back-and-forth, the kill-switch policy, idempotency, and the prompt-injection defense |
 | [approve-and-run.md](approve-and-run.md) | The `APPROVE_AND_RUN` micro-workflow — draining pending records, resolving a verdict into a ledger row plus an authorized execution |
 | [terminal-probe.md](terminal-probe.md) | The `TERMINAL_PROBE` graph — the read-only session/observe diagnostic for the terminal stack |
 | [sweep.md](sweep.md) | The `SWEEP` workflow — the roadmap sweep ported field-for-field from `roadmap_sweep.py`, its single-node shape, and the permission-profile-gated routing |

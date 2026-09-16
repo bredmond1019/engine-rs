@@ -61,6 +61,7 @@ mod policy_baseline;
 mod policy_framework;
 mod policy_profile_matrix;
 mod post_draft;
+mod pre_plan;
 mod preflight;
 mod prompt_externalization;
 mod queue_park;
