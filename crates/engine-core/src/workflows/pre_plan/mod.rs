@@ -159,18 +159,28 @@ pub struct PrePlanPolicy {
     /// only consults it when `research_model_tier` resolves to
     /// `ModelTier::Local`.
     pub local: LocalConfig,
+    /// The research node's [`AgentBackend`], threaded through
+    /// `llm_node::resolve_meta_transport` (standing rule 11) rather than the
+    /// hand-rolled `ClaudeCli`-literal `AgentBackend` value
+    /// `registry_for_policy` used to pass directly. `ClaudeCli` (the
+    /// built-in [`AgentBackend`] default) matches today's only-ever-behavior,
+    /// so introducing this field is behavior-stable.
+    pub research_backend: AgentBackend,
 }
 
 impl Default for PrePlanPolicy {
     /// Kill-switch default (standing rule 12): disabled until a profile or
     /// override explicitly turns PRE_PLAN on. `research_model_tier`
     /// defaults to `Sonnet`, matching `research::ResearchCodebaseNode`'s own
-    /// pre-policy default model.
+    /// pre-policy default model. `research_backend` defaults to
+    /// [`AgentBackend`]'s own `ClaudeCli` default, matching today's
+    /// only-ever-behavior.
     fn default() -> Self {
         Self {
             enabled: false,
             research_model_tier: ModelTier::Sonnet,
             local: LocalConfig::default(),
+            research_backend: AgentBackend::default(),
         }
     }
 }
@@ -185,6 +195,7 @@ pub struct PartialPrePlanPolicy {
     pub enabled: Option<bool>,
     pub research_model_tier: Option<ModelTier>,
     pub local: Option<PartialLocalConfig>,
+    pub research_backend: Option<AgentBackend>,
 }
 
 impl Policy for PrePlanPolicy {
@@ -201,6 +212,7 @@ impl Policy for PrePlanPolicy {
                 Some(l) => merge_local(base.local, l),
                 None => base.local,
             },
+            research_backend: merge_opt(base.research_backend, over.research_backend),
         }
     }
 }
@@ -214,6 +226,7 @@ pub fn baseline() -> PartialPrePlanPolicy {
     PartialPrePlanPolicy {
         enabled: Some(true),
         research_model_tier: Some(ModelTier::Sonnet),
+        research_backend: Some(AgentBackend::default()),
         ..Default::default()
     }
 }
@@ -224,6 +237,7 @@ pub fn cheap_fast() -> PartialPrePlanPolicy {
     PartialPrePlanPolicy {
         enabled: Some(true),
         research_model_tier: Some(ModelTier::Haiku),
+        research_backend: Some(AgentBackend::default()),
         ..Default::default()
     }
 }
@@ -234,6 +248,7 @@ pub fn thorough() -> PartialPrePlanPolicy {
     PartialPrePlanPolicy {
         enabled: Some(true),
         research_model_tier: Some(ModelTier::Opus),
+        research_backend: Some(AgentBackend::default()),
         ..Default::default()
     }
 }
@@ -336,18 +351,18 @@ pub fn registry() -> NodeRegistry {
 /// given resolved `policy`. Per standing rule 11, `ResearchCodebaseNode`'s
 /// transport override is resolved through the shared
 /// `llm_node::resolve_meta_transport`/`wire` seam rather than a hand-rolled
-/// per-node model field — `AgentBackend::ClaudeCli` at any non-`Local` tier
-/// is a documented no-op (the node keeps its own default cloud transport),
-/// so only `ModelTier::Local` actually rewires the transport. The node SET
-/// is INVARIANT across every policy setting (standing rule 6) — this never
-/// swaps which identities are registered, only `ResearchCodebaseNode`'s own
-/// transport.
+/// per-node model field — `policy.research_backend` at its `ClaudeCli`
+/// default and any non-`Local` tier is a documented no-op (the node keeps
+/// its own default cloud transport); `Pi`/`Aider` always route local
+/// regardless of tier. The node SET is INVARIANT across every policy setting (standing
+/// rule 6) — this never swaps which identities are registered, only
+/// `ResearchCodebaseNode`'s own transport.
 #[must_use]
 pub fn registry_for_policy(policy: &PrePlanPolicy) -> NodeRegistry {
     let mut registry = registry();
     let transport = resolve_meta_transport(
         policy.research_model_tier,
-        AgentBackend::ClaudeCli,
+        policy.research_backend,
         &policy.local,
         &crate::policy::PiConfig::default(),
     );
@@ -583,6 +598,7 @@ mod tests {
         let policy = PrePlanPolicy::default();
         assert!(!policy.enabled);
         assert_eq!(policy.research_model_tier, ModelTier::Sonnet);
+        assert_eq!(policy.research_backend, AgentBackend::ClaudeCli);
     }
 
     #[test]
@@ -679,5 +695,85 @@ mod tests {
         .expect("resolve should succeed");
         assert!(resolved.enabled);
         assert_eq!(resolved.research_model_tier, ModelTier::Haiku);
+    }
+
+    /// Writes an executable `/bin/sh` script with `body` — mirrors
+    /// `sdlc_task::graph`'s private `write_fake_binary` test helper.
+    #[cfg(unix)]
+    fn write_fake_binary(body: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let script_path = dir.path().join("fake-binary.sh");
+        let mut file = std::fs::File::create(&script_path).expect("create script");
+        std::io::Write::write_all(&mut file, format!("#!/bin/sh\n{body}\n").as_bytes())
+            .expect("write script");
+        drop(file);
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod +x");
+        (dir, script_path)
+    }
+
+    /// Serializes every test in this module that mutates the process-global
+    /// `PI_BINARY` env var — `cargo nextest run` (standing rule 8) forks one
+    /// process per test, so this only guards a stray plain `cargo test` run,
+    /// mirroring `pi_transport.rs`'s own `PI_BINARY_ENV_LOCK`.
+    #[cfg(unix)]
+    static PI_BACKEND_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    /// A `PrePlanPolicy` with `research_backend: AgentBackend::Pi`, resolved
+    /// through `registry_for_policy`, must produce a registry whose
+    /// `ResearchCodebaseNode` dispatches the Pi meta-transport — this is the
+    /// exact bug task 8 fixes: before it, `registry_for_policy` always
+    /// passed the literal `AgentBackend::ClaudeCli` to
+    /// `resolve_meta_transport`, so a `research_backend: pi` policy was
+    /// silently ignored. Would fail if that fix were reverted.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn registry_for_policy_with_pi_backend_dispatches_pi_transport() {
+        let _guard = PI_BACKEND_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        let (_script_dir, script) = write_fake_binary(
+            r#"printf '{"type":"agent_end","messages":[{"role":"assistant","content":[{"type":"text","text":"hi"}]}]}\n'
+printf '{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"done"}],"usage":{"totalTokens":1}}}\n'
+"#,
+        );
+        // SAFETY: single-threaded within this test's own process
+        // (`cargo nextest run` forks one process per test), scoped to this
+        // test and serialized via `PI_BACKEND_ENV_LOCK`.
+        unsafe {
+            std::env::set_var("PI_BINARY", &script);
+        }
+
+        let policy = PrePlanPolicy {
+            research_backend: AgentBackend::Pi,
+            ..PrePlanPolicy::default()
+        };
+        let registry = registry_for_policy(&policy);
+        let node = registry
+            .get(research::NODE_NAME)
+            .expect("ResearchCodebaseNode registered");
+        let ctx = context_with_intake_for_registry("build a widget", "widget-idea");
+        let result = node.process(ctx).await;
+
+        unsafe {
+            std::env::remove_var("PI_BINARY");
+        }
+
+        let out = result.expect("process should succeed against the fake pi script");
+        let backend = out.nodes[research::NODE_NAME]["transport"]["backend"].clone();
+        assert_eq!(backend, json!("pi"));
+    }
+
+    #[cfg(unix)]
+    fn context_with_intake_for_registry(idea: &str, slug: &str) -> TaskContext {
+        let mut ctx = empty_context(json!({}));
+        put_result(
+            &mut ctx,
+            intake::NODE_NAME,
+            json!({"idea": idea, "slug": slug, "channel": null, "sender": null}),
+        );
+        ctx
     }
 }
