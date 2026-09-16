@@ -32,15 +32,17 @@
 //!   pre-plan folder (task 1).
 //! - `decompose` — [`decompose::DecomposePlanNode`], the one model-calling
 //!   stage (task 2).
-//! - `stage_candidate_blocks` — `StageCandidateBlocksNode` (task 3, not
-//!   yet implemented).
+//! - `stage_candidate_blocks` — [`stage_candidate_blocks::StageCandidateBlocksNode`],
+//!   mints a candidate id per proposed block, validates it against
+//!   `.claude/workflows/block.schema.json`'s required-field/enum contract,
+//!   and writes each to `candidate-blocks/<ID>.json` — never `mev
+//!   create-block`, never `state.json` (task 3).
 //! - `write_narrative` — `WritePlanNarrativeNode` (task 4, not yet
 //!   implemented).
 //!
 //! `WORKFLOW_TYPE`, the assembled `WorkflowSchema`/`NodeRegistry`, and the
 //! `register_plan_authoring` wiring into `crates/engine-serve/src/workflows.rs`
-//! all land in task 5 — this module exports only the two task-1 nodes
-//! today.
+//! all land in task 5 — this module exports the task-1/2/3 nodes today.
 //!
 //! # On the deferred `ExistsGuardNode` extraction
 //!
@@ -61,3 +63,4 @@
 pub mod check_existing;
 pub mod decompose;
 pub mod gather_context;
+pub mod stage_candidate_blocks;
