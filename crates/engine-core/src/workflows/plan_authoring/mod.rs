@@ -37,12 +37,13 @@
 //!   `.claude/workflows/block.schema.json`'s required-field/enum contract,
 //!   and writes each to `candidate-blocks/<ID>.json` — never `mev
 //!   create-block`, never `state.json` (task 3).
-//! - `write_narrative` — `WritePlanNarrativeNode` (task 4, not yet
-//!   implemented).
+//! - `write_narrative` — [`write_narrative::WritePlanNarrativeNode`],
+//!   renders `plan.md` from `StageCandidateBlocksNode`'s staged records,
+//!   matching `.claude/commands/plan.md`'s Output Format (task 4).
 //!
 //! `WORKFLOW_TYPE`, the assembled `WorkflowSchema`/`NodeRegistry`, and the
 //! `register_plan_authoring` wiring into `crates/engine-serve/src/workflows.rs`
-//! all land in task 5 — this module exports the task-1/2/3 nodes today.
+//! all land in task 5 — this module exports the task-1/2/3/4 nodes today.
 //!
 //! # On the deferred `ExistsGuardNode` extraction
 //!
@@ -64,3 +65,4 @@ pub mod check_existing;
 pub mod decompose;
 pub mod gather_context;
 pub mod stage_candidate_blocks;
+pub mod write_narrative;
