@@ -94,6 +94,24 @@
       "type": "string",
       "description": "OPTIONAL. A shell command the bookkeep stage runs immediately after `mev emit-state --write` succeeds, in an in-place (non-worktree) run only. No default value ships, and the scaffold stub does not carry this key — its absence means the engines behave exactly as before this field existed: no post-emit command runs. When present, the engine invokes this command as-is and surfaces a non-zero exit as a reported failure rather than swallowing it; it never runs in worktree mode, where the preceding emit-state step itself does not run. This key carries no assumption about what the command does or where it lives — that is project policy, not engine mechanism."
     },
+    "lintRules": {
+      "type": "object",
+      "description": "OPTIONAL. Rule id -> {enabled, config} policy for the check_tasks_json.py lint rule registry (task 3 of BT.ticket.prepare-run-replaces-setup-agents). A rule id absent from this object defaults to enabled with an empty config — this key exists purely so enabling/disabling a rule, or changing its config, is a harness.json edit, never a code change. No default value is assumed for the object itself; its absence means every registry rule runs at its own built-in default.",
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "enabled": {
+            "type": "boolean",
+            "description": "Whether this rule runs. Absent (no entry for this rule id at all) also means enabled — this field only matters once an entry exists."
+          },
+          "config": {
+            "type": "object",
+            "description": "Rule-specific configuration, shape owned by the rule module itself. Absent means the rule's own built-in default config."
+          }
+        }
+      }
+    },
     "flow": {
       "type": "object",
       "additionalProperties": false,
@@ -197,6 +215,32 @@
           "type": "string",
           "enum": ["fixable", "escalate"],
           "description": "Absent means 'fixable'. 'escalate' means a failure of this check is not addressable by editing code (a flaky external tool, a missing credential, an upstream advisory), so an engine that honours the key should bail rather than spend fix retries on it."
+        },
+        "probeCommand": {
+          "type": "string",
+          "description": "OPTIONAL. A collect-only command (e.g. 'cargo nextest list', 'pytest --collect-only -q', 'node --check') that proves this check is actually runnable before any implement-stage agent spends a token. Read by prepare_run.py (BT.ticket.prepare-run-replaces-setup-agents task 4), not by the engines directly. Absent means 'not probed' — no default value assumed."
+        },
+        "requires": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "OPTIONAL. What this check needs present in the environment, verified by prepare_run.py before treating a spec as ready-to-run. Absent means 'no extra requirement' — no default value assumed.",
+          "properties": {
+            "bins": {
+              "type": "array",
+              "items": { "type": "string" },
+              "description": "Executable names that must resolve on PATH (checked via e.g. shutil.which)."
+            },
+            "env": {
+              "type": "array",
+              "items": { "type": "string" },
+              "description": "Environment variable names that must be set (e.g. the FE.7.B FELI_TEST_DATABASE_URL shape)."
+            },
+            "services": {
+              "type": "array",
+              "items": { "type": "string" },
+              "description": "Named services that must be reachable (e.g. a database or a port), verified best-effort."
+            }
+          }
         },
         "observed_red": {
           "type": "object",

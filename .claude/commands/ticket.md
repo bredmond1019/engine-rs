@@ -224,6 +224,15 @@ downstream block waiting on its code, so there is nothing to defer (D65).
       the self-check. Reading the harness is the check; asserting "task 1 is fine" is not.
     - **Nothing this ticket depends on is unclassified** as built / half-built / absent.
 
+9a. **Run `check_tasks_json.py` and require it to exit 0 before this spec commits anywhere.**
+    This is the same lint-rule registry the engines' `prepare_run.py` setup stage runs before
+    spending any implement token (`BT.ticket.prepare-run-replaces-setup-agents`):
+    ```bash
+    python3 .claude/workflows/bin/check_tasks_json.py planning/<BlockID>/tasks.json
+    ```
+    A nonzero exit means step 9's self-check missed something — fix the spec in place per whichever
+    rule the findings name, then re-run this check.
+
 10. Report the paths and next step.
 
 ## Session boundary

@@ -70,6 +70,16 @@ description: >
 When the user asks you to run `/sdlc-flow <spec-slug> [range]`, do NOT run `sdlc-flow.js`. Instead, perform the flow execution yourself:
 
 1. **Setup — plain branch, or isolated worktree with `--worktree`**:
+   - **Since `BT.ticket.prepare-run-replaces-setup-agents`, the real engine's setup phase runs ONE
+     `prepare-run` agent** (whose whole job is `python3 .claude/workflows/bin/prepare_run.py
+     --spec-slug <spec-slug>`, returning its JSON — repo root, vault detection, rendered flags,
+     harness config, task enumeration, a lint/probe verdict) **before, at most, a second agent
+     that creates/locates the worktree.** If `prepare_run.py` exists in this repo, run it directly
+     with your own bash tools instead of hand-deriving these facts — you have exactly the shell
+     access it needs. A `refused: true` result stops the whole run right here, before any branch
+     or worktree work, reporting `reason` verbatim. `--resume` reads this same JSON back from the
+     run's meta bundle (`sdlc-flow-state.json`'s `setup` field) rather than re-running it. If
+     `prepare_run.py` does not exist yet in this repo, fall back to the manual steps below.
    - **Without `--worktree` (default):** check out branch `<spec-slug>-flow` IN THE MAIN WORKING
      TREE — no sparse-checkout worktree, so a relative `planning/` symlink (brain-vaulted repos) stays
      intact. `main` stays on the branch until the PR merges; refuse to start on a dirty working tree —

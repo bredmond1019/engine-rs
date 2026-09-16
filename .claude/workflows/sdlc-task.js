@@ -202,19 +202,100 @@ const VAULT_DETECT_SCHEMA = {
   }
 }
 // <</shared:VAULT_DETECT_SCHEMA>>
-// <<shared:detectPlanningVault>>
-async function detectPlanningVault(repoRoot) {
+// <<shared:PREPARE_RUN_SCHEMA>>
+// BT.ticket.prepare-run-replaces-setup-agents, task 6: the schema for the ONE 'prepare-run' agent
+// turn that replaces the eight mechanical setup-phase agents (resolve-repo-root, detect-vault,
+// verify-setup-binding, render-agent-flag, render-scope-flag, harness-config, enumerate,
+// state-load — see the block record's `what`). The agent's ONLY job is to run
+// .claude/workflows/bin/prepare_run.py and transcribe its stdout VERBATIM into `rawOutput` — a
+// two-turn shell task (the block's own `why`), never a reasoning task. All parsing and every
+// decision (refused vs. not, which field means what) happen HERE IN JS, in
+// parsePrepareRunOutput() below, exactly like every other mechanical stage in this engine
+// (verifySetupBinding, verifyVaultCommit) already does.
+const PREPARE_RUN_SCHEMA = {
+  type: 'object',
+  required: ['rawOutput'],
+  properties: {
+    rawOutput: { type: 'string', description: 'Everything the prepare-run script printed to stdout, verbatim, unmodified, unsummarized, unreformatted' }
+  }
+}
+// <</shared:PREPARE_RUN_SCHEMA>>
+// <<shared:parsePrepareRunOutput>>
+// Parses runPrepareRun()'s transcribed stdout into { prepareRun, gitCommonDir, tierPrefix,
+// brainTomlAtRoot } — never throws; returns null on any parse failure so callers fail exactly the
+// way resolveRepoRoot() returning null already did before this ticket. `prepareRun` is
+// prepare_run.py's own JSON object verbatim (repo_root, is_vaulted, vault_root, agent_flag,
+// scope_flag, harness_config, tasks_enumeration, lint, probes, refused[, reason]) — see that
+// script's module docstring for the field list.
+function parsePrepareRunOutput(rawOutput) {
+  if (!rawOutput || typeof rawOutput !== 'string') return null
+  const marker = '---PREPARE_RUN_EXTRA---'
+  const idx = rawOutput.indexOf(marker)
+  const jsonPart = (idx === -1 ? rawOutput : rawOutput.slice(0, idx)).trim()
+  const extraPart = idx === -1 ? '' : rawOutput.slice(idx + marker.length)
+  let prepareRun
+  try {
+    prepareRun = JSON.parse(jsonPart)
+  } catch {
+    return null
+  }
+  const gitCommonDirMatch = extraPart.match(/GIT_COMMON_DIR:(.*)/)
+  const tierPrefixMatch   = extraPart.match(/TIER_PREFIX:(.*)/)
+  const brainTomlMatch    = extraPart.match(/BRAIN_TOML:(.*)/)
+  return {
+    prepareRun,
+    gitCommonDir:    gitCommonDirMatch ? gitCommonDirMatch[1].trim() : null,
+    tierPrefix:      tierPrefixMatch ? tierPrefixMatch[1].trim() : '',
+    brainTomlAtRoot: brainTomlMatch ? brainTomlMatch[1].trim() === 'yes' : false,
+  }
+}
+// <</shared:parsePrepareRunOutput>>
+
+// <<shared:runPrepareRun>>
+// ONE cached agent turn per process, called lazily by whichever of resolveRepoRoot()/
+// detectPlanningVault()/renderAgentFlag()/renderScopeFlag()/loadHarnessConfig() runs first — every
+// later caller in the SAME run reuses the cached result instead of spawning its own agent, which is
+// the actual mechanism of the setup-agent collapse (block AC1/AC2). `_prepareRunCache` can also be
+// seeded directly from a resumed run's recorded `state.setup` (see the --resume block in the engine
+// body) — in that case this function is never called at all for the rest of that run.
+//
+// specSlug is optional: resolveRepoRoot() (the very first caller, before any spec-file existence
+// check has even happened) calls this with no slug, so the very first prepare-run turn never
+// depends on knowing the spec is real yet. A later caller passing a DIFFERENT specSlug than the
+// cached one forces a fresh call — this does not happen in either engine's normal flow, since both
+// resolve blockId once, before Setup, and never change it mid-run.
+let _prepareRunCache = null
+let _prepareRunCacheSlug = undefined
+async function runPrepareRun(specSlug) {
+  if (_prepareRunCache && _prepareRunCacheSlug === (specSlug || null)) return _prepareRunCache
+  const specFlag = specSlug ? ` --spec-slug ${specSlug}` : ''
   const result = await agent(`
-Determine whether planning/ in this repo is a symlink (a brain-vaulted repo) or a plain directory.
-Run exactly this ONE Bash call (from the repo root, ${repoRoot}):
-  cd ${repoRoot} && { [ -L planning ] && echo "SYMLINK" || echo "PLAIN"; } && python3 -c "import os; print(os.path.realpath('planning'))"
-The first line is SYMLINK or PLAIN. The second line is the resolved absolute real path (this works
-for both cases — realpath of a plain directory is itself).
-Return via StructuredOutput: vaulted (true iff the first line is SYMLINK), planningPath (the
-resolved absolute path from the second line).
-`, { label: 'detect-vault', schema: VAULT_DETECT_SCHEMA, model: 'haiku' })
-  if (!result) return { vaulted: false, planningPath: `${repoRoot}/planning` }
-  return result
+Run exactly this ONE Bash call, from the invoking directory — do not cd anywhere first, do not
+substitute or re-derive any value, and do not run any other command:
+  REPO_ROOT=$(${GIT} rev-parse --show-toplevel) && python3 "$REPO_ROOT/.claude/workflows/bin/prepare_run.py"${specFlag} --repo-root "$REPO_ROOT"; echo "---PREPARE_RUN_EXTRA---" && echo "GIT_COMMON_DIR:$(${GIT} rev-parse --path-format=absolute --git-common-dir)" && echo "TIER_PREFIX:$(python3 -c "import os; r=os.path.relpath(os.getcwd(), '$REPO_ROOT'); print('' if r=='.' else r+'/')")" && { [ -f "$REPO_ROOT/brain.toml" ] && echo "BRAIN_TOML:yes" || echo "BRAIN_TOML:no"; }
+This is a two-turn shell task, not a reasoning task: prepare_run.py already resolved every setup
+fact, ran the tasks.json lint, and probed runnability. Do not interpret, summarize, or reformat its
+JSON — transcribe stdout EXACTLY as printed (including the JSON's own newlines and indentation)
+into one string.
+Return via StructuredOutput: rawOutput (everything printed above, verbatim, in order).
+`, { label: 'prepare-run', schema: PREPARE_RUN_SCHEMA, model: 'haiku' })
+  _prepareRunCache = parsePrepareRunOutput(result && result.rawOutput)
+  _prepareRunCacheSlug = specSlug || null
+  return _prepareRunCache
+}
+// <</shared:runPrepareRun>>
+
+// <<shared:detectPlanningVault>>
+// BT.ticket.prepare-run-replaces-setup-agents, task 6: sourced from the shared runPrepareRun()
+// cache instead of its own agent turn — prepare_run.py's detect_vault() is the same
+// os.path.islink/os.path.realpath check this used to hand a Haiku agent to run and transcribe.
+// repoRoot is accepted for call-site compatibility and used only as the fallback root when the
+// cache is unusable (agent failure, or a refused run) — no agent call happens in that fallback.
+async function detectPlanningVault(repoRoot) {
+  const cache = await runPrepareRun()
+  const pr = cache && cache.prepareRun
+  if (!pr || pr.refused) return { vaulted: false, planningPath: `${repoRoot}/planning` }
+  return { vaulted: !!pr.is_vaulted, planningPath: pr.vault_root || `${repoRoot}/planning` }
 }
 // <</shared:detectPlanningVault>>
 
@@ -245,18 +326,24 @@ const RESOLVE_REPO_ROOT_SCHEMA = {
 }
 // <</shared:RESOLVE_REPO_ROOT_SCHEMA>>
 // <<shared:resolveRepoRoot>>
+// BT.ticket.prepare-run-replaces-setup-agents, task 6: the FIRST caller of runPrepareRun() on a
+// fresh (non-resumed) run — Setup calls this before anything else (see the engine body below), so
+// this is where the single 'prepare-run' agent turn actually happens. A `refused: true`
+// prepare_run.py verdict is surfaced here as { refused: true, reason } rather than folded into the
+// existing null-on-agent-failure contract, so the caller can bail with the REASON prepare_run.py
+// gave (an unmet requires.bins/env/services, or a failing probeCommand) instead of a bare null a
+// run log can't explain — see the refusal check at this function's call site.
 async function resolveRepoRoot() {
-  const result = await agent(`
-Resolve this repo's root and related mechanical facts ONCE, before anything else runs.
-Run exactly this ONE Bash call, from the invoking directory — do not cd anywhere first, do not
-substitute or re-derive any value, and do not run any other command:
-  REPO_ROOT=$(${GIT} rev-parse --show-toplevel) && echo "REPO_ROOT:$REPO_ROOT" && echo "GIT_COMMON_DIR:$(${GIT} rev-parse --path-format=absolute --git-common-dir)" && echo "TIER_PREFIX:$(python3 -c "import os; r=os.path.relpath(os.getcwd(), '$REPO_ROOT'); print('' if r=='.' else r+'/')")" && { [ -f "$REPO_ROOT/brain.toml" ] && echo "BRAIN_TOML:yes" || echo "BRAIN_TOML:no"; }
-Four labelled lines come back — REPO_ROOT:, GIT_COMMON_DIR:, TIER_PREFIX:, BRAIN_TOML: (yes/no).
-Return via StructuredOutput: repoRoot (the REPO_ROOT: value), gitCommonDir (the GIT_COMMON_DIR:
-value), tierPrefix (the TIER_PREFIX: value, "" when invoking at the repo root), brainTomlAtRoot
-(true iff BRAIN_TOML: is yes).
-`, { label: 'resolve-repo-root', schema: RESOLVE_REPO_ROOT_SCHEMA, model: 'haiku' })
-  return result || null
+  const cache = await runPrepareRun()
+  const pr = cache && cache.prepareRun
+  if (!pr) return null
+  if (pr.refused) return { refused: true, reason: pr.reason || 'prepare_run.py refused with no reason given' }
+  return {
+    repoRoot:        pr.repo_root,
+    gitCommonDir:    cache.gitCommonDir,
+    tierPrefix:      cache.tierPrefix,
+    brainTomlAtRoot: cache.brainTomlAtRoot,
+  }
 }
 // <</shared:resolveRepoRoot>>
 
@@ -927,6 +1014,10 @@ ${sameContext ? `(Previous attempt context for the same-failure check: ${sameCon
 function renderTestPrompt({ enginePhrase, overrideNote, runRootLabel, runRoot, checklistBody, diffBase, stateFile, recordedCommitsJson, emojiScopeNote, onPassRecipe, stateWrittenNote, heartbeatRecipe }) {
   return `You are the test agent for the ${enginePhrase} pipeline. Run the project's validation checks and report.
 
+Before anything else, read .claude/workflows/agent-rules.md (from ${runRoot}) — the engine's own
+minimal-context rules for this run. It is short by design; do not skip it because this looks like a
+mechanical stage.
+
 IMPORTANT — run ONLY the checks enumerated below (${overrideNote}). Do NOT invent
 checks. All Bash calls run from the ${runRootLabel} (prefix each with: cd ${runRoot} &&).
 
@@ -974,7 +1065,8 @@ Target:
 1. Read CLAUDE.md and planning/context.md — internalize the project's standing rules (CLAUDE.md is the
    authority; assume no stack/locale/narrative/content rule unless written there). Universal harness
    rules always apply: no fabricated metrics or quotes, no emoji, every change ships with tests.
-   Run: cd ${runRoot} && cat CLAUDE.md
+   Also read .claude/workflows/agent-rules.md — the engine's own minimal-context rules for this run.
+   Run: cd ${runRoot} && cat CLAUDE.md .claude/workflows/agent-rules.md
 
 2. Read the spec and the task list:
    Run: cd ${runRoot} && cat ${specFile} ${tasksJsonFile}
@@ -1252,6 +1344,7 @@ const STATE_LOAD_SCHEMA = {
     bailReason:  { type: 'string',  description: 'the prior bail_reason, or "" when none' },
     tasksJson:   { type: 'string',  description: 'Verbatim JSON (as a string) of the state file\'s top-level "tasks" object, so the engine can carry the full prior task history forward. "{}" when absent/no state.' },
     bails:       { type: 'array', items: { type: 'object' }, description: 'Verbatim contents (each entry as-is, unmodified) of the state file\'s top-level "bails" array — BT.ticket.bails-must-be-append-only. [] when absent/no state.' },
+    setupJson:   { type: 'string',  description: 'BT.ticket.prepare-run-replaces-setup-agents (task 6): verbatim JSON (as a string) of the state file\'s top-level "setup" object -- the recorded prepare-run result -- so a resume can seed it instead of spawning a fresh prepare-run agent for every later renderAgentFlag/renderScopeFlag/loadHarnessConfig/detectPlanningVault call. "null" when absent/no state.' },
     notes:       { type: 'string' }
   }
 }
@@ -1540,60 +1633,21 @@ const HARNESS_CONFIG_BAIL = {
   zeroGatingChecks: 'HARNESS_CONFIG_ZERO_GATING_CHECKS',
 }
 
+// BT.ticket.prepare-run-replaces-setup-agents, task 6: sourced from the shared runPrepareRun()
+// cache instead of its own agent turn — prepare_run.py's load_harness_config() reads
+// planning/harness.json BY CODE and parses it directly (never a model-copied summary), which is
+// exactly the fix the block's `why` describes: harness-config used to run 432 times on Sonnet
+// because Haiku could not fill its nested StructuredOutput. Because the parse now happens in
+// python, not in a model's own StructuredOutput call, the double-wrap malformation this used to
+// defend against (a model returning {"config":{"present":true,"config":{...}}}) cannot occur any
+// more — there is no model in the loop to produce it. `cwd` is accepted for call-site
+// compatibility only; the cached prepare-run result already carries the parsed config.
 async function loadHarnessConfig(cwd) {
-  const result = await agent(`
-You are the harness-config loader for the SDLC pipeline. Your ONLY job is to read the project's
-validation-policy file and return it as structured data. Do not run any checks or modify anything.
-
-STEP 1 — Read the config file (from the run root):
-  cd ${cwd} && cat planning/harness.json 2>/dev/null && echo "__HARNESS_PRESENT__" || echo "__HARNESS_ABSENT__"
-
-STEP 2 — Decide:
-  - "__HARNESS_ABSENT__" (file missing) → present=false, omit config.
-  - File printed but NOT valid JSON → present=false, notes="harness.json present but invalid JSON: <reason>".
-  - File printed and valid JSON → present=true, and copy the parsed object into "config", keeping ONLY
-    these fields when present: stack; postEmitCommitCommand (string, verbatim, do not interpret it);
-    validation.checks[] (each: {kind, name, command, purpose, gates,
-    perTask, fastCommand} plus any kind-specific fields present — baselineCommand, reasonCommand,
-    compareKeys[], countPattern, failOn, warningPatterns[], rules[] ({id, pattern, paths,
-    allowlistPattern})); flow ({testDepth, bailReasons[]} only — ignore autoMerge/prBase, which
-    belong to the other engine). Preserve kind-specific fields verbatim; ignore any other fields.
-
-Return your findings using the StructuredOutput tool.
-`, { label: 'harness-config', schema: HARNESS_CONFIG_SCHEMA, model: MODEL.harnessConfig })
-
-  // "__HARNESS_ABSENT__" or present-but-invalid-JSON both come back as present=false (STEP 2 above)
-  // — both degrade to the spec's `## Validation Commands`, never a bail (D5 / standing rule 1: the
-  // engine ships no stack defaults, and every scaffolded repo with no harness.json must keep running).
-  if (!result || !result.present) return null
-
-  // Defensive unwrap (BT.ticket.harness-config-must-bail-not-warn-on-a-malformed-payload): the
-  // loader agent has been observed returning a double-wrapped payload
-  // ({"config":{"present":true,"config":{...}}}) instead of the flat {present, config} shape
-  // HARNESS_CONFIG_SCHEMA declares. Detect it by SHAPE, not by trusting the agent's own claimed
-  // shape — either the outer `config` value itself carries a `present` key (the double-wrap
-  // signature: a whole second {present, config} envelope one level too deep), or its own `.config`
-  // carries `validation`/`stack` (the real config content one level too deep, present key or not).
-  let cfg = result.config
-  if (cfg && typeof cfg === 'object' && !Array.isArray(cfg)) {
-    const nested = cfg.config
-    if (nested && typeof nested === 'object' && !Array.isArray(nested)) {
-      const wrapperLooksDoubled = Object.prototype.hasOwnProperty.call(cfg, 'present')
-      const nestedLooksLikeConfig = Object.prototype.hasOwnProperty.call(nested, 'validation') ||
-        Object.prototype.hasOwnProperty.call(nested, 'stack')
-      if (wrapperLooksDoubled || nestedLooksLikeConfig) cfg = nested
-    }
-  }
-
-  // present=true (planning/harness.json exists and parsed as JSON) but, even after the defensive
-  // unwrap above, there is no usable config object to return — this must be a hard BAIL, never a
-  // silent null-fallback: a null return here is indistinguishable downstream from "no harness.json
-  // at all", and the engine cannot tell "the project configured zero checks" apart from "I could
-  // not read the config" any other way (this exact ambiguity is what let BA.22.A close a block
-  // having run no project gate at all, see the block record's `why`).
-  if (!cfg || typeof cfg !== 'object' || Array.isArray(cfg)) {
-    return { __bail: HARNESS_CONFIG_BAIL.unparseable }
-  }
+  const cache = await runPrepareRun()
+  const pr = cache && cache.prepareRun
+  if (!pr || pr.refused) return null
+  const cfg = pr.harness_config
+  if (!cfg || typeof cfg !== 'object' || Array.isArray(cfg)) return null
   return cfg
 }
 
@@ -1904,6 +1958,13 @@ const state = {
   // Criteria ever does.
   criteriaVerdicts: [],
   tokens: { stages: [], total: { promptTokEst: 0, filesReadKb: 0, inTokEst: 0, outTok: 0 } },  // Block A — refreshed on every write
+  // BT.ticket.prepare-run-replaces-setup-agents (task 6): the run meta bundle for this
+  // run's setup facts — the SAME cached prepare_run.py JSON resolveRepoRoot() etc. all read
+  // from, persisted here purely so writeTaskState()'s existing wholesale JSON.stringify(state)
+  // carries it to disk. null until the prepare-run stage resolves (or on a refused run, which
+  // never reaches a write); seeded straight from a resumed run's own recorded value on --resume
+  // instead of re-deriving it — see the --resume block below.
+  setup: null,
 }
 
 // Learned from the first successful state write of this process. Later writes are handed it as a
@@ -2019,7 +2080,21 @@ if (!repoRootResult) {
   log('resolveRepoRoot agent returned null — aborting pipeline before any branch/worktree work')
   return { error: 'resolveRepoRoot failed', blockId }
 }
+// BT.ticket.prepare-run-replaces-setup-agents (task 6, AC4): a refused prepare_run.py verdict
+// stops the run HERE — before any worktree is created and before any implement-stage agent ever
+// launches — surfacing prepare_run.py's own `reason` exactly as today's setup agents would report
+// an unrunnable spec.
+if (repoRootResult.refused) {
+  log(`BAILED (PREPARE_RUN_REFUSED) — prepare_run.py refused this spec before any implement-stage agent ran: ${repoRootResult.reason}`)
+  return { error: 'PREPARE_RUN_REFUSED', reason: repoRootResult.reason, blockId }
+}
 const { repoRoot, gitCommonDir, tierPrefix: invocationTierPrefix, brainTomlAtRoot } = repoRootResult
+// BT.ticket.prepare-run-replaces-setup-agents (task 6): record the run meta bundle now, right
+// after it resolves, so every later writeTaskState()/writeFlowState() call persists it — the
+// SAME cached object detectPlanningVault()/renderAgentFlag()/renderScopeFlag()/
+// loadHarnessConfig() below all read from (module-level `_prepareRunCache`, populated by
+// runPrepareRun() inside resolveRepoRoot() above).
+state.setup = _prepareRunCache
 log(`Resolved repoRoot: ${repoRoot} (git-common-dir: ${gitCommonDir})`)
 
 const setupResult = await tracedAgent(`
@@ -2582,13 +2657,16 @@ const passedFromState = new Set()
 if (resumeMode) {
   const loaded = await tracedAgent(`${W}
 You read the COMMITTED run-state for an /sdlc-task resume. Do NOT modify anything.
-  cd ${runDir} && cat ${stateFile} 2>/dev/null || echo "__NO_STATE__"
-If "__NO_STATE__" or invalid JSON → exists=false, tasksJson="{}", bails=[]. Otherwise exists=true,
+  cd {runDir} && cat ${stateFile} 2>/dev/null || echo "__NO_STATE__"
+If "__NO_STATE__" or invalid JSON → exists=false, tasksJson="{}", bails=[], setupJson="null". Otherwise exists=true,
 startedAt = its started_at, passedTasks = the task numbers whose tasks[N].status == "passed",
 bailReason = its bail_reason or "", tasksJson = the exact JSON (as a string) of its top-level "tasks"
 object, verbatim, bails = the exact contents (each entry unmodified) of its top-level "bails" array,
-or [] when absent — this is how the engine carries the full prior task history AND every prior bail
-record forward across a resume (BT.ticket.bails-must-be-append-only: never drop or rewrite an entry).
+or [] when absent, setupJson = the exact JSON (as a string) of its top-level "setup" object, verbatim,
+or "null" when absent/null (BT.ticket.prepare-run-replaces-setup-agents, task 6: this is how a
+resume seeds the prepare-run cache instead of spawning a fresh prepare-run agent) — this is how the
+engine carries the full prior task history AND every prior bail record forward across a resume
+(BT.ticket.bails-must-be-append-only: never drop or rewrite an entry).
 Return via StructuredOutput.
 `, withModel({ label: 'state-load', schema: STATE_LOAD_SCHEMA, phase: 'Plan' }, MODEL.stateLoad))
   if (loaded && loaded.exists) {
@@ -2606,6 +2684,22 @@ Return via StructuredOutput.
       if (priorTasks && typeof priorTasks === 'object') Object.assign(state.tasks, priorTasks); const inheritedBails = (typeof priorState !== 'undefined' && Array.isArray(priorState.bails) ? priorState.bails : (priorTasks && Array.isArray(priorTasks.__pendingBails) ? priorTasks.__pendingBails : [])).map(b => (b && b.resolution === null) ? { ...b, resolution: 'resumed-clean' } : b); state.bails = inheritedBails.concat(state.bails); if (state.tasks) delete state.tasks.__pendingBails
     } catch {
       log('(resume) could not parse prior tasks JSON from state.json — already-passed tasks may drop out of the committed history on the next write.')
+    }
+    // BT.ticket.prepare-run-replaces-setup-agents (task 6, AC3): seed the prepare-run cache from
+    // the resumed run's OWN recorded setup facts instead of leaving it empty — every later call to
+    // renderAgentFlag()/renderScopeFlag()/loadHarnessConfig()/detectPlanningVault() below reuses
+    // this seeded value and spawns NO further prepare-run agent this run. (The very first
+    // prepare-run call, inside resolveRepoRoot() above, still had to happen once, before this
+    // point — repoRoot must be known before the worktree/state file can even be located.)
+    try {
+      const priorSetup = JSON.parse(loaded.setupJson || 'null')
+      if (priorSetup && typeof priorSetup === 'object' && priorSetup.prepareRun) {
+        _prepareRunCache = priorSetup
+        _prepareRunCacheSlug = blockId
+        state.setup = priorSetup
+      }
+    } catch {
+      log('(resume) could not parse prior setup JSON from state.json — later setup lookups will spawn a fresh prepare-run agent.')
     }
   } else {
     log('Resume requested but no valid state.json found — running all selected tasks fresh.')
@@ -3707,118 +3801,16 @@ return {
 // no identity resolves — an unconditional flag would change every non-lane, standalone-repo run
 // of these engines across 18+ downstream repos with no brain.toml at all.
 //
-// MEASURED 2026-09-07 (BT.ticket.engine-helpers-call-require-which-the-workflow-runtime-does-not-
-// define): the Workflow script sandbox has NO `process` global at all, not merely no `require` —
-// a direct probe (`typeof process`) returned 'undefined'. The previous version of this function
-// read `process.env.FLEET_LANE_AGENT` as its very first statement, inside its own try/catch, so
-// every call threw immediately and fell straight to the catch's `return ''` — this function was
-// dead code, unconditionally, in every real engine run, not merely on the `require`-only
-// branches downstream of that line. There is no in-process fallback: env lookups and file reads
-// both go through a cheap probe agent, the same convention `detectPlanningVault()` /
-// `resolveRepoRoot()` above already use, and (per `verifyVaultCommit()`'s note above) the
-// resolution logic runs entirely inside the probe SCRIPT — the agent only transcribes its one
-// output line, it never reasons about TOML or lease-file structure itself.
-//
-// Resolution order (all decided inside the probe script):
-//   1. FLEET_LANE_AGENT env var, if set and non-empty.
-//   2. Else the `agent` field of <lock_dir>/leases/lease-<repo>.json, where <repo> is the
-//      brain.toml [[repos]] slug whose repo_path resolves to (or is an ancestor of) cwd, and
-//      <lock_dir> uses the SAME precedence scripts/check_lane_agents.py's find_lock_dir()
-//      already uses: FLEET_LOCK_DIR env var, else a brain.toml found by walking up from cwd,
-//      joined with .fleet-locks. No new precedence is introduced.
-//   3. Else no identity resolves and '' is returned.
+// BT.ticket.prepare-run-replaces-setup-agents, task 6: sourced from the shared runPrepareRun()
+// cache instead of its own agent turn — prepare_run.py's render_agent_flag() is a line-for-line
+// port of the same FLEET_LANE_AGENT / lease-file resolution this used to hand a Haiku agent to run
+// and transcribe (MEASURED 2026-09-07, BT.ticket.engine-helpers-call-require-which-the-workflow-
+// runtime-does-not-define — this JS function itself never touches `process`; the whole resolution
+// still happens inside prepare_run.py's python, never in this function's own reasoning).
 async function renderAgentFlag() {
-  const result = await agent(`
-Resolve this fleet lane's agent identity for a mev '--agent' exemption flag. Run this exact
-script with Bash, verbatim — do not reason about the resolution yourself, the script already
-decided it:
-\`\`\`
-python3 -c "
-import os, json, sys
-
-def find_brain_root(start):
-    d = os.path.abspath(start)
-    while True:
-        if os.path.exists(os.path.join(d, 'brain.toml')):
-            return d
-        parent = os.path.dirname(d)
-        if parent == d:
-            return None
-        d = parent
-
-def repo_blocks(text):
-    blocks, cur = [], None
-    for line in text.splitlines():
-        if line.strip() == '[[repos]]':
-            cur = []
-            blocks.append(cur)
-        elif cur is not None:
-            cur.append(line)
-    return [chr(10).join(b) for b in blocks]
-
-def block_value(block_text, key):
-    dq = chr(34)
-    for line in block_text.splitlines():
-        s = line.strip()
-        eq = s.find('=')
-        if eq == -1 or s[:eq].strip() != key:
-            continue
-        v = s[eq + 1:].strip()
-        if len(v) >= 2 and v[0] == dq and v[-1] == dq:
-            return v[1:-1]
-        return None
-    return None
-
-def best_slug(brain_root, cwd):
-    with open(os.path.join(brain_root, 'brain.toml')) as f:
-        text = f.read()
-    here = os.path.abspath(cwd)
-    best, best_depth = None, -1
-    for block in repo_blocks(text):
-        slug = block_value(block, 'slug')
-        repo_path = block_value(block, 'repo_path')
-        if not slug or not repo_path:
-            continue
-        repo_abs = os.path.abspath(os.path.join(brain_root, repo_path))
-        if here != repo_abs and not here.startswith(repo_abs + os.sep):
-            continue
-        depth = len(repo_abs.split(os.sep))
-        if depth > best_depth:
-            best_depth, best = depth, slug
-    return best
-
-env_agent = os.environ.get('FLEET_LANE_AGENT', '').strip()
-if env_agent:
-    print('VALUE:' + env_agent); sys.exit(0)
-
-brain_root = find_brain_root(os.getcwd())
-if not brain_root:
-    print('VALUE:'); sys.exit(0)
-
-slug = best_slug(brain_root, os.getcwd())
-if not slug:
-    print('VALUE:'); sys.exit(0)
-
-lock_dir = os.environ.get('FLEET_LOCK_DIR', '').strip() or os.path.join(brain_root, '.fleet-locks')
-lease_path = os.path.join(lock_dir, 'leases', 'lease-' + slug + '.json')
-if not os.path.exists(lease_path):
-    print('VALUE:'); sys.exit(0)
-
-try:
-    with open(lease_path) as f:
-        lease = json.load(f)
-    resolved = str(lease.get('agent') or '').strip()
-except Exception:
-    resolved = ''
-print('VALUE:' + resolved)
-"
-\`\`\`
-The script never fails destructively — any error inside it degrades to an empty VALUE: line.
-Return via StructuredOutput: value (the text after "VALUE:" on the script's stdout, or "" if that
-line is missing or the script produced no output).
-`, { label: 'render-agent-flag', schema: RENDER_IDENTITY_SCHEMA, model: 'haiku' })
-  const value = (result && typeof result.value === 'string') ? result.value.trim() : ''
-  return value ? ` --agent ${value}` : ''
+  const cache = await runPrepareRun()
+  const pr = cache && cache.prepareRun
+  return (pr && !pr.refused && pr.agent_flag) || ''
 }
 // <</shared:renderAgentFlag>>
 
@@ -3829,89 +3821,13 @@ line is missing or the script produced no output).
 // no repo slug resolves -- an unconditional flag would break every non-lane, standalone-repo run
 // of these engines across 18+ downstream repos with no brain.toml at all.
 //
-// Same MEASURED 2026-09-07 finding as renderAgentFlag() above applies here identically: `process`
-// does not exist in the Workflow sandbox, so the old `process.env.FLEET_LANE_REPO` first
-// statement always threw and this function always returned '' — resolution now goes through the
-// same probe-script convention.
-//
-// Resolution order (mirrors renderAgentFlag()'s FLEET_LANE_AGENT / lease-file precedence):
-//   1. FLEET_LANE_REPO env var, if set and non-empty.
-//   2. Else the brain.toml [[repos]] walk-up already used by renderAgentFlag(): the deepest
-//      repo_path that is cwd or an ancestor of cwd, yielding that entry's slug.
-//   3. Else no identity resolves and '' is returned.
+// Same replacement as renderAgentFlag() immediately above — prepare_run.py's render_scope_flag()
+// is a line-for-line port of the same brain.toml [[repos]] walk-up this used to hand a Haiku agent
+// to run and transcribe.
 async function renderScopeFlag() {
-  const result = await agent(`
-Resolve this fleet lane's own repo slug for a mev '--scope' argument. Run this exact script with
-Bash, verbatim — do not reason about the resolution yourself, the script already decided it:
-\`\`\`
-python3 -c "
-import os, sys
-
-def find_brain_root(start):
-    d = os.path.abspath(start)
-    while True:
-        if os.path.exists(os.path.join(d, 'brain.toml')):
-            return d
-        parent = os.path.dirname(d)
-        if parent == d:
-            return None
-        d = parent
-
-def repo_blocks(text):
-    blocks, cur = [], None
-    for line in text.splitlines():
-        if line.strip() == '[[repos]]':
-            cur = []
-            blocks.append(cur)
-        elif cur is not None:
-            cur.append(line)
-    return [chr(10).join(b) for b in blocks]
-
-def block_value(block_text, key):
-    dq = chr(34)
-    for line in block_text.splitlines():
-        s = line.strip()
-        eq = s.find('=')
-        if eq == -1 or s[:eq].strip() != key:
-            continue
-        v = s[eq + 1:].strip()
-        if len(v) >= 2 and v[0] == dq and v[-1] == dq:
-            return v[1:-1]
-        return None
-    return None
-
-env_repo = os.environ.get('FLEET_LANE_REPO', '').strip()
-if env_repo:
-    print('VALUE:' + env_repo); sys.exit(0)
-
-brain_root = find_brain_root(os.getcwd())
-if not brain_root:
-    print('VALUE:'); sys.exit(0)
-
-with open(os.path.join(brain_root, 'brain.toml')) as f:
-    text = f.read()
-here = os.path.abspath(os.getcwd())
-best, best_depth = None, -1
-for block in repo_blocks(text):
-    slug = block_value(block, 'slug')
-    repo_path = block_value(block, 'repo_path')
-    if not slug or not repo_path:
-        continue
-    repo_abs = os.path.abspath(os.path.join(brain_root, repo_path))
-    if here != repo_abs and not here.startswith(repo_abs + os.sep):
-        continue
-    depth = len(repo_abs.split(os.sep))
-    if depth > best_depth:
-        best_depth, best = depth, slug
-print('VALUE:' + (best or ''))
-"
-\`\`\`
-The script never fails destructively — any error degrades to an empty VALUE: line.
-Return via StructuredOutput: value (the text after "VALUE:" on the script's stdout, or "" if that
-line is missing or the script produced no output).
-`, { label: 'render-scope-flag', schema: RENDER_IDENTITY_SCHEMA, model: 'haiku' })
-  const value = (result && typeof result.value === 'string') ? result.value.trim() : ''
-  return value ? ` --scope ${value}` : ''
+  const cache = await runPrepareRun()
+  const pr = cache && cache.prepareRun
+  return (pr && !pr.refused && pr.scope_flag) || ''
 }
 // <</shared:renderScopeFlag>>
 

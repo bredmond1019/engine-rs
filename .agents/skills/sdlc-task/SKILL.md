@@ -129,6 +129,24 @@ only this section — not the `.js` — should end up doing exactly what the rea
 
 ### Step 1 — Setup: locate the repo, or create the isolated worktree
 
+**Since `BT.ticket.prepare-run-replaces-setup-agents`, the real engine's setup phase runs ONE
+`prepare-run` agent — not the several separate fact-gathering agents this section walks through
+by hand — followed by, at most, a second agent that creates/locates the worktree.** That single
+agent's whole job is to run `python3 .claude/workflows/bin/prepare_run.py --spec-slug <blockId>`
+and return its JSON output verbatim (repo root, vault detection, rendered flags, harness config
+parsed by code, task enumeration, and a lint/probe verdict) — it makes no fact-deriving judgment
+calls of its own. If `prepare_run.py` exists in this repo (`test -f
+.claude/workflows/bin/prepare_run.py`), **run it directly with your own bash tools instead of
+manually re-deriving each fact below** — you have exactly the shell access it needs and none of
+the steps below apply once you have its output. If it returns `refused: true`, stop the whole run
+right here (before creating any worktree or running any implement step) and report the `reason`
+verbatim, exactly as the real engine does. `--resume` reads this same JSON back from the run's
+meta bundle (`sdlc-task-state.json`'s `setup` field) instead of re-running `prepare_run.py`.
+
+If `prepare_run.py` does not exist in this repo (an older base-template snapshot, or a
+scaffolded project that hasn't pulled this harness change yet), fall back to deriving each fact by
+hand, below — this is the pre-collapse manual procedure, kept as the fallback.
+
 Run everything below from the **main repo root** unless noted. Without `--worktree`, skip straight
 to "In-place mode" below; with it, work through the worktree-mode branch (fresh create, reuse,
 re-attach, Steps 1b/1c).
