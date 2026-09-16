@@ -14,6 +14,37 @@ related: [status, context]
 
 *Append-only working log. One dated entry per session. Newest entries at the top.*
 
+## [run: 2026-09-15]
+
+`/sdlc-flow EN.19.B` — PLAN_AUTHORING workflow: a Node-composed `/plan` that turns a
+`notes.md`/`sequence.md` into `plan.md` + reviewable candidate block records. All 7 tasks passed,
+PASS review. Task 1 scaffolded the `plan_authoring` module (`CheckExistingPlanNode` short-circuits a
+repeat run unless `force_regenerate`, `GatherPlanContextNode` gathers CLAUDE.md/context.md/state.json
+wave + pre-plan folder context). Task 2 added `DecomposePlanNode`, the one model-calling stage
+(`TransportSlotted`+`Cancellable`, D24 colocated `prompts/decompose.md`), with `mark_incomplete`
+staging any candidate missing a required field rather than dropping it. Task 3 added
+`StageCandidateBlocksNode`, which mints a `<PREFIX>.<phase>.<letter>` id and hand-validates each
+candidate against `block.schema.json` — never touching `mev` or `state.json` (grep-verified). Task 4
+added `WritePlanNarrativeNode`, rendering `plan.md` from the staged candidate-block JSON files
+(OKF frontmatter, `related: [master-plan]`, one heading per block, Cut list, Sequence table). Task 5
+assembled the `PLAN_AUTHORING` workflow graph and registered it via `register_plan_authoring` in
+engine-serve, with `planning/harness.json` documenting the (currently doc-only) enable flag and
+decompose model-tier knob. Task 6 added the `plan_authoring` integration suite (dispatch/schema
+validity, idempotency, `force_regenerate`, and the no-mev/no-state.json grep). Task 7 documented
+`PLAN_AUTHORING` in `docs/workflows/README.md` and corrected its stale registered-workflow count;
+full workspace suite (4582 tests) and release build both pass. Closes `EN.19.B`. Next: `EN.19.C` —
+GenerateTasksNode reads a real block record, not just `planning/*.md`.
+
+```
+31568c2 feat: implement EN.19.B-task7
+aca4e6e feat: implement EN.19.B-task6
+ba672ac feat: implement EN.19.B-task5
+c48365a feat: implement EN.19.B-task4
+bb5a43c feat: implement EN.19.B-task3
+400f7c0 feat: implement EN.19.B-task2
+ae79646 feat: implement EN.19.B-task1
+```
+
 ## [2026-09-15]
 
 ### planning-command-nodes lane (EN.19.A-D): fmt/clippy baseline repair, EN.19.A paused on a pre-existing test defect
