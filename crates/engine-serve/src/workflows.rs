@@ -1827,6 +1827,36 @@ pub fn register_sweep_with(
 /// `Dispatcher::dispatch_with_event`; per Fork 4 (this block's `out_of_scope`), it does NOT
 /// schedule it anywhere — `planning/harness.json`'s `schedule.entries` stays `[]`, and
 /// `base-template/scripts/commander_drain.sh` stays and is unmodified (Fork 2).
+/// Register the `PLAN_AUTHORING` workflow (`engine_core::workflows::plan_authoring`,
+/// `EN.19.B` task 5): the Node-composed port of `.claude/commands/plan.md`'s
+/// single-repo path that turns a `notes.md`/`sequence.md` pre-plan folder
+/// into a rendered `plan.md` narrative plus schema-valid candidate block
+/// records staged for human review (never `mev create-block --write`,
+/// see `plan_authoring`'s own module doc). Dispatches via the existing
+/// generic `POST /events/` endpoint — no new webhook route.
+///
+/// Mirrors [`register_terminal_probe`]/[`register_recall`]'s "model-free
+/// registration" shape rather than [`register_content_pipeline`]'s
+/// `registry_for_policy`: `plan_authoring` has no `policy`/`profiles`
+/// module of its own yet (see that module's own doc comment on why), so
+/// this factory resolves no policy and seeds no policy stamp — there is no
+/// `resolve_policy_for_run_from` call and no `seed_resolved_policy` call.
+/// `DecomposePlanNode`'s resolved transport tier is still readable via
+/// `ctx.nodes["DecomposePlanNode"]["transport"]` regardless (block record
+/// acceptance criterion 4) — `AgentCodeStep::process` stamps that
+/// unconditionally, independent of whether a policy layer rewired it.
+pub fn register_plan_authoring(dispatcher: &mut Dispatcher) {
+    dispatcher.register(
+        engine_core::workflows::plan_authoring::schema(),
+        Box::new(|_event: &serde_json::Value| {
+            Ok(Workflow::new(
+                engine_core::workflows::plan_authoring::registry(),
+                engine_core::workflows::plan_authoring::schema(),
+            ))
+        }),
+    );
+}
+
 pub fn register_commander(dispatcher: &mut Dispatcher) {
     dispatcher.register(
         engine_core::workflows::commander::schema(),
@@ -1898,6 +1928,7 @@ pub fn register_builtin_workflows_with_registry(
     register_claim_reaffirm(dispatcher);
     register_sweep(dispatcher);
     register_commander(dispatcher);
+    register_plan_authoring(dispatcher);
 }
 
 /// Register every builtin workflow with a real `OperatorTransport`
@@ -3627,6 +3658,7 @@ mod tests {
             "CLAIM_REAFFIRM",
             "SWEEP",
             "COMMANDER",
+            "PLAN_AUTHORING",
         ]
         .to_vec();
         expected.sort_unstable();
@@ -3736,6 +3768,39 @@ mod tests {
         register_builtin_workflows(&mut dispatcher);
 
         assert!(dispatcher.is_registered("COMMANDER"));
+    }
+
+    #[test]
+    fn register_plan_authoring_populates_both_registries() {
+        let mut dispatcher = Dispatcher::new();
+
+        register_plan_authoring(&mut dispatcher);
+
+        assert!(dispatcher.is_registered("PLAN_AUTHORING"));
+
+        let schema = dispatcher
+            .resolve_schema("PLAN_AUTHORING")
+            .expect("PLAN_AUTHORING schema should resolve");
+        assert_eq!(schema.start_node, "CheckExistingPlanNode");
+    }
+
+    #[test]
+    fn register_builtin_workflows_registers_plan_authoring() {
+        let mut dispatcher = Dispatcher::new();
+
+        register_builtin_workflows(&mut dispatcher);
+
+        assert!(dispatcher.is_registered("PLAN_AUTHORING"));
+    }
+
+    #[test]
+    fn dispatch_plan_authoring_builds_a_runnable_workflow_with_no_policy_stamp() {
+        let mut dispatcher = Dispatcher::new();
+        register_plan_authoring(&mut dispatcher);
+
+        dispatcher
+            .dispatch_with_event("PLAN_AUTHORING", &serde_json::json!({ "slug": "my-slug" }))
+            .expect("PLAN_AUTHORING should dispatch with no policy resolution");
     }
 
     #[test]

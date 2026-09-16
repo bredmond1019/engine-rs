@@ -78,7 +78,7 @@ alone — never by guessing at payload contents:
 
 ## The workflows
 
-Twenty-two registered types, grouped by what you'd use them for. The registration list in
+Twenty-four registered types, grouped by what you'd use them for. The registration list in
 `crates/engine-serve/src/workflows.rs` (`register_builtin_workflows`) is the source of truth; this
 table is a reader's copy.
 
@@ -92,6 +92,12 @@ table is a reader's copy.
 | `DEBRIEF` | Renders a morning brief from one campaign's journal — every step, every bail named with its reason — readable on a phone. | [debrief.md](debrief.md) |
 | `RECALL` | Asks the Brain a question mid-run via Synapse's `GET /recall`, so a chain step can branch on what the corpus already knows instead of carrying it in the event payload. | [recall.md](recall.md) |
 | `PRE_PLAN` | Turns a short free-text idea into a researched `$BRAIN_ROOT/planning/open-work/pre-plan/<slug>/notes.md`, no human back-and-forth — the smallest usable slice of the pre-plan pipeline (`/capture` today), externally triggerable over HTTP. Disabled by default (a kill switch). | [pre-plan.md](pre-plan.md) |
+
+### Planning
+
+| Workflow | What it does | Detail |
+|---|---|---|
+| `PLAN_AUTHORING` | Ports `/plan.md`'s single-repo path into nodes: reads a pre-plan folder (`notes.md`/`sequence.md`), decomposes it into candidate blocks, and renders a `plan.md` narrative. **Stages, never registers** — every candidate lands as schema-validated JSON under `candidate-blocks/`, not `planning/blocks/`, and no node here calls `mev create-block` or writes `state.json`. It also ports none of `/plan.md`'s red-team pass (step 10) or the initiative-wide C1-C7 consistency pass — a single-model decomposition is a known, accepted quality gap, which is exactly why registering a staged candidate stays a separate, human-reviewed action. Detail: [`../../crates/engine-core/src/workflows/plan_authoring/mod.rs`](../../crates/engine-core/src/workflows/plan_authoring/mod.rs)'s module doc. |
 
 ### Winning and serving work
 
