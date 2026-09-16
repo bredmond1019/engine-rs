@@ -16,6 +16,35 @@ related: [status, context]
 
 ## [run: 2026-09-15]
 
+`/sdlc-flow` on branch `EN.19.A-flow` resumed `EN.19.A` past the AC6 operator gate and ran tasks
+8-10 to completion, then re-ran the consolidated end review, which returned PASS. Task 8 replaced
+`ResearchCodebaseNode`'s hardcoded `AgentBackend::ClaudeCli` with `PrePlanPolicy.research_backend`,
+threaded through `registry_for_policy`'s `resolve_meta_transport` call. Tasks 9-10 added
+`SecretGuardNode` — backend-agnostic mitigation for the revised AC6 — plus
+`secret_guard_patterns`/`secret_guard_scan_root` policy knobs (defaulting to the fleet's existing
+`deny-secret-paths.py` pattern list), wired into the `PRE_PLAN` graph between research and write,
+with leak/clean-pass-through integration tests, `planning/harness.json` and
+`docs/workflows/pre-plan.md` updated, and the full workspace suite + release build green. AC6 was
+formally revised 2026-09-15 (D18 amendment, see `planning/blocks/EN.19.A.json`): `claude-code-rs`
+has no path/permission-hook mechanism to enforce denial of the read itself (that gap is now ticketed
+separately as `CC.ticket.enforced-secret-path-denial-hook`), so this block's guarantee targets the
+artifact that actually leaves the process — `notes.md` — which `SecretGuardNode` makes airtight
+regardless of backend. All 10 tasks passed with confirmed `workAssertionPassed` outcomes. Verdict:
+PASS. Closes `EN.19.A`. Next: `EN.19.C` — GenerateTasksNode reads a real block record.
+
+```
+4eadbf8 feat: implement EN.19.A-task10
+fbfc98d feat: implement EN.19.A-task9
+06401f2 feat: PrePlanPolicy.research_backend replaces hardcoded AgentBackend::ClaudeCli
+1ece5b7 chore: wrap up EN.19.A
+67c3b9a Merge branch 'main' into EN.19.A-flow
+615ae6c fix: consolidate.rs hermetic_hq fixture uses stale flat sandbox layout
+1b53704 docs: build the Node/Molecule Library (docs/nodes/atoms, docs/nodes/molecules) and cross-link workflows
+6feae0c docs(log): record planning-command-nodes lane -- fmt/clippy baseline repair, EN.19.A paused
+```
+
+## [run: 2026-09-15]
+
 `/sdlc-flow` on branch `EN.19.A-flow` resumed `EN.19.A` past the earlier task-7 pre-existing-defect
 bail, re-ran the consolidated review, and BAILED with verdict FAIL. All 7 tasks passed with
 confirmed `workAssertionPassed` outcomes (module scaffold, `ResearchCodebaseNode`, `WriteNotesNode`,
