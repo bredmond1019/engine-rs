@@ -4278,25 +4278,6 @@ ${renderAttributionCacheLookup({ runRoot, checkId, baseSha, repoSlug, checkComma
 }
 // <</shared:attributionLookback>>
 
-// <<shared:REMOVED_LITERAL_SCAN_CONFIG>>
-// BT.ticket.failure-attribution-and-gate-cache, task 4: defaults for the post-commit removed-
-// literal scan -- all three are config knobs (standing rule 12), never literals baked into the
-// scan script itself. A project overrides any of them via planning/harness.json's optional
-// `removedLiteralScan: { testGlobRegex, minLiteralLen, identifierMinLen }` object; absent-or-partial
-// falls back here. `identifierMinLen` exists SEPARATELY from `minLiteralLen` (quoted strings) because
-// a bare-identifier match at the same low threshold is noisy -- ordinary English words removed from
-// a comment or log message (e.g. "failed", "returned") are common at 6-8 chars and are not the
-// distinctive symbol names this scan exists to catch; an underscored identifier of any length (a
-// real snake_case/CONST_CASE symbol) is always reported regardless of identifierMinLen.
-const REMOVED_LITERAL_SCAN_CONFIG = {
-  // Matches this fleet's own test-naming conventions plus the common cross-language ones, so the
-  // harness ships one sane default without hardcoding a single project's directory layout.
-  testGlobRegex: '(^|/)test_[^/]+\\.py$|(^|/)[^/]+_test\\.py$|(^|/)tests?/.*|\\.test\\.[jt]sx?$|\\.spec\\.[jt]sx?$',
-  minLiteralLen: 8,
-  identifierMinLen: 12,
-}
-// <</shared:REMOVED_LITERAL_SCAN_CONFIG>>
-
 // <<shared:REMOVED_LITERAL_SCAN_SCHEMA>>
 const REMOVED_LITERAL_SCAN_SCHEMA = {
   type: 'object',
@@ -4444,17 +4425,40 @@ Return via StructuredOutput: rawOutput (everything printed above, verbatim, in o
 
 // <<shared:removedLiteralScan>>
 // Orchestrates one post-commit removed-literal scan for the current task: resolves the config knobs
-// (project override via harnessCfg.removedLiteralScan, else REMOVED_LITERAL_SCAN_CONFIG's default),
-// renders and runs the mechanical script above, and returns { hits, instrumentOk, note }. A hit
-// inside the task's own files[] is filtered out BY THE SCRIPT ITSELF (never reported here at all) --
-// see renderRemovedLiteralScanScript's is_own() check. instrumentOk=false means the scan could not
+// (project override via harnessCfg.removedLiteralScan, else the built-in defaults below), renders
+// and runs the mechanical script above, and returns { hits, instrumentOk, note }. A hit inside the
+// task's own files[] is filtered out BY THE SCRIPT ITSELF (never reported here at all) -- see
+// renderRemovedLiteralScanScript's is_own() check. instrumentOk=false means the scan could not
 // positively confirm it ran (no candidate test files, or an incomplete transcription) -- callers
 // must treat that as "scan inconclusive", never as "no hits found".
+//
+// BT.ticket.failure-attribution-and-gate-cache task 4 shipped these three defaults as a shared
+// top-level REMOVED_LITERAL_SCAN_CONFIG const declared ~150 lines above this function's own
+// definition (standing rule 12: all three are config knobs, never literals baked into the scan
+// script itself; a project overrides any of them via planning/harness.json's optional
+// `removedLiteralScan: { testGlobRegex, minLiteralLen, identifierMinLen }` object). That const,
+// positioned very late in the ~4600-line generated engine files, hit a
+// `ReferenceError: Cannot access '...' before initialization` when invoked through the Workflow
+// tool's execution model (reproduced deterministically 2026-09-17 on a real engine-rs
+// `/sdlc-task` run) despite being lexically declared before its only use -- some interaction with
+// how that tool wraps/evaluates a script this large. Inlining the defaults removes the cross-
+// reference to a late top-level `const` entirely; the values and the override contract are
+// unchanged.
 async function removedLiteralScan({ runRoot, taskNum, tasksJsonPath, prevSha, harnessCfg }) {
   const cfg = harnessCfg?.removedLiteralScan || {}
-  const testGlobRegex = typeof cfg.testGlobRegex === 'string' && cfg.testGlobRegex ? cfg.testGlobRegex : REMOVED_LITERAL_SCAN_CONFIG.testGlobRegex
-  const minLiteralLen = Number.isInteger(cfg.minLiteralLen) && cfg.minLiteralLen > 0 ? cfg.minLiteralLen : REMOVED_LITERAL_SCAN_CONFIG.minLiteralLen
-  const identifierMinLen = Number.isInteger(cfg.identifierMinLen) && cfg.identifierMinLen > 0 ? cfg.identifierMinLen : REMOVED_LITERAL_SCAN_CONFIG.identifierMinLen
+  // Matches this fleet's own test-naming conventions plus the common cross-language ones, so the
+  // harness ships one sane default without hardcoding a single project's directory layout.
+  const defaultTestGlobRegex = '(^|/)test_[^/]+\\.py$|(^|/)[^/]+_test\\.py$|(^|/)tests?/.*|\\.test\\.[jt]sx?$|\\.spec\\.[jt]sx?$'
+  const defaultMinLiteralLen = 8
+  // identifierMinLen exists SEPARATELY from minLiteralLen (quoted strings) because a bare-
+  // identifier match at the same low threshold is noisy -- ordinary English words removed from a
+  // comment or log message (e.g. "failed", "returned") are common at 6-8 chars and are not the
+  // distinctive symbol names this scan exists to catch; an underscored identifier of any length
+  // (a real snake_case/CONST_CASE symbol) is always reported regardless of identifierMinLen.
+  const defaultIdentifierMinLen = 12
+  const testGlobRegex = typeof cfg.testGlobRegex === 'string' && cfg.testGlobRegex ? cfg.testGlobRegex : defaultTestGlobRegex
+  const minLiteralLen = Number.isInteger(cfg.minLiteralLen) && cfg.minLiteralLen > 0 ? cfg.minLiteralLen : defaultMinLiteralLen
+  const identifierMinLen = Number.isInteger(cfg.identifierMinLen) && cfg.identifierMinLen > 0 ? cfg.identifierMinLen : defaultIdentifierMinLen
   const range = prevSha || 'HEAD~1'
   const result = await tracedAgent(`
 ${renderRemovedLiteralScan({ runRoot, taskNum, tasksJsonPath, range, testGlobRegex, minLiteralLen, identifierMinLen })}
