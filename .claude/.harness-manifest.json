@@ -1,6 +1,6 @@
 {
-  "version": "702de57d46733e6b58ee9fab3470ed496cbf48b8",
-  "generated": "2026-09-16",
+  "version": "29a63bbf57dbe76c769af6e22b9029b826b38b63",
+  "generated": "2026-09-17",
   "files": {
     ".claude/commands/update-task.md": "47afa30cf2e5593c9b39b974d360f9f0f1b1ff6a5e30cc2f525042f283cd8720",
     ".claude/commands/backlog-ticket.md": "300b15c584866e1beb86e6b12ae9aa1941f0373b94da635da39030970514c925",
@@ -71,6 +71,10 @@
     ".claude/workflows/templates/spec-template.md": "e35fa94c1ed104c27bfce0a362ae234c72c165de2e5989f82eb323d2a2ecf039",
     ".claude/workflows/prompts/shared.js": "612fca643176b1203e947261a424dd20d9b3ab02faf527a44903a666b41894d2",
     "scripts/check_block_records.py": "8e4912e705e7132088553befd196094eb63152337deba07c94c9ddf315890b5a",
+    "scripts/check_task_files.py": "9a9d6629f371311e620abd66fc6565a9ff25a4b211f7b92f4fed409d2ece31e4",
+    "scripts/check_spec_validation_commands.py": "6af5a4f8daeee12245d9b2d13b20c1ed976b5007b9bc4f9be998e335da223d0b",
+    "scripts/check_task_gate_boundaries.py": "b03261a23245548696a07b2e8552e2c41579fa27bd81bc131b0a971bd46354c5",
+    "scripts/check_observed_red.py": "f39f0ead9dab1eeca4d24be5a910de9b4b13d7de04951edda262f72709dbef7c",
     ".agents/skills/write-carryover-entry/SKILL.md": "36bbdccdcd4d011662c5de96adb3d8d2306e1f5abce8f1e5cf66a196039d23b3",
     ".agents/skills/record-a-bail/SKILL.md": "db16029e77e6b3979a12a7d0e71654ba0638eb307682d98e3fdbb023be578aba",
     ".agents/skills/sdlc-task/SKILL.md": "2bef45638f5432243256c1ac0c5a50fa99a3786d55aeff6e85cfae800a03d0d9",
