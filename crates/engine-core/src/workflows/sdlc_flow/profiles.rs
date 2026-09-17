@@ -31,6 +31,10 @@ pub fn baseline() -> PartialPolicy {
             // `GenerateTasksNode` actually runs); baseline must restate that
             // exactly, or selecting it would silently downgrade the stage.
             generate: Some(ModelTier::Opus),
+            // Same reasoning as `generate` above: the built-in default is
+            // what `GenerateTasksNode`'s block-record path actually runs
+            // (EN.19.C), and baseline restates it exactly.
+            generate_from_block: Some(ModelTier::Opus),
             docs: Some(ModelTier::Sonnet),
             // Restates the built-in default verbatim — baseline's no-op
             // contract. No escalation.
@@ -238,6 +242,7 @@ pub fn thorough() -> PartialPolicy {
             review: Some(ModelTier::Opus),
             triage: Some(ModelTier::Opus),
             generate: Some(ModelTier::Opus),
+            generate_from_block: Some(ModelTier::Opus),
             docs: Some(ModelTier::Opus),
             // The quality ceiling: already Opus on every attempt via
             // `implement` above, so this never changes the tier used — set

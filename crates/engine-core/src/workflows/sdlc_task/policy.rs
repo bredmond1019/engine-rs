@@ -349,6 +349,11 @@ impl SdlcTaskPolicy {
                 review: fallback.model_tiers.review,
                 triage: self.model_tiers.triage,
                 generate: self.model_tiers.generate,
+                // Not part of SdlcTaskModelTiers (EN.19.C's block-record
+                // path is not yet applicable to SDLC_TASK's own narrower
+                // model) — left at SdlcPolicy::default()'s value like the
+                // other omitted fields on this projection.
+                generate_from_block: fallback.model_tiers.generate_from_block,
                 docs: fallback.model_tiers.docs,
                 // Applicable (EN.17.F task 6): `ImplementTaskNode` is the
                 // same shared node, reused unmodified by this workflow's

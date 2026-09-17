@@ -64,6 +64,10 @@ fn baseline_profile_resolves_to_documented_policy() {
             // tier `GenerateTasksNode` actually runs, and `baseline` is a
             // no-op against the built-in default by contract.
             generate: ModelTier::Opus,
+            // Same reasoning as `generate` above: the built-in default
+            // matches what GenerateTasksNode's block-record path actually
+            // runs, and `baseline` is a no-op against the built-in default.
+            generate_from_block: ModelTier::Opus,
             docs: ModelTier::Sonnet,
             // No escalation: baseline's no-op contract.
             implement_final_attempt: None,
