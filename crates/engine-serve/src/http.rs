@@ -143,7 +143,7 @@
 //!   failure to resolve the brain root. See `get_heavy_work`.
 
 use std::collections::HashMap as StdHashMap;
-use std::sync::{Arc, OnceLock, RwLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
 use actix_web::{web, HttpRequest, HttpResponse, Responder};
 use chrono::{DateTime, Utc};
@@ -397,6 +397,115 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         .route("/api/coordination/send", web::post().to(coord_send))
         .route("/api/coordination/drain", web::post().to(coord_drain))
         .route("/api/coordination/complete", web::post().to(coord_complete));
+}
+
+/// The shared, per-process `OperatorQueue` every `PLANNING_PIPELINE` run's
+/// `ApprovalGateNode` instances enqueue an `OperatorPayload` onto (`EN.19.D`
+/// task 8) — mirrors [`live_run_metadata`]'s own `OnceLock`-backed
+/// process-global pattern immediately below (both exist for the same
+/// reason: a fresh, per-dispatch instance would make an approval enqueued
+/// by one run invisible to every other request this process serves).
+pub(crate) fn planning_pipeline_operator_queue(
+) -> &'static Arc<Mutex<engine_core::operator::queue::OperatorQueue>> {
+    static QUEUE: OnceLock<Arc<Mutex<engine_core::operator::queue::OperatorQueue>>> =
+        OnceLock::new();
+    QUEUE.get_or_init(|| {
+        Arc::new(Mutex::new(engine_core::operator::queue::OperatorQueue::new(
+            engine_core::operator::queue::OperatorQueuePolicy::default(),
+        )))
+    })
+}
+
+/// Register the `PLANNING_PIPELINE` workflow
+/// (`engine_core::workflows::planning_pipeline`, `EN.19.D` task 8) with
+/// `dispatcher`, alongside every other `workflow_type` this service
+/// registers (see [`crate::workflows::register_builtin_workflows`] for the
+/// rest — this one is registered separately because, unlike every other
+/// builtin, its runnable graph is not fixed: it is built fresh **per
+/// dispatched event** from the event's own `stages` list).
+///
+/// Accepts `POST /events/` events shaped `{slug, stages, <stage-specific
+/// inputs>, approval?, approval_channel?}` (block record `EN.19.D.json`'s
+/// `what` field) — `stages` (an ordered, contiguous, non-empty subset of
+/// `{pre_plan, plan, generate_tasks, dispatch}`) selects which nodes even
+/// exist in the per-run graph (see `planning_pipeline`'s own module doc,
+/// "Graph shape"). A missing or invalid `stages` field is rejected here with
+/// a named `Err(String)`, surfaced through `dispatch_with_event` as
+/// `DispatchError::PolicyResolutionFailed` — the same channel every other
+/// registered factory's own input validation already uses (e.g.
+/// `APPROVE_AND_RUN`'s unknown-profile rejection in
+/// [`crate::workflows::register_approve_and_run`]).
+///
+/// `approval`/`approval_channel` resolve into an
+/// `engine_core::workflows::planning_pipeline::policy::ApprovalGatePolicy`
+/// via the standard `event_override` layer of `engine_core::policy::resolve`
+/// — there is no `harness.json`/named-profile layer here yet, since
+/// `planning_pipeline` carries no `profiles` module of its own (this task's
+/// only declared file is this one; adding one is out of scope). An event
+/// naming no `approval` map at all therefore resolves every stage to
+/// `ApprovalGatePolicy`'s own safe-by-default `Manual`
+/// (`ApprovalGatePolicy::mode_for_stage`'s own contract) — never silently
+/// `Auto`.
+///
+/// Adds **no new HTTP route**: `POST /events/{event_id}/resume` (already
+/// registered by [`configure`]) is the resume/approval surface for every
+/// workflow this service dispatches, `PLANNING_PIPELINE` included — task 8's
+/// own description explicitly rules out a dedicated 'approve' endpoint.
+///
+/// The `WorkflowSchema` handed to `dispatcher.register` (read back by `GET
+/// /workflows/PLANNING_PIPELINE/graph`) is the full four-stage slice — the
+/// widest graph this workflow can ever produce — since
+/// [`Dispatcher::register`] requires one fixed schema per `workflow_type`
+/// while this workflow's actual per-run schema varies with the dispatched
+/// `stages` (`schema_for_stages`'s own doc comment).
+pub fn register_planning_pipeline(dispatcher: &mut Dispatcher) {
+    let full_stages: Vec<String> = ["pre_plan", "plan", "generate_tasks", "dispatch"]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+    let declared_schema =
+        engine_core::workflows::planning_pipeline::schema_for_stages(&full_stages).expect(
+            "the full four-stage PLANNING_PIPELINE slice is always a valid declared schema",
+        );
+
+    dispatcher.register(
+        declared_schema,
+        Box::new(|event: &serde_json::Value| {
+            let stages: Vec<String> = event
+                .get("stages")
+                .cloned()
+                .map(serde_json::from_value)
+                .transpose()
+                .map_err(|err: serde_json::Error| {
+                    format!("invalid PLANNING_PIPELINE 'stages': {err}")
+                })?
+                .ok_or_else(|| {
+                    "PLANNING_PIPELINE event is missing required field 'stages'".to_string()
+                })?;
+
+            // `PartialApprovalGatePolicy` has no `deny_unknown_fields`, so
+            // deserializing the whole event into it simply ignores `slug`/
+            // `stages`/every other field this workflow's stage nodes read —
+            // only `approval`/`approval_channel`/`max_discussion_rounds`
+            // (the fields that struct declares) are ever picked up.
+            let event_override: engine_core::workflows::planning_pipeline::policy::PartialApprovalGatePolicy =
+                serde_json::from_value(event.clone()).map_err(|err| {
+                    format!("invalid PLANNING_PIPELINE approval policy fields: {err}")
+                })?;
+            let policy = engine_core::policy::resolve(
+                engine_core::workflows::planning_pipeline::policy::ApprovalGatePolicy::default(),
+                None,
+                None,
+                Some(&event_override),
+            );
+
+            engine_core::workflows::planning_pipeline::workflow_for_stages(
+                &stages,
+                Arc::clone(planning_pipeline_operator_queue()),
+                &policy,
+            )
+        }),
+    );
 }
 
 /// `EN.ticket.stamp-engine-sha-on-every-run` task 3: `engine_build_sha` here must equal the
@@ -2015,6 +2124,161 @@ mod tests {
         let resp = test::call_service(&app, req).await;
 
         assert_eq!(resp.status(), 422);
+    }
+
+    // --- EN.19.D task 8: PLANNING_PIPELINE registered in the dispatcher ---
+
+    /// An `AppState` registered exactly the way production would via
+    /// `register_planning_pipeline` — no fixture substitute — proving the
+    /// real `PLANNING_PIPELINE` workflow is dispatchable through the
+    /// existing `POST /events/` HTTP surface (task 8's AC1).
+    fn test_app_state_with_planning_pipeline() -> AppState {
+        let mut dispatcher = Dispatcher::new();
+        register_planning_pipeline(&mut dispatcher);
+
+        AppState {
+            dispatcher: Arc::new(dispatcher),
+            live: LiveStateStore::new(),
+            durable: crate::durable::spawn_durable_writer(None),
+            runs: RunRegistry::new(),
+            campaigns: crate::abort::CampaignRegistry::new(),
+            api_key: "test-key".to_string(),
+        }
+    }
+
+    #[actix_web::test]
+    async fn planning_pipeline_is_registered_and_appears_in_workflows_list() {
+        let state = test_app_state_with_planning_pipeline();
+        let app = test::init_service(
+            App::new()
+                .app_data(web::Data::new(state))
+                .configure(configure),
+        )
+        .await;
+
+        let req = test::TestRequest::get().uri("/workflows").to_request();
+        let resp = test::call_service(&app, req).await;
+        assert_eq!(resp.status(), 200);
+        let body: Vec<String> = test::read_body_json(resp).await;
+        assert!(body.iter().any(|t| t == "PLANNING_PIPELINE"));
+    }
+
+    /// AC1: dispatching `PLANNING_PIPELINE` with a valid `stages` list
+    /// through the real `POST /events/` surface spawns a run (`202`), the
+    /// same contract every other registered `workflow_type` gets — never a
+    /// dedicated approval endpoint (task 8's own description).
+    #[actix_web::test]
+    async fn post_events_dispatches_planning_pipeline_with_a_valid_stages_list() {
+        let state = test_app_state_with_planning_pipeline();
+        let app = test::init_service(
+            App::new()
+                .app_data(web::Data::new(state))
+                .configure(configure),
+        )
+        .await;
+
+        let req = test::TestRequest::post()
+            .uri("/events/")
+            .insert_header(("X-API-Key", "test-key"))
+            .set_json(serde_json::json!({
+                "workflow_type": "PLANNING_PIPELINE",
+                "data": { "slug": "some-slug", "stages": ["pre_plan"] }
+            }))
+            .to_request();
+        let resp = test::call_service(&app, req).await;
+
+        assert_eq!(resp.status(), 202);
+        let body: serde_json::Value = test::read_body_json(resp).await;
+        assert!(body.get("run_id").is_some());
+        assert_eq!(body.get("event_id"), body.get("run_id"));
+    }
+
+    /// A dispatched event with no `stages` field at all is rejected as a
+    /// policy-resolution failure (422), never a panic or a 500 — this
+    /// factory's own input validation, mirroring `APPROVE_AND_RUN`'s
+    /// unknown-profile rejection.
+    #[actix_web::test]
+    async fn post_events_rejects_planning_pipeline_with_no_stages_field() {
+        let state = test_app_state_with_planning_pipeline();
+        let app = test::init_service(
+            App::new()
+                .app_data(web::Data::new(state))
+                .configure(configure),
+        )
+        .await;
+
+        let req = test::TestRequest::post()
+            .uri("/events/")
+            .insert_header(("X-API-Key", "test-key"))
+            .set_json(serde_json::json!({
+                "workflow_type": "PLANNING_PIPELINE",
+                "data": { "slug": "some-slug" }
+            }))
+            .to_request();
+        let resp = test::call_service(&app, req).await;
+
+        assert_eq!(resp.status(), 422);
+    }
+
+    /// An event naming no `approval` map at all still dispatches
+    /// successfully (the policy resolves every stage to `Manual`, which is
+    /// a valid, safe-by-default policy, not a rejection) — proving task 8's
+    /// factory does not require callers to opt into the approval map.
+    #[actix_web::test]
+    async fn post_events_dispatches_planning_pipeline_with_an_approval_map() {
+        let state = test_app_state_with_planning_pipeline();
+        let app = test::init_service(
+            App::new()
+                .app_data(web::Data::new(state))
+                .configure(configure),
+        )
+        .await;
+
+        let req = test::TestRequest::post()
+            .uri("/events/")
+            .insert_header(("X-API-Key", "test-key"))
+            .set_json(serde_json::json!({
+                "workflow_type": "PLANNING_PIPELINE",
+                "data": {
+                    "slug": "some-slug",
+                    "stages": ["pre_plan", "plan"],
+                    "approval": { "pre_plan": "auto" },
+                    "approval_channel": "session"
+                }
+            }))
+            .to_request();
+        let resp = test::call_service(&app, req).await;
+
+        assert_eq!(resp.status(), 202);
+    }
+
+    /// No dedicated approve/reject HTTP route exists for `PLANNING_PIPELINE`
+    /// — `configure`'s route table carries exactly one `/events/*/resume`
+    /// path, and it is the same one every other workflow already resumes
+    /// through (task 8 AC2: "No new approval-specific endpoint is added").
+    #[actix_web::test]
+    async fn no_dedicated_planning_pipeline_approval_route_exists() {
+        let state = test_app_state_with_planning_pipeline();
+        let app = test::init_service(
+            App::new()
+                .app_data(web::Data::new(state))
+                .configure(configure),
+        )
+        .await;
+
+        for uri in [
+            "/events/00000000-0000-0000-0000-000000000000/approve",
+            "/planning-pipeline/approve",
+            "/approvals/planning-pipeline",
+        ] {
+            let req = test::TestRequest::post().uri(uri).to_request();
+            let resp = test::call_service(&app, req).await;
+            assert_eq!(
+                resp.status(),
+                404,
+                "unexpected route registered at '{uri}'"
+            );
+        }
     }
 
     // --- EN.3.K task 5: pre-flight repo/spec_slug validation on SDLC_FLOW ---
