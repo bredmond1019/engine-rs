@@ -5,7 +5,7 @@ description: Chronological log of work completed for engine-rs.
 doc_id: log
 layer: [factory]
 status: active
-timestamp: "2026-09-16T02:16:40Z"
+timestamp: "2026-09-18T01:30:14Z"
 keywords: [work log, session history, development log]
 related: [status, context]
 ---
@@ -13,6 +13,38 @@ related: [status, context]
 # Log — engine-rs
 
 *Append-only working log. One dated entry per session. Newest entries at the top.*
+
+## [2026-09-18]
+
+### planning-command-nodes lane: EN.19.C closed; 2 fleet-wide base-template engine defects found, fixed, and synced
+- **What:**
+  - Ran `EN.19.C` (`GenerateTasksNode` block-record-aware decomposition path) to completion via
+    `/sdlc-task`, in place on `main` — all 4 tasks passed, all 6 acceptance criteria met.
+  - Found and fixed two fleet-wide `base-template` engine defects blocking every `/sdlc-task`/
+    `/sdlc-flow` run in the whole fleet, discovered mid-run: (1) `sync_downstream_harness.py`'s
+    `SCRIPT_FILENAMES` missing 4 checker scripts `prepare_run.py`'s `lint_rules` module requires;
+    (2) a top-level-await TDZ hazard — three `const`s (`REMOVED_LITERAL_SCAN_CONFIG`,
+    `REMOVED_LITERAL_SCAN_SCHEMA`, `ATTRIBUTION_CACHE_SCHEMA`) declared after the main per-task
+    loop's own `for` statement but referenced from inside it, the second known occurrence of the
+    class first documented in `test_engine_tdz_ordering.py` (2026-09-07,
+    `RENDER_IDENTITY_SCHEMA`). Both fixed in base-template and synced to all 19 fleet repos.
+  - Hit and hand-corrected a third, still-open engine bug live: a work-assertion step comparing a
+    task's own just-made commit against itself, falsely reporting no work done. Verified the real
+    diff independently, corrected the disk-only `sdlc-task-state.json` by hand, continued.
+  - Filed two base-template tickets for what's still open:
+    `BT.ticket.work-assertion-base-sha-self-comparison` (the base_sha bug above) and
+    `BT.ticket.per-task-state-write-before-implement` (write a `running` marker at task START, not
+    only at the end — the operator's own proposal, and the concrete fix for engine-rs's existing
+    carryover `sdlc-task-no-crash-recovery-for-its-own-state-file`).
+  - Coordinated with a concurrent peer session (`bastion-6c`) over shared `engine-core`/
+    `engine-serve` build safety via cross-session messaging — no collisions.
+- **Why:** `EN.19.C` was blocked outright by the two engine defects before any of its own work
+  could run; fixing them was a prerequisite, not a detour, and both affect every SDLC run fleet-wide
+  going forward. The base_sha bug and the state-write gap were filed rather than fixed live to keep
+  this session's scope to unblocking `EN.19.C`, not rewriting the engine further.
+- **Refs:** base-template commits `e9a8681`, `81b8a34` (TDZ fixes); `BT.ticket.work-assertion-base-sha-self-comparison`,
+  `BT.ticket.per-task-state-write-before-implement`; `docs/workflows/README.md`,
+  `docs/workflows/sdlc-flow.md`.
 
 ## [run: 2026-09-15]
 
