@@ -109,6 +109,84 @@ pulled in via `include_str!` per D24 (a node's stable prompt is a file, not a st
 | Workflow | What it does | Detail |
 |---|---|---|
 | `PLAN_AUTHORING` | Ports `/plan.md`'s single-repo path into nodes: reads a pre-plan folder (`notes.md`/`sequence.md`), decomposes it into candidate blocks, and renders a `plan.md` narrative. **Stages, never registers** — every candidate lands as schema-validated JSON under `candidate-blocks/`, not `planning/blocks/`, and no node here calls `mev create-block` or writes `state.json`. It also ports none of `/plan.md`'s red-team pass (step 10) or the initiative-wide C1-C7 consistency pass — a single-model decomposition is a known, accepted quality gap, which is exactly why registering a staged candidate stays a separate, human-reviewed action. Detail: [`../../crates/engine-core/src/workflows/plan_authoring/mod.rs`](../../crates/engine-core/src/workflows/plan_authoring/mod.rs)'s module doc. |
+| `PLANNING_PIPELINE` | One dispatchable entry point for any contiguous slice of `pre_plan -> plan -> generate_tasks -> dispatch`, pausing for an operator decision between every pair of adjacent requested stages. See "Composing the planning loop: `PLANNING_PIPELINE`" below. | [`../../crates/engine-core/src/workflows/planning_pipeline/mod.rs`](../../crates/engine-core/src/workflows/planning_pipeline/mod.rs)'s module doc. |
+
+### Composing the planning loop: `PLANNING_PIPELINE` (`EN.19.D`)
+
+Runs any contiguous, in-order slice of `pre_plan -> plan -> generate_tasks -> dispatch` — composing
+`PRE_PLAN`'s and `PLAN_AUTHORING`'s own node sets by import plus two new stage nodes
+(`GenerateTasksForBlockNode`, `DispatchNode`) — as one graph, so a single trigger can run the full
+loop or a sub-slice of it, instead of dispatching three-to-four separate `workflow_type`s by hand in
+the right order.
+
+```bash
+curl -X POST $ENGINE/events/ \
+  -H "X-API-Key: $ENGINE_EVENTS_API_KEY" \
+  -H 'Content-Type: application/json' \
+  -d '{"workflow_type":"PLANNING_PIPELINE","data":{
+    "slug":"my-idea",
+    "stages":["pre_plan","plan"],
+    "approval":{"pre_plan":"auto","plan":"manual"},
+    "approval_channel":"notification"
+  }}'
+```
+
+- **`stages` contract.** A non-empty, contiguous, in-order subset of `{pre_plan, plan,
+  generate_tasks, dispatch}` — `["plan","pre_plan"]` (out of order) or `["pre_plan","generate_tasks"]`
+  (a gap, skipping `plan`) is rejected by `StageSelectorNode` with a named reason and dispatches
+  nothing. `["pre_plan"]` alone produces exactly `PRE_PLAN`'s own behavior, with no gate node in the
+  graph at all — a single-stage run is never made to pay for an approval pause it has nothing to
+  gate. Each stage's own idempotency guard (`CheckExisting*Node`/`GenerateTasksForBlockNode`'s
+  `tasks.json`-exists check) fires first, so re-dispatching the same `slug`/`stages` after success
+  short-circuits every stage rather than redoing them.
+- **The per-stage `approval` map, manual by default.** Between every pair of *adjacent requested*
+  stages, an `ApprovalGateNode` reads the just-completed stage's resolved mode from the event's
+  `approval` map (stage name -> `"auto"` | `"manual"`). A stage absent from the map — including an
+  event that omits `approval` entirely — resolves to `manual`: the run always pauses unless a stage
+  explicitly opts into `auto`. `auto` is a pure no-op passthrough; the node stays in the declared
+  graph either way (standing rule 6 — policy changes behavior, never the node set).
+- **Built on `operator/`, never a CLI shell-out.** `ApprovalGateNode` is composed directly on this
+  repo's existing, generic `crates/engine-core/src/operator/{payload,channel,queue,ledger,transport,
+  limits}.rs` primitives — the same seam `APPROVE_AND_RUN` (`EN.8.D`) already composes for harvest
+  approval, never a second queue or approval mechanism and never a `bastion notify ask` subprocess.
+  A `manual` gate renders this module's own three named option consts
+  (`PLANNING_PIPELINE_APPROVE`/`_REJECT`/`_DISCUSS`, defined once in `approval_gate.rs` — no call
+  site scatters the raw strings, and none of `APPROVE_AND_RUN`'s own harvest-specific consts are
+  reused) into an `OperatorPayload`, enqueues it on the shared `OperatorQueue`, and suspends via the
+  existing `SuspendNode` primitive. The operator resolves it through the same
+  `POST /events/{run_id}/resume` endpoint every other suspended workflow uses — `PLANNING_PIPELINE`
+  adds no dedicated approve/reject HTTP route.
+- **`approval_channel` picks `OperatorChannel::{Notification, Session}`** — `notification` (the
+  default, headless) or `session` (interactive; the split `EN.19.E`'s terminal-nodes composition
+  keys off of).
+- **Every verdict lands a durable ledger row.** `approve` continues to the next stage and reuses
+  `operator::ledger::LedgerDecision::Approved`; `reject` holds the run in a distinct terminal state
+  (`Rejected`) and is never treated as approve; `discuss` routes to `EN.19.E`'s `DiscussFurtherNode`
+  seam (`RoutedToDiscussion`). `Rejected`/`RoutedToDiscussion` were added as new `LedgerDecision`
+  variants — never a second, `planning_pipeline`-scoped decision type — per the extend-vs-wrap
+  decision `crates/engine-core/src/operator/ledger/record.rs`'s own doc comment records (`EN.19.D`
+  task 1): no call site exhaustively `match`es over the enum, so the extension changes zero existing
+  match arms, and a wrapping type would have forced every ledger query to special-case two decision
+  types over the same `ApprovalLedgerRow`. A tap resolved against a stale/already-re-rendered digest
+  is refused and requeued by the existing digest-mismatch enforcement, unchanged by this addition —
+  never authorizing continuation.
+- **`DispatchNode`'s guard.** Refuses to fire when the target block's authored `status`
+  (`planning/state.json`, read-only) is already `in_progress` or `closed`, with a named reason;
+  otherwise it POSTs to the same unmodified `POST /events/` dispatch path every other in-repo
+  trigger uses (`ORCHESTRATION` or `SDLC_FLOW`/`SDLC_TASK`, resolved from an explicit
+  `workflow_type` or the block's own `sdlc_workflow` field) and returns the resulting `run_id`. It
+  never writes the block's status itself, and never reimplements chain execution, PR creation, or
+  merge.
+- **Policy knobs** (`approval`, `approval_channel`, `max_discussion_rounds`) live on
+  `ApprovalGatePolicy`/`PartialApprovalGatePolicy`
+  (`crates/engine-core/src/workflows/planning_pipeline/policy.rs`), resolved through the standard
+  four-layer precedence and documented in `planning/harness.json`'s `planning_pipeline` section
+  (`enable` flag, default `approval_channel`, `max_discussion_rounds` — all three named profiles).
+  As of `EN.19.D` task 8, the HTTP registration (`register_planning_pipeline`,
+  `crates/engine-serve/src/http.rs`) resolves `approval`/`approval_channel`/`max_discussion_rounds`
+  only from the dispatched event's own `policy`-shaped fields — the `harness.json`/named-`profile`
+  layer is documented for consistency with every other workflow's section but not yet wired into
+  that resolve call (`planning_pipeline` carries no `profiles` Rust module of its own yet).
 
 ### Winning and serving work
 
