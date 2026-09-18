@@ -1,6 +1,6 @@
 {
   "running": {
-    "meaning": "The engine has started this run and is actively working through tasks; the initial status written when state is first created.",
+    "meaning": "The engine has started this run and is actively working through tasks; the initial status written when state is first created. Also used per-task (BT.ticket.per-task-state-write-before-implement): before any edit or commit, the implement agent's own STEP 0 merges tasks[N] = {status:'running', start_sha:<HEAD at that moment>, marker_at:<UTC ISO>} into the state file, so a crash between a task's commit and the normal end-of-task write still leaves a record. A task found at `running` on disk means the process died mid-task -- never treat it as passed or failed; --resume re-enters it at implement attempt 1, and its start_sha becomes the work-assertion baseline (never a fix attempt, never skipped).",
     "emitters": ["sdlc-task", "sdlc-flow"]
   },
   "passed": {

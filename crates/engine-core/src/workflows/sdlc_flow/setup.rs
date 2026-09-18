@@ -1457,6 +1457,161 @@ fn snapshot_baselines(
     Ok(())
 }
 
+/// Stable system-prompt prefix for the block-record-aware decomposition
+/// branch (`EN.19.C` task 2) — the disjoint-ownership-unless-sequential-edge
+/// rule and the observable-acceptance-criteria requirement ported from
+/// `.claude/commands/generate-tasks.md`'s block-record-mode contract.
+/// Colocated per D24 (standing rule 7): only [`build_block_record_prompt`]'s
+/// per-run body below interpolates the parsed record's fields — this
+/// constant itself never carries run-varying text, keeping it a stable
+/// cache-breakpoint prefix like [`super::task_loop::STABLE_SYSTEM_PROMPT`].
+const GENERATE_FROM_BLOCK_STABLE_PROMPT: &str =
+    include_str!("prompts/generate_tasks_from_block.md");
+
+/// One entry of a block record's `files.new[]` (`.claude/workflows/block.schema.json`).
+#[derive(Debug, Clone, Deserialize)]
+struct BlockRecordFileNew {
+    path: String,
+    purpose: String,
+}
+
+/// One entry of a block record's `files.modified[]`.
+#[derive(Debug, Clone, Deserialize)]
+struct BlockRecordFileModified {
+    path: String,
+    change: String,
+}
+
+/// A block record's `files` object — both arrays default to empty so a
+/// record naming only one of the two still parses.
+#[derive(Debug, Clone, Default, Deserialize)]
+struct BlockRecordFiles {
+    #[serde(default)]
+    new: Vec<BlockRecordFileNew>,
+    #[serde(default)]
+    modified: Vec<BlockRecordFileModified>,
+}
+
+/// The subset of `planning/blocks/<ID>.json` (`.claude/workflows/block.schema.json`)
+/// this node's block-record branch decomposes from: `what`/`files`/
+/// `acceptance_criteria`/`out_of_scope`/`interfaces`, per this block's own
+/// `what`. Every other field on the real record (`id`, `repo`, `depends_on`,
+/// `validation_commands`, ...) is intentionally not read here — this is a
+/// decomposition input, not a full block-record model. `acceptance_criteria`
+/// is kept as raw [`serde_json::Value`]s because the schema allows either a
+/// bare string or a `{criterion, gateable, evidence}` object (D64); rendering
+/// picks the right text for either shape rather than requiring one.
+#[derive(Debug, Clone, Deserialize)]
+struct BlockRecordForTasks {
+    what: String,
+    #[serde(default)]
+    files: BlockRecordFiles,
+    #[serde(default)]
+    acceptance_criteria: Vec<serde_json::Value>,
+    #[serde(default)]
+    out_of_scope: Vec<String>,
+    #[serde(default)]
+    interfaces: Vec<String>,
+}
+
+/// `<planning dir>/blocks/<spec_slug>.json` — the block record
+/// `/generate-tasks`'s own contract reads by EXACT filename match only,
+/// never fuzzy (`block-registration.md`'s invariant that a spec directory
+/// equals its block ID exactly). Derives the `planning/` directory from
+/// `dir`'s own parent rather than re-deriving `worktree`/root resolution
+/// independently, so this always agrees with [`spec_dir`] about which repo
+/// checkout is being read — `dir` is `<root>/planning/<spec_slug>`, so
+/// `dir.parent()` is `<root>/planning`.
+fn block_record_path(dir: &Path, spec_slug: &str) -> Option<PathBuf> {
+    dir.parent().map(|planning_dir| {
+        planning_dir
+            .join("blocks")
+            .join(format!("{spec_slug}.json"))
+    })
+}
+
+/// Render one `acceptance_criteria[]` entry (bare string or D64's
+/// `{criterion, ...}` object) as prompt text.
+fn acceptance_criterion_text(value: &serde_json::Value) -> String {
+    if let Some(text) = value.as_str() {
+        return text.to_string();
+    }
+    value
+        .get("criterion")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+        .unwrap_or_else(|| value.to_string())
+}
+
+/// Build the per-run prompt for the block-record-aware branch: the stable
+/// prefix followed by the parsed record's fields interpolated in Rust
+/// (never into the included prompt file itself, per D24).
+fn build_block_record_prompt(spec_slug: &str, record: &BlockRecordForTasks) -> String {
+    let new_files: String = if record.files.new.is_empty() {
+        "  (none)".to_string()
+    } else {
+        record
+            .files
+            .new
+            .iter()
+            .map(|f| format!("  - {} — {}", f.path, f.purpose))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let modified_files: String = if record.files.modified.is_empty() {
+        "  (none)".to_string()
+    } else {
+        record
+            .files
+            .modified
+            .iter()
+            .map(|f| format!("  - {} — {}", f.path, f.change))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let acceptance_criteria: String = if record.acceptance_criteria.is_empty() {
+        "  (none)".to_string()
+    } else {
+        record
+            .acceptance_criteria
+            .iter()
+            .map(|c| format!("  - {}", acceptance_criterion_text(c)))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let out_of_scope: String = if record.out_of_scope.is_empty() {
+        "  (none)".to_string()
+    } else {
+        record
+            .out_of_scope
+            .iter()
+            .map(|s| format!("  - {s}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let interfaces: String = if record.interfaces.is_empty() {
+        "  (none)".to_string()
+    } else {
+        record
+            .interfaces
+            .iter()
+            .map(|s| format!("  - {s}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+
+    format!(
+        "{GENERATE_FROM_BLOCK_STABLE_PROMPT}Block record for spec {spec_slug:?}:\n\n\
+         What:\n  {}\n\n\
+         New files:\n{new_files}\n\n\
+         Modified files:\n{modified_files}\n\n\
+         Acceptance criteria:\n{acceptance_criteria}\n\n\
+         Out of scope (hard boundary — do not generate tasks for these):\n{out_of_scope}\n\n\
+         Interfaces:\n{interfaces}\n",
+        record.what,
+    )
+}
+
 /// Model output shape expected from `GenerateTasksNode`'s prompt: the task
 /// list plus its rendered `tasks.md` body.
 ///
@@ -1570,17 +1725,25 @@ fn truncate_context_section(section: String, file_name: &str, max_bytes: Option<
     truncated
 }
 
-/// Model node (planning-fallback path only): gathers
-/// `planning/{spec_slug}/*.md` context, prompts for a task list, and writes
-/// `tasks.md` + `tasks.json`. Composes a `AgentCodeStep` (EN.2.A) under its
-/// own identity rather than being a bare `AgentCodeStep` instance, so it
-/// can post-process the model's JSON output into the two files this task's
-/// acceptance criteria require.
+/// Model node with two decomposition paths (`EN.19.C`): when
+/// `planning/blocks/{spec_slug}.json` exists (an EXACT filename match
+/// only — never fuzzy), gathers that block record's `what`/`files`/
+/// `acceptance_criteria`/`out_of_scope`/`interfaces` and decomposes from
+/// them; otherwise falls back to the original planning-fallback path,
+/// gathering `planning/{spec_slug}/*.md` context byte-for-byte unchanged.
+/// Either way, prompts for a task list and writes `tasks.md` + `tasks.json`.
+/// Composes a `AgentCodeStep` (EN.2.A) under its own identity rather than
+/// being a bare `AgentCodeStep` instance, so it can post-process the
+/// model's JSON output into the two files this task's acceptance criteria
+/// require.
 ///
-/// The model is **not** hardcoded here: `process` resolves it from the
-/// stamped policy's `model_tiers.generate` (`Stage::Generate`), which
+/// The model is **not** hardcoded here: the fallback path resolves it from
+/// the stamped policy's `model_tiers.generate` (`Stage::Generate`), which
 /// defaults to the Opus tier — byte-identical to the `claude-opus-4-8`
-/// literal this node used to carry in `new()`.
+/// literal this node used to carry in `new()`. The block-record path
+/// resolves its model through the SEPARATE `model_tiers.generate_from_block`
+/// knob instead, so tuning one path's tier can never silently change the
+/// other's.
 pub struct GenerateTasksNode {
     config: Config,
     transport: TransportSlot,
@@ -1645,15 +1808,64 @@ impl Node for GenerateTasksNode {
         // `gather_context` so its `generate_context_max_bytes` cap is
         // available at gather time.
         let policy = resolved_policy(&ctx)?;
-        let context = gather_context(&dir, policy.generate_context_max_bytes);
-        let prompt = format!(
-            "Generate the task list for spec {:?} from the following planning \
-             context. Respond with strict JSON of the shape \
-             {{\"tasks\": [<SDLCTask>, ...], \"tasks_markdown\": \"<rendered tasks.md body>\"}}.\n\n{context}",
-            event.spec_slug
-        );
+
+        // Exact-match-only check (never fuzzy) against
+        // `planning/blocks/{spec_slug}.json` — see `block_record_path`'s
+        // doc comment. An unparsable record that DOES exist is a hard
+        // error rather than a silent fall-through: a malformed block file
+        // is a spec defect the run should surface, not paper over by
+        // decomposing from the wrong (fallback) input.
+        let block_record = match block_record_path(&dir, &event.spec_slug) {
+            Some(path) if path.is_file() => {
+                let content = std::fs::read_to_string(&path).map_err(|err| {
+                    NodeError::new(format!(
+                        "GenerateTasksNode: failed to read block record {}: {err}",
+                        path.display()
+                    ))
+                })?;
+                let record: BlockRecordForTasks =
+                    serde_json::from_str(&content).map_err(|err| {
+                        NodeError::new(format!(
+                            "GenerateTasksNode: failed to parse block record {}: {err}",
+                            path.display()
+                        ))
+                    })?;
+                Some(record)
+            }
+            _ => None,
+        };
+
+        let prompt = match &block_record {
+            Some(record) => build_block_record_prompt(&event.spec_slug, record),
+            None => {
+                let context = gather_context(&dir, policy.generate_context_max_bytes);
+                format!(
+                    "Generate the task list for spec {:?} from the following planning \
+                     context. Respond with strict JSON of the shape \
+                     {{\"tasks\": [<SDLCTask>, ...], \"tasks_markdown\": \"<rendered tasks.md body>\"}}.\n\n{context}",
+                    event.spec_slug
+                )
+            }
+        };
+
         let (mut config, prompt) =
             apply_policy(self.config.clone(), prompt, &policy, Stage::Generate);
+
+        // The block-record path resolves its model through the SEPARATE
+        // `model_tiers.generate_from_block` knob (EN.19.C task 1) instead of
+        // `model_tiers.generate`, which `apply_policy` above already applied
+        // and which the fallback path keeps exclusively. Re-applying
+        // `apply_model_tier` here overwrites only `config.model` — every
+        // other field `apply_policy` resolved (timeout, max_turns, prompt
+        // cache, isolation) is untouched, so this is a targeted override,
+        // not a second full policy application.
+        let resolved_model_tier = if block_record.is_some() {
+            let tier = policy.model_tiers.generate_from_block;
+            config = crate::policy::apply_model_tier(config, tier, &policy.local.model);
+            tier
+        } else {
+            policy.model_tiers.generate
+        };
 
         // Scope the model's session to the run's worktree instead of letting
         // it inherit the host process's ambient cwd (under `bastion serve`,
@@ -1750,7 +1962,7 @@ impl Node for GenerateTasksNode {
             // Stamp the resolved knob values so `RunTelemetry` /
             // `PolicyAggregate` can attribute this stage's observed cost
             // to the settings that caused it (standing rule 6).
-            "model_tier": policy.model_tiers.generate,
+            "model_tier": resolved_model_tier,
             "call_timeout_secs": policy.timeouts.generate,
         });
         // This site previously carried forward nothing — `put_result` below
@@ -5412,6 +5624,176 @@ repo_path = "alpha"
 
         let err = node.process(ctx).await.expect_err("should fail");
         assert!(err.message.contains("failed to parse model output"));
+    }
+
+    // --- GenerateTasksNode block-record branch (EN.19.C task 2) ------------
+
+    fn write_block_record(worktree: &Path, spec_slug: &str, record: serde_json::Value) {
+        let blocks_dir = worktree.join("planning").join("blocks");
+        std::fs::create_dir_all(&blocks_dir).unwrap();
+        std::fs::write(
+            blocks_dir.join(format!("{spec_slug}.json")),
+            serde_json::to_string_pretty(&record).unwrap(),
+        )
+        .unwrap();
+    }
+
+    fn minimal_block_record(what: &str) -> serde_json::Value {
+        json!({
+            "what": what,
+            "files": {
+                "new": [{ "path": "src/foo.rs", "purpose": "the new thing" }],
+                "modified": [{ "path": "src/bar.rs", "change": "wires the new thing in" }],
+            },
+            "acceptance_criteria": [
+                "the new thing exists",
+                { "criterion": "an installed check passes", "gateable": false, "evidence": "manual" },
+            ],
+            "out_of_scope": ["renaming bar.rs"],
+            "interfaces": ["src/foo.rs's public fn"],
+        })
+    }
+
+    /// A transport that records every `(Config, prompt)` it is called with
+    /// and replies with a minimal valid `GeneratedTasks` payload.
+    fn recording_transport(captured: Arc<Mutex<Option<(Config, String)>>>) -> ModelTransport {
+        Arc::new(move |config, prompt| {
+            *captured.lock().unwrap() = Some((config.clone(), prompt.clone()));
+            let outcome = stub_outcome_with_text(
+                &json!({
+                    "tasks": [{ "task_id": 1, "title": "Do it", "description": "desc" }],
+                    "tasks_markdown": "# Tasks\n\n1. Do it",
+                })
+                .to_string(),
+            );
+            Box::pin(async move { Ok(outcome) })
+        })
+    }
+
+    /// AC1: a spec_slug that EXACTLY names a real `planning/blocks/<ID>.json`
+    /// takes the block-record branch — the prompt carries the record's
+    /// stable rules prefix and its interpolated fields.
+    #[tokio::test]
+    async fn generate_takes_block_record_branch_on_exact_match() {
+        let worktree = temp_dir();
+        std::fs::create_dir_all(worktree.join("planning").join("my-spec")).unwrap();
+        write_block_record(
+            &worktree,
+            "my-spec",
+            minimal_block_record("Add the new thing"),
+        );
+
+        let captured = Arc::new(Mutex::new(None));
+        let node = GenerateTasksNode::new().with_transport(recording_transport(captured.clone()));
+        let ctx = ctx_with_worktree("my-spec", &worktree);
+        node.process(ctx).await.expect("generate should succeed");
+
+        let (_, prompt) = captured.lock().unwrap().clone().expect("transport called");
+        assert!(
+            prompt.contains("decomposing an already-authored block record"),
+            "expected the block-record stable prompt prefix, got: {prompt}"
+        );
+        assert!(prompt.contains("Add the new thing"));
+        assert!(prompt.contains("src/foo.rs"));
+        assert!(prompt.contains("renaming bar.rs"));
+    }
+
+    /// AC1 (near-miss half) + AC3: a spec_slug that does NOT exactly match
+    /// any block file — including a one-character-different near miss —
+    /// falls through to the existing planning-fallback prompt, unchanged.
+    #[tokio::test]
+    async fn generate_falls_through_to_fallback_on_near_miss_slug() {
+        let worktree = temp_dir();
+        std::fs::create_dir_all(worktree.join("planning").join("my-spec")).unwrap();
+        // Near miss: one trailing character different from the real slug.
+        write_block_record(
+            &worktree,
+            "my-specx",
+            minimal_block_record("Add the new thing"),
+        );
+
+        let captured = Arc::new(Mutex::new(None));
+        let node = GenerateTasksNode::new().with_transport(recording_transport(captured.clone()));
+        let ctx = ctx_with_worktree("my-spec", &worktree);
+        node.process(ctx).await.expect("generate should succeed");
+
+        let (_, prompt) = captured.lock().unwrap().clone().expect("transport called");
+        assert!(
+            prompt.starts_with("Generate the task list for spec"),
+            "expected the unchanged planning-fallback prompt, got: {prompt}"
+        );
+        assert!(!prompt.contains("decomposing an already-authored block record"));
+    }
+
+    /// AC2 (both directions): tuning `model_tiers.generate_from_block` moves
+    /// only the block-record path's resolved model; the fallback path's
+    /// resolved model, under the very same policy, is unchanged.
+    #[tokio::test]
+    async fn generate_from_block_resolves_model_tier_independently_of_fallback() {
+        let mut tiered_policy = SdlcPolicy::default();
+        tiered_policy.model_tiers.generate_from_block = ModelTier::Haiku;
+        assert_ne!(
+            tiered_policy.model_tiers.generate_from_block, tiered_policy.model_tiers.generate,
+            "fixture must actually diverge the two knobs"
+        );
+
+        // Block-record branch: resolves through generate_from_block (Haiku).
+        let worktree = temp_dir();
+        std::fs::create_dir_all(worktree.join("planning").join("my-spec")).unwrap();
+        write_block_record(
+            &worktree,
+            "my-spec",
+            minimal_block_record("Add the new thing"),
+        );
+        let captured = Arc::new(Mutex::new(None));
+        let node = GenerateTasksNode::new().with_transport(recording_transport(captured.clone()));
+        let ctx = ctx_with_worktree_and_policy("my-spec", &worktree, &tiered_policy);
+        node.process(ctx).await.expect("generate should succeed");
+        let (config, _) = captured.lock().unwrap().clone().expect("transport called");
+        assert_eq!(config.model, Some("claude-haiku-4-5".to_string()));
+
+        // Fallback branch, same tuned policy: resolved model is unaffected,
+        // still `model_tiers.generate`'s value (Sonnet, the default).
+        let worktree2 = temp_dir();
+        std::fs::create_dir_all(worktree2.join("planning").join("other-spec")).unwrap();
+        let captured2 = Arc::new(Mutex::new(None));
+        let node2 = GenerateTasksNode::new().with_transport(recording_transport(captured2.clone()));
+        let ctx2 = ctx_with_worktree_and_policy("other-spec", &worktree2, &tiered_policy);
+        node2.process(ctx2).await.expect("generate should succeed");
+        let (config2, prompt2) = captured2.lock().unwrap().clone().expect("transport called");
+        assert!(prompt2.starts_with("Generate the task list for spec"));
+        assert_eq!(
+            config2.model,
+            Some(crate::policy::model_tier_to_model_string(
+                tiered_policy.model_tiers.generate,
+                &tiered_policy.local.model
+            ))
+        );
+    }
+
+    /// The new prompt file is pulled in via `include_str!`, never an inline
+    /// literal — a change to the file is observable here without touching
+    /// this test.
+    #[test]
+    fn generate_from_block_stable_prompt_is_loaded_from_its_own_file() {
+        assert!(GENERATE_FROM_BLOCK_STABLE_PROMPT.contains("dependsOn"));
+        assert!(GENERATE_FROM_BLOCK_STABLE_PROMPT.contains("disjoint"));
+    }
+
+    /// A malformed (existing) block record is a hard error, never a silent
+    /// fall-through to the fallback path.
+    #[tokio::test]
+    async fn generate_errors_on_unparsable_block_record() {
+        let worktree = temp_dir();
+        std::fs::create_dir_all(worktree.join("planning").join("my-spec")).unwrap();
+        let blocks_dir = worktree.join("planning").join("blocks");
+        std::fs::create_dir_all(&blocks_dir).unwrap();
+        std::fs::write(blocks_dir.join("my-spec.json"), "not json").unwrap();
+
+        let node = GenerateTasksNode::new();
+        let ctx = ctx_with_worktree("my-spec", &worktree);
+        let err = node.process(ctx).await.expect_err("should fail");
+        assert!(err.message.contains("failed to parse block record"));
     }
 
     // --- GenerateTasksNode policy/cwd contract -----------------------------

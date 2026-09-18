@@ -5,7 +5,7 @@ description: Chronological log of work completed for engine-rs.
 doc_id: log
 layer: [factory]
 status: active
-timestamp: "2026-09-16T02:16:40Z"
+timestamp: "2026-09-18T01:30:14Z"
 keywords: [work log, session history, development log]
 related: [status, context]
 ---
@@ -13,6 +13,74 @@ related: [status, context]
 # Log — engine-rs
 
 *Append-only working log. One dated entry per session. Newest entries at the top.*
+
+## [run: 2026-09-18]
+
+`/sdlc-flow` on branch `EN.19.D-flow` ran `EN.19.D` to completion — all 10 tasks passed, PASS
+review. Added the `PLANNING_PIPELINE` workflow: a single dispatchable entry point composing
+EN.19.A's `pre_plan`, EN.19.B's `plan_authoring`, and EN.19.C's block-record-aware
+`GenerateTasksNode` into one graph, selected per-run by a `stages` list. `StageSelectorNode`
+validates the requested stages are a contiguous, in-order, duplicate-free subset of
+`{pre_plan, plan, generate_tasks, dispatch}` before any node runs (task 3). `DispatchNode` reads a
+block's authored `state.json` status, refuses to double-dispatch an `in_progress`/`closed` block,
+and fires the existing ORCHESTRATION/SDLC_* dispatch path via the injectable `HttpPost` seam (task
+6). `ApprovalGateNode` is built directly on the existing `operator/` primitives
+(`OperatorPayload`/`OperatorQueue`/`OperatorChannel`/`operator::ledger`) rather than a CLI
+shell-out, wired between adjacent requested stages through the existing `build_loop`/`LoopSpec`
+combinator instead of a hand-wired cyclic edge (tasks 2, 4, 7). Task 1's ground-truth check found
+extending the shared `LedgerDecision` enum (adding `Rejected`/`RoutedToDiscussion`) was the safe,
+single-writer move fleet-wide — no call site exhaustively matches over it — so it was extended, not
+wrapped. `ApprovalGatePolicy` resolves through the standard four-layer precedence, safe-by-default
+(an event naming no `approval` map pauses after every requested stage). `PLANNING_PIPELINE` is
+registered as a workflow_type in `engine-serve`'s dispatcher (task 8); a 15-test hermetic
+integration suite covers every trigger shape, gap/out-of-order rejection, redispatch idempotency,
+double-dispatch refusal, and approve/reject/discuss ledger verdicts (task 9). `docs/workflows/
+README.md` and `planning/harness.json` document the workflow, its per-stage approval map, and the
+`LedgerDecision` extension decision; full workspace suite (4757 tests), release build, and all
+gates green (task 10). This closes `EN.19.D`. Next: `EN.19.E` — ApprovalGateNode's discuss route.
+
+```
+a01bb9b fix: review pass 1 for "EN.19.D
+533b189 feat: implement EN.19.D-task10
+43acc64 feat: implement EN.19.D-task9
+a6d5aec feat: implement EN.19.D-task8
+f9fe381 feat: implement EN.19.D-task7
+81956e7 feat: implement EN.19.D-task6
+d3f39e1 feat: implement EN.19.D-task5
+7ff065b feat: implement EN.19.D-task4
+```
+
+## [2026-09-18]
+
+### planning-command-nodes lane: EN.19.C closed; 2 fleet-wide base-template engine defects found, fixed, and synced
+- **What:**
+  - Ran `EN.19.C` (`GenerateTasksNode` block-record-aware decomposition path) to completion via
+    `/sdlc-task`, in place on `main` — all 4 tasks passed, all 6 acceptance criteria met.
+  - Found and fixed two fleet-wide `base-template` engine defects blocking every `/sdlc-task`/
+    `/sdlc-flow` run in the whole fleet, discovered mid-run: (1) `sync_downstream_harness.py`'s
+    `SCRIPT_FILENAMES` missing 4 checker scripts `prepare_run.py`'s `lint_rules` module requires;
+    (2) a top-level-await TDZ hazard — three `const`s (`REMOVED_LITERAL_SCAN_CONFIG`,
+    `REMOVED_LITERAL_SCAN_SCHEMA`, `ATTRIBUTION_CACHE_SCHEMA`) declared after the main per-task
+    loop's own `for` statement but referenced from inside it, the second known occurrence of the
+    class first documented in `test_engine_tdz_ordering.py` (2026-09-07,
+    `RENDER_IDENTITY_SCHEMA`). Both fixed in base-template and synced to all 19 fleet repos.
+  - Hit and hand-corrected a third, still-open engine bug live: a work-assertion step comparing a
+    task's own just-made commit against itself, falsely reporting no work done. Verified the real
+    diff independently, corrected the disk-only `sdlc-task-state.json` by hand, continued.
+  - Filed two base-template tickets for what's still open:
+    `BT.ticket.work-assertion-base-sha-self-comparison` (the base_sha bug above) and
+    `BT.ticket.per-task-state-write-before-implement` (write a `running` marker at task START, not
+    only at the end — the operator's own proposal, and the concrete fix for engine-rs's existing
+    carryover `sdlc-task-no-crash-recovery-for-its-own-state-file`).
+  - Coordinated with a concurrent peer session (`bastion-6c`) over shared `engine-core`/
+    `engine-serve` build safety via cross-session messaging — no collisions.
+- **Why:** `EN.19.C` was blocked outright by the two engine defects before any of its own work
+  could run; fixing them was a prerequisite, not a detour, and both affect every SDLC run fleet-wide
+  going forward. The base_sha bug and the state-write gap were filed rather than fixed live to keep
+  this session's scope to unblocking `EN.19.C`, not rewriting the engine further.
+- **Refs:** base-template commits `e9a8681`, `81b8a34` (TDZ fixes); `BT.ticket.work-assertion-base-sha-self-comparison`,
+  `BT.ticket.per-task-state-write-before-implement`; `docs/workflows/README.md`,
+  `docs/workflows/sdlc-flow.md`.
 
 ## [run: 2026-09-15]
 

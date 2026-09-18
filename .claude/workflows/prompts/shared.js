@@ -176,8 +176,8 @@ const BAIL_REASONS = [
 // brainTomlAtRoot } — never throws; returns null on any parse failure so callers fail exactly the
 // way resolveRepoRoot() returning null already did before this ticket. `prepareRun` is
 // prepare_run.py's own JSON object verbatim (repo_root, is_vaulted, vault_root, agent_flag,
-// scope_flag, harness_config, tasks_enumeration, lint, probes, refused[, reason]) — see that
-// script's module docstring for the field list.
+// scope_flag, harness_config, tasks_enumeration, task_commits, lint, probes, refused[, reason])
+// — see that script's module docstring for the field list.
 function parsePrepareRunOutput(rawOutput) {
   if (!rawOutput || typeof rawOutput !== 'string') return null
   const marker = '---PREPARE_RUN_EXTRA---'
@@ -220,10 +220,11 @@ let _prepareRunCacheSlug = undefined
 async function runPrepareRun(specSlug) {
   if (_prepareRunCache && _prepareRunCacheSlug === (specSlug || null)) return _prepareRunCache
   const specFlag = specSlug ? ` --spec-slug ${specSlug}` : ''
+  const blockIdFlag = blockId ? ` --block-id ${blockId}` : ''
   const result = await agent(`
 Run exactly this ONE Bash call, from the invoking directory — do not cd anywhere first, do not
 substitute or re-derive any value, and do not run any other command:
-  REPO_ROOT=$(${GIT} rev-parse --show-toplevel) && python3 "$REPO_ROOT/.claude/workflows/bin/prepare_run.py"${specFlag} --repo-root "$REPO_ROOT"; echo "---PREPARE_RUN_EXTRA---" && echo "GIT_COMMON_DIR:$(${GIT} rev-parse --path-format=absolute --git-common-dir)" && echo "TIER_PREFIX:$(python3 -c "import os; r=os.path.relpath(os.getcwd(), '$REPO_ROOT'); print('' if r=='.' else r+'/')")" && { [ -f "$REPO_ROOT/brain.toml" ] && echo "BRAIN_TOML:yes" || echo "BRAIN_TOML:no"; }
+  REPO_ROOT=$(${GIT} rev-parse --show-toplevel) && python3 "$REPO_ROOT/.claude/workflows/bin/prepare_run.py"${specFlag}${blockIdFlag} --repo-root "$REPO_ROOT"; echo "---PREPARE_RUN_EXTRA---" && echo "GIT_COMMON_DIR:$(${GIT} rev-parse --path-format=absolute --git-common-dir)" && echo "TIER_PREFIX:$(python3 -c "import os; r=os.path.relpath(os.getcwd(), '$REPO_ROOT'); print('' if r=='.' else r+'/')")" && { [ -f "$REPO_ROOT/brain.toml" ] && echo "BRAIN_TOML:yes" || echo "BRAIN_TOML:no"; }
 This is a two-turn shell task, not a reasoning task: prepare_run.py already resolved every setup
 fact, ran the tasks.json lint, and probed runnability. Do not interpret, summarize, or reformat its
 JSON — transcribe stdout EXACTLY as printed (including the JSON's own newlines and indentation)
@@ -924,6 +925,14 @@ This changes only the wording/evidence of bailReason — bailing on IMMEDIATE-BA
 (environment/credential/auth/network) stays correct and fast, "when unsure, BAIL" stays, and no
 additional retry attempts are introduced by this rule.
 
+Re-measured vs. carried-over data: a work-assertion, vault-commit, or removed-literal-scan failure
+happens BEFORE the test stage runs, so any gate_results/issues data shown to you below (in the state
+object, if this bail turns out to be MAJOR) can be CARRIED OVER unchanged from an earlier attempt
+that actually ran tests, not a fresh measurement of the current diff — check for an explicit
+DATA FRESHNESS WARNING above the state-write instructions. Never write sameFailureAsBefore=true or
+describe data as "byte-identical"/"no progress" from carried-over data alone; say explicitly that
+the check was not re-run this attempt instead.
+
 Otherwise:
   RETRYABLE — transient/infra (agent died, flaky), OR the failure CHANGED from the previous attempt
               (it is making progress and a bounded fix can plausibly close it).
@@ -1007,8 +1016,75 @@ their output; empty when allPassed), gate_results (the per-check array described
 //   runRootLabel       what to call the run directory in prose.
 //   extraReturnFields  StructuredOutput fields this engine wants that the other does not
 //                      (/sdlc-flow's reportFile). Empty string in the lean engine.
-function renderImplementPrompt({ roleIntro, runRootLabel, runRoot, extraReturnFields, isFix, taskNum, attempt, stem, blockId, specFile, specDesc, tasksJsonFile, breakdownFile, prevFailBlob, vault, GIT, renderCommitSafetyGuard, renderWorkAssertion, prevSha }) {
+//
+// BT.ticket.per-task-state-write-before-implement (task 1): three more caller-supplied seams —
+//   stateFile        this engine's own run-state path (sdlc-task-state.json / sdlc-flow-state.json),
+//                    relative to runRoot. Used only by the STEP 0 marker below, never read/written
+//                    anywhere else in this prompt.
+//   startedMarker    true renders STEP 0, a deterministic python3 heredoc that merges
+//                    tasks["<taskNum>"] = {..existing, status:'running', start_sha:<HEAD short sha>,
+//                    marker_at:<UTC ISO now>} into stateFile BEFORE any edit or commit — the caller
+//                    decides this per-attempt (true only on attempt 1 with no start_sha recorded
+//                    yet; a fix attempt must NEVER re-stamp start_sha, since by then HEAD already
+//                    includes attempt 1's own commit). The agent transcribes the printed sha back as
+//                    `startSha` in its StructuredOutput return; the engine persists it onto
+//                    state.tasks[N].start_sha so the next full state write keeps it.
+//   resumingRunning  true when this task was found at status `running` on disk with a start_sha
+//                    already recorded (a crashed prior attempt) — renders a note telling the agent
+//                    to check for and reuse an already-complete commit rather than blindly
+//                    re-implementing.
+function renderImplementPrompt({ roleIntro, runRootLabel, runRoot, extraReturnFields, isFix, taskNum, attempt, stem, blockId, specFile, specDesc, tasksJsonFile, breakdownFile, prevFailBlob, vault, GIT, renderCommitSafetyGuard, renderWorkAssertion, prevSha, stateFile, startedMarker, resumingRunning }) {
+  const markerStep = startedMarker ? `
+
+STEP 0 — write a 'started' marker to ${stateFile} BEFORE reading, editing, or committing anything,
+so a crash between this task's commit and its normal end-of-task state write still leaves a record
+that this task started and exactly where from:
+  cd ${runRoot} && python3 - <<'PY'
+import json, os, subprocess
+from datetime import datetime, timezone
+
+path = "${stateFile}"
+try:
+    with open(path) as f:
+        data = json.load(f)
+except (FileNotFoundError, json.JSONDecodeError):
+    data = {}
+if not isinstance(data, dict):
+    data = {}
+if not isinstance(data.get("tasks"), dict):
+    data["tasks"] = {}
+sha = subprocess.run(["git", "rev-parse", "--short", "HEAD"], capture_output=True, text=True).stdout.strip()
+existing = data["tasks"].get("${taskNum}")
+if not isinstance(existing, dict):
+    existing = {}
+existing["status"] = "running"
+existing["start_sha"] = sha
+existing["marker_at"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+data["tasks"]["${taskNum}"] = existing
+parent = os.path.dirname(path)
+if parent:
+    os.makedirs(parent, exist_ok=True)
+with open(path, "w") as f:
+    json.dump(data, f, indent=2)
+    f.write("\\n")
+print("STARTED_MARKER:" + sha)
+PY
+  Every other key already in ${stateFile} (prior tasks, bails, setup, started_at) is preserved
+  byte-for-byte in meaning — this is a merge, never a rewrite. A missing/unparseable state file is
+  created as the minimal valid document above; the run's own later state write fully supersedes it.
+  Report the sha printed after \`STARTED_MARKER:\` as \`startSha\` in your StructuredOutput return.` : ''
+  const resumeNote = resumingRunning ? `
+
+NOTE — this task was found at status \`running\` on disk with a start_sha already recorded: a
+crashed prior attempt may already have committed this task's work (commit subject
+\`feat: implement ${stem}\`). Before implementing anything, run
+\`cd ${runRoot} && ${GIT} log --oneline ${prevSha || 'HEAD~5'}..HEAD\` and check whether such a
+commit already exists. If it does, and the work is complete and correct against the spec, make NO
+new commit — report that commit's own short hash as \`commitHash\`, proceed straight to step 7a's
+work assertion, and skip the implementation steps below. Only implement from scratch if no such
+commit exists, or the existing one is incomplete or wrong.` : ''
   return `${roleIntro}
+${markerStep}${resumeNote}
 
 Target:
   Spec:        ${blockId}
@@ -1155,6 +1231,7 @@ Return via StructuredOutput:${extraReturnFields}
     (cd ${runRoot} && wc -c <each file>), divide the total by 1024, and report the number.
   workAssertionPassed: true only if step 7a's FINAL run this attempt printed no WORK_ASSERTION_ABORT
     and exited 0; false otherwise. Never omit this field.
+  startSha: ${startedMarker ? "the exact sha STEP 0 printed after `STARTED_MARKER:`" : "empty string — STEP 0 was not rendered this attempt"}
   notes: one-line status${vault.vaulted ? ' — mention explicitly whether a vault commit (step 7b) happened and, if so, its outcome' : ''}`
 }
 // <</shared:renderImplementPrompt>>
@@ -1362,17 +1439,6 @@ function decideAttribution({ checkId, taskGateHistory, cacheStatus = null, curre
 }
 // <</shared:decideAttribution>>
 
-// <<shared:ATTRIBUTION_CACHE_SCHEMA>>
-const ATTRIBUTION_CACHE_SCHEMA = {
-  type: 'object',
-  required: ['cacheStatus'],
-  properties: {
-    cacheStatus: { type: 'string', enum: ['pass', 'fail', 'unknown'], description: 'the check\'s status at base_sha per the gate cache -- "pass" or "fail" from a cache hit or a safe re-run, "unknown" only when neither was possible' },
-    notes: { type: 'string' }
-  }
-}
-// <</shared:ATTRIBUTION_CACHE_SCHEMA>>
-
 // <<shared:renderAttributionCacheLookup>>
 // The read-only gate-cache consult for decideAttribution()'s step 2 -- an agent turn because the
 // engine script itself has no filesystem/subprocess access (base-template CLAUDE.md's "stamp-
@@ -1416,6 +1482,15 @@ lookup's JSON or the re-run's exit code).`
 // at an earlier task), falling back to ONE cheap gate-cache-lookup agent turn only when this run's
 // history has nothing to say. Returns decideAttribution()'s verdict object, or null when nothing
 // decides (the caller's existing, unchanged triage flow is the correct fallback for null).
+//
+// The schema below was a separate top-level ATTRIBUTION_CACHE_SCHEMA const until 2026-09-17: this
+// function is called from the main per-task loop (on a failing check), which is textually BEFORE
+// where that const was declared in the generated engines -- the same top-level-await TDZ hazard as
+// REMOVED_LITERAL_SCAN_CONFIG/_SCHEMA (see that fix's comment on removedLiteralScan() below), just
+// not yet triggered by a real run when it was found (no gate check had failed requiring lookback
+// yet). Found by sweeping every top-level const declared after the main loop's own `for` statement
+// while fixing the REMOVED_LITERAL_SCAN crash. Inlined for the same reason: removes the late
+// top-level const entirely rather than trying to reorder it correctly.
 async function attributionLookback({ checkId, state, taskNum, runRoot, baseSha, harnessCfg, GIT, currentTaskFiles = [] }) {
   const history = buildTaskGateHistory(state.tasks, taskNum)
   const fromHistory = decideAttribution({ checkId, taskGateHistory: history, cacheStatus: null, currentTaskFiles })
@@ -1426,42 +1501,21 @@ async function attributionLookback({ checkId, state, taskNum, runRoot, baseSha, 
   const repoSlug = scopeMatch ? scopeMatch[1] : null
   const checkCfg = (harnessCfg?.validation?.checks || []).find(c => c.name === checkId)
   const checkCommand = checkCfg ? (checkCfg.command || null) : null
+  const attributionCacheSchema = {
+    type: 'object',
+    required: ['cacheStatus'],
+    properties: {
+      cacheStatus: { type: 'string', enum: ['pass', 'fail', 'unknown'], description: 'the check\'s status at base_sha per the gate cache -- "pass" or "fail" from a cache hit or a safe re-run, "unknown" only when neither was possible' },
+      notes: { type: 'string' }
+    }
+  }
   const result = await tracedAgent(`
 ${renderAttributionCacheLookup({ runRoot, checkId, baseSha, repoSlug, checkCommand, GIT })}
-`, { label: `attribution-cache:${checkId}`, schema: ATTRIBUTION_CACHE_SCHEMA, model: 'haiku' })
+`, { label: `attribution-cache:${checkId}`, schema: attributionCacheSchema, model: 'haiku' })
   if (!result || result.cacheStatus === 'unknown') return null
   return decideAttribution({ checkId, taskGateHistory: history, cacheStatus: result.cacheStatus, currentTaskFiles })
 }
 // <</shared:attributionLookback>>
-
-// <<shared:REMOVED_LITERAL_SCAN_CONFIG>>
-// BT.ticket.failure-attribution-and-gate-cache, task 4: defaults for the post-commit removed-
-// literal scan -- all three are config knobs (standing rule 12), never literals baked into the
-// scan script itself. A project overrides any of them via planning/harness.json's optional
-// `removedLiteralScan: { testGlobRegex, minLiteralLen, identifierMinLen }` object; absent-or-partial
-// falls back here. `identifierMinLen` exists SEPARATELY from `minLiteralLen` (quoted strings) because
-// a bare-identifier match at the same low threshold is noisy -- ordinary English words removed from
-// a comment or log message (e.g. "failed", "returned") are common at 6-8 chars and are not the
-// distinctive symbol names this scan exists to catch; an underscored identifier of any length (a
-// real snake_case/CONST_CASE symbol) is always reported regardless of identifierMinLen.
-const REMOVED_LITERAL_SCAN_CONFIG = {
-  // Matches this fleet's own test-naming conventions plus the common cross-language ones, so the
-  // harness ships one sane default without hardcoding a single project's directory layout.
-  testGlobRegex: '(^|/)test_[^/]+\\.py$|(^|/)[^/]+_test\\.py$|(^|/)tests?/.*|\\.test\\.[jt]sx?$|\\.spec\\.[jt]sx?$',
-  minLiteralLen: 8,
-  identifierMinLen: 12,
-}
-// <</shared:REMOVED_LITERAL_SCAN_CONFIG>>
-
-// <<shared:REMOVED_LITERAL_SCAN_SCHEMA>>
-const REMOVED_LITERAL_SCAN_SCHEMA = {
-  type: 'object',
-  required: ['rawOutput'],
-  properties: {
-    rawOutput: { type: 'string', description: 'Everything the removed-literal scan script printed to stdout, verbatim, unmodified, unsummarized' }
-  }
-}
-// <</shared:REMOVED_LITERAL_SCAN_SCHEMA>>
 
 // <<shared:parseRemovedLiteralScanOutput>>
 // Parses runRemovedLiteralScan()'s transcribed stdout -- never throws; a malformed/empty
@@ -1534,6 +1588,7 @@ print('CANDIDATE_TEST_COUNT:%d' % len(candidates))
 
 diff = sh('${GIT} diff --unified=0 %s HEAD -- .' % RANGE)
 removed_lines = [l[1:] for l in diff.splitlines() if l.startswith('-') and not l.startswith('---')]
+added_lines = [l[1:] for l in diff.splitlines() if l.startswith('+') and not l.startswith('+++')]
 # Quoted-string literals gate on MIN_LEN. Bare identifiers gate on EITHER containing an underscore
 # (a real snake_case/CONST_CASE symbol, reported at any length) OR being at least IDENT_MIN_LEN chars
 # with no underscore -- this is what keeps an ordinary removed English word ("failed", "returned")
@@ -1544,12 +1599,23 @@ lit_re = re.compile(
     + r'|\\b([A-Za-z_][A-Za-z0-9]*_[A-Za-z0-9_]*)\\b'
     + r'|\\b([A-Za-z][A-Za-z0-9]{%d,})\\b' % (IDENT_MIN_LEN - 1)
 )
-literals = set()
-for line in removed_lines:
-    for m in lit_re.finditer(line):
-        lit = m.group(1) or m.group(2) or m.group(3) or m.group(4)
-        if lit:
-            literals.add(lit)
+def extract(lines):
+    found = set()
+    for line in lines:
+        for m in lit_re.finditer(line):
+            lit = m.group(1) or m.group(2) or m.group(3) or m.group(4)
+            if lit:
+                found.add(lit)
+    return found
+
+removed_literals = extract(removed_lines)
+added_literals = extract(added_lines)
+# A literal that still appears in this SAME commit's added lines was not actually removed from the
+# codebase -- a single-line edit (e.g. inserting a flag into an existing command string) shows the
+# whole line as both '-' and '+' in a unified diff, so its unchanged tokens would otherwise be
+# reported as "removed" even though they survive, unmoved, in this very commit. Only a literal that
+# disappears from the diff's added side entirely is a genuine removal worth scanning for elsewhere.
+literals = removed_literals - added_literals
 
 if not literals:
     print('NO_LITERALS_REMOVED')
@@ -1600,21 +1666,51 @@ Return via StructuredOutput: rawOutput (everything printed above, verbatim, in o
 
 // <<shared:removedLiteralScan>>
 // Orchestrates one post-commit removed-literal scan for the current task: resolves the config knobs
-// (project override via harnessCfg.removedLiteralScan, else REMOVED_LITERAL_SCAN_CONFIG's default),
-// renders and runs the mechanical script above, and returns { hits, instrumentOk, note }. A hit
-// inside the task's own files[] is filtered out BY THE SCRIPT ITSELF (never reported here at all) --
-// see renderRemovedLiteralScanScript's is_own() check. instrumentOk=false means the scan could not
+// (project override via harnessCfg.removedLiteralScan, else the built-in defaults below), renders
+// and runs the mechanical script above, and returns { hits, instrumentOk, note }. A hit inside the
+// task's own files[] is filtered out BY THE SCRIPT ITSELF (never reported here at all) -- see
+// renderRemovedLiteralScanScript's is_own() check. instrumentOk=false means the scan could not
 // positively confirm it ran (no candidate test files, or an incomplete transcription) -- callers
 // must treat that as "scan inconclusive", never as "no hits found".
+//
+// BT.ticket.failure-attribution-and-gate-cache task 4 shipped these three defaults as a shared
+// top-level REMOVED_LITERAL_SCAN_CONFIG const declared ~150 lines above this function's own
+// definition (standing rule 12: all three are config knobs, never literals baked into the scan
+// script itself; a project overrides any of them via planning/harness.json's optional
+// `removedLiteralScan: { testGlobRegex, minLiteralLen, identifierMinLen }` object). That const,
+// positioned very late in the ~4600-line generated engine files, hit a
+// `ReferenceError: Cannot access '...' before initialization` when invoked through the Workflow
+// tool's execution model (reproduced deterministically 2026-09-17 on a real engine-rs
+// `/sdlc-task` run) despite being lexically declared before its only use -- some interaction with
+// how that tool wraps/evaluates a script this large. Inlining the defaults removes the cross-
+// reference to a late top-level `const` entirely; the values and the override contract are
+// unchanged.
 async function removedLiteralScan({ runRoot, taskNum, tasksJsonPath, prevSha, harnessCfg }) {
   const cfg = harnessCfg?.removedLiteralScan || {}
-  const testGlobRegex = typeof cfg.testGlobRegex === 'string' && cfg.testGlobRegex ? cfg.testGlobRegex : REMOVED_LITERAL_SCAN_CONFIG.testGlobRegex
-  const minLiteralLen = Number.isInteger(cfg.minLiteralLen) && cfg.minLiteralLen > 0 ? cfg.minLiteralLen : REMOVED_LITERAL_SCAN_CONFIG.minLiteralLen
-  const identifierMinLen = Number.isInteger(cfg.identifierMinLen) && cfg.identifierMinLen > 0 ? cfg.identifierMinLen : REMOVED_LITERAL_SCAN_CONFIG.identifierMinLen
+  // Matches this fleet's own test-naming conventions plus the common cross-language ones, so the
+  // harness ships one sane default without hardcoding a single project's directory layout.
+  const defaultTestGlobRegex = '(^|/)test_[^/]+\\.py$|(^|/)[^/]+_test\\.py$|(^|/)tests?/.*|\\.test\\.[jt]sx?$|\\.spec\\.[jt]sx?$'
+  const defaultMinLiteralLen = 8
+  // identifierMinLen exists SEPARATELY from minLiteralLen (quoted strings) because a bare-
+  // identifier match at the same low threshold is noisy -- ordinary English words removed from a
+  // comment or log message (e.g. "failed", "returned") are common at 6-8 chars and are not the
+  // distinctive symbol names this scan exists to catch; an underscored identifier of any length
+  // (a real snake_case/CONST_CASE symbol) is always reported regardless of identifierMinLen.
+  const defaultIdentifierMinLen = 12
+  const testGlobRegex = typeof cfg.testGlobRegex === 'string' && cfg.testGlobRegex ? cfg.testGlobRegex : defaultTestGlobRegex
+  const minLiteralLen = Number.isInteger(cfg.minLiteralLen) && cfg.minLiteralLen > 0 ? cfg.minLiteralLen : defaultMinLiteralLen
+  const identifierMinLen = Number.isInteger(cfg.identifierMinLen) && cfg.identifierMinLen > 0 ? cfg.identifierMinLen : defaultIdentifierMinLen
   const range = prevSha || 'HEAD~1'
+  const removedLiteralScanSchema = {
+    type: 'object',
+    required: ['rawOutput'],
+    properties: {
+      rawOutput: { type: 'string', description: 'Everything the removed-literal scan script printed to stdout, verbatim, unmodified, unsummarized' }
+    }
+  }
   const result = await tracedAgent(`
 ${renderRemovedLiteralScan({ runRoot, taskNum, tasksJsonPath, range, testGlobRegex, minLiteralLen, identifierMinLen })}
-`, { label: `removed-literal-scan-${taskNum}`, schema: REMOVED_LITERAL_SCAN_SCHEMA, model: 'haiku' })
+`, { label: `removed-literal-scan-${taskNum}`, schema: removedLiteralScanSchema, model: 'haiku' })
   return parseRemovedLiteralScanOutput(result && result.rawOutput)
 }
 // <</shared:removedLiteralScan>>

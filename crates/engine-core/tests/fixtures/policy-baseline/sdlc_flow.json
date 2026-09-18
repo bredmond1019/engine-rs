@@ -20,6 +20,7 @@
   "model_tiers": {
     "docs": "sonnet",
     "generate": "opus",
+    "generate_from_block": "opus",
     "implement": "sonnet",
     "implement_final_attempt": null,
     "implement_simple": "sonnet",

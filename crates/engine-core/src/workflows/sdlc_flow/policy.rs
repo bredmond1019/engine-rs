@@ -96,6 +96,12 @@ pub struct ModelTiers {
     /// `GenerateTasksNode`'s tier (`setup.rs`). **`Opus`, not `Sonnet`** —
     /// see [`ModelTiers::default`]'s note.
     pub generate: ModelTier,
+    /// `GenerateTasksNode`'s tier on its block-record-aware branch
+    /// (`EN.19.C`) — resolved independently of [`Self::generate`], which
+    /// stays exclusively the planning-fallback path's knob, so tuning one
+    /// path's model tier can never silently change the other's. Defaults to
+    /// the same value `generate` defaults to (`Opus`).
+    pub generate_from_block: ModelTier,
     /// `PatchDocsNode`'s tier (`docs.rs`). `Sonnet` by default, matching the
     /// model string that node was hardcoded to before it was onboarded to
     /// the policy path.
@@ -129,6 +135,7 @@ impl Default for ModelTiers {
             review: ModelTier::Sonnet,
             triage: ModelTier::Sonnet,
             generate: ModelTier::Opus,
+            generate_from_block: ModelTier::Opus,
             docs: ModelTier::Sonnet,
             implement_final_attempt: None,
         }
@@ -517,6 +524,7 @@ pub struct PartialModelTiers {
     pub review: Option<ModelTier>,
     pub triage: Option<ModelTier>,
     pub generate: Option<ModelTier>,
+    pub generate_from_block: Option<ModelTier>,
     pub docs: Option<ModelTier>,
     /// Nested `Option` — [`ModelTiers::implement_final_attempt`] is itself
     /// `Option<ModelTier>`, so an override layer needs "unset" (fall through)
@@ -565,6 +573,9 @@ fn merge_model_tiers(mut base: ModelTiers, over: &PartialModelTiers) -> ModelTie
     }
     if let Some(v) = over.generate {
         base.generate = v;
+    }
+    if let Some(v) = over.generate_from_block {
+        base.generate_from_block = v;
     }
     if let Some(v) = over.docs {
         base.docs = v;
@@ -923,6 +934,37 @@ mod tests {
         let merged = merge_model_tiers(base, &over);
         assert_eq!(merged.generate, ModelTier::Sonnet);
         assert_eq!(merged.docs, ModelTier::Sonnet);
+    }
+
+    /// `EN.19.C` task 1 — `generate_from_block` defaults to the same tier as
+    /// `generate` (`Opus`), and `merge_model_tiers` overrides each
+    /// independently: setting one in a `PartialModelTiers` leaves the other
+    /// at its base value.
+    #[test]
+    fn generate_from_block_defaults_match_generate_and_merge_independently() {
+        let base = ModelTiers::default();
+        assert_eq!(base.generate_from_block, ModelTier::Opus);
+        assert_eq!(base.generate_from_block, base.generate);
+
+        let over = PartialModelTiers {
+            generate_from_block: Some(ModelTier::Haiku),
+            ..Default::default()
+        };
+        let merged = merge_model_tiers(base, &over);
+        assert_eq!(merged.generate_from_block, ModelTier::Haiku);
+        // `generate` is untouched by an override that names only
+        // `generate_from_block`.
+        assert_eq!(merged.generate, ModelTier::Opus);
+
+        let over = PartialModelTiers {
+            generate: Some(ModelTier::Sonnet),
+            ..Default::default()
+        };
+        let merged = merge_model_tiers(base, &over);
+        assert_eq!(merged.generate, ModelTier::Sonnet);
+        // `generate_from_block` is untouched by an override that names only
+        // `generate`.
+        assert_eq!(merged.generate_from_block, ModelTier::Opus);
     }
 
     /// `implement_final_attempt`'s built-in default is `None`; an absent

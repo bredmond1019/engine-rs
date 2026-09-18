@@ -82,6 +82,14 @@ whether `TriageTaskNode`/`ConsolidatedReviewNode` get rewired to the local-model
 other node makes no model call at all. Full knob-by-knob reference:
 [sdlc-flow-policy.md](sdlc-flow-policy.md).
 
+**`GenerateTasksNode` update (`EN.19.C`):** the table row above still describes the
+planning-fallback path byte-for-byte. A second, block-record-aware path now sits ahead of it: an
+EXACT filename match (never fuzzy or near-miss) on `planning/blocks/{spec_slug}.json` routes to a
+decomposition of that real block record's own fields instead of the loose markdown walk, resolved
+through a knob that is separate from the one named in the row above so tuning either one can never
+silently move the other's resolved model. See [README.md](README.md#building-software) for the
+full two-path summary and the new prompt file's path.
+
 ### Commit topology and what the reviewer sees
 
 **The invariant:** `HEAD` carries every previously completed task's code; the working tree's delta

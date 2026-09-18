@@ -33,8 +33,12 @@ Prints one JSON object to stdout. On success:
     "vault_root": "<abs path — realpath of planning/, same whether vaulted or not>",
     "agent_flag": " --agent <slug>" | "",
     "scope_flag": " --scope <slug>" | "",
-    "harness_config": <planning/harness.json parsed, or null if absent/invalid>,
+    "harness_config": <planning/harness.json parsed and compacted (prose-only keys removed -- see
+                       compact_harness_config), or null if absent/invalid>,
+    "harness_check_count": <len(validation.checks) as read from disk, or null>,
     "tasks_enumeration": [{"task_id": 1, "dependsOn": [...]}, ...],
+    "task_commits": {"<N>": {"shas": ["<newest short sha>", ...], "newest": "<sha>",
+                              "earliest_parent": "<short sha>" | null}, ...},
     "lint": {"passed": bool, "findings": [...], "enabled_rules": int, "total_rules": int},
     "probes": [{"check": "<name>", "command": "<probeCommand>", "passed": true}, ...],
     "refused": false
@@ -47,6 +51,7 @@ On refusal (nonzero exit), ONLY:
 import argparse
 import json
 import os
+import re
 import shutil
 import socket
 import subprocess
@@ -235,6 +240,75 @@ def enumerate_tasks(repo_root, spec_slug):
     return enumeration
 
 
+def find_task_commits(repo_root, block_id):
+    """BT.ticket.work-assertion-base-sha-self-comparison, task 1: report this block's own
+    per-task commits from git history, so sdlc-task.js's per-task prevSha resolution can fall
+    back to a real prior commit instead of blindly trusting state.base_sha (which is only the
+    correct pre-task baseline for task 1 of a fresh run — see that ticket's `what`).
+
+    Parses `git log --format=%h%x09%s` (newest first) in repo_root and matches ONLY the engine's
+    own commit-subject convention for block_id:
+      feat: implement <block_id>-task<N>
+      fix: fix pass <P> for <block_id>-task<N>
+    anchored to the WHOLE subject, so a ` (vault)`-suffixed variant (those commits live in the
+    brain vault, not this repo) and a prefix-sharing block id (e.g. block_id `BT.x.A` against a
+    commit for `BT.x.AB`) never match. block_id is regex-escaped (dots in a block id are literal,
+    not "any character").
+
+    Returns {"<N>": {"shas": [sha, ...] newest first, "newest": sha,
+                      "earliest_parent": short sha of the parent of the OLDEST matching commit,
+                      or null if it has none}}.
+
+    No block_id, not a git repo, or no matches -> {}. Never raises and never refuses a run — any
+    subprocess failure degrades to {}, the same contract enumerate_tasks() already uses for a
+    missing tasks.json."""
+    if not block_id:
+        return {}
+    escaped = re.escape(block_id)
+    pattern = re.compile(
+        r'^(?:feat: implement|fix: fix pass \d+ for) ' + escaped + r'-task(\d+)$'
+    )
+    try:
+        result = subprocess.run(
+            ['git', 'log', '-n', '500', '--format=%h%x09%s'],
+            cwd=repo_root, capture_output=True, text=True,
+        )
+    except OSError:
+        return {}
+    if result.returncode != 0:
+        return {}
+
+    by_task = {}
+    for line in result.stdout.splitlines():
+        if '\t' not in line:
+            continue
+        sha, subject = line.split('\t', 1)
+        m = pattern.match(subject)
+        if not m:
+            continue
+        by_task.setdefault(m.group(1), []).append(sha)
+
+    task_commits = {}
+    for task_num, shas in by_task.items():
+        oldest = shas[-1]
+        earliest_parent = None
+        try:
+            parent_result = subprocess.run(
+                ['git', 'rev-parse', '--short', f'{oldest}^'],
+                cwd=repo_root, capture_output=True, text=True,
+            )
+            if parent_result.returncode == 0:
+                earliest_parent = parent_result.stdout.strip() or None
+        except OSError:
+            earliest_parent = None
+        task_commits[task_num] = {
+            'shas': shas,
+            'newest': shas[0],
+            'earliest_parent': earliest_parent,
+        }
+    return task_commits
+
+
 def run_lint(repo_root, spec_slug):
     """Fold check_tasks_json.py's own verdict into prepare_run.py's output. Reimplements its
     main() loop field-for-field (same registry, same resolve_enabled(), same per-finding
@@ -359,7 +433,34 @@ def verify_requires_and_probes(repo_root, harness_config, simulate_missing_env=N
     return (None, probes)
 
 
-def prepare_run(spec_slug, explicit_repo_root=None, cwd=None, simulate_missing_env=None):
+# Prose-only keys a harness.json check (or the config itself) may carry that NO engine reads. They
+# are the bulk of the file (base-template: ~190 KB of 193 KB), and this script's stdout is copied
+# verbatim by a model turn (runPrepareRun) -- a copy that size is never verbatim: measured
+# 2026-09-18, four launches in a row got 1-of-113 or 0-of-113 gating checks back. Stripping them
+# keeps every field an engine consumes while shrinking the payload ~10x; harness_check_count lets
+# the engine prove the copy it received is complete (loadHarnessConfig fails closed on a mismatch).
+_HARNESS_PROSE_KEYS = frozenset({'purpose', 'observed_red', 'evidence', 'gates_reason', 'rationale'})
+
+
+def compact_harness_config(cfg):
+    """Return `cfg` minus _HARNESS_PROSE_KEYS and any `_`-prefixed key, at every depth. None -> None."""
+    if isinstance(cfg, dict):
+        return {k: compact_harness_config(v) for k, v in cfg.items()
+                if k not in _HARNESS_PROSE_KEYS and not k.startswith('_')}
+    if isinstance(cfg, list):
+        return [compact_harness_config(v) for v in cfg]
+    return cfg
+
+
+def harness_check_count(cfg):
+    """Number of validation.checks[] entries in the config as read from disk, or None."""
+    if not isinstance(cfg, dict):
+        return None
+    checks = (cfg.get('validation') or {}).get('checks')
+    return len(checks) if isinstance(checks, list) else 0
+
+
+def prepare_run(spec_slug, explicit_repo_root=None, cwd=None, simulate_missing_env=None, block_id=None):
     cwd = cwd or os.getcwd()
     repo_root = resolve_repo_root(explicit_repo_root)
     if not repo_root:
@@ -377,6 +478,7 @@ def prepare_run(spec_slug, explicit_repo_root=None, cwd=None, simulate_missing_e
     agent_flag = render_agent_flag(cwd)
     scope_flag = render_scope_flag(cwd)
     tasks_enumeration = enumerate_tasks(repo_root, spec_slug) if spec_slug else []
+    task_commits = find_task_commits(repo_root, block_id)
     lint = run_lint(repo_root, spec_slug)
     return {
         'repo_root': repo_root,
@@ -384,8 +486,10 @@ def prepare_run(spec_slug, explicit_repo_root=None, cwd=None, simulate_missing_e
         'vault_root': vault_root,
         'agent_flag': agent_flag,
         'scope_flag': scope_flag,
-        'harness_config': harness_config,
+        'harness_config': compact_harness_config(harness_config),
+        'harness_check_count': harness_check_count(harness_config),
         'tasks_enumeration': tasks_enumeration,
+        'task_commits': task_commits,
         'lint': lint,
         'probes': probes,
         'refused': False,
@@ -397,6 +501,10 @@ def main(argv=None):
     parser.add_argument('--spec-slug', default=None, help='spec slug under planning/<slug>/tasks.json')
     parser.add_argument('--repo-root', default=None, help='override repo root instead of resolving via git')
     parser.add_argument(
+        '--block-id', default=None,
+        help='block id whose own per-task commits to report as task_commits (e.g. BT.x.A)',
+    )
+    parser.add_argument(
         '--simulate-missing-env', action='append', default=None, metavar='VAR',
         help='test-only: refuse if VAR is unset, as if a check declared requires.env: [VAR]',
     )
@@ -406,8 +514,10 @@ def main(argv=None):
         args.spec_slug,
         explicit_repo_root=args.repo_root,
         simulate_missing_env=args.simulate_missing_env,
+        block_id=args.block_id,
     )
-    print(json.dumps(result, indent=2))
+    # Compact separators: this output is copied by a model turn, so every byte is a transcription risk.
+    print(json.dumps(result, separators=(',', ':')))
     return 1 if result.get('refused') else 0
 
 

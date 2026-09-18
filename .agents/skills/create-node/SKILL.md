@@ -4,11 +4,18 @@ description: Guardrail before writing any new engine-rs Node (atom) — check wh
 allowed-tools: Bash(rg:*) Bash(grep:*) Bash(cat:*)
 ---
 
-# Before creating a new node in engine-rs
+# Before creating a new node
 
-Scoped to `core/engine-rs`. This is the general node-design checklist; if the node makes an LLM
-call, this skill hands off to **`create-llm-node`** for the transport/cancellation shape — read
-both, this one first.
+Covers **`core/engine-rs`** (Rust) and **`feli`** (Python). The design questions are the same in
+both; where a step is language-specific it says so. This is the general node-design checklist; if
+the node makes an LLM call, this skill hands off to **`create-llm-node`** for the
+transport/cancellation shape — read both, this one first.
+
+**The two repos implement eight of the same nodes** — `CompanyResearchNode`, `ProposalWriterNode`,
+`ProposalReviewNode`, `ProposalReviseNode`, `SelfCriticNode`, `ReviseNode`, the fetch pair, and
+`SourceRouterNode` — and the same workflows (`RESEARCH_AGENT`, `PROPOSAL_GENERATOR`,
+`CONTENT_PIPELINE`). So "does this already exist?" is a **cross-repo** question, and Step 2b's
+contract question is what stops the two implementations drifting apart after you answer it.
 
 > **The governing principle (AGENTS.md standing rule 12, engine-rs CLAUDE.md standing rule 6):**
 > lean config-heavy, avoid hardcoding strings/data/names, and build extendible, single-purpose
@@ -97,6 +104,54 @@ Before the first line of code, name:
   `TransportSlotted`/`Cancellable` and resolves through `resolve_meta_transport`. This is a hard
   rule (standing rule 11), not optional for a node that "just does one small model call."
 
+## Step 2b — the node's I/O is a contract, not an ad-hoc dict
+
+**Declare the node's output shape. Do not write a bare dict or a `json!({...})` literal into the
+context.** This is the step most commonly skipped, and it is the one that produces silent cross-repo
+breakage rather than a failing test.
+
+Where the shapes live and who owns them (brain decision D97's four-layer table):
+
+| Layer | Author | You are a… |
+|---|---|---|
+| L1 run envelope — `TaskContext`, `NodeRun`, `EventsRow`, `Usage` | engine-rs | consumer; never edit these from a node |
+| L2 collaboration — `Actor`, `RunEvent`, `RunEventTarget`, `client_account`, `outreach_campaign_id` | engine-rs | consumer |
+| **L3 node I/O — your node's input and output shape** | **feli** | **author, if you are writing the feli side first** |
+| L4 brain RAG — `POST /ingest/*`, `GET /recall` | synapse | consumer |
+
+**The contract artifact is JSON Schema plus an example fixture — never a Rust type and never a
+pydantic model.** Neither language is the contract; both validate against the same committed files.
+That is what lets either repo implement a node first without privileging its language.
+
+- **feli (the L3 author):** declare a `NodeOutput` pydantic model under
+  `app/contracts/node_io/<node_id>/`, generate `schema.json` from it, commit an `example.json`, and
+  let the drift gate regenerate and compare. Return the model; do not hand-build a dict.
+- **engine-rs (the L3 consumer):** implement `NodeOutput` over the vendored fixture and round-trip
+  it in the **existing** `crates/engine-contract/tests/round_trip.rs` binary. Write through
+  `put_typed`/`get_typed` (`crates/engine-core/src/workflows/mod.rs`), not the untyped
+  `put_result`/`get_result` pair, for any node whose shape another repo reads.
+- **Both:** node identity is a **declared stable `node_id`**, not the class or struct name. A
+  rename must not be a contract break, and the two repos must be able to agree on the string. This
+  is also what `FE.8.E`'s comment anchors depend on.
+
+**Reads stay tolerant; only writes are typed.** No `deny_unknown_fields` in Rust, no forbidden
+extras in pydantic. A producer one version ahead must never break a consumer — that rule is what
+keeps the whole scheme additive.
+
+### The one place looseness is correct
+
+`SDLC_FLOW` / `SDLC_TASK` state is deliberately read back through an untyped, forward-tolerant JSON
+boundary, and that is **not** a gap to fix. Three reasons, all of them live: base-template's
+`sdlc-flow.js` / `sdlc-task.js` are a **second writer** of the same artifact; `bastion`'s `flow.rs`
+and `run-sdlc-flow.sh`'s `jq` queries read it; and D37 set the additive-schema-growth precedent the
+whole file relies on. Note that the Rust side there is *already* strongly typed
+(`sdlc_flow/schema.rs`) — the looseness is at the serialization boundary only. If your node writes
+into a multi-writer artifact like this one, copy that pattern: typed in memory, tolerant on the
+wire, and say so in the doc comment.
+
+If you had to leave a shape untyped for a reason, **name the reason in the node's doc comment** —
+same discipline as a justified hardcode in Step 4.
+
 ## Step 3 — is this actually two responsibilities in one node?
 
 If the node does research-then-write, or fetch-then-normalize, or decide-then-notify, check
@@ -109,10 +164,16 @@ multi-node sequence rather than one node.
 
 Every new atom gets an entry in `docs/nodes/atoms/<group>.md` (create the group file if none fits)
 with: what it's for and when to reach for it; the workflow doc(s) that use it; the trait/seam it
-implements (or should implement); if it's a known duplicate slated for consolidation, a
+implements (or should implement); **its declared `node_id` and a link to its `schema.json`, or an
+explicit "untyped, because <reason>"**; **whether the other repo implements the same node, and
+under which `node_id`**; if it's a known duplicate slated for consolidation, a
 `[will consolidate with <Node>]` note linking the molecule doc; file path + key struct/method
 names. Update `docs/nodes/atoms/index.md`'s table and the directory's `index.md` (AGENTS.md
 standing rule 7).
+
+**The atoms index is the cross-repo register.** A node implemented in both repos carries a row
+naming both implementations — a node that exists twice under two different `node_id`s is the drift
+this whole layer exists to prevent, and the index is where it becomes visible.
 
 If you deliberately chose NOT to reuse something close (like `linkedin_post::CriticRouterNode`
 correctly not reusing `content_pipeline`'s same-named router because the identities are hardcoded

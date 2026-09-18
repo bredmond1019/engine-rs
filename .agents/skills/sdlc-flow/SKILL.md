@@ -42,6 +42,10 @@ description: >
      implement → fast-test → (triage → fix/​bail) ×≤3
      One state-commit per task. A triage MAJOR / immediate-bail reason breaks
      straight to wrap-up (draft PR) — it does NOT burn three attempts.
+     Triage's "same failure, no progress" must be measured THIS attempt: a work-assertion,
+     vault-commit or removed-literal-scan failure precedes the test stage, so gate_results/issues
+     may be carried over from an earlier attempt (DATA FRESHNESS WARNING) and never alone justify
+     sameFailureAsBefore=true.
 
    End-review: ONE review over the integrated tree, fed state.json as the index but
    reading `git diff <prBase>..HEAD` + tasks.md criteria directly + the AGGREGATED
@@ -190,6 +194,16 @@ When the user asks you to run `/sdlc-flow <spec-slug> [range]`, do NOT run `sdlc
 3. **Execute Tasks sequentially in the worktree**:
    - For each task in the specified range (or all if not specified):
      - Run `/update-task` to flip status to `In progress` in the worklog and local files.
+     - **STEP 0 — started marker (implement attempt only, `BT.ticket.per-task-state-write-before-implement`)**:
+       the same marker as `/sdlc-task` (see `.agents/skills/sdlc-task/SKILL.md`'s Step 3), written
+       against `sdlc-flow-state.json` instead of `sdlc-task-state.json`. On attempt 1 with no
+       `start_sha` recorded for this task, before reading, editing, or committing anything, merge
+       `tasks["<taskNum>"] = {status: "running", start_sha: <git rev-parse --short HEAD>,
+       marker_at: <UTC ISO now>}` into the state file, preserving every other key; a fix attempt
+       never re-stamps `start_sha`. A task found at `running` on entry (a resumed crashed attempt)
+       keeps its original `start_sha`, re-enters at implement attempt 1, and gets the same
+       crashed-prior-attempt note as `/sdlc-task`. `/sdlc-flow`'s own work-assertion range is
+       UNCHANGED by this — it stays `HEAD~1` with no `prevSha`, unlike `/sdlc-task`.
      - Implement the task following instructions.
      - Run fast validation tests. **Record `gate_results`** — one entry per check actually run
        this turn (same set, same order as the checklist): `{check_id, status: 'pass'|'fail',

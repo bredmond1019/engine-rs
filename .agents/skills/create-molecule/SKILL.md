@@ -4,10 +4,13 @@ description: Guardrail before wiring a new multi-node sequence (a "molecule") in
 allowed-tools: Bash(rg:*) Bash(grep:*) Bash(cat:*)
 ---
 
-# Before composing a new molecule (multi-node sequence) in engine-rs
+# Before composing a new molecule (multi-node sequence)
 
-Scoped to `core/engine-rs`. A **molecule** is a small, named sequence of atom nodes that recurs
-across workflows — the level between a single `Node` (an atom) and a full workflow graph. Read
+Covers **`core/engine-rs`** (Rust) and **`feli`** (Python) — both implement the same workflows
+(`RESEARCH_AGENT`, `PROPOSAL_GENERATOR`, `CONTENT_PIPELINE`), so a shape hand-copied in one is
+usually already hand-copied in the other.
+
+A **molecule** is a small, named sequence of atom nodes that recurs across workflows — the level between a single `Node` (an atom) and a full workflow graph. Read
 `create-node` first if you're not yet sure the pieces you're composing are the right atoms.
 
 > **The governing principle (AGENTS.md standing rule 12, engine-rs CLAUDE.md standing rule 6):**
@@ -73,6 +76,31 @@ generic existed or because reaching for "just wire the edges" felt faster in the
 for the generic costs you a few extra minutes now; reaching for a fresh hand-copy costs the next
 three readers a "wait, which router is this" moment and eventually a consolidation task.
 
+## Step 1b — pin the molecule's KEY CONVENTIONS, not just its node order
+
+**A molecule's contract is the set of context keys its members read and write, and that is what
+actually drifts** — not the node sequence. Two implementations can wire the same four nodes in the
+same order and still be incompatible because one writes `verdict` and the other nests it under
+`review`, or one counts iterations in `metadata.critic_iteration` and the other in the node's own
+output.
+
+This is not hypothetical. `content_pipeline::TranslateSkipRouterNode` and
+`linkedin_post::TranslateGateNode` were deliberately **not** unified, and the documented reason is
+"different upstream key conventions" — the node shapes were compatible; the keys were not.
+
+So when you name a molecule, name in the same breath:
+
+- **Every context key its members read or write**, with the owning node for each.
+- **The iteration/counter key**, if it is a bounded loop, and where the cap is resolved from.
+- **The verdict field and its vocabulary**, if it has a router — the exact string values, not "a
+  verdict".
+- **Which of those keys are part of the cross-repo contract** (declared under `node_io/`, per
+  `create-node` Step 2b) and which are internal to this molecule.
+
+A molecule whose keys are declared can be reimplemented in the other repo from the doc alone. One
+whose keys are implicit can only be reimplemented by reading the source, which is how the fleet got
+three `ReviseNode`s and two company-research nodes.
+
 ## Step 2 — if nothing fits, is the new shape actually novel?
 
 Some workflows are irreducibly workflow-specific (`COMMANDER`'s drain-triage fusion,
@@ -84,9 +112,10 @@ so the second workflow that needs it finds it instead of re-deriving it.
 
 ## Step 3 — document it
 
-New or newly-named molecule: add `docs/nodes/molecules/<slug>.md` — the node sequence, which
-workflows use or could use it, why it's genuinely reusable (or only a near-molecule, with the
-concrete refactor named), file paths for every instance. Update
+New or newly-named molecule: add `docs/nodes/molecules/<slug>.md` — the node sequence, **the key
+conventions from Step 1b**, which workflows use or could use it, **whether the other repo implements
+the same shape and under which keys**, why it's genuinely reusable (or only a near-molecule, with
+the concrete refactor named), file paths for every instance. Update
 `docs/nodes/molecules/index.md`'s table and cross-link from each consuming workflow's doc in
 `docs/workflows/`. If you found and fixed a hand-copy while doing this, name the collapsed copy in
 the doc so a future reader sees the before/after, not just the after.

@@ -463,6 +463,24 @@ For each `taskNum` in `taskList` (skip any already in the resume skip-set, loggi
 2. **Attempt loop, up to 3 attempts** (`attempt` 1..3):
    - Attempt 1 = **implement**; attempts 2–3 = **fix**. On the FINAL attempt (attempt 3), escalate the
      acting model to Opus (attempts 1–2 use Sonnet) — this is the one and only escalation point.
+   - **STEP 0 — started marker (implement attempt only, `BT.ticket.per-task-state-write-before-implement`)**:
+     on attempt 1 with no `start_sha` already recorded for this task, BEFORE reading, editing, or
+     committing anything, run a deterministic merge against `<stateFile>` (`sdlc-task-state.json`):
+     load the JSON if present (else start from a minimal valid document), set
+     `tasks["<taskNum>"] = {...existing, status: "running", start_sha: <git rev-parse --short HEAD>,
+     marker_at: <UTC ISO now>}` — preserving every other key on disk byte-for-byte — write it back,
+     and record `start_sha` as this attempt's `startSha`. A fix attempt (attempt 2–3) NEVER re-stamps
+     `start_sha` — by then `HEAD` already includes attempt 1's commit. If this task was found at
+     `running` on disk on entry to the loop (a resumed crashed attempt), it keeps its ORIGINAL
+     `start_sha`, is NOT treated as passed or skipped, re-enters at implement attempt 1 (not a fix
+     attempt, attempt counter not advanced by the crashed prior try), and gets a note that a crashed
+     prior attempt may already have committed the work since `start_sha` (commit subject
+     `feat: implement <stem>`) — check for that commit against the spec first and make NO new commit
+     if it is already complete and correct. After this attempt's implement/fix step returns, persist
+     the returned `startSha` onto `state.tasks[taskNum].start_sha` if not already set, so the run's
+     next full state write keeps it. This `start_sha`, when present, is the HIGHEST-precedence source
+     for the post-commit work assertion's `prevSha` (ahead of `state.tasks[taskNum-1].commit` /
+     `taskCommits` / `base_sha`) — see the POST-COMMIT WORK ASSERTION step below.
    - **Implement/fix step**: read `CLAUDE.md` + `planning/context.md`; read `<specFile>` +
      `<tasksJsonFile>` and find the entry whose `task_id == taskNum`; on a fix pass, make the MINIMUM
      targeted change addressing the previous failure's output (do not re-implement from scratch); if
@@ -720,6 +738,11 @@ For each `taskNum` in `taskList` (skip any already in the resume skip-set, loggi
        4. The needed change would be destructive or out-of-scope.
        5. The SAME failure twice with no progress (stuck), or a structural design flaw needing a
           re-plan.
+          "No progress" must be MEASURED this attempt: a work-assertion, vault-commit or
+          removed-literal-scan failure happens BEFORE the test stage, so any gate_results/issues in
+          the state can be CARRIED OVER from an earlier attempt (look for a DATA FRESHNESS WARNING).
+          Never set sameFailureAsBefore=true or call data "byte-identical" from carried-over data
+          alone -- say the check was not re-run this attempt.
 
        Those five are hardcoded mechanism. A project may APPEND its own via
        `planning/harness.json`'s `flow.bailReasons[]` — read that key and treat any entry there as
