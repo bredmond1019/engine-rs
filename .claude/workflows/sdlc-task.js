@@ -985,6 +985,14 @@ This changes only the wording/evidence of bailReason — bailing on IMMEDIATE-BA
 (environment/credential/auth/network) stays correct and fast, "when unsure, BAIL" stays, and no
 additional retry attempts are introduced by this rule.
 
+Re-measured vs. carried-over data: a work-assertion, vault-commit, or removed-literal-scan failure
+happens BEFORE the test stage runs, so any gate_results/issues data shown to you below (in the state
+object, if this bail turns out to be MAJOR) can be CARRIED OVER unchanged from an earlier attempt
+that actually ran tests, not a fresh measurement of the current diff — check for an explicit
+DATA FRESHNESS WARNING above the state-write instructions. Never write sameFailureAsBefore=true or
+describe data as "byte-identical"/"no progress" from carried-over data alone; say explicitly that
+the check was not re-run this attempt instead.
+
 Otherwise:
   RETRYABLE — transient/infra (agent died, flaky), OR the failure CHANGED from the previous attempt
               (it is making progress and a bounded fix can plausibly close it).
@@ -2939,12 +2947,12 @@ STEP W3 — use the Write tool for the file. Do NOT run \`git add\`, \`git commi
 // Renders the "if this triage call is terminal, ALSO perform this exact state write, in this same
 // turn" instruction block for the triage agent — mirrors sdlc-flow.js's renderBailStateWriteRecipe,
 // state.json only (no worklog.md in this engine). `onBail` is
-// { stateFile, stateJson, majorFallback, exhaustionFallback } — exhaustionFallback is null at call
-// sites that have no attempt-exhaustion bail path (mirrors the asymmetry between the NULL_RESULT
-// and test-failure call sites in the per-task loop below).
+// { stateFile, stateJson, majorFallback, exhaustionFallback, dataFreshnessNote } — exhaustionFallback
+// is null at call sites that have no attempt-exhaustion bail path (mirrors the asymmetry between the
+// NULL_RESULT and test-failure call sites in the per-task loop below).
 function renderBailStateWriteRecipe(onBail, attempt, maxAttempts) {
   const esc = s => String(s).replace(/"/g, '\\"')
-  return `
+  return `${onBail.dataFreshnessNote || ''}
 IF AND ONLY IF your class above is MAJOR${onBail.exhaustionFallback ? `, OR this is the final attempt (attempt ${attempt} of ${maxAttempts})` : ''}, ALSO perform this state
 write as part of THIS SAME turn — do NOT do this ${onBail.exhaustionFallback ? `if class is RETRYABLE and this is NOT the final attempt` : `unless class is MAJOR`} (leave stateWritten unset/false in that case):
 
@@ -3041,7 +3049,28 @@ function mostRecentRecordedGateResults(tasksState) {
 // renderBailStateWriteRecipe). Handed to triage() as `onBail` so a terminal triage call can write
 // it in its own turn instead of a follow-up dedicated state-writer agent. Does NOT mutate the live
 // `state`/`t` objects — this is a snapshot for the CANDIDATE outcome.
-function buildBailPayload(taskNum, t, majorFallback, exhaustionFallback = null) {
+// gateResultsFreshThisAttempt (BT.ticket.work-assertion-triage-reads-stale-gate-results, found
+// 2026-09-18 on a real bastion BA.ticket.code-index-cache run): t.gate_results/t.issues are ONLY
+// refreshed inside the test stage (the `t.gate_results = ...` fold right after runTests). A bail
+// from work-assertion, vault-commit, or removed-literal-scan happens BEFORE that stage ever runs
+// this attempt, so `t` still carries whatever gate_results/issues the LAST attempt that actually
+// reached the test stage recorded — and that stale array gets embedded VERBATIM into the triage
+// prompt via onBail.stateJson (renderBailStateWriteRecipe). The triage agent then reads its own
+// prompt's stale data and can genuinely, factually observe it is "byte-identical" to a previous
+// attempt's failure — without any signal that this attempt never re-measured anything at all.
+// Defaults to false (assume stale) so a future bail call site that forgets to pass this explicitly
+// gets the cautious note rather than false confidence; only the post-test-stage bail path passes
+// true.
+function buildBailPayload(taskNum, t, majorFallback, exhaustionFallback = null, gateResultsFreshThisAttempt = false) {
+  const dataFreshnessNote = gateResultsFreshThisAttempt ? '' : `
+DATA FRESHNESS WARNING — task ${taskNum}'s gate_results/issues below are CARRIED OVER, not
+re-measured this attempt: this attempt's bail happened before the test stage ran (a work-assertion,
+vault-commit, or removed-literal-scan failure), so gate_results/issues still hold whatever the LAST
+attempt that actually ran tests recorded. Do NOT describe this data as "byte-identical to attempt
+N" or as evidence of "no progress" on the current diff — you have no measurement of this attempt's
+actual changes. If sameFailureAsBefore matters to your classification, say explicitly that the
+test was not re-run this attempt rather than asserting sameness from stale data.
+`
   const snapshot = JSON.parse(JSON.stringify(state))
   snapshot.tasks[String(taskNum)] = { ...t, status: 'failed' }
   snapshot.status = 'blocked'
@@ -3076,7 +3105,7 @@ function buildBailPayload(taskNum, t, majorFallback, exhaustionFallback = null) 
     resolution: null,
   }]
   snapshot.tokens = buildTokensBlock()
-  return { stateFile, stateJson: JSON.stringify(snapshot, null, 2), majorFallback, exhaustionFallback }
+  return { stateFile, stateJson: JSON.stringify(snapshot, null, 2), majorFallback, exhaustionFallback, dataFreshnessNote }
 }
 
 async function runTests(label, { gatingOnly, taskCommands = null, expectRedSet = new Set(), onPass = null, engineFiles = [] }) {
@@ -3190,7 +3219,7 @@ ${renderImplementPrompt({ roleIntro, runRootLabel: 'run root', runRoot: runDir, 
       // No attempt-exhaustion bail path exists at this call site today (an exhausted NULL_RESULT
       // loop just falls out of the `for` naturally without ever setting `bailed`), so
       // exhaustionFallback is omitted: the folded write only fires when this call classifies MAJOR.
-      const nullBailPayload = buildBailPayload(taskNum, t, 'agent returned null')
+      const nullBailPayload = buildBailPayload(taskNum, t, 'agent returned null', null, false)
       const tr = await triage(`task ${taskNum} implement`, attempt, MAX_TASK_ATTEMPTS, 'NULL_RESULT — the agent died or returned nothing.', prevFailBlob, nullBailPayload)
       if (tr && tr.class === 'MAJOR') {
         bailed = true
@@ -3223,7 +3252,7 @@ ${renderImplementPrompt({ roleIntro, runRootLabel: 'run root', runRoot: runDir, 
       log(`Task ${taskNum} attempt ${attempt}: work assertion not confirmed (workAssertionPassed=${stageResult.workAssertionPassed === false ? 'false' : 'absent'}) — refusing to record this task done/passed without that evidence.`)
       const waFailBlob = `WORK_ASSERTION_NOT_CONFIRMED — step 7a's renderWorkAssertion outcome was ${stageResult.workAssertionPassed === false ? 'reported false (WORK_ASSERTION_ABORT fired)' : 'not reported at all'} for task ${taskNum}. The terminal write recipe refuses done/passed without a positive workAssertionPassed field.`
       t.issues = [...(t.issues || []), 'work assertion not confirmed']
-      const waBailPayload = buildBailPayload(taskNum, t, `Task ${taskNum}: work assertion not confirmed`)
+      const waBailPayload = buildBailPayload(taskNum, t, `Task ${taskNum}: work assertion not confirmed`, null, false)
       const tr = await triage(`task ${taskNum} work-assertion`, attempt, MAX_TASK_ATTEMPTS, waFailBlob, prevFailBlob, waBailPayload)
       prevFailBlob = waFailBlob
       if (tr && tr.class === 'MAJOR') {
@@ -3259,7 +3288,7 @@ ${renderImplementPrompt({ roleIntro, runRootLabel: 'run root', runRoot: runDir, 
         log(`Task ${taskNum} attempt ${attempt}: vault commit incomplete — not committed in ${vault.planningPath}: ${uncommitted.join(', ')}.`)
         const vaultFailBlob = `VAULT_COMMIT_INCOMPLETE — planning/ path(s) not committed in the vault repo (${vault.planningPath}): ${uncommitted.join(', ')}. ${vaultVerify.notes || ''}`.trim()
         t.issues = [...(t.issues || []), 'vault commit incomplete']
-        const vaultBailPayload = buildBailPayload(taskNum, t, `Task ${taskNum}: vault commit incomplete — ${uncommitted.join(', ')}`)
+        const vaultBailPayload = buildBailPayload(taskNum, t, `Task ${taskNum}: vault commit incomplete — ${uncommitted.join(', ')}`, null, false)
         const tr = await triage(`task ${taskNum} vault-commit`, attempt, MAX_TASK_ATTEMPTS, vaultFailBlob, prevFailBlob, vaultBailPayload)
         prevFailBlob = vaultFailBlob
         if (tr && tr.class === 'MAJOR') {
@@ -3297,7 +3326,7 @@ ${renderImplementPrompt({ roleIntro, runRootLabel: 'run root', runRoot: runDir, 
       log(`Task ${taskNum}: removed-literal scan found ${scanResult.hits.length} hit(s) outside files[] — ${hitList}.`)
       const scanFailBlob = `REMOVED_LITERAL_SURVIVES (BT.ticket.failure-attribution-and-gate-cache, task 4) — this task's own commit removed a literal/identifier still referenced by a test outside this task's files[]: ${hitList}. This is IN-SPEC DEBT, failure_class=fixable: fix the surviving reference (update or remove it) as part of this task's fix pass. Your writable set for the next fix pass is WIDENED to include the hit file(s) in addition to this task's own files[].`
       t.issues = [...(t.issues || []), 'removed literal survives outside files[]']
-      const scanBailPayload = buildBailPayload(taskNum, t, `Task ${taskNum}: removed literal survives outside files[] — ${hitList}`)
+      const scanBailPayload = buildBailPayload(taskNum, t, `Task ${taskNum}: removed literal survives outside files[] — ${hitList}`, null, false)
       const tr = await triage(`task ${taskNum} removed-literal`, attempt, MAX_TASK_ATTEMPTS, scanFailBlob, prevFailBlob, scanBailPayload)
       prevFailBlob = scanFailBlob
       if (tr && tr.class === 'MAJOR') {
@@ -3387,7 +3416,7 @@ ${renderImplementPrompt({ roleIntro, runRootLabel: 'run root', runRoot: runDir, 
     const exhaustionFallback = attempt === MAX_TASK_ATTEMPTS
       ? `Task ${taskNum} still failing after ${MAX_TASK_ATTEMPTS} attempts: ${(testResult?.failedTests || []).join(', ')}`
       : null
-    const testBailPayload = buildBailPayload(taskNum, t, majorFallback, exhaustionFallback)
+    const testBailPayload = buildBailPayload(taskNum, t, majorFallback, exhaustionFallback, true)
     const tr = await triage(`task ${taskNum} test`, attempt, MAX_TASK_ATTEMPTS, failBlob, prevFailBlob, testBailPayload)
     prevFailBlob = failBlob
     if (tr && tr.class === 'MAJOR') {

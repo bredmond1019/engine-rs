@@ -1,6 +1,6 @@
 {
-  "version": "81b8a34bc94f913efd1d467de8439fe42f54edf6",
-  "generated": "2026-09-17",
+  "version": "7547dda2436f9383cbcafeedcd1845c3d757c4cc",
+  "generated": "2026-09-18",
   "files": {
     ".claude/commands/update-task.md": "47afa30cf2e5593c9b39b974d360f9f0f1b1ff6a5e30cc2f525042f283cd8720",
     ".claude/commands/backlog-ticket.md": "300b15c584866e1beb86e6b12ae9aa1941f0373b94da635da39030970514c925",
@@ -51,8 +51,8 @@
     ".claude/commands/handoff.md": "df2d6ec1af4e38e2d2d840431943cc2221d8d856eeabbb10e5f9fc34807749c7",
     ".claude/commands/test_crud_api.md": "8d57ef6e1c3c9f54eb73bf762946efa93a65b0fe50d00cb1bcc0c5b987d5b5fc",
     ".claude/commands/test_error_handling.md": "6a35c2fc64ee5f0c076b07bf479373189391ea7d8d20ab2953b8800991e059be",
-    ".claude/workflows/sdlc-flow.js": "3024a446d34d3b94043297b537c2d70be01c911d5ccc20b47133239849f9afc0",
-    ".claude/workflows/sdlc-task.js": "3ace6d1bafa52dd6c2001e9727c216efbb827da67fa9e0833883aa2b12c131c7",
+    ".claude/workflows/sdlc-flow.js": "aada8d74e550151fdb4f822c8ecf77204a9995cb8048d391d7bb0e3554e43f11",
+    ".claude/workflows/sdlc-task.js": "75e71fb9be24c8f9ebd437adb9afcf19d26b0c5e0622dc4cbf048501bd9b3a1f",
     ".claude/workflows/block.schema.json": "2d05a0316a7ff4a48aac3c4aa4d74b8ecd7a1370072e38b6e0e737e3bad5c22c",
     ".claude/workflows/meta.schema.json": "c3442d5106a759355ec293b57553e37007665b9f7aaf40f2ef574efdb61a160a",
     ".claude/workflows/lane-agent.schema.json": "d4130522f8abe89f430cb59c94f9ccb01879de6dfc9f347f39ae8d20bc815daf",
@@ -69,7 +69,7 @@
     ".claude/workflows/bin/gate_cache.py": "703a7a9cab55ead08f08832fa3ab0077e1a9a5fca10cddfcacf7d19184486dcc",
     ".claude/workflows/bin/lint_rules/__init__.py": "c9fca7a6267914876051af7e399c5365317a6a4ebeb3052460eac8322d06c5f5",
     ".claude/workflows/templates/spec-template.md": "e35fa94c1ed104c27bfce0a362ae234c72c165de2e5989f82eb323d2a2ecf039",
-    ".claude/workflows/prompts/shared.js": "df5bd3a1eadb5aa786da4012791c359e43c64acfb5b776c005cb72e3e4c1fa38",
+    ".claude/workflows/prompts/shared.js": "2243c8d6935df9c90d432aed5708e9fb295c075fc5878ab3afc3bb8feff2cbac",
     "scripts/check_block_records.py": "8e4912e705e7132088553befd196094eb63152337deba07c94c9ddf315890b5a",
     "scripts/check_task_files.py": "9a9d6629f371311e620abd66fc6565a9ff25a4b211f7b92f4fed409d2ece31e4",
     "scripts/check_spec_validation_commands.py": "6af5a4f8daeee12245d9b2d13b20c1ed976b5007b9bc4f9be998e335da223d0b",

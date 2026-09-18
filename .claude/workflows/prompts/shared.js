@@ -924,6 +924,14 @@ This changes only the wording/evidence of bailReason — bailing on IMMEDIATE-BA
 (environment/credential/auth/network) stays correct and fast, "when unsure, BAIL" stays, and no
 additional retry attempts are introduced by this rule.
 
+Re-measured vs. carried-over data: a work-assertion, vault-commit, or removed-literal-scan failure
+happens BEFORE the test stage runs, so any gate_results/issues data shown to you below (in the state
+object, if this bail turns out to be MAJOR) can be CARRIED OVER unchanged from an earlier attempt
+that actually ran tests, not a fresh measurement of the current diff — check for an explicit
+DATA FRESHNESS WARNING above the state-write instructions. Never write sameFailureAsBefore=true or
+describe data as "byte-identical"/"no progress" from carried-over data alone; say explicitly that
+the check was not re-run this attempt instead.
+
 Otherwise:
   RETRYABLE — transient/infra (agent died, flaky), OR the failure CHANGED from the previous attempt
               (it is making progress and a bounded fix can plausibly close it).
