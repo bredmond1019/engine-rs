@@ -58,6 +58,7 @@ mod orchestration_bail;
 mod orchestration_chain;
 mod parallel;
 mod plan_authoring;
+mod planning_pipeline;
 mod policy_baseline;
 mod policy_framework;
 mod policy_profile_matrix;
