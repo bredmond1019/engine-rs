@@ -211,7 +211,9 @@ impl DispatchNode {
         match &self.target_root {
             Some(root) => Ok(root.clone()),
             None => std::env::current_dir().map_err(|err| {
-                NodeError::new(format!("{NODE_NAME}: failed to resolve current_dir(): {err}"))
+                NodeError::new(format!(
+                    "{NODE_NAME}: failed to resolve current_dir(): {err}"
+                ))
             }),
         }
     }
@@ -248,11 +250,13 @@ impl DispatchNode {
         match EngineKind::from_sdlc_workflow(sdlc_workflow) {
             Ok(EngineKind::Flow) => Ok("SDLC_FLOW".to_string()),
             Ok(EngineKind::Task) => Ok("SDLC_TASK".to_string()),
-            Err(err) => Err(NodeError::new(format!("{NODE_NAME}: {err}")).with_node_result(json!({
-                REFUSED_KEY: true,
-                REASON_KEY: refusal_reason::UNSUPPORTED_SDLC_WORKFLOW,
-                "slug": slug,
-            }))),
+            Err(err) => Err(
+                NodeError::new(format!("{NODE_NAME}: {err}")).with_node_result(json!({
+                    REFUSED_KEY: true,
+                    REASON_KEY: refusal_reason::UNSUPPORTED_SDLC_WORKFLOW,
+                    "slug": slug,
+                })),
+            ),
         }
     }
 }
@@ -325,7 +329,11 @@ impl Node for DispatchNode {
 
         let response = self
             .http_post
-            .post_with_headers(&self.events_url, payload, &[("X-API-Key", self.api_key.as_str())])
+            .post_with_headers(
+                &self.events_url,
+                payload,
+                &[("X-API-Key", self.api_key.as_str())],
+            )
             .await
             .map_err(|err| {
                 NodeError::new(format!(

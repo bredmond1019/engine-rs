@@ -410,9 +410,11 @@ pub(crate) fn planning_pipeline_operator_queue(
     static QUEUE: OnceLock<Arc<Mutex<engine_core::operator::queue::OperatorQueue>>> =
         OnceLock::new();
     QUEUE.get_or_init(|| {
-        Arc::new(Mutex::new(engine_core::operator::queue::OperatorQueue::new(
-            engine_core::operator::queue::OperatorQueuePolicy::default(),
-        )))
+        Arc::new(Mutex::new(
+            engine_core::operator::queue::OperatorQueue::new(
+                engine_core::operator::queue::OperatorQueuePolicy::default(),
+            ),
+        ))
     })
 }
 
@@ -463,10 +465,10 @@ pub fn register_planning_pipeline(dispatcher: &mut Dispatcher) {
         .into_iter()
         .map(str::to_string)
         .collect();
-    let declared_schema =
-        engine_core::workflows::planning_pipeline::schema_for_stages(&full_stages).expect(
-            "the full four-stage PLANNING_PIPELINE slice is always a valid declared schema",
-        );
+    let declared_schema = engine_core::workflows::planning_pipeline::schema_for_stages(
+        &full_stages,
+    )
+    .expect("the full four-stage PLANNING_PIPELINE slice is always a valid declared schema");
 
     dispatcher.register(
         declared_schema,
@@ -2273,11 +2275,7 @@ mod tests {
         ] {
             let req = test::TestRequest::post().uri(uri).to_request();
             let resp = test::call_service(&app, req).await;
-            assert_eq!(
-                resp.status(),
-                404,
-                "unexpected route registered at '{uri}'"
-            );
+            assert_eq!(resp.status(), 404, "unexpected route registered at '{uri}'");
         }
     }
 

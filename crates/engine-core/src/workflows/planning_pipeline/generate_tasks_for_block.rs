@@ -172,7 +172,9 @@ impl GenerateTasksForBlockNode {
         match &self.target_root {
             Some(root) => Ok(root.clone()),
             None => std::env::current_dir().map_err(|err| {
-                NodeError::new(format!("{NODE_NAME}: failed to resolve current_dir(): {err}"))
+                NodeError::new(format!(
+                    "{NODE_NAME}: failed to resolve current_dir(): {err}"
+                ))
             }),
         }
     }
@@ -332,7 +334,8 @@ mod tests {
     fn stub_transport(tasks_json: String) -> ModelTransport {
         Arc::new(move |_config, _prompt| {
             let outcome = canned_outcome(tasks_json.clone());
-            Box::pin(async move { Ok(outcome) }) as BoxFuture<'static, claude_code_rs::Result<Outcome>>
+            Box::pin(async move { Ok(outcome) })
+                as BoxFuture<'static, claude_code_rs::Result<Outcome>>
         })
     }
 
@@ -384,7 +387,10 @@ mod tests {
         // Never rewritten — still the original two-task fixture, byte for
         // byte.
         let on_disk = std::fs::read_to_string(dir.join("tasks.json")).unwrap();
-        assert_eq!(on_disk, json!([{ "task_id": 1 }, { "task_id": 2 }]).to_string());
+        assert_eq!(
+            on_disk,
+            json!([{ "task_id": 1 }, { "task_id": 2 }]).to_string()
+        );
     }
 
     #[tokio::test]
@@ -408,7 +414,10 @@ mod tests {
             .expect("compose path succeeds");
 
         let dir = root.join("planning").join("fresh-slug");
-        assert!(dir.join("tasks.json").is_file(), "tasks.json must be written");
+        assert!(
+            dir.join("tasks.json").is_file(),
+            "tasks.json must be written"
+        );
         assert!(dir.join("tasks.md").is_file(), "tasks.md must be written");
         let tasks_md = std::fs::read_to_string(dir.join("tasks.md")).unwrap();
         assert!(tasks_md.contains("first"));
@@ -441,7 +450,9 @@ mod tests {
             .await
             .expect("first run composes");
         assert_eq!(
-            get_result(&ctx, NODE_NAME).unwrap().get(SHORT_CIRCUITED_KEY),
+            get_result(&ctx, NODE_NAME)
+                .unwrap()
+                .get(SHORT_CIRCUITED_KEY),
             Some(&json!(false))
         );
 

@@ -42,13 +42,17 @@ use serde_json::json;
 use crate::node::{Node, NodeError};
 use crate::nodes::suspend::SuspendNode;
 use crate::operator::channel::OperatorChannel;
-use crate::operator::ledger::{record_decision, ApprovalLedger, LedgerDecision, RecordDecisionOutcome};
+use crate::operator::ledger::{
+    record_decision, ApprovalLedger, LedgerDecision, RecordDecisionOutcome,
+};
 use crate::operator::queue::{ItemSource, OperatorQueue, OperatorQueueItem};
 use crate::operator::{
     validate, OperatorPayload, OperatorPayloadLimits, OperatorResponseOption,
     OperatorValidationError, ValidatedOperatorPayload,
 };
-use crate::workflows::planning_pipeline::policy::{ApprovalChannel, ApprovalGatePolicy, ApprovalMode};
+use crate::workflows::planning_pipeline::policy::{
+    ApprovalChannel, ApprovalGatePolicy, ApprovalMode,
+};
 use crate::workflows::put_result;
 
 /// The `Node::name()` identity [`ApprovalGateNode`] runs under by default,
@@ -432,7 +436,9 @@ mod tests {
     }
 
     fn queue() -> Arc<Mutex<OperatorQueue>> {
-        Arc::new(Mutex::new(OperatorQueue::new(OperatorQueuePolicy::default())))
+        Arc::new(Mutex::new(OperatorQueue::new(
+            OperatorQueuePolicy::default(),
+        )))
     }
 
     #[test]
@@ -447,9 +453,13 @@ mod tests {
 
     #[test]
     fn render_and_validate_succeeds_under_default_limits() {
-        let validated = render_and_validate("my-slug", "pre_plan", &OperatorPayloadLimits::default())
-            .expect("default three-option payload validates");
-        assert_eq!(validated.payload().gate_id, gate_id_for("my-slug", "pre_plan"));
+        let validated =
+            render_and_validate("my-slug", "pre_plan", &OperatorPayloadLimits::default())
+                .expect("default three-option payload validates");
+        assert_eq!(
+            validated.payload().gate_id,
+            gate_id_for("my-slug", "pre_plan")
+        );
     }
 
     #[tokio::test]
@@ -539,12 +549,16 @@ mod tests {
             .expect("auto mode never fails");
 
         assert!(get_result(&out, NODE_NAME).is_none());
-        let stamped =
-            get_result(&out, "ApprovalGateNode#plan").expect("relabeled result stamped");
+        let stamped = get_result(&out, "ApprovalGateNode#plan").expect("relabeled result stamped");
         assert_eq!(stamped["stage"], json!("plan"));
     }
 
-    fn deliver(q: &Arc<Mutex<OperatorQueue>>, slug: &str, stage: &str, at: DateTime<Utc>) -> String {
+    fn deliver(
+        q: &Arc<Mutex<OperatorQueue>>,
+        slug: &str,
+        stage: &str,
+        at: DateTime<Utc>,
+    ) -> String {
         let validated = render_and_validate(slug, stage, &OperatorPayloadLimits::default())
             .expect("renders and validates");
         let item = OperatorQueueItem::new(
@@ -677,7 +691,10 @@ mod tests {
         )
         .expect_err("unknown gate_id must error");
 
-        assert_eq!(err, ApprovalVerdictError::UnknownGate("nonexistent".to_string()));
+        assert_eq!(
+            err,
+            ApprovalVerdictError::UnknownGate("nonexistent".to_string())
+        );
         assert!(ledger.read_all().is_empty());
     }
 

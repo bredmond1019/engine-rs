@@ -236,9 +236,7 @@ fn gate_loop_spec(stage: &str, next_entry: &str, max_discussion_rounds: u32) -> 
 /// invalid list, so a caller that skips running
 /// [`stage_selector::StageSelectorNode`] as an explicit first step still
 /// gets the same named-reason rejection rather than a panic.
-pub fn schema_for_stages(
-    stages: &[String],
-) -> Result<WorkflowSchema, (&'static str, String)> {
+pub fn schema_for_stages(stages: &[String]) -> Result<WorkflowSchema, (&'static str, String)> {
     let ordered = stage_selector::validate_stages(stages)?;
 
     let mut nodes: HashMap<String, NodeConfig> = HashMap::new();
@@ -263,7 +261,10 @@ pub fn schema_for_stages(
             let next_entry = stage_graph_for(&ordered[i + 1]).entry;
             let gate = gate_identity(stage);
             for terminal in &graph.terminals {
-                nodes.insert(terminal.clone(), NodeConfig::new(terminal.clone(), vec![gate.clone()]));
+                nodes.insert(
+                    terminal.clone(),
+                    NodeConfig::new(terminal.clone(), vec![gate.clone()]),
+                );
             }
 
             // Placeholder max_discussion_rounds for schema shape only — the
@@ -273,8 +274,15 @@ pub fn schema_for_stages(
             // across every policy setting (standing rule 6), so the exact
             // cap value never changes which nodes/edges this schema
             // declares.
-            let cluster = build_loop(gate_loop_spec(stage, &next_entry, ApprovalGatePolicy::default().max_discussion_rounds));
-            nodes.insert(gate.clone(), NodeConfig::new(gate.clone(), vec![cluster.guard_identity.clone()]));
+            let cluster = build_loop(gate_loop_spec(
+                stage,
+                &next_entry,
+                ApprovalGatePolicy::default().max_discussion_rounds,
+            ));
+            nodes.insert(
+                gate.clone(),
+                NodeConfig::new(gate.clone(), vec![cluster.guard_identity.clone()]),
+            );
             nodes.extend(cluster.connections);
         } else {
             for terminal in &graph.terminals {
@@ -299,7 +307,9 @@ pub fn schema_for_stages(
 /// composition this module's registry-building shape allows without
 /// editing `crate::node::NodeRegistry` itself.
 fn register_pre_plan_nodes(registry: &mut NodeRegistry) {
-    registry.register(Box::new(pre_plan::check_existing::CheckExistingNotesNode::new()));
+    registry.register(Box::new(
+        pre_plan::check_existing::CheckExistingNotesNode::new(),
+    ));
     registry.register(Box::new(pre_plan::PrePlanNotesAlreadyExistsNode::new()));
     registry.register(Box::new(pre_plan::intake::IntakeIdeaNode::new()));
     registry.register(Box::new(pre_plan::research::ResearchCodebaseNode::new()));
@@ -313,8 +323,12 @@ fn register_pre_plan_nodes(registry: &mut NodeRegistry) {
 /// [`register_pre_plan_nodes`]'s doc comment for why this re-lists
 /// constructor calls rather than merging a pre-built `NodeRegistry`.
 fn register_plan_authoring_nodes(registry: &mut NodeRegistry) {
-    registry.register(Box::new(plan_authoring::check_existing::CheckExistingPlanNode::new()));
-    registry.register(Box::new(plan_authoring::gather_context::GatherPlanContextNode::new()));
+    registry.register(Box::new(
+        plan_authoring::check_existing::CheckExistingPlanNode::new(),
+    ));
+    registry.register(Box::new(
+        plan_authoring::gather_context::GatherPlanContextNode::new(),
+    ));
     registry.register(Box::new(plan_authoring::decompose::DecomposePlanNode::new()));
     registry.register(Box::new(
         plan_authoring::stage_candidate_blocks::StageCandidateBlocksNode::new(),
@@ -360,8 +374,11 @@ pub fn registry_for_stages(
                 .with_identity(gate_identity(stage));
             registry.register(Box::new(gate));
 
-            let cluster: LoopCluster =
-                build_loop(gate_loop_spec(stage, &next_entry, policy.max_discussion_rounds));
+            let cluster: LoopCluster = build_loop(gate_loop_spec(
+                stage,
+                &next_entry,
+                policy.max_discussion_rounds,
+            ));
             for node in cluster.nodes {
                 registry.register(node);
             }
@@ -400,7 +417,9 @@ mod tests {
     }
 
     fn queue() -> Arc<Mutex<OperatorQueue>> {
-        Arc::new(Mutex::new(OperatorQueue::new(OperatorQueuePolicy::default())))
+        Arc::new(Mutex::new(OperatorQueue::new(
+            OperatorQueuePolicy::default(),
+        )))
     }
 
     #[test]
@@ -510,13 +529,9 @@ mod tests {
 
     #[test]
     fn full_four_stage_slice_wires_three_gates() {
-        let schema = schema_for_stages(&stages(&[
-            "pre_plan",
-            "plan",
-            "generate_tasks",
-            "dispatch",
-        ]))
-        .expect("full slice is valid");
+        let schema =
+            schema_for_stages(&stages(&["pre_plan", "plan", "generate_tasks", "dispatch"]))
+                .expect("full slice is valid");
 
         for stage in ["pre_plan", "plan", "generate_tasks"] {
             assert!(
@@ -534,10 +549,7 @@ mod tests {
         let schema = schema_for_stages(&stages(&["plan", "generate_tasks", "dispatch"]))
             .expect("middle-to-end slice is valid");
 
-        assert_eq!(
-            schema.start_node,
-            stage_selector::NODE_NAME
-        );
+        assert_eq!(schema.start_node, stage_selector::NODE_NAME);
         assert_eq!(
             schema.nodes[stage_selector::NODE_NAME].connections,
             vec![plan_authoring::check_existing::NODE_NAME.to_string()]
@@ -609,7 +621,8 @@ mod tests {
             vec!["pre_plan", "plan", "generate_tasks", "dispatch"],
         ] {
             let stage_list = stages(&slice);
-            let workflow = workflow_for_stages(&stage_list, queue(), &ApprovalGatePolicy::default());
+            let workflow =
+                workflow_for_stages(&stage_list, queue(), &ApprovalGatePolicy::default());
             assert!(
                 workflow.is_ok(),
                 "slice {slice:?} should build a valid Workflow: {:?}",
@@ -628,8 +641,9 @@ mod tests {
         ] {
             let stage_list = stages(&slice);
             let schema = schema_for_stages(&stage_list).expect("valid slice");
-            let registry = registry_for_stages(&stage_list, queue(), &ApprovalGatePolicy::default())
-                .expect("valid slice");
+            let registry =
+                registry_for_stages(&stage_list, queue(), &ApprovalGatePolicy::default())
+                    .expect("valid slice");
             WorkflowValidator::validate(&registry, &schema)
                 .unwrap_or_else(|err| panic!("slice {slice:?} failed validation: {err}"));
         }
