@@ -14,6 +14,42 @@ related: [status, context]
 
 *Append-only working log. One dated entry per session. Newest entries at the top.*
 
+## [run: 2026-09-18]
+
+`/sdlc-flow` on branch `EN.19.D-flow` ran `EN.19.D` to completion — all 10 tasks passed, PASS
+review. Added the `PLANNING_PIPELINE` workflow: a single dispatchable entry point composing
+EN.19.A's `pre_plan`, EN.19.B's `plan_authoring`, and EN.19.C's block-record-aware
+`GenerateTasksNode` into one graph, selected per-run by a `stages` list. `StageSelectorNode`
+validates the requested stages are a contiguous, in-order, duplicate-free subset of
+`{pre_plan, plan, generate_tasks, dispatch}` before any node runs (task 3). `DispatchNode` reads a
+block's authored `state.json` status, refuses to double-dispatch an `in_progress`/`closed` block,
+and fires the existing ORCHESTRATION/SDLC_* dispatch path via the injectable `HttpPost` seam (task
+6). `ApprovalGateNode` is built directly on the existing `operator/` primitives
+(`OperatorPayload`/`OperatorQueue`/`OperatorChannel`/`operator::ledger`) rather than a CLI
+shell-out, wired between adjacent requested stages through the existing `build_loop`/`LoopSpec`
+combinator instead of a hand-wired cyclic edge (tasks 2, 4, 7). Task 1's ground-truth check found
+extending the shared `LedgerDecision` enum (adding `Rejected`/`RoutedToDiscussion`) was the safe,
+single-writer move fleet-wide — no call site exhaustively matches over it — so it was extended, not
+wrapped. `ApprovalGatePolicy` resolves through the standard four-layer precedence, safe-by-default
+(an event naming no `approval` map pauses after every requested stage). `PLANNING_PIPELINE` is
+registered as a workflow_type in `engine-serve`'s dispatcher (task 8); a 15-test hermetic
+integration suite covers every trigger shape, gap/out-of-order rejection, redispatch idempotency,
+double-dispatch refusal, and approve/reject/discuss ledger verdicts (task 9). `docs/workflows/
+README.md` and `planning/harness.json` document the workflow, its per-stage approval map, and the
+`LedgerDecision` extension decision; full workspace suite (4757 tests), release build, and all
+gates green (task 10). This closes `EN.19.D`. Next: `EN.19.E` — ApprovalGateNode's discuss route.
+
+```
+a01bb9b fix: review pass 1 for "EN.19.D
+533b189 feat: implement EN.19.D-task10
+43acc64 feat: implement EN.19.D-task9
+a6d5aec feat: implement EN.19.D-task8
+f9fe381 feat: implement EN.19.D-task7
+81956e7 feat: implement EN.19.D-task6
+d3f39e1 feat: implement EN.19.D-task5
+7ff065b feat: implement EN.19.D-task4
+```
+
 ## [2026-09-18]
 
 ### planning-command-nodes lane: EN.19.C closed; 2 fleet-wide base-template engine defects found, fixed, and synced
