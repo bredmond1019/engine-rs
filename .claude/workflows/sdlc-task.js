@@ -225,8 +225,8 @@ const PREPARE_RUN_SCHEMA = {
 // brainTomlAtRoot } — never throws; returns null on any parse failure so callers fail exactly the
 // way resolveRepoRoot() returning null already did before this ticket. `prepareRun` is
 // prepare_run.py's own JSON object verbatim (repo_root, is_vaulted, vault_root, agent_flag,
-// scope_flag, harness_config, tasks_enumeration, lint, probes, refused[, reason]) — see that
-// script's module docstring for the field list.
+// scope_flag, harness_config, tasks_enumeration, task_commits, lint, probes, refused[, reason])
+// — see that script's module docstring for the field list.
 function parsePrepareRunOutput(rawOutput) {
   if (!rawOutput || typeof rawOutput !== 'string') return null
   const marker = '---PREPARE_RUN_EXTRA---'
@@ -269,10 +269,11 @@ let _prepareRunCacheSlug = undefined
 async function runPrepareRun(specSlug) {
   if (_prepareRunCache && _prepareRunCacheSlug === (specSlug || null)) return _prepareRunCache
   const specFlag = specSlug ? ` --spec-slug ${specSlug}` : ''
+  const blockIdFlag = blockId ? ` --block-id ${blockId}` : ''
   const result = await agent(`
 Run exactly this ONE Bash call, from the invoking directory — do not cd anywhere first, do not
 substitute or re-derive any value, and do not run any other command:
-  REPO_ROOT=$(${GIT} rev-parse --show-toplevel) && python3 "$REPO_ROOT/.claude/workflows/bin/prepare_run.py"${specFlag} --repo-root "$REPO_ROOT"; echo "---PREPARE_RUN_EXTRA---" && echo "GIT_COMMON_DIR:$(${GIT} rev-parse --path-format=absolute --git-common-dir)" && echo "TIER_PREFIX:$(python3 -c "import os; r=os.path.relpath(os.getcwd(), '$REPO_ROOT'); print('' if r=='.' else r+'/')")" && { [ -f "$REPO_ROOT/brain.toml" ] && echo "BRAIN_TOML:yes" || echo "BRAIN_TOML:no"; }
+  REPO_ROOT=$(${GIT} rev-parse --show-toplevel) && python3 "$REPO_ROOT/.claude/workflows/bin/prepare_run.py"${specFlag}${blockIdFlag} --repo-root "$REPO_ROOT"; echo "---PREPARE_RUN_EXTRA---" && echo "GIT_COMMON_DIR:$(${GIT} rev-parse --path-format=absolute --git-common-dir)" && echo "TIER_PREFIX:$(python3 -c "import os; r=os.path.relpath(os.getcwd(), '$REPO_ROOT'); print('' if r=='.' else r+'/')")" && { [ -f "$REPO_ROOT/brain.toml" ] && echo "BRAIN_TOML:yes" || echo "BRAIN_TOML:no"; }
 This is a two-turn shell task, not a reasoning task: prepare_run.py already resolved every setup
 fact, ran the tasks.json lint, and probed runnability. Do not interpret, summarize, or reformat its
 JSON — transcribe stdout EXACTLY as printed (including the JSON's own newlines and indentation)
@@ -1076,8 +1077,75 @@ their output; empty when allPassed), gate_results (the per-check array described
 //   runRootLabel       what to call the run directory in prose.
 //   extraReturnFields  StructuredOutput fields this engine wants that the other does not
 //                      (/sdlc-flow's reportFile). Empty string in the lean engine.
-function renderImplementPrompt({ roleIntro, runRootLabel, runRoot, extraReturnFields, isFix, taskNum, attempt, stem, blockId, specFile, specDesc, tasksJsonFile, breakdownFile, prevFailBlob, vault, GIT, renderCommitSafetyGuard, renderWorkAssertion, prevSha }) {
+//
+// BT.ticket.per-task-state-write-before-implement (task 1): three more caller-supplied seams —
+//   stateFile        this engine's own run-state path (sdlc-task-state.json / sdlc-flow-state.json),
+//                    relative to runRoot. Used only by the STEP 0 marker below, never read/written
+//                    anywhere else in this prompt.
+//   startedMarker    true renders STEP 0, a deterministic python3 heredoc that merges
+//                    tasks["<taskNum>"] = {..existing, status:'running', start_sha:<HEAD short sha>,
+//                    marker_at:<UTC ISO now>} into stateFile BEFORE any edit or commit — the caller
+//                    decides this per-attempt (true only on attempt 1 with no start_sha recorded
+//                    yet; a fix attempt must NEVER re-stamp start_sha, since by then HEAD already
+//                    includes attempt 1's own commit). The agent transcribes the printed sha back as
+//                    `startSha` in its StructuredOutput return; the engine persists it onto
+//                    state.tasks[N].start_sha so the next full state write keeps it.
+//   resumingRunning  true when this task was found at status `running` on disk with a start_sha
+//                    already recorded (a crashed prior attempt) — renders a note telling the agent
+//                    to check for and reuse an already-complete commit rather than blindly
+//                    re-implementing.
+function renderImplementPrompt({ roleIntro, runRootLabel, runRoot, extraReturnFields, isFix, taskNum, attempt, stem, blockId, specFile, specDesc, tasksJsonFile, breakdownFile, prevFailBlob, vault, GIT, renderCommitSafetyGuard, renderWorkAssertion, prevSha, stateFile, startedMarker, resumingRunning }) {
+  const markerStep = startedMarker ? `
+
+STEP 0 — write a 'started' marker to ${stateFile} BEFORE reading, editing, or committing anything,
+so a crash between this task's commit and its normal end-of-task state write still leaves a record
+that this task started and exactly where from:
+  cd ${runRoot} && python3 - <<'PY'
+import json, os, subprocess
+from datetime import datetime, timezone
+
+path = "${stateFile}"
+try:
+    with open(path) as f:
+        data = json.load(f)
+except (FileNotFoundError, json.JSONDecodeError):
+    data = {}
+if not isinstance(data, dict):
+    data = {}
+if not isinstance(data.get("tasks"), dict):
+    data["tasks"] = {}
+sha = subprocess.run(["git", "rev-parse", "--short", "HEAD"], capture_output=True, text=True).stdout.strip()
+existing = data["tasks"].get("${taskNum}")
+if not isinstance(existing, dict):
+    existing = {}
+existing["status"] = "running"
+existing["start_sha"] = sha
+existing["marker_at"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+data["tasks"]["${taskNum}"] = existing
+parent = os.path.dirname(path)
+if parent:
+    os.makedirs(parent, exist_ok=True)
+with open(path, "w") as f:
+    json.dump(data, f, indent=2)
+    f.write("\\n")
+print("STARTED_MARKER:" + sha)
+PY
+  Every other key already in ${stateFile} (prior tasks, bails, setup, started_at) is preserved
+  byte-for-byte in meaning — this is a merge, never a rewrite. A missing/unparseable state file is
+  created as the minimal valid document above; the run's own later state write fully supersedes it.
+  Report the sha printed after \`STARTED_MARKER:\` as \`startSha\` in your StructuredOutput return.` : ''
+  const resumeNote = resumingRunning ? `
+
+NOTE — this task was found at status \`running\` on disk with a start_sha already recorded: a
+crashed prior attempt may already have committed this task's work (commit subject
+\`feat: implement ${stem}\`). Before implementing anything, run
+\`cd ${runRoot} && ${GIT} log --oneline ${prevSha || 'HEAD~5'}..HEAD\` and check whether such a
+commit already exists. If it does, and the work is complete and correct against the spec, make NO
+new commit — report that commit's own short hash as \`commitHash\`, proceed straight to step 7a's
+work assertion, and skip the implementation steps below. Only implement from scratch if no such
+commit exists, or the existing one is incomplete or wrong.` : ''
   return `${roleIntro}
+${markerStep}${resumeNote}
 
 Target:
   Spec:        ${blockId}
@@ -1224,6 +1292,7 @@ Return via StructuredOutput:${extraReturnFields}
     (cd ${runRoot} && wc -c <each file>), divide the total by 1024, and report the number.
   workAssertionPassed: true only if step 7a's FINAL run this attempt printed no WORK_ASSERTION_ABORT
     and exited 0; false otherwise. Never omit this field.
+  startSha: ${startedMarker ? "the exact sha STEP 0 printed after `STARTED_MARKER:`" : "empty string — STEP 0 was not rendered this attempt"}
   notes: one-line status${vault.vaulted ? ' — mention explicitly whether a vault commit (step 7b) happened and, if so, its outcome' : ''}`
 }
 // <</shared:renderImplementPrompt>>
@@ -1388,6 +1457,10 @@ const STAGE_SCHEMA = {
     // this attempt) printed no WORK_ASSERTION_ABORT and exited 0. Absent/false is treated as a
     // failed assertion by the terminal write recipe below — never a silent pass.
     workAssertionPassed: { type: 'boolean', description: 'true only if step 7a\'s renderWorkAssertion check printed no WORK_ASSERTION_ABORT and exited 0 on its final run this attempt; false/absent means the terminal write must refuse to record this task done/passed' },
+    // BT.ticket.per-task-state-write-before-implement (task 1): the sha STEP 0's marker printed
+    // after `STARTED_MARKER:`, transcribed verbatim. Empty/absent when STEP 0 was not rendered this
+    // attempt (a fix attempt, or a resumed `running` task that already has one recorded).
+    startSha:            { type: 'string', description: 'the sha printed by STEP 0\'s STARTED_MARKER line when rendered this attempt; empty string otherwise' },
     notes:               { type: 'string' }
   }
 }
@@ -1671,6 +1744,7 @@ const HARNESS_CONFIG_SCHEMA = {
 const HARNESS_CONFIG_BAIL = {
   unparseable: 'HARNESS_CONFIG_UNPARSEABLE',
   zeroGatingChecks: 'HARNESS_CONFIG_ZERO_GATING_CHECKS',
+  transcriptionIncomplete: 'HARNESS_CONFIG_TRANSCRIPTION_INCOMPLETE',
 }
 
 // BT.ticket.prepare-run-replaces-setup-agents, task 6: sourced from the shared runPrepareRun()
@@ -1688,6 +1762,17 @@ async function loadHarnessConfig(cwd) {
   if (!pr || pr.refused) return null
   const cfg = pr.harness_config
   if (!cfg || typeof cfg !== 'object' || Array.isArray(cfg)) return null
+  // prepare_run.py reports how many validation.checks[] the file on disk holds. The config reaches
+  // this engine through a model's verbatim copy of that script's stdout, and a copy that drops
+  // checks still parses -- measured 2026-09-18: runs gated on 1 of 113 checks, silently. A count
+  // mismatch is a hard bail, never a degraded run. Absent count (older prepare_run.py) skips this.
+  if (typeof pr.harness_check_count === 'number') {
+    const got = Array.isArray(cfg.validation && cfg.validation.checks) ? cfg.validation.checks.length : 0
+    if (got !== pr.harness_check_count) {
+      log(`harness-config: transcribed config carries ${got} check(s) but prepare_run.py read ${pr.harness_check_count} from disk.`)
+      return { __bail: HARNESS_CONFIG_BAIL.transcriptionIncomplete }
+    }
+  }
   return cfg
 }
 
@@ -1830,7 +1915,7 @@ function renderCheckList(cfg, { gatingOnly = false, cwd, engineFiles = [], baseS
     const gate = c.gates
       ? 'GATING — a failure here blocks the verdict'
       : 'non-gating — informational; a failure here does not block the verdict'
-    const header = `CHECK ${n} — ${c.name} (${c.purpose}) [${gate}]`
+    const header = `CHECK ${n} — ${c.name}${c.purpose ? ` (${c.purpose})` : ''} [${gate}]`
 
     if (kind === 'baseline-diff') {
       const baselinePath = `${cwd ? cwd + '/' : ''}${reportsDir}/${slug}-baseline.json`
@@ -3176,6 +3261,56 @@ const vault = await detectPlanningVault(runDir)
 let bailed = false
 let bailReason = null
 
+// BT.ticket.work-assertion-base-sha-self-comparison (task 2): resolve the PREVIOUS task's own
+// commit deterministically instead of assuming state.base_sha is always a safe pre-task boundary.
+// Order: (1) state.tasks[N-1].commit — the ordinary fresh-run path, unchanged; (2)
+// taskCommits[N-1].newest — prepare_run.py's own git-history lookup (task 1's find_task_commits),
+// covering a task-range launch or a relaunch after a crash lost state.tasks; (3) state.base_sha —
+// the pre-RUN HEAD, the only remaining fallback once git history has nothing either. Independent of
+// HOW it resolved, GUARD: never let the result be a sha taskCommits attributes to task N itself
+// (self-comparison — engine-rs EN.19.C, 2026-09-17: base_sha == task 2's own commit) — fall back to
+// that task's earliest_parent when the guard fires, and report which path was taken. Hoisted
+// function declaration, not a const arrow, to avoid the top-level-const TDZ hazard
+// scripts/test_engine_tdz_ordering.py exists to catch (this is engine-local, called only from
+// inside the per-task loop below, but keeping it a declaration matches the rest of this file).
+function resolvePrevSha(taskState, taskNum, taskCommits) {
+  const tc = taskCommits || {}
+  const prevKey = String(taskNum - 1)
+  const ownKey = String(taskNum)
+  let prevSha
+  let source
+  // BT.ticket.per-task-state-write-before-implement (task 1): this task's OWN recorded start_sha
+  // (from STEP 0's marker) is the exact pre-task baseline, and takes precedence over every other
+  // source — a resume's work assertion must diff from exactly where this task's own work began,
+  // not from the previous task's commit (which is usually, but not always, the same point).
+  const ownStartSha = taskState.tasks[ownKey] && taskState.tasks[ownKey].start_sha
+  const stateCommit = taskState.tasks[prevKey] && taskState.tasks[prevKey].commit
+  if (ownStartSha) {
+    prevSha = ownStartSha
+    source = 'start_sha'
+  } else if (stateCommit) {
+    prevSha = stateCommit
+    source = 'state'
+  } else if (tc[prevKey] && tc[prevKey].newest) {
+    prevSha = tc[prevKey].newest
+    source = 'git-history'
+  } else {
+    prevSha = taskState.base_sha
+    source = 'base_sha'
+  }
+  let guardFired = false
+  const own = tc[ownKey]
+  if (prevSha && own && Array.isArray(own.shas)) {
+    const isOwnCommit = own.shas.some(sha => sha && (sha.startsWith(prevSha) || prevSha.startsWith(sha)))
+    if (isOwnCommit && own.earliest_parent) {
+      prevSha = own.earliest_parent
+      source = 'guard:earliest_parent'
+      guardFired = true
+    }
+  }
+  return { prevSha, source, guardFired }
+}
+
 for (const taskNum of taskList) {
   if (passedFromState.has(taskNum)) {
     log(`Task ${taskNum}: already passed (resume) — skipping.`)
@@ -3185,14 +3320,25 @@ for (const taskNum of taskList) {
   const stem = `${blockId}-task${taskNum}`
   state.tasks[String(taskNum)] = state.tasks[String(taskNum)] || { status: 'running', attempts: 0, summary: '', issues: [], fixes: [], decisions: [], files_changed: [], commit: '', validated: '' }
   const t = state.tasks[String(taskNum)]
+  // BT.ticket.per-task-state-write-before-implement (task 1): captured BEFORE the attempt loop
+  // below touches `t` at all (it will set t.status='running' on every fresh task too) — a start_sha
+  // already present here can only have arrived via a prior run's STEP 0 marker surviving a crash,
+  // which is exactly the "resumed a running task" case AC3 requires be neither skipped as passed
+  // nor charged a fix attempt.
+  const resumingRunning = t.status === 'running' && !!t.start_sha
 
   // Work-assertion commit-range boundary (BT.ticket.work-assertion-cannot-express-a-correct-empty-
-  // intersection, task 3): the range's start is the PREVIOUS task's own recorded commit, or the
-  // run's base_sha for task 1 — both already persisted in state.tasks/state.base_sha, so this value
-  // is identical whether the engine is running fresh or resuming (a literal `HEAD~1`, by contrast,
-  // silently re-points at whatever commit is immediately before HEAD, which a resume-time wrap-up
-  // commit changes without changing the underlying work).
-  const prevSha = state.tasks[String(taskNum - 1)]?.commit || state.base_sha
+  // intersection, task 3): the range's start is the PREVIOUS task's own recorded commit — resolved
+  // via resolvePrevSha() above (state, else git history, else base_sha, never task N's own commit;
+  // see BT.ticket.work-assertion-base-sha-self-comparison) — so this value is identical whether the
+  // engine is running fresh or resuming (a literal `HEAD~1`, by contrast, silently re-points at
+  // whatever commit is immediately before HEAD, which a resume-time wrap-up commit changes without
+  // changing the underlying work). taskCommits defaults to {} on a resume seeded from a
+  // pre-change state.setup that predates this field.
+  const prepareRunCacheForTask = await runPrepareRun()
+  const taskCommitsForTask = (prepareRunCacheForTask && prepareRunCacheForTask.prepareRun && prepareRunCacheForTask.prepareRun.task_commits) || {}
+  const { prevSha, source: prevShaSource, guardFired: prevShaGuardFired } = resolvePrevSha(state, taskNum, taskCommitsForTask)
+  log(`Task ${taskNum}: prevSha resolved via ${prevShaSource}${prevShaGuardFired ? ' (self-comparison guard fired)' : ''}.`)
 
   let taskPassed = false
   let prevFailBlob = null
@@ -3209,8 +3355,13 @@ for (const taskNum of taskList) {
     const roleIntro = `You are the ${isFix ? 'fix' : 'implementation'} agent for the lean /sdlc-task pipeline. You run IN PLACE on
     the branch (sequential — earlier tasks in this spec are already committed on this branch). Work ONLY on
     Task ${taskNum} of this spec.`
+    // BT.ticket.per-task-state-write-before-implement (task 1): the marker renders only on attempt
+    // 1 of a task with no start_sha recorded yet — a fix attempt (attempt > 1) never re-stamps it
+    // (HEAD by then already includes attempt 1's own commit), and a resumed `running` task keeps
+    // its existing start_sha and gets no marker either.
+    const startedMarker = attempt === 1 && !t.start_sha
     const stageResult = await tracedAgent(`${W}
-${renderImplementPrompt({ roleIntro, runRootLabel: 'run root', runRoot: runDir, extraReturnFields: '', isFix, taskNum, attempt, stem, blockId, specFile, specDesc, tasksJsonFile, breakdownFile, prevFailBlob, vault, GIT, renderCommitSafetyGuard, renderWorkAssertion, prevSha })}
+${renderImplementPrompt({ roleIntro, runRootLabel: 'run root', runRoot: runDir, extraReturnFields: '', isFix, taskNum, attempt, stem, blockId, specFile, specDesc, tasksJsonFile, breakdownFile, prevFailBlob, vault, GIT, renderCommitSafetyGuard, renderWorkAssertion, prevSha, stateFile, startedMarker, resumingRunning })}
 `, withModel({ label: `${isFix ? 'fix' : 'implement'}-${taskNum}-${attempt}`, schema: STAGE_SCHEMA, phase: 'Tasks' }, isFix ? fixModel : MODEL.implement))
     recordFilesRead(stageResult)
 
@@ -3240,6 +3391,15 @@ ${renderImplementPrompt({ roleIntro, runRootLabel: 'run root', runRoot: runDir, 
     if (stageResult.summary) t.summary = stageResult.summary
     if (Array.isArray(stageResult.filesModified)) t.files_changed = [...new Set([...(t.files_changed || []), ...stageResult.filesModified])]
     if (Array.isArray(stageResult.decisions) && stageResult.decisions.length) t.decisions = [...(t.decisions || []), ...stageResult.decisions]
+    // BT.ticket.per-task-state-write-before-implement (task 1): persist STEP 0's marker sha onto
+    // state.tasks[N].start_sha so the next full writeTaskState() keeps it (the agent's returned
+    // field alone never reaches disk on its own). Only ever fills an EMPTY start_sha — a fix
+    // attempt's stageResult.startSha is always '' (startedMarker was false), so this can never
+    // overwrite attempt 1's already-recorded value with a later attempt's HEAD.
+    if (!t.start_sha) {
+      const rawStartSha = (stageResult.startSha || '').replace(/["']/g, '').trim()
+      if (/^[0-9a-f]{7,40}$/i.test(rawStartSha)) t.start_sha = rawStartSha
+    }
 
     // Work-assertion evidence gate (BT.ticket.engine-terminal-state-needs-evidence, task 3, Gap 1).
     // renderWorkAssertion's files[]-vs-diff check (BT.ticket.a-run-must-prove-its-commits-contain-
@@ -4384,6 +4544,7 @@ print('CANDIDATE_TEST_COUNT:%d' % len(candidates))
 
 diff = sh('${GIT} diff --unified=0 %s HEAD -- .' % RANGE)
 removed_lines = [l[1:] for l in diff.splitlines() if l.startswith('-') and not l.startswith('---')]
+added_lines = [l[1:] for l in diff.splitlines() if l.startswith('+') and not l.startswith('+++')]
 # Quoted-string literals gate on MIN_LEN. Bare identifiers gate on EITHER containing an underscore
 # (a real snake_case/CONST_CASE symbol, reported at any length) OR being at least IDENT_MIN_LEN chars
 # with no underscore -- this is what keeps an ordinary removed English word ("failed", "returned")
@@ -4394,12 +4555,23 @@ lit_re = re.compile(
     + r'|\\b([A-Za-z_][A-Za-z0-9]*_[A-Za-z0-9_]*)\\b'
     + r'|\\b([A-Za-z][A-Za-z0-9]{%d,})\\b' % (IDENT_MIN_LEN - 1)
 )
-literals = set()
-for line in removed_lines:
-    for m in lit_re.finditer(line):
-        lit = m.group(1) or m.group(2) or m.group(3) or m.group(4)
-        if lit:
-            literals.add(lit)
+def extract(lines):
+    found = set()
+    for line in lines:
+        for m in lit_re.finditer(line):
+            lit = m.group(1) or m.group(2) or m.group(3) or m.group(4)
+            if lit:
+                found.add(lit)
+    return found
+
+removed_literals = extract(removed_lines)
+added_literals = extract(added_lines)
+# A literal that still appears in this SAME commit's added lines was not actually removed from the
+# codebase -- a single-line edit (e.g. inserting a flag into an existing command string) shows the
+# whole line as both '-' and '+' in a unified diff, so its unchanged tokens would otherwise be
+# reported as "removed" even though they survive, unmoved, in this very commit. Only a literal that
+# disappears from the diff's added side entirely is a genuine removal worth scanning for elsewhere.
+literals = removed_literals - added_literals
 
 if not literals:
     print('NO_LITERALS_REMOVED')
