@@ -4520,17 +4520,6 @@ function decideAttribution({ checkId, taskGateHistory, cacheStatus = null, curre
 }
 // <</shared:decideAttribution>>
 
-// <<shared:ATTRIBUTION_CACHE_SCHEMA>>
-const ATTRIBUTION_CACHE_SCHEMA = {
-  type: 'object',
-  required: ['cacheStatus'],
-  properties: {
-    cacheStatus: { type: 'string', enum: ['pass', 'fail', 'unknown'], description: 'the check\'s status at base_sha per the gate cache -- "pass" or "fail" from a cache hit or a safe re-run, "unknown" only when neither was possible' },
-    notes: { type: 'string' }
-  }
-}
-// <</shared:ATTRIBUTION_CACHE_SCHEMA>>
-
 // <<shared:renderAttributionCacheLookup>>
 // The read-only gate-cache consult for decideAttribution()'s step 2 -- an agent turn because the
 // engine script itself has no filesystem/subprocess access (base-template CLAUDE.md's "stamp-
@@ -4574,6 +4563,15 @@ lookup's JSON or the re-run's exit code).`
 // at an earlier task), falling back to ONE cheap gate-cache-lookup agent turn only when this run's
 // history has nothing to say. Returns decideAttribution()'s verdict object, or null when nothing
 // decides (the caller's existing, unchanged triage flow is the correct fallback for null).
+//
+// The schema below was a separate top-level ATTRIBUTION_CACHE_SCHEMA const until 2026-09-17: this
+// function is called from the main per-task loop (on a failing check), which is textually BEFORE
+// where that const was declared in the generated engines -- the same top-level-await TDZ hazard as
+// REMOVED_LITERAL_SCAN_CONFIG/_SCHEMA (see that fix's comment on removedLiteralScan() below), just
+// not yet triggered by a real run when it was found (no gate check had failed requiring lookback
+// yet). Found by sweeping every top-level const declared after the main loop's own `for` statement
+// while fixing the REMOVED_LITERAL_SCAN crash. Inlined for the same reason: removes the late
+// top-level const entirely rather than trying to reorder it correctly.
 async function attributionLookback({ checkId, state, taskNum, runRoot, baseSha, harnessCfg, GIT, currentTaskFiles = [] }) {
   const history = buildTaskGateHistory(state.tasks, taskNum)
   const fromHistory = decideAttribution({ checkId, taskGateHistory: history, cacheStatus: null, currentTaskFiles })
@@ -4584,23 +4582,21 @@ async function attributionLookback({ checkId, state, taskNum, runRoot, baseSha, 
   const repoSlug = scopeMatch ? scopeMatch[1] : null
   const checkCfg = (harnessCfg?.validation?.checks || []).find(c => c.name === checkId)
   const checkCommand = checkCfg ? (checkCfg.command || null) : null
+  const attributionCacheSchema = {
+    type: 'object',
+    required: ['cacheStatus'],
+    properties: {
+      cacheStatus: { type: 'string', enum: ['pass', 'fail', 'unknown'], description: 'the check\'s status at base_sha per the gate cache -- "pass" or "fail" from a cache hit or a safe re-run, "unknown" only when neither was possible' },
+      notes: { type: 'string' }
+    }
+  }
   const result = await tracedAgent(`
 ${renderAttributionCacheLookup({ runRoot, checkId, baseSha, repoSlug, checkCommand, GIT })}
-`, { label: `attribution-cache:${checkId}`, schema: ATTRIBUTION_CACHE_SCHEMA, model: 'haiku' })
+`, { label: `attribution-cache:${checkId}`, schema: attributionCacheSchema, model: 'haiku' })
   if (!result || result.cacheStatus === 'unknown') return null
   return decideAttribution({ checkId, taskGateHistory: history, cacheStatus: result.cacheStatus, currentTaskFiles })
 }
 // <</shared:attributionLookback>>
-
-// <<shared:REMOVED_LITERAL_SCAN_SCHEMA>>
-const REMOVED_LITERAL_SCAN_SCHEMA = {
-  type: 'object',
-  required: ['rawOutput'],
-  properties: {
-    rawOutput: { type: 'string', description: 'Everything the removed-literal scan script printed to stdout, verbatim, unmodified, unsummarized' }
-  }
-}
-// <</shared:REMOVED_LITERAL_SCAN_SCHEMA>>
 
 // <<shared:parseRemovedLiteralScanOutput>>
 // Parses runRemovedLiteralScan()'s transcribed stdout -- never throws; a malformed/empty
@@ -4774,9 +4770,16 @@ async function removedLiteralScan({ runRoot, taskNum, tasksJsonPath, prevSha, ha
   const minLiteralLen = Number.isInteger(cfg.minLiteralLen) && cfg.minLiteralLen > 0 ? cfg.minLiteralLen : defaultMinLiteralLen
   const identifierMinLen = Number.isInteger(cfg.identifierMinLen) && cfg.identifierMinLen > 0 ? cfg.identifierMinLen : defaultIdentifierMinLen
   const range = prevSha || 'HEAD~1'
+  const removedLiteralScanSchema = {
+    type: 'object',
+    required: ['rawOutput'],
+    properties: {
+      rawOutput: { type: 'string', description: 'Everything the removed-literal scan script printed to stdout, verbatim, unmodified, unsummarized' }
+    }
+  }
   const result = await tracedAgent(`
 ${renderRemovedLiteralScan({ runRoot, taskNum, tasksJsonPath, range, testGlobRegex, minLiteralLen, identifierMinLen })}
-`, { label: `removed-literal-scan-${taskNum}`, schema: REMOVED_LITERAL_SCAN_SCHEMA, model: 'haiku' })
+`, { label: `removed-literal-scan-${taskNum}`, schema: removedLiteralScanSchema, model: 'haiku' })
   return parseRemovedLiteralScanOutput(result && result.rawOutput)
 }
 // <</shared:removedLiteralScan>>
