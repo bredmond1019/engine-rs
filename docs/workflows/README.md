@@ -101,6 +101,8 @@ near-miss one — it decomposes that real block record's `what`/`files`/`accepta
 Otherwise it falls back to the original path — gathering loose `planning/<slug>/*.md` context —
 byte-for-byte unchanged, resolving through `model_tiers.generate` as before. Tuning one knob can
 never silently change the other's resolved model. Detail: [sdlc-flow.md](sdlc-flow.md#nodes-model-vs-deterministic-and-what-each-does).
+The block-record path's prompt lives at `crates/engine-core/src/workflows/sdlc_flow/prompts/generate_tasks_from_block.md`,
+pulled in via `include_str!` per D24 (a node's stable prompt is a file, not a string literal).
 
 ### Planning
 
