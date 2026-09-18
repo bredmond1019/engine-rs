@@ -93,6 +93,15 @@ table is a reader's copy.
 | `RECALL` | Asks the Brain a question mid-run via Synapse's `GET /recall`, so a chain step can branch on what the corpus already knows instead of carrying it in the event payload. | [recall.md](recall.md) |
 | `PRE_PLAN` | Turns a short free-text idea into a researched `$BRAIN_ROOT/planning/open-work/pre-plan/<slug>/notes.md`, no human back-and-forth — the smallest usable slice of the pre-plan pipeline (`/capture` today), externally triggerable over HTTP. Disabled by default (a kill switch). | [pre-plan.md](pre-plan.md) |
 
+**`GenerateTasksNode` (`SDLC_FLOW`/`SDLC_TASK`) has two decomposition paths (`EN.19.C`).** When
+`planning/blocks/{spec_slug}.json` exists — an EXACT filename match only, never a fuzzy or
+near-miss one — it decomposes that real block record's `what`/`files`/`acceptance_criteria`/
+`out_of_scope`/`interfaces`, per-task file ownership disjoint unless two tasks share an explicit
+`dependsOn` edge, resolving its model through the SEPARATE `model_tiers.generate_from_block` knob.
+Otherwise it falls back to the original path — gathering loose `planning/<slug>/*.md` context —
+byte-for-byte unchanged, resolving through `model_tiers.generate` as before. Tuning one knob can
+never silently change the other's resolved model. Detail: [sdlc-flow.md](sdlc-flow.md#nodes-model-vs-deterministic-and-what-each-does).
+
 ### Planning
 
 | Workflow | What it does | Detail |
